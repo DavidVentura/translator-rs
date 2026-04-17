@@ -1,7 +1,7 @@
 use crate::catalog::CatalogSnapshot;
 use crate::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use crate::routing::{NothingReason, detect_language_robust_code};
-use crate::translate::{TokenAlignment, translate_texts_with_alignment_in_snapshot};
+use crate::translate::{TokenAlignment, Translator};
 use crate::{BackgroundMode, BergamotEngine};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,9 +160,7 @@ pub fn translate_structured_fragments_in_snapshot(
         }
     }
 
-    let Some(translations) = translate_texts_with_alignment_in_snapshot(
-        engine,
-        snapshot,
+    let Some(translations) = Translator::new(engine, snapshot).translate_texts_with_alignment(
         &source_code,
         target_code,
         &all_segment_texts,

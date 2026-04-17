@@ -6,11 +6,178 @@ use crate::catalog::CatalogSnapshot;
 use crate::catalog::{
     LanguageCatalog, PackInstallChecker, PackResolver, has_translation_direction_installed,
 };
+#[cfg(feature = "tesseract")]
+use crate::ocr::{ImageTranslationOutcome, ReadingOrder};
+use crate::routing::MixedTextTranslationResult;
+#[cfg(not(feature = "tesseract"))]
+use crate::routing::translate_mixed_texts_in_snapshot;
+#[cfg(feature = "tesseract")]
+use crate::settings::BackgroundMode;
+use crate::styled::{
+    OverlayScreenshot, StructuredTranslationResult, StyledFragment,
+    translate_structured_fragments_in_snapshot,
+};
+#[cfg(feature = "tesseract")]
+use crate::{
+    ocr_runtime::translate_image_rgba_in_snapshot, routing::translate_mixed_texts_in_snapshot,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedText {
     pub translated: String,
     pub transliterated: Option<String>,
+}
+
+pub struct Translator<'a> {
+    engine: &'a mut BergamotEngine,
+    snapshot: &'a CatalogSnapshot,
+}
+
+impl<'a> Translator<'a> {
+    pub fn new(engine: &'a mut BergamotEngine, snapshot: &'a CatalogSnapshot) -> Self {
+        Self { engine, snapshot }
+    }
+
+    pub fn warm(&mut self, from_code: &str, to_code: &str) -> Result<bool, String> {
+        let Some(plan) = resolve_translation_plan_in_snapshot(self.snapshot, from_code, to_code)
+        else {
+            return Ok(false);
+        };
+        ensure_plan_loaded(self.engine, &plan)?;
+        Ok(true)
+    }
+
+    pub fn translate_text(
+        &mut self,
+        from_code: &str,
+        to_code: &str,
+        text: &str,
+    ) -> Result<Option<String>, String> {
+        let normalized = text.trim();
+        if normalized.is_empty() {
+            return Ok(Some(String::new()));
+        }
+        if from_code == to_code || normalized.parse::<f32>().is_ok() {
+            return Ok(Some(normalized.to_string()));
+        }
+
+        let lines = normalized
+            .split('\n')
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let non_empty_indices = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| (!line.trim().is_empty()).then_some(index))
+            .collect::<Vec<_>>();
+        if non_empty_indices.is_empty() {
+            return Ok(Some(String::new()));
+        }
+
+        let texts_to_translate = non_empty_indices
+            .iter()
+            .map(|&index| lines[index].clone())
+            .collect::<Vec<_>>();
+        let translated = match self.translate_texts(from_code, to_code, &texts_to_translate) {
+            Some(Ok(values)) => values,
+            Some(Err(message)) => return Err(message),
+            None => return Ok(None),
+        };
+
+        let mut merged = lines;
+        for (index, translated_text) in non_empty_indices.into_iter().zip(translated.into_iter()) {
+            merged[index] = translated_text;
+        }
+        Ok(Some(merged.join("\n")))
+    }
+
+    pub(crate) fn translate_texts(
+        &mut self,
+        from_code: &str,
+        to_code: &str,
+        texts: &[String],
+    ) -> Option<Result<Vec<String>, String>> {
+        let plan = resolve_translation_plan_in_snapshot(self.snapshot, from_code, to_code)?;
+        Some(execute_translation_plan(self.engine, &plan, texts))
+    }
+
+    pub fn translate_mixed_texts(
+        &mut self,
+        inputs: &[String],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[String],
+    ) -> Result<MixedTextTranslationResult, String> {
+        translate_mixed_texts_in_snapshot(
+            self.engine,
+            self.snapshot,
+            inputs,
+            forced_source_code,
+            target_code,
+            available_language_codes,
+        )
+    }
+
+    pub fn translate_structured_fragments(
+        &mut self,
+        fragments: &[StyledFragment],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[String],
+        screenshot: Option<&OverlayScreenshot>,
+        background_mode: crate::BackgroundMode,
+    ) -> Result<StructuredTranslationResult, String> {
+        translate_structured_fragments_in_snapshot(
+            self.engine,
+            self.snapshot,
+            fragments,
+            forced_source_code,
+            target_code,
+            available_language_codes,
+            screenshot,
+            background_mode,
+        )
+    }
+
+    #[cfg(feature = "tesseract")]
+    pub fn translate_image_rgba(
+        &mut self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        source_code: &str,
+        target_code: &str,
+        min_confidence: u32,
+        reading_order: ReadingOrder,
+        background_mode: BackgroundMode,
+    ) -> Result<ImageTranslationOutcome, String> {
+        translate_image_rgba_in_snapshot(
+            self.engine,
+            self.snapshot,
+            rgba_bytes,
+            width,
+            height,
+            source_code,
+            target_code,
+            min_confidence,
+            reading_order,
+            background_mode,
+        )
+    }
+
+    pub(crate) fn translate_texts_with_alignment(
+        &mut self,
+        from_code: &str,
+        to_code: &str,
+        texts: &[String],
+    ) -> Option<Result<Vec<TranslationWithAlignment>, String>> {
+        let plan = resolve_translation_plan_in_snapshot(self.snapshot, from_code, to_code)?;
+        Some(execute_translation_plan_with_alignment(
+            self.engine,
+            &plan,
+            texts,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -171,30 +338,6 @@ pub(crate) fn execute_translation_plan_with_alignment(
         }
         _ => Ok(Vec::new()),
     }
-}
-
-pub fn translate_texts_in_snapshot(
-    engine: &mut BergamotEngine,
-    snapshot: &CatalogSnapshot,
-    from_code: &str,
-    to_code: &str,
-    texts: &[String],
-) -> Option<Result<Vec<String>, String>> {
-    let plan = resolve_translation_plan_in_snapshot(snapshot, from_code, to_code)?;
-    Some(execute_translation_plan(engine, &plan, texts))
-}
-
-pub fn translate_texts_with_alignment_in_snapshot(
-    engine: &mut BergamotEngine,
-    snapshot: &CatalogSnapshot,
-    from_code: &str,
-    to_code: &str,
-    texts: &[String],
-) -> Option<Result<Vec<TranslationWithAlignment>, String>> {
-    let plan = resolve_translation_plan_in_snapshot(snapshot, from_code, to_code)?;
-    Some(execute_translation_plan_with_alignment(
-        engine, &plan, texts,
-    ))
 }
 
 fn ensure_plan_loaded(engine: &mut BergamotEngine, plan: &TranslationPlan) -> Result<(), String> {

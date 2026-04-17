@@ -8,7 +8,7 @@ use crate::ocr::{
 };
 use crate::settings::BackgroundMode;
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
-use crate::translate::translate_texts_in_snapshot;
+use crate::translate::Translator;
 use crate::{BergamotEngine, PageSegMode, TesseractWrapper};
 
 struct OcrEngineState {
@@ -135,9 +135,7 @@ fn translate_block_texts(
         .iter()
         .map(|&index| block_texts[index].clone())
         .collect::<Vec<_>>();
-    let translated = match translate_texts_in_snapshot(
-        engine,
-        snapshot,
+    let translated = match Translator::new(engine, snapshot).translate_texts(
         source_code,
         target_code,
         &texts_to_translate,

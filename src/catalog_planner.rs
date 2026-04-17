@@ -41,6 +41,12 @@ pub struct CatalogSnapshot {
     pub availability_by_code: HashMap<String, LangAvailability>,
 }
 
+impl CatalogSnapshot {
+    pub fn can_translate(&self, from_code: &str, to_code: &str) -> bool {
+        can_translate_in_snapshot(self, from_code, to_code)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LanguageAvailabilityRow {
