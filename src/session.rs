@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
@@ -44,9 +44,10 @@ pub enum Feature {
     Tts,
 }
 
+static BERGAMOT_ENGINE: OnceLock<Mutex<BergamotEngine>> = OnceLock::new();
+
 pub struct TranslatorSession {
     snapshot: RwLock<Arc<CatalogSnapshot>>,
-    engine: Mutex<BergamotEngine>,
     #[cfg(feature = "tts")]
     speech: Mutex<SpeechCache>,
     #[cfg(feature = "dictionary")]
@@ -59,7 +60,6 @@ impl TranslatorSession {
     pub fn from_snapshot(snapshot: CatalogSnapshot) -> Self {
         Self {
             snapshot: RwLock::new(Arc::new(snapshot)),
-            engine: Mutex::new(BergamotEngine::new()),
             #[cfg(feature = "tts")]
             speech: Mutex::new(SpeechCache::new()),
             #[cfg(feature = "dictionary")]
@@ -67,6 +67,10 @@ impl TranslatorSession {
             #[cfg(feature = "tesseract")]
             ocr: Mutex::new(OcrCache::new()),
         }
+    }
+
+    fn engine(&self) -> &'static Mutex<BergamotEngine> {
+        BERGAMOT_ENGINE.get_or_init(|| Mutex::new(BergamotEngine::new()))
     }
 
     pub fn open<C>(
@@ -117,7 +121,7 @@ impl TranslatorSession {
 
     pub fn warm(&self, from_code: &str, to_code: &str) -> Result<(), TranslatorError> {
         let snap = self.snapshot();
-        let mut engine = self.engine.lock().expect("engine lock poisoned");
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
         Translator::new(&mut engine, &snap)
             .warm(&LanguageCode::from(from_code), &LanguageCode::from(to_code))
     }
@@ -129,7 +133,7 @@ impl TranslatorSession {
         text: &str,
     ) -> Result<String, TranslatorError> {
         let snap = self.snapshot();
-        let mut engine = self.engine.lock().expect("engine lock poisoned");
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
         Translator::new(&mut engine, &snap).translate_text(
             &LanguageCode::from(from_code),
             &LanguageCode::from(to_code),
@@ -145,7 +149,7 @@ impl TranslatorSession {
         available_language_codes: &[LanguageCode],
     ) -> Result<MixedTextTranslationResult, TranslatorError> {
         let snap = self.snapshot();
-        let mut engine = self.engine.lock().expect("engine lock poisoned");
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
         Translator::new(&mut engine, &snap).translate_mixed_texts(
             inputs,
             forced_source_code.map(LanguageCode::from).as_ref(),
@@ -164,7 +168,7 @@ impl TranslatorSession {
         background_mode: BackgroundMode,
     ) -> Result<StructuredTranslationResult, TranslatorError> {
         let snap = self.snapshot();
-        let mut engine = self.engine.lock().expect("engine lock poisoned");
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
         Translator::new(&mut engine, &snap).translate_structured_fragments(
             fragments,
             forced_source_code.map(LanguageCode::from).as_ref(),
@@ -188,7 +192,7 @@ impl TranslatorSession {
         background_mode: BackgroundMode,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
-        let mut engine = self.engine.lock().expect("engine lock poisoned");
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
         let mut ocr = self.ocr.lock().expect("ocr cache poisoned");
         translate_image_rgba_in_snapshot(
             &mut engine,
@@ -225,10 +229,12 @@ impl TranslatorSession {
         let code = LanguageCode::from(language_code);
         match feature {
             Feature::Core => {
-                self.engine
-                    .lock()
-                    .expect("engine lock poisoned")
-                    .evict_involving(language_code);
+                if let Some(engine) = BERGAMOT_ENGINE.get() {
+                    engine
+                        .lock()
+                        .expect("engine lock poisoned")
+                        .evict_involving(language_code);
+                }
                 #[cfg(feature = "dictionary")]
                 self.close_dictionary(&snap, &code);
                 #[cfg(feature = "tts")]
