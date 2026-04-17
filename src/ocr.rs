@@ -45,6 +45,14 @@ pub enum ReadingOrder {
     TopToBottomLeftToRight,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum OverlayLayoutMode {
+    #[default]
+    PerLine,
+    BlockRect,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectedWord {
     pub text: String,
@@ -74,6 +82,13 @@ pub struct OverlayColors {
     pub foreground_argb: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct OverlayLayoutHints {
+    pub layout_mode: OverlayLayoutMode,
+    pub suggested_font_size_px: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextLine {
@@ -84,18 +99,19 @@ pub struct PreparedTextLine {
     pub foreground_argb: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextBlock {
     pub source_text: String,
     pub translated_text: String,
     pub bounding_box: Rect,
     pub lines: Vec<PreparedTextLine>,
+    pub layout_hints: OverlayLayoutHints,
     pub background_argb: u32,
     pub foreground_argb: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedImageOverlay {
     pub rgba_bytes: Vec<u8>,
@@ -104,6 +120,13 @@ pub struct PreparedImageOverlay {
     pub extracted_text: String,
     pub translated_text: String,
     pub blocks: Vec<PreparedTextBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ImageTranslationOutcome {
+    Ready(PreparedImageOverlay),
+    MissingLanguagePair,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +167,33 @@ impl TextBlock {
             combined.union(line.bounding_box);
         }
         combined
+    }
+}
+
+fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> OverlayLayoutHints {
+    let layout_mode = match reading_order {
+        ReadingOrder::LeftToRight => OverlayLayoutMode::PerLine,
+        ReadingOrder::TopToBottomLeftToRight => OverlayLayoutMode::BlockRect,
+    };
+    let suggested_font_size_px = if block.lines.is_empty() {
+        match reading_order {
+            ReadingOrder::LeftToRight => block.bounds().height() as f32,
+            ReadingOrder::TopToBottomLeftToRight => block.bounds().width() as f32,
+        }
+    } else {
+        let total = block
+            .lines
+            .iter()
+            .map(|line| match reading_order {
+                ReadingOrder::LeftToRight => line.bounding_box.height() as f32,
+                ReadingOrder::TopToBottomLeftToRight => line.bounding_box.width() as f32,
+            })
+            .sum::<f32>();
+        total / block.lines.len() as f32
+    };
+    OverlayLayoutHints {
+        layout_mode,
+        suggested_font_size_px,
     }
 }
 
@@ -602,6 +652,7 @@ pub fn prepare_overlay_image(
 
     for (block, translated_text) in blocks.iter().zip(translated_blocks.iter()) {
         let block_bounds = block.bounds();
+        let layout_hints = overlay_layout_hints(block, reading_order);
         match reading_order {
             ReadingOrder::LeftToRight => {
                 let mut prepared_lines = Vec::with_capacity(block.lines.len());
@@ -631,6 +682,7 @@ pub fn prepare_overlay_image(
                     translated_text: translated_text.clone(),
                     bounding_box: block_bounds,
                     lines: prepared_lines,
+                    layout_hints,
                     background_argb: block_background,
                     foreground_argb: block_foreground,
                 });
@@ -659,6 +711,7 @@ pub fn prepare_overlay_image(
                     translated_text: translated_text.clone(),
                     bounding_box: block_bounds,
                     lines: prepared_lines,
+                    layout_hints,
                     background_argb: colors.background_argb,
                     foreground_argb: colors.foreground_argb,
                 });
@@ -893,7 +946,8 @@ pub fn build_text_blocks(
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectedWord, Rect, TextBlock, TextLine, build_text_blocks, prepare_overlay_image,
+        DetectedWord, OverlayLayoutMode, Rect, TextBlock, TextLine, build_text_blocks,
+        prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
 
@@ -1030,5 +1084,10 @@ mod tests {
         assert_eq!(erased_pixel, 0xFFFF_FFFF);
         assert_eq!(prepared.blocks[0].lines.len(), 2);
         assert_eq!(prepared.blocks[0].lines[0].foreground_argb, 0xFF00_0000);
+        assert_eq!(
+            prepared.blocks[0].layout_hints.layout_mode,
+            OverlayLayoutMode::PerLine
+        );
+        assert_eq!(prepared.blocks[0].layout_hints.suggested_font_size_px, 2.0);
     }
 }

@@ -8,6 +8,8 @@ pub mod language_detect;
 #[cfg(feature = "mucab")]
 pub mod mucab;
 pub mod ocr;
+#[cfg(feature = "tesseract")]
+mod ocr_runtime;
 pub mod routing;
 pub mod settings;
 #[cfg(feature = "tts")]
@@ -42,10 +44,12 @@ pub use catalog::{
 pub use language::Language;
 pub use language_detect::{DetectionResult, detect_language};
 pub use ocr::{
-    DetectedWord, OverlayColors, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine,
-    ReadingOrder, Rect, TextBlock, TextLine, build_text_blocks, prepare_overlay_image,
-    sample_overlay_colors,
+    DetectedWord, ImageTranslationOutcome, OverlayColors, OverlayLayoutHints, OverlayLayoutMode,
+    PreparedImageOverlay, PreparedTextBlock, PreparedTextLine, ReadingOrder, Rect, TextBlock,
+    TextLine, build_text_blocks, prepare_overlay_image, sample_overlay_colors,
 };
+#[cfg(feature = "tesseract")]
+pub use ocr_runtime::translate_image_rgba_in_snapshot;
 pub use routing::{
     MixedTextTranslationResult, NothingReason, TextTranslation, detect_language_robust_code,
     translate_mixed_texts_in_snapshot,
