@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+use crate::CatalogSnapshot;
 
 pub use tarkka::WordWithTaggedEntries;
 use tarkka::reader::DictionaryReader;
@@ -19,7 +22,7 @@ where
     f(&mut readers)
 }
 
-pub fn lookup_dictionary(path: &str, word: &str) -> Result<Option<WordWithTaggedEntries>, String> {
+fn lookup_dictionary(path: &str, word: &str) -> Result<Option<WordWithTaggedEntries>, String> {
     with_reader_cache(|readers| {
         if !readers.contains_key(path) {
             let file = File::open(path)
@@ -42,9 +45,65 @@ pub fn lookup_dictionary(path: &str, word: &str) -> Result<Option<WordWithTagged
     })
 }
 
-pub fn close_dictionary(path: &str) -> Result<(), String> {
+fn close_dictionary(path: &str) -> Result<(), String> {
     with_reader_cache(|readers| {
         readers.remove(path);
         Ok(())
     })
+}
+
+fn dictionary_path(base_dir: &str, dictionary_code: &str) -> Option<String> {
+    let path = Path::new(base_dir)
+        .join("dictionaries")
+        .join(format!("{dictionary_code}.dict"));
+    path.exists().then(|| path.to_string_lossy().into_owned())
+}
+
+pub fn lookup_dictionary_for_code(
+    base_dir: &str,
+    dictionary_code: &str,
+    word: &str,
+) -> Result<Option<WordWithTaggedEntries>, String> {
+    let normalized = word.trim();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(path) = dictionary_path(base_dir, dictionary_code) else {
+        return Ok(None);
+    };
+
+    let lowered = normalized.to_lowercase();
+    match lookup_dictionary(&path, normalized) {
+        Ok(Some(word_data)) => Ok(Some(word_data)),
+        Ok(None) if lowered != normalized => lookup_dictionary(&path, &lowered),
+        other => other,
+    }
+}
+
+fn dictionary_path_for_language(snapshot: &CatalogSnapshot, language_code: &str) -> Option<String> {
+    let language = snapshot.catalog.language_by_code(language_code)?;
+    dictionary_path(&snapshot.base_dir, &language.dictionary_code)
+}
+
+pub fn lookup_dictionary_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+    word: &str,
+) -> Result<Option<WordWithTaggedEntries>, String> {
+    let language = snapshot
+        .catalog
+        .language_by_code(language_code)
+        .ok_or_else(|| format!("unknown dictionary language: {language_code}"))?;
+    lookup_dictionary_for_code(&snapshot.base_dir, &language.dictionary_code, word)
+}
+
+pub fn close_dictionary_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+) -> Result<(), String> {
+    let Some(path) = dictionary_path_for_language(snapshot, language_code) else {
+        return Ok(());
+    };
+    close_dictionary(&path)
 }

@@ -66,7 +66,9 @@ pub use styled::{
     TranslationSegment, translate_structured_fragments_in_snapshot,
 };
 #[cfg(feature = "dictionary")]
-pub use tarkka::{close_dictionary, lookup_dictionary};
+pub use tarkka::{
+    close_dictionary_in_snapshot, lookup_dictionary_for_code, lookup_dictionary_in_snapshot,
+};
 #[cfg(feature = "tesseract")]
 pub use tesseract::{PageSegMode, TesseractWrapper};
 pub use translate::{
