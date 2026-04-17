@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::{
-    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
+    CatalogSnapshot, PcmAudio, PhonemeChunk, ResolvedTtsVoiceFiles, SpeechChunk,
+    SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks, resolve_tts_voice_files_in_snapshot,
 };
 use piper_rs::{
     Backend, BoundaryAfter, CoquiVitsModel, KokoroModel, MmsModel,
@@ -47,6 +48,15 @@ struct CachedSpeechModel {
     voices: Vec<(String, i64)>,
     default_voice: Option<(String, i64)>,
     model: SpeechModel,
+}
+
+struct ResolvedSpeechAssets {
+    engine: String,
+    model_path: String,
+    aux_path: String,
+    language_code: String,
+    speaker_id: Option<i64>,
+    support_data_root: Option<String>,
 }
 
 fn log_timing(step: &str, started_at: Instant) {
@@ -270,6 +280,45 @@ fn clamp_speech_speed(speech_speed: f32) -> f32 {
     speech_speed.clamp(0.5, 2.0)
 }
 
+fn support_data_root(snapshot: &CatalogSnapshot, _files: &ResolvedTtsVoiceFiles) -> Option<String> {
+    let data_dir = Path::new(&snapshot.base_dir).join("bin");
+    data_dir
+        .join("espeak-ng-data")
+        .is_dir()
+        .then(|| data_dir.display().to_string())
+}
+
+fn absolute_install_path(snapshot: &CatalogSnapshot, relative_path: &str) -> String {
+    Path::new(&snapshot.base_dir)
+        .join(relative_path)
+        .display()
+        .to_string()
+}
+
+fn resolve_speech_assets(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+) -> Option<ResolvedSpeechAssets> {
+    let files = resolve_tts_voice_files_in_snapshot(snapshot, language_code)?;
+    let support_data_root = support_data_root(snapshot, &files);
+    let model_path = absolute_install_path(snapshot, &files.model_install_path);
+    if !Path::new(&model_path).exists() {
+        return None;
+    }
+    let aux_path = absolute_install_path(snapshot, &files.aux_install_path);
+    if !Path::new(&aux_path).exists() {
+        return None;
+    }
+    Some(ResolvedSpeechAssets {
+        engine: files.engine,
+        model_path,
+        aux_path,
+        language_code: files.language_code,
+        speaker_id: files.speaker_id.map(i64::from),
+        support_data_root,
+    })
+}
+
 fn piper_length_scale_for_speed(speech_speed: f32) -> f32 {
     1.0 / clamp_speech_speed(speech_speed)
 }
@@ -282,6 +331,78 @@ pub fn clear_cached_model() {
     if let Ok(mut cache) = model_cache().lock() {
         *cache = None;
     }
+}
+
+pub fn available_tts_voices_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+) -> Result<Option<Vec<TtsVoiceOption>>, String> {
+    let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
+        return Ok(None);
+    };
+    list_voices(
+        &assets.engine,
+        &assets.model_path,
+        &assets.aux_path,
+        assets.support_data_root.as_deref(),
+        &assets.language_code,
+    )
+    .map(Some)
+}
+
+pub fn warm_tts_model_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+) -> Result<bool, String> {
+    let Some(_voices) = available_tts_voices_in_snapshot(snapshot, language_code)? else {
+        return Ok(false);
+    };
+    Ok(true)
+}
+
+pub fn plan_speech_chunks_for_text_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+    text: &str,
+) -> Result<Option<Vec<SpeechChunk>>, String> {
+    let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
+        return Ok(None);
+    };
+    plan_speech_chunks_for_text(
+        &assets.engine,
+        &assets.model_path,
+        &assets.aux_path,
+        assets.support_data_root.as_deref(),
+        &assets.language_code,
+        text,
+    )
+    .map(Some)
+}
+
+pub fn synthesize_pcm_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    language_code: &str,
+    text: &str,
+    speech_speed: f32,
+    voice_name: Option<&str>,
+    is_phonemes: bool,
+) -> Result<Option<PcmAudio>, String> {
+    let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
+        return Ok(None);
+    };
+    synthesize_pcm(
+        &assets.engine,
+        &assets.model_path,
+        &assets.aux_path,
+        assets.support_data_root.as_deref(),
+        &assets.language_code,
+        text,
+        speech_speed,
+        voice_name,
+        assets.speaker_id,
+        is_phonemes,
+    )
+    .map(Some)
 }
 
 fn derive_japanese_dict_path(support_data_root: &str, language_code: &str) -> Option<PathBuf> {
@@ -586,7 +707,7 @@ fn synthesize(
     }
 }
 
-pub fn synthesize_pcm(
+fn synthesize_pcm(
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -666,7 +787,7 @@ pub fn synthesize_pcm(
     })
 }
 
-pub fn list_voices(
+fn list_voices(
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -747,7 +868,7 @@ fn to_phoneme_chunk(chunk: PiperPhonemeChunk) -> PhonemeChunk {
     }
 }
 
-pub fn plan_speech_chunks_for_text(
+fn plan_speech_chunks_for_text(
     engine: &str,
     model_path: &str,
     aux_path: &str,

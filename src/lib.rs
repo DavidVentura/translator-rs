@@ -13,7 +13,7 @@ mod ocr_runtime;
 pub mod routing;
 pub mod settings;
 #[cfg(feature = "tts")]
-pub mod speech;
+mod speech;
 pub mod styled;
 #[cfg(feature = "dictionary")]
 pub mod tarkka;
@@ -56,7 +56,10 @@ pub use routing::{
 };
 pub use settings::{AppSettings, BackgroundMode, DEFAULT_CATALOG_INDEX_URL};
 #[cfg(feature = "tts")]
-pub use speech::{clear_cached_model, list_voices, plan_speech_chunks_for_text, synthesize_pcm};
+pub use speech::{
+    available_tts_voices_in_snapshot, clear_cached_model, plan_speech_chunks_for_text_in_snapshot,
+    synthesize_pcm_in_snapshot, warm_tts_model_in_snapshot,
+};
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyleSpan as StructuredStyleSpan,
     StyledFragment as StructuredStyledFragment, TextStyle, TranslatedStyledBlock,
