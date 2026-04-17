@@ -28,6 +28,46 @@ pub trait PackInstallChecker {
     fn install_marker_exists(&self, marker_path: &str, expected_version: i32) -> bool;
 }
 
+pub struct FsPackInstallChecker {
+    base_dir: std::path::PathBuf,
+}
+
+impl FsPackInstallChecker {
+    pub fn new(base_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+        }
+    }
+
+    fn resolve(&self, relative_path: &str) -> std::path::PathBuf {
+        self.base_dir.join(relative_path)
+    }
+}
+
+impl PackInstallChecker for FsPackInstallChecker {
+    fn file_exists(&self, install_path: &str) -> bool {
+        self.resolve(install_path).exists()
+    }
+
+    fn install_marker_exists(&self, marker_path: &str, expected_version: i32) -> bool {
+        let marker_file = self.resolve(marker_path);
+        if !marker_file.exists() {
+            return false;
+        }
+
+        let Ok(contents) = std::fs::read_to_string(marker_file) else {
+            return false;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            return false;
+        };
+        json.get("version")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            == Some(expected_version)
+    }
+}
+
 pub struct PackResolver<'a, C> {
     catalog: &'a LanguageCatalog,
     install_checker: &'a C,

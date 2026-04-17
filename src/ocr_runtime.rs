@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::catalog::CatalogSnapshot;
 use crate::ocr::{
-    DetectedWord, ImageTranslationOutcome, ReadingOrder, Rect, TextBlock, build_text_blocks,
+    DetectedWord, PreparedImageOverlay, ReadingOrder, Rect, TextBlock, build_text_blocks,
     prepare_overlay_image,
 };
 use crate::settings::BackgroundMode;
@@ -46,7 +46,7 @@ pub(crate) fn translate_image_rgba_in_snapshot(
     min_confidence: u32,
     reading_order: ReadingOrder,
     background_mode: BackgroundMode,
-) -> Result<ImageTranslationOutcome, TranslatorError> {
+) -> Result<PreparedImageOverlay, TranslatorError> {
     let bytes_per_pixel = 4i32;
     let i_width = width as i32;
     let i_height = height as i32;
@@ -62,37 +62,40 @@ pub(crate) fn translate_image_rgba_in_snapshot(
     let join_without_spaces = source_code.as_str() == "ja";
     let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomLeftToRight;
 
-    let blocks = with_ocr_engine(ocr_cache, snapshot, source_code.as_str(), reading_order, |ocr| {
-        ocr.set_page_seg_mode(page_seg_mode);
-        ocr.set_frame(
-            rgba_bytes,
-            i_width,
-            i_height,
-            bytes_per_pixel,
-            bytes_per_line,
-        )
-        .map_err(|err| format!("failed to set OCR frame: {err}"))?;
-        let words = ocr
-            .get_word_boxes()
-            .map_err(|err| format!("failed to read OCR words: {err}"))?;
-        let detected_words = words
-            .into_iter()
-            .map(map_tesseract_word)
-            .collect::<Vec<_>>();
-        Ok(build_text_blocks(
-            &detected_words,
-            min_confidence,
-            join_without_spaces,
-            relax_single_char_confidence,
-        ))
-    })
+    let blocks = with_ocr_engine(
+        ocr_cache,
+        snapshot,
+        source_code.as_str(),
+        reading_order,
+        |ocr| {
+            ocr.set_page_seg_mode(page_seg_mode);
+            ocr.set_frame(
+                rgba_bytes,
+                i_width,
+                i_height,
+                bytes_per_pixel,
+                bytes_per_line,
+            )
+            .map_err(|err| format!("failed to set OCR frame: {err}"))?;
+            let words = ocr
+                .get_word_boxes()
+                .map_err(|err| format!("failed to read OCR words: {err}"))?;
+            let detected_words = words
+                .into_iter()
+                .map(map_tesseract_word)
+                .collect::<Vec<_>>();
+            Ok(build_text_blocks(
+                &detected_words,
+                min_confidence,
+                join_without_spaces,
+                relax_single_char_confidence,
+            ))
+        },
+    )
     .map_err(TranslatorError::ocr)?;
 
-    let Some(translated_blocks) =
-        translate_block_texts(engine, snapshot, source_code, target_code, &blocks)?
-    else {
-        return Ok(ImageTranslationOutcome::MissingLanguagePair);
-    };
+    let translated_blocks =
+        translate_block_texts(engine, snapshot, source_code, target_code, &blocks)?;
 
     prepare_overlay_image(
         rgba_bytes,
@@ -103,7 +106,6 @@ pub(crate) fn translate_image_rgba_in_snapshot(
         background_mode,
         reading_order,
     )
-    .map(ImageTranslationOutcome::Ready)
     .map_err(TranslatorError::ocr)
 }
 
@@ -129,7 +131,7 @@ fn translate_block_texts(
     source_code: &LanguageCode,
     target_code: &LanguageCode,
     blocks: &[TextBlock],
-) -> Result<Option<Vec<String>>, TranslatorError> {
+) -> Result<Vec<String>, TranslatorError> {
     let block_texts = blocks
         .iter()
         .map(TextBlock::translation_text)
@@ -145,27 +147,24 @@ fn translate_block_texts(
     }
 
     if source_code == target_code {
-        return Ok(Some(block_texts));
+        return Ok(block_texts);
     }
 
     let texts_to_translate = non_empty_indices
         .iter()
         .map(|&index| block_texts[index].clone())
         .collect::<Vec<_>>();
-    let translated = match Translator::new(engine, snapshot).translate_texts(
-        &source_code,
-        &target_code,
+    let translated = Translator::new(engine, snapshot).translate_texts(
+        source_code,
+        target_code,
         &texts_to_translate,
-    )? {
-        Some(values) => values,
-        None => return Ok(None),
-    };
+    )?;
 
-    Ok(Some(merge_translated_block_texts(
+    Ok(merge_translated_block_texts(
         &block_texts,
         &non_empty_indices,
         translated,
-    )))
+    ))
 }
 
 fn merge_translated_block_texts(

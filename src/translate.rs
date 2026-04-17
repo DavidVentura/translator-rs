@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::BergamotEngine;
-use crate::api::{LanguageCode, TextTranslationOutcome, TranslationWarmOutcome, TranslatorError};
+use crate::api::{LanguageCode, TranslatorError};
 use crate::catalog::CatalogSnapshot;
 #[cfg(test)]
 use crate::catalog::{
@@ -33,16 +33,20 @@ impl<'a> Translator<'a> {
         &mut self,
         from_code: &LanguageCode,
         to_code: &LanguageCode,
-    ) -> Result<TranslationWarmOutcome, TranslatorError> {
-        let Some(plan) = resolve_translation_plan_in_snapshot(
+    ) -> Result<(), TranslatorError> {
+        let plan = resolve_translation_plan_in_snapshot(
             self.snapshot,
             from_code.as_str(),
             to_code.as_str(),
-        ) else {
-            return Ok(TranslationWarmOutcome::MissingLanguagePair);
-        };
-        ensure_plan_loaded(self.engine, &plan).map_err(TranslatorError::translation)?;
-        Ok(TranslationWarmOutcome::Warmed)
+        )
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "translation pack not installed for {}->{}",
+                from_code.as_str(),
+                to_code.as_str()
+            ))
+        })?;
+        ensure_plan_loaded(self.engine, &plan).map_err(TranslatorError::translation)
     }
 
     pub fn translate_text(
@@ -50,13 +54,13 @@ impl<'a> Translator<'a> {
         from_code: &LanguageCode,
         to_code: &LanguageCode,
         text: &str,
-    ) -> Result<TextTranslationOutcome, TranslatorError> {
+    ) -> Result<String, TranslatorError> {
         let normalized = text.trim();
         if normalized.is_empty() {
-            return Ok(TextTranslationOutcome::Passthrough(String::new()));
+            return Ok(String::new());
         }
         if from_code == to_code || normalized.parse::<f32>().is_ok() {
-            return Ok(TextTranslationOutcome::Passthrough(normalized.to_string()));
+            return Ok(normalized.to_string());
         }
 
         let lines = normalized
@@ -69,23 +73,20 @@ impl<'a> Translator<'a> {
             .filter_map(|(index, line)| (!line.trim().is_empty()).then_some(index))
             .collect::<Vec<_>>();
         if non_empty_indices.is_empty() {
-            return Ok(TextTranslationOutcome::Passthrough(String::new()));
+            return Ok(String::new());
         }
 
         let texts_to_translate = non_empty_indices
             .iter()
             .map(|&index| lines[index].clone())
             .collect::<Vec<_>>();
-        let translated = match self.translate_texts(from_code, to_code, &texts_to_translate)? {
-            Some(values) => values,
-            None => return Ok(TextTranslationOutcome::MissingLanguagePair),
-        };
+        let translated = self.translate_texts(from_code, to_code, &texts_to_translate)?;
 
         let mut merged = lines;
         for (index, translated_text) in non_empty_indices.into_iter().zip(translated.into_iter()) {
             merged[index] = translated_text;
         }
-        Ok(TextTranslationOutcome::Translated(merged.join("\n")))
+        Ok(merged.join("\n"))
     }
 
     pub(crate) fn translate_texts(
@@ -93,17 +94,20 @@ impl<'a> Translator<'a> {
         from_code: &LanguageCode,
         to_code: &LanguageCode,
         texts: &[String],
-    ) -> Result<Option<Vec<String>>, TranslatorError> {
-        let Some(plan) = resolve_translation_plan_in_snapshot(
+    ) -> Result<Vec<String>, TranslatorError> {
+        let plan = resolve_translation_plan_in_snapshot(
             self.snapshot,
             from_code.as_str(),
             to_code.as_str(),
-        ) else {
-            return Ok(None);
-        };
-        execute_translation_plan(self.engine, &plan, texts)
-            .map(Some)
-            .map_err(TranslatorError::translation)
+        )
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "translation pack not installed for {}->{}",
+                from_code.as_str(),
+                to_code.as_str()
+            ))
+        })?;
+        execute_translation_plan(self.engine, &plan, texts).map_err(TranslatorError::translation)
     }
 
     pub fn translate_mixed_texts(
@@ -234,7 +238,7 @@ alignment: soft\n"
 }
 
 fn cache_key(from_code: &str, to_code: &str) -> String {
-    format!("{from_code}{to_code}")
+    format!("{from_code}-{to_code}")
 }
 
 #[cfg(test)]

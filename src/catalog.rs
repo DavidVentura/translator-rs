@@ -12,9 +12,10 @@ pub use model::{
     TtsVoicePickerRegion,
 };
 pub use planner::{
-    CatalogSnapshot, LanguageAvailabilityRow, PackInstallChecker, PackInstallStatus, PackResolver,
-    build_catalog_snapshot, can_swap_languages_installed, can_translate, can_translate_in_snapshot,
-    can_translate_with_checker, compute_language_availability, has_translation_direction_installed,
+    CatalogSnapshot, FsPackInstallChecker, LanguageAvailabilityRow, PackInstallChecker,
+    PackInstallStatus, PackResolver, build_catalog_snapshot, can_swap_languages_installed,
+    can_translate, can_translate_in_snapshot, can_translate_with_checker,
+    compute_language_availability, has_translation_direction_installed,
     installed_tts_pack_id_for_language, is_pack_installed, language_rows_in_snapshot,
     plan_delete_dictionary, plan_delete_dictionary_in_snapshot, plan_delete_language,
     plan_delete_language_in_snapshot, plan_delete_superseded_tts,

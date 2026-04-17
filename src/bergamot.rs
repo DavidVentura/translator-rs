@@ -33,6 +33,17 @@ impl BergamotEngine {
         Ok(())
     }
 
+    pub fn evict(&mut self, key: &str) {
+        self.models.remove(key);
+    }
+
+    pub fn evict_involving(&mut self, language_code: &str) {
+        let needle_from = format!("{language_code}-");
+        let needle_to = format!("-{language_code}");
+        self.models
+            .retain(|key, _| !key.starts_with(&needle_from) && !key.ends_with(&needle_to));
+    }
+
     pub fn translate_multiple(&self, inputs: &[String], key: &str) -> Result<Vec<String>, String> {
         let model = self.model(key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();

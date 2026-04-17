@@ -161,6 +161,7 @@ impl fmt::Display for DictionaryCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum TranslatorErrorKind {
     Translation,
     Ocr,
@@ -169,6 +170,7 @@ pub enum TranslatorErrorKind {
     Transliterate,
     InvalidInput,
     Internal,
+    MissingAsset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +205,14 @@ impl TranslatorError {
     pub(crate) fn dictionary(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::Dictionary, message)
     }
+
+    pub(crate) fn missing_asset(message: impl Into<String>) -> Self {
+        Self::new(TranslatorErrorKind::MissingAsset, message)
+    }
+
+    pub fn is_missing_asset(&self) -> bool {
+        self.kind == TranslatorErrorKind::MissingAsset
+    }
 }
 
 impl fmt::Display for TranslatorError {
@@ -212,52 +222,3 @@ impl fmt::Display for TranslatorError {
 }
 
 impl std::error::Error for TranslatorError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranslationWarmOutcome {
-    Warmed,
-    MissingLanguagePair,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TextTranslationOutcome {
-    Translated(String),
-    Passthrough(String),
-    MissingLanguagePair,
-}
-
-#[cfg(feature = "tts")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TtsVoicesOutcome {
-    Available(Vec<crate::TtsVoiceOption>),
-    MissingLanguage,
-}
-
-#[cfg(feature = "tts")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TtsWarmOutcome {
-    Warmed,
-    MissingLanguage,
-}
-
-#[cfg(feature = "tts")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpeechChunkPlanningOutcome {
-    Planned(Vec<crate::SpeechChunk>),
-    MissingLanguage,
-}
-
-#[cfg(feature = "tts")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PcmSynthesisOutcome {
-    Ready(crate::PcmAudio),
-    MissingLanguage,
-}
-
-#[cfg(feature = "dictionary")]
-#[derive(Debug)]
-pub enum DictionaryLookupOutcome {
-    Found(crate::tarkka::WordWithTaggedEntries),
-    NotFound,
-    MissingDictionary,
-}

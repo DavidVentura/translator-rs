@@ -123,13 +123,6 @@ pub struct PreparedImageOverlay {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum ImageTranslationOutcome {
-    Ready(PreparedImageOverlay),
-    MissingLanguagePair,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 struct WordInfo {
     text: String,
     confidence: f32,

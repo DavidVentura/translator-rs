@@ -1,10 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::api::{
-    LanguageCode, PcmSynthesisOutcome, SpeechChunkPlanningOutcome, TranslatorError,
-    TtsVoicesOutcome, TtsWarmOutcome, VoiceName,
-};
+use crate::api::{LanguageCode, TranslatorError, VoiceName};
 use crate::{
     CatalogSnapshot, PcmAudio, PhonemeChunk, ResolvedTtsVoiceFiles, SpeechChunk,
     SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks, resolve_tts_voice_files_in_snapshot,
@@ -343,14 +340,20 @@ fn piper_length_scale_for_speed(speech_speed: f32) -> f32 {
     1.0 / clamp_speech_speed(speech_speed)
 }
 
+fn missing_tts_asset(language_code: &LanguageCode) -> TranslatorError {
+    TranslatorError::missing_asset(format!(
+        "TTS voice not installed for {}",
+        language_code.as_str()
+    ))
+}
+
 pub(crate) fn available_tts_voices_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
-) -> Result<TtsVoicesOutcome, TranslatorError> {
-    let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
-        return Ok(TtsVoicesOutcome::MissingLanguage);
-    };
+) -> Result<Vec<TtsVoiceOption>, TranslatorError> {
+    let assets = resolve_speech_assets(snapshot, language_code)
+        .ok_or_else(|| missing_tts_asset(language_code))?;
     list_voices(
         cache,
         &assets.engine,
@@ -359,7 +362,6 @@ pub(crate) fn available_tts_voices_in_snapshot(
         assets.support_data_root.as_deref(),
         &assets.language_code,
     )
-    .map(TtsVoicesOutcome::Available)
     .map_err(TranslatorError::tts)
 }
 
@@ -367,11 +369,8 @@ pub(crate) fn warm_tts_model_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
-) -> Result<TtsWarmOutcome, TranslatorError> {
-    match available_tts_voices_in_snapshot(snapshot, cache, language_code)? {
-        TtsVoicesOutcome::Available(_) => Ok(TtsWarmOutcome::Warmed),
-        TtsVoicesOutcome::MissingLanguage => Ok(TtsWarmOutcome::MissingLanguage),
-    }
+) -> Result<(), TranslatorError> {
+    available_tts_voices_in_snapshot(snapshot, cache, language_code).map(|_| ())
 }
 
 pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
@@ -379,10 +378,9 @@ pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
     text: &str,
-) -> Result<SpeechChunkPlanningOutcome, TranslatorError> {
-    let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
-        return Ok(SpeechChunkPlanningOutcome::MissingLanguage);
-    };
+) -> Result<Vec<SpeechChunk>, TranslatorError> {
+    let assets = resolve_speech_assets(snapshot, language_code)
+        .ok_or_else(|| missing_tts_asset(language_code))?;
     plan_speech_chunks_for_text(
         cache,
         &assets.engine,
@@ -392,7 +390,6 @@ pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
         &assets.language_code,
         text,
     )
-    .map(SpeechChunkPlanningOutcome::Planned)
     .map_err(TranslatorError::tts)
 }
 
@@ -404,10 +401,9 @@ pub(crate) fn synthesize_pcm_in_snapshot(
     speech_speed: f32,
     voice_name: Option<&VoiceName>,
     is_phonemes: bool,
-) -> Result<PcmSynthesisOutcome, TranslatorError> {
-    let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
-        return Ok(PcmSynthesisOutcome::MissingLanguage);
-    };
+) -> Result<PcmAudio, TranslatorError> {
+    let assets = resolve_speech_assets(snapshot, language_code)
+        .ok_or_else(|| missing_tts_asset(language_code))?;
     synthesize_pcm(
         cache,
         &assets.engine,
@@ -421,7 +417,6 @@ pub(crate) fn synthesize_pcm_in_snapshot(
         assets.speaker_id,
         is_phonemes,
     )
-    .map(PcmSynthesisOutcome::Ready)
     .map_err(TranslatorError::tts)
 }
 

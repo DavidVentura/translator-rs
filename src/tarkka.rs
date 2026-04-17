@@ -3,7 +3,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::CatalogSnapshot;
-use crate::api::{DictionaryCode, DictionaryLookupOutcome, LanguageCode, TranslatorError};
+use crate::api::{DictionaryCode, LanguageCode, TranslatorError};
 
 pub use tarkka::WordWithTaggedEntries;
 use tarkka::reader::DictionaryReader;
@@ -64,28 +64,26 @@ pub(crate) fn lookup_dictionary_for_code(
     cache: &mut DictionaryCache,
     dictionary_code: &DictionaryCode,
     word: &str,
-) -> Result<DictionaryLookupOutcome, TranslatorError> {
+) -> Result<Option<WordWithTaggedEntries>, TranslatorError> {
     let normalized = word.trim();
     if normalized.is_empty() {
-        return Ok(DictionaryLookupOutcome::NotFound);
+        return Ok(None);
     }
 
-    let Some(path) = dictionary_path(base_dir, dictionary_code.as_str()) else {
-        return Ok(DictionaryLookupOutcome::MissingDictionary);
-    };
+    let path = dictionary_path(base_dir, dictionary_code.as_str()).ok_or_else(|| {
+        TranslatorError::missing_asset(format!(
+            "dictionary not installed: {}",
+            dictionary_code.as_str()
+        ))
+    })?;
 
     let lowered = normalized.to_lowercase();
     match cache.lookup(&path, normalized) {
-        Ok(Some(word_data)) => Ok(DictionaryLookupOutcome::Found(word_data)),
+        Ok(Some(word_data)) => Ok(Some(word_data)),
         Ok(None) if lowered != normalized => cache
             .lookup(&path, &lowered)
-            .map(|result| {
-                result
-                    .map(DictionaryLookupOutcome::Found)
-                    .unwrap_or(DictionaryLookupOutcome::NotFound)
-            })
             .map_err(TranslatorError::dictionary),
-        Ok(None) => Ok(DictionaryLookupOutcome::NotFound),
+        Ok(None) => Ok(None),
         Err(err) => Err(TranslatorError::dictionary(err)),
     }
 }
@@ -103,7 +101,7 @@ pub(crate) fn lookup_dictionary_in_snapshot(
     cache: &mut DictionaryCache,
     language_code: &LanguageCode,
     word: &str,
-) -> Result<DictionaryLookupOutcome, TranslatorError> {
+) -> Result<Option<WordWithTaggedEntries>, TranslatorError> {
     let language = snapshot
         .catalog
         .language_by_code(language_code)
