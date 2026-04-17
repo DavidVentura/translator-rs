@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::api::{DictionaryCode, LanguageCode};
 use crate::language::{Language, LanguageDirection, ModelFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,20 +275,24 @@ impl LanguageCatalog {
             .collect()
     }
 
-    pub fn language_by_code(&self, code: &str) -> Option<Language> {
-        self.languages.get(code).map(|info| info.language.clone())
+    pub fn language_by_code(&self, code: &LanguageCode) -> Option<Language> {
+        self.languages
+            .get(code.as_str())
+            .map(|info| info.language.clone())
     }
 
     pub fn english(&self) -> Option<Language> {
-        self.language_by_code("en")
+        self.language_by_code(&LanguageCode::from("en"))
     }
 
     pub fn dictionary_info_for(&self, language: &Language) -> Option<DictionaryInfo> {
-        self.dictionary_info(&language.dictionary_code)
+        self.dictionary_info(&DictionaryCode::from(language.dictionary_code.clone()))
     }
 
-    pub fn dictionary_info(&self, dictionary_code: &str) -> Option<DictionaryInfo> {
-        let pack_id = self.dictionary_pack_ids_by_code.get(dictionary_code)?;
+    pub fn dictionary_info(&self, dictionary_code: &DictionaryCode) -> Option<DictionaryInfo> {
+        let pack_id = self
+            .dictionary_pack_ids_by_code
+            .get(dictionary_code.as_str())?;
         let pack = self.packs.get(pack_id)?;
         let file = pack.files.first()?;
         let metadata = match &pack.kind {
@@ -306,11 +311,11 @@ impl LanguageCatalog {
         })
     }
 
-    pub(crate) fn tts(&self, language_code: &str) -> Option<&LanguageTtsV2> {
-        self.language_info(language_code)?.tts.as_ref()
+    pub(crate) fn tts(&self, language_code: &LanguageCode) -> Option<&LanguageTtsV2> {
+        self.language_info(language_code.as_str())?.tts.as_ref()
     }
 
-    pub fn tts_pack_ids_for_language(&self, language_code: &str) -> Vec<String> {
+    pub fn tts_pack_ids_for_language(&self, language_code: &LanguageCode) -> Vec<String> {
         let Some(tts) = self.tts(language_code) else {
             return Vec::new();
         };
@@ -319,7 +324,7 @@ impl LanguageCatalog {
 
     pub fn ordered_tts_regions_for_language(
         &self,
-        language_code: &str,
+        language_code: &LanguageCode,
     ) -> Vec<(String, LanguageTtsRegionV2)> {
         let Some(tts) = self.tts(language_code) else {
             return Vec::new();
@@ -352,7 +357,7 @@ impl LanguageCatalog {
             .collect()
     }
 
-    pub fn default_tts_pack_id_for_language(&self, language_code: &str) -> Option<String> {
+    pub fn default_tts_pack_id_for_language(&self, language_code: &LanguageCode) -> Option<String> {
         let tts = self.tts(language_code)?;
         let region = tts
             .default_region
@@ -367,19 +372,19 @@ impl LanguageCatalog {
         region.voices.first().cloned()
     }
 
-    pub fn tts_size_bytes_for_language(&self, language_code: &str) -> u64 {
+    pub fn tts_size_bytes_for_language(&self, language_code: &LanguageCode) -> u64 {
         self.default_tts_pack_id_for_language(language_code)
             .map(|pack_id| self.pack_size_bytes(&pack_id))
             .unwrap_or(0)
     }
 
-    pub fn has_tts_voices(&self, language_code: &str) -> bool {
+    pub fn has_tts_voices(&self, language_code: &LanguageCode) -> bool {
         !self
             .root_pack_ids_for_feature(language_code, LanguageFeature::Tts)
             .is_empty()
     }
 
-    pub fn translation_size_bytes_for_language(&self, language_code: &str) -> u64 {
+    pub fn translation_size_bytes_for_language(&self, language_code: &LanguageCode) -> u64 {
         self.root_pack_ids_for_feature(language_code, LanguageFeature::Translation)
             .iter()
             .map(|pack_id| self.pack_size_bytes(pack_id))
@@ -399,7 +404,10 @@ impl LanguageCatalog {
         })
     }
 
-    pub fn tts_voice_picker_regions(&self, language_code: &str) -> Vec<TtsVoicePickerRegion> {
+    pub fn tts_voice_picker_regions(
+        &self,
+        language_code: &LanguageCode,
+    ) -> Vec<TtsVoicePickerRegion> {
         self.ordered_tts_regions_for_language(language_code)
             .into_iter()
             .map(|(code, region)| TtsVoicePickerRegion {
@@ -428,46 +436,52 @@ impl LanguageCatalog {
             .cloned()
     }
 
-    pub fn can_swap_languages(&self, from_code: &str, to_code: &str) -> bool {
-        let to_can_be_source = to_code == "en" || self.translation_pack_id(to_code, "en").is_some();
-        let from_can_be_target =
-            from_code == "en" || self.translation_pack_id("en", from_code).is_some();
+    pub fn can_swap_languages(&self, from_code: &LanguageCode, to_code: &LanguageCode) -> bool {
+        let to_can_be_source =
+            to_code.as_str() == "en" || self.translation_pack_id(to_code.as_str(), "en").is_some();
+        let from_can_be_target = from_code.as_str() == "en"
+            || self.translation_pack_id("en", from_code.as_str()).is_some();
         to_can_be_source && from_can_be_target
     }
 
-    pub fn translation_direction(&self, from: &str, to: &str) -> Option<LanguageDirection> {
-        let pack_id = self.translation_pack_id(from, to)?;
+    pub fn translation_direction(
+        &self,
+        from: &LanguageCode,
+        to: &LanguageCode,
+    ) -> Option<LanguageDirection> {
+        let pack_id = self.translation_pack_id(from.as_str(), to.as_str())?;
         let pack = self.pack(&pack_id)?;
         translation_direction_from_pack(pack)
     }
 
     pub(crate) fn root_pack_ids_for_feature(
         &self,
-        language_code: &str,
+        language_code: &LanguageCode,
         feature: LanguageFeature,
     ) -> &[String] {
         self.root_pack_ids_by_language_feature
-            .get(&(language_code.to_string(), feature))
+            .get(&(language_code.as_str().to_string(), feature))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
     pub(crate) fn core_pack_ids_for_language(&self, language_code: &str) -> HashSet<String> {
+        let language_code = LanguageCode::from(language_code);
         let mut pack_ids = HashSet::new();
-        if language_code != "en" {
+        if language_code.as_str() != "en" {
             pack_ids.extend(
-                self.root_pack_ids_for_feature(language_code, LanguageFeature::Translation)
+                self.root_pack_ids_for_feature(&language_code, LanguageFeature::Translation)
                     .iter()
                     .cloned(),
             );
         }
         pack_ids.extend(
-            self.root_pack_ids_for_feature(language_code, LanguageFeature::Ocr)
+            self.root_pack_ids_for_feature(&language_code, LanguageFeature::Ocr)
                 .iter()
                 .cloned(),
         );
         pack_ids.extend(
-            self.root_pack_ids_for_feature(language_code, LanguageFeature::Support)
+            self.root_pack_ids_for_feature(&language_code, LanguageFeature::Support)
                 .iter()
                 .cloned(),
         );
@@ -475,9 +489,12 @@ impl LanguageCatalog {
     }
 
     pub(crate) fn dictionary_pack_id_for_language(&self, language_code: &str) -> Option<String> {
-        self.root_pack_ids_for_feature(language_code, LanguageFeature::Dictionary)
-            .first()
-            .cloned()
+        self.root_pack_ids_for_feature(
+            &LanguageCode::from(language_code),
+            LanguageFeature::Dictionary,
+        )
+        .first()
+        .cloned()
     }
 
     pub(crate) fn dependency_closure<'a, I>(&self, root_pack_ids: I) -> Vec<String>

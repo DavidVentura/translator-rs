@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::CatalogSnapshot;
+use crate::api::{DictionaryCode, DictionaryLookupOutcome, LanguageCode, TranslatorError};
 
 pub use tarkka::WordWithTaggedEntries;
 use tarkka::reader::DictionaryReader;
@@ -61,49 +62,68 @@ fn dictionary_path(base_dir: &str, dictionary_code: &str) -> Option<String> {
 
 pub fn lookup_dictionary_for_code(
     base_dir: &str,
-    dictionary_code: &str,
+    dictionary_code: &DictionaryCode,
     word: &str,
-) -> Result<Option<WordWithTaggedEntries>, String> {
+) -> Result<DictionaryLookupOutcome, TranslatorError> {
     let normalized = word.trim();
     if normalized.is_empty() {
-        return Ok(None);
+        return Ok(DictionaryLookupOutcome::NotFound);
     }
 
-    let Some(path) = dictionary_path(base_dir, dictionary_code) else {
-        return Ok(None);
+    let Some(path) = dictionary_path(base_dir, dictionary_code.as_str()) else {
+        return Ok(DictionaryLookupOutcome::MissingDictionary);
     };
 
     let lowered = normalized.to_lowercase();
     match lookup_dictionary(&path, normalized) {
-        Ok(Some(word_data)) => Ok(Some(word_data)),
-        Ok(None) if lowered != normalized => lookup_dictionary(&path, &lowered),
-        other => other,
+        Ok(Some(word_data)) => Ok(DictionaryLookupOutcome::Found(word_data)),
+        Ok(None) if lowered != normalized => lookup_dictionary(&path, &lowered)
+            .map(|result| {
+                result
+                    .map(DictionaryLookupOutcome::Found)
+                    .unwrap_or(DictionaryLookupOutcome::NotFound)
+            })
+            .map_err(TranslatorError::dictionary),
+        Ok(None) => Ok(DictionaryLookupOutcome::NotFound),
+        Err(err) => Err(TranslatorError::dictionary(err)),
     }
 }
 
-fn dictionary_path_for_language(snapshot: &CatalogSnapshot, language_code: &str) -> Option<String> {
+fn dictionary_path_for_language(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Option<String> {
     let language = snapshot.catalog.language_by_code(language_code)?;
     dictionary_path(&snapshot.base_dir, &language.dictionary_code)
 }
 
 pub fn lookup_dictionary_in_snapshot(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
+    language_code: &LanguageCode,
     word: &str,
-) -> Result<Option<WordWithTaggedEntries>, String> {
+) -> Result<DictionaryLookupOutcome, TranslatorError> {
     let language = snapshot
         .catalog
         .language_by_code(language_code)
-        .ok_or_else(|| format!("unknown dictionary language: {language_code}"))?;
-    lookup_dictionary_for_code(&snapshot.base_dir, &language.dictionary_code, word)
+        .ok_or_else(|| {
+            TranslatorError::dictionary(format!(
+                "unknown dictionary language: {}",
+                language_code.as_str()
+            ))
+        })?;
+    lookup_dictionary_for_code(
+        &snapshot.base_dir,
+        &DictionaryCode::from(language.dictionary_code.clone()),
+        word,
+    )
 }
 
 pub fn close_dictionary_in_snapshot(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
-) -> Result<(), String> {
+    language_code: &LanguageCode,
+) -> Result<(), TranslatorError> {
     let Some(path) = dictionary_path_for_language(snapshot, language_code) else {
         return Ok(());
     };
-    close_dictionary(&path)
+    close_dictionary(&path).map_err(TranslatorError::dictionary)
 }

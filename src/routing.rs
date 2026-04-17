@@ -3,8 +3,10 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::api::LanguageCode;
+use crate::language_detect::detect_language_robust_code;
 use crate::translate::{execute_translation_plan, resolve_translation_plan_in_snapshot};
-use crate::{BergamotEngine, CatalogSnapshot, detect_language};
+use crate::{BergamotEngine, CatalogSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -74,40 +76,6 @@ fn unique_texts(inputs: &[String]) -> Vec<String> {
     result
 }
 
-pub fn detect_language_robust_code(
-    text: &str,
-    hint: Option<&str>,
-    available_language_codes: &[String],
-) -> Option<String> {
-    if text.trim().is_empty() {
-        return None;
-    }
-
-    if let Some(detected) = detect_language(text, hint) {
-        if detected.is_reliable
-            && available_language_codes
-                .iter()
-                .any(|code| code == &detected.language)
-        {
-            return Some(detected.language);
-        }
-    }
-
-    for code in available_language_codes {
-        if hint == Some(code.as_str()) {
-            continue;
-        }
-        let Some(detected) = detect_language(text, Some(code)) else {
-            continue;
-        };
-        if detected.is_reliable && detected.language == *code {
-            return Some(code.clone());
-        }
-    }
-
-    None
-}
-
 pub fn plan_batch_text_translation(
     inputs: &[String],
     forced_source_code: Option<&str>,
@@ -115,6 +83,10 @@ pub fn plan_batch_text_translation(
     available_language_codes: &[String],
 ) -> BatchTextRoutingPlan {
     let unique_inputs = unique_texts(inputs);
+    let available_language_codes = available_language_codes
+        .iter()
+        .map(|code| LanguageCode::from(code.as_str()))
+        .collect::<Vec<_>>();
     let mut passthrough_texts = Vec::new();
     let mut translatable = Vec::new();
 
@@ -143,16 +115,18 @@ pub fn plan_batch_text_translation(
         }
     } else {
         for text in translatable {
-            let source_code = detect_language_robust_code(&text, None, available_language_codes);
+            let source_code = detect_language_robust_code(&text, None, &available_language_codes);
             match source_code {
                 None => undetected_texts += 1,
-                Some(source_code) if source_code == target_code => detected_same_as_target += 1,
+                Some(source_code) if source_code.as_str() == target_code => {
+                    detected_same_as_target += 1
+                }
                 Some(source_code) => {
                     let batch_index = *batch_index_by_source
-                        .entry(source_code.clone())
+                        .entry(source_code.as_str().to_string())
                         .or_insert_with(|| {
                             batches.push(SourceTextBatch {
-                                source_language_code: source_code.clone(),
+                                source_language_code: source_code.as_str().to_string(),
                                 texts: Vec::new(),
                             });
                             batches.len() - 1
@@ -180,7 +154,7 @@ pub fn plan_batch_text_translation(
     }
 }
 
-pub fn translate_mixed_texts_in_snapshot(
+pub(crate) fn translate_mixed_texts_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     inputs: &[String],

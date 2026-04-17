@@ -1,14 +1,16 @@
 use icu::locale::Locale;
 use icu_experimental::transliterate::Transliterator;
 
+use crate::api::{LanguageCode, ScriptCode};
+
 fn make_transliterator(source_script: &str) -> Option<Transliterator> {
     let locale_str = format!("und-Latn-t-und-{}", source_script.to_lowercase());
     let locale: Locale = locale_str.parse().ok()?;
     Transliterator::try_new(&locale).ok()
 }
 
-pub fn transliterate(text: &str, source_script: &str) -> Option<String> {
-    match source_script {
+fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
+    match source_script.as_str() {
         "Jpan" => {
             let kana = make_transliterator("Kana")?;
             let hira = make_transliterator("Hira")?;
@@ -16,24 +18,24 @@ pub fn transliterate(text: &str, source_script: &str) -> Option<String> {
             Some(hira.transliterate(result))
         }
         _ => {
-            let t = make_transliterator(source_script)?;
+            let t = make_transliterator(source_script.as_str())?;
             Some(t.transliterate(text.to_string()))
         }
     }
 }
 
-pub fn transliterate_with_policy(
+fn transliterate_with_policy(
     text: &str,
-    language_code: &str,
-    source_script: &str,
-    target_script: &str,
+    language_code: &LanguageCode,
+    source_script: &ScriptCode,
+    target_script: &ScriptCode,
     japanese_preprocessed: Option<&str>,
 ) -> Option<String> {
     if source_script == target_script {
         return None;
     }
 
-    let input = match language_code {
+    let input = match language_code.as_str() {
         "ja" => japanese_preprocessed.unwrap_or(text),
         _ => text,
     };
@@ -43,9 +45,9 @@ pub fn transliterate_with_policy(
 
 pub fn transliterate_with_policy_for_language(
     text: &str,
-    language_code: &str,
-    source_script: &str,
-    target_script: &str,
+    language_code: &LanguageCode,
+    source_script: &ScriptCode,
+    target_script: &ScriptCode,
     japanese_dict_path: Option<&str>,
     japanese_spaced: bool,
 ) -> Option<String> {
@@ -54,7 +56,7 @@ pub fn transliterate_with_policy_for_language(
         return None;
     }
 
-    let japanese_preprocessed = if language_code == "ja" {
+    let japanese_preprocessed = if language_code.as_str() == "ja" {
         preprocess_japanese(normalized, japanese_dict_path, japanese_spaced)
     } else {
         None
@@ -96,7 +98,7 @@ mod tests {
     use super::*;
 
     fn translit(script: &str, text: &str) -> String {
-        transliterate(text, script).unwrap()
+        transliterate(text, &ScriptCode::from(script)).unwrap()
     }
 
     #[test]
@@ -188,12 +190,21 @@ mod tests {
 
     #[test]
     fn test_latin_is_none() {
-        assert!(transliterate("Hello", "Latn").is_none());
+        assert!(transliterate("Hello", &ScriptCode::from("Latn")).is_none());
     }
 
     #[test]
     fn test_policy_skips_same_script() {
-        assert!(transliterate_with_policy("Hello", "en", "Latn", "Latn", None).is_none());
+        assert!(
+            transliterate_with_policy(
+                "Hello",
+                &LanguageCode::from("en"),
+                &ScriptCode::from("Latn"),
+                &ScriptCode::from("Latn"),
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -201,9 +212,9 @@ mod tests {
         assert_eq!(
             transliterate_with_policy(
                 "東京タワー",
-                "ja",
-                "Jpan",
-                "Latn",
+                &LanguageCode::from("ja"),
+                &ScriptCode::from("Jpan"),
+                &ScriptCode::from("Latn"),
                 Some("とうきょう タワー")
             )
             .unwrap(),

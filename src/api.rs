@@ -1,0 +1,263 @@
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct LanguageCode {
+    pub code: String,
+}
+
+impl LanguageCode {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self { code: value.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.code
+    }
+}
+
+impl From<&str> for LanguageCode {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for LanguageCode {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for LanguageCode {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for LanguageCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.code.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ScriptCode {
+    pub code: String,
+}
+
+impl ScriptCode {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self { code: value.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.code
+    }
+}
+
+impl From<&str> for ScriptCode {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ScriptCode {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for ScriptCode {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for ScriptCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.code.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct VoiceName {
+    pub name: String,
+}
+
+impl VoiceName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self { name: value.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+}
+
+impl From<&str> for VoiceName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for VoiceName {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for VoiceName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for VoiceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.name.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DictionaryCode {
+    pub code: String,
+}
+
+impl DictionaryCode {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self { code: value.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.code
+    }
+}
+
+impl From<&str> for DictionaryCode {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for DictionaryCode {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for DictionaryCode {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for DictionaryCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.code.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslatorErrorKind {
+    Translation,
+    Ocr,
+    Tts,
+    Dictionary,
+    Transliterate,
+    InvalidInput,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslatorError {
+    pub kind: TranslatorErrorKind,
+    pub message: String,
+}
+
+impl TranslatorError {
+    pub fn new(kind: TranslatorErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn translation(message: impl Into<String>) -> Self {
+        Self::new(TranslatorErrorKind::Translation, message)
+    }
+
+    #[cfg(feature = "tesseract")]
+    pub(crate) fn ocr(message: impl Into<String>) -> Self {
+        Self::new(TranslatorErrorKind::Ocr, message)
+    }
+
+    #[cfg(feature = "tts")]
+    pub(crate) fn tts(message: impl Into<String>) -> Self {
+        Self::new(TranslatorErrorKind::Tts, message)
+    }
+
+    #[cfg(feature = "dictionary")]
+    pub(crate) fn dictionary(message: impl Into<String>) -> Self {
+        Self::new(TranslatorErrorKind::Dictionary, message)
+    }
+}
+
+impl fmt::Display for TranslatorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+impl std::error::Error for TranslatorError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationWarmOutcome {
+    Warmed,
+    MissingLanguagePair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextTranslationOutcome {
+    Translated(String),
+    Passthrough(String),
+    MissingLanguagePair,
+}
+
+#[cfg(feature = "tts")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtsVoicesOutcome {
+    Available(Vec<crate::TtsVoiceOption>),
+    MissingLanguage,
+}
+
+#[cfg(feature = "tts")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtsWarmOutcome {
+    Warmed,
+    MissingLanguage,
+}
+
+#[cfg(feature = "tts")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeechChunkPlanningOutcome {
+    Planned(Vec<crate::SpeechChunk>),
+    MissingLanguage,
+}
+
+#[cfg(feature = "tts")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcmSynthesisOutcome {
+    Ready(crate::PcmAudio),
+    MissingLanguage,
+}
+
+#[cfg(feature = "dictionary")]
+#[derive(Debug)]
+pub enum DictionaryLookupOutcome {
+    Found(crate::tarkka::WordWithTaggedEntries),
+    NotFound,
+    MissingDictionary,
+}

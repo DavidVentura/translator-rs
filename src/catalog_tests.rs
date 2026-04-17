@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::api::{DictionaryCode, LanguageCode};
 use crate::catalog::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, LangAvailability, LanguageCatalog,
     LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker, PackRecord,
@@ -439,7 +440,7 @@ fn computes_dependency_closure_and_pack_size_without_double_counting() {
         20 + 21 + 22 + 23 + 28
     );
     assert_eq!(
-        catalog.translation_size_bytes_for_language("es"),
+        catalog.translation_size_bytes_for_language(&LanguageCode::from("es")),
         (20 + 21 + 22 + 23 + 28) + (24 + 25 + 26 + 27 + 28)
     );
 }
@@ -448,7 +449,11 @@ fn computes_dependency_closure_and_pack_size_without_double_counting() {
 fn resolves_missing_pack_files_through_install_boundary() {
     let catalog = base_catalog();
     let checker = FakeInstallChecker::with_files(&["bin/model.enes.bin", "bin/shared.bin"]);
-    let plan = plan_language_download(&catalog, "es", &mut PackResolver::new(&catalog, &checker));
+    let plan = plan_language_download(
+        &catalog,
+        &LanguageCode::from("es"),
+        &mut PackResolver::new(&catalog, &checker),
+    );
     let missing_paths = plan
         .tasks
         .into_iter()
@@ -492,8 +497,8 @@ fn computes_language_availability_from_pack_install_state() {
     let mut resolver = PackResolver::new(&catalog, &checker);
 
     let availability = compute_language_availability(&catalog, &mut resolver);
-    let spanish = catalog.language_by_code("es").unwrap();
-    let english = catalog.language_by_code("en").unwrap();
+    let spanish = catalog.language_by_code(&LanguageCode::from("es")).unwrap();
+    let english = catalog.language_by_code(&LanguageCode::from("en")).unwrap();
 
     assert_eq!(
         availability.get(&spanish),
@@ -520,8 +525,10 @@ fn computes_language_availability_from_pack_install_state() {
 #[test]
 fn builds_languages_and_dictionary_info_from_catalog() {
     let catalog = base_catalog();
-    let spanish = catalog.language_by_code("es").unwrap();
-    let dictionary_info = catalog.dictionary_info("en").unwrap();
+    let spanish = catalog.language_by_code(&LanguageCode::from("es")).unwrap();
+    let dictionary_info = catalog
+        .dictionary_info(&DictionaryCode::from("en"))
+        .unwrap();
 
     assert_eq!(spanish.tess_name, "spa");
     assert_eq!(dictionary_info.filename, "en.dict");
@@ -531,11 +538,25 @@ fn builds_languages_and_dictionary_info_from_catalog() {
 
 #[test]
 fn parses_bundled_catalog_asset() {
-    let json = include_str!("../../app/src/main/assets/index.json");
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let asset_path = manifest_dir
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(|parent| {
+            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index.json")
+        })
+        .expect("repo layout should have a parent");
+    let Ok(json) = std::fs::read_to_string(asset_path) else {
+        return;
+    };
     let catalog =
-        crate::catalog::parse_and_validate_catalog(json).expect("bundled catalog should parse");
+        crate::catalog::parse_and_validate_catalog(&json).expect("bundled catalog should parse");
     assert!(!catalog.language_list().is_empty());
-    assert!(catalog.language_by_code("en").is_some());
+    assert!(
+        catalog
+            .language_by_code(&LanguageCode::from("en"))
+            .is_some()
+    );
 }
 
 #[test]

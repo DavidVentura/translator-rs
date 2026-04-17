@@ -3,6 +3,10 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use crate::api::{
+    LanguageCode, PcmSynthesisOutcome, SpeechChunkPlanningOutcome, TranslatorError,
+    TtsVoicesOutcome, TtsWarmOutcome, VoiceName,
+};
 use crate::{
     CatalogSnapshot, PcmAudio, PhonemeChunk, ResolvedTtsVoiceFiles, SpeechChunk,
     SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks, resolve_tts_voice_files_in_snapshot,
@@ -297,7 +301,7 @@ fn absolute_install_path(snapshot: &CatalogSnapshot, relative_path: &str) -> Str
 
 fn resolve_speech_assets(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
+    language_code: &LanguageCode,
 ) -> Option<ResolvedSpeechAssets> {
     let files = resolve_tts_voice_files_in_snapshot(snapshot, language_code)?;
     let support_data_root = support_data_root(snapshot, &files);
@@ -335,10 +339,10 @@ pub fn clear_cached_model() {
 
 pub fn available_tts_voices_in_snapshot(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
-) -> Result<Option<Vec<TtsVoiceOption>>, String> {
+    language_code: &LanguageCode,
+) -> Result<TtsVoicesOutcome, TranslatorError> {
     let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
-        return Ok(None);
+        return Ok(TtsVoicesOutcome::MissingLanguage);
     };
     list_voices(
         &assets.engine,
@@ -347,26 +351,27 @@ pub fn available_tts_voices_in_snapshot(
         assets.support_data_root.as_deref(),
         &assets.language_code,
     )
-    .map(Some)
+    .map(TtsVoicesOutcome::Available)
+    .map_err(TranslatorError::tts)
 }
 
 pub fn warm_tts_model_in_snapshot(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
-) -> Result<bool, String> {
-    let Some(_voices) = available_tts_voices_in_snapshot(snapshot, language_code)? else {
-        return Ok(false);
-    };
-    Ok(true)
+    language_code: &LanguageCode,
+) -> Result<TtsWarmOutcome, TranslatorError> {
+    match available_tts_voices_in_snapshot(snapshot, language_code)? {
+        TtsVoicesOutcome::Available(_) => Ok(TtsWarmOutcome::Warmed),
+        TtsVoicesOutcome::MissingLanguage => Ok(TtsWarmOutcome::MissingLanguage),
+    }
 }
 
 pub fn plan_speech_chunks_for_text_in_snapshot(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
+    language_code: &LanguageCode,
     text: &str,
-) -> Result<Option<Vec<SpeechChunk>>, String> {
+) -> Result<SpeechChunkPlanningOutcome, TranslatorError> {
     let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
-        return Ok(None);
+        return Ok(SpeechChunkPlanningOutcome::MissingLanguage);
     };
     plan_speech_chunks_for_text(
         &assets.engine,
@@ -376,19 +381,20 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
         &assets.language_code,
         text,
     )
-    .map(Some)
+    .map(SpeechChunkPlanningOutcome::Planned)
+    .map_err(TranslatorError::tts)
 }
 
 pub fn synthesize_pcm_in_snapshot(
     snapshot: &CatalogSnapshot,
-    language_code: &str,
+    language_code: &LanguageCode,
     text: &str,
     speech_speed: f32,
-    voice_name: Option<&str>,
+    voice_name: Option<&VoiceName>,
     is_phonemes: bool,
-) -> Result<Option<PcmAudio>, String> {
+) -> Result<PcmSynthesisOutcome, TranslatorError> {
     let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
-        return Ok(None);
+        return Ok(PcmSynthesisOutcome::MissingLanguage);
     };
     synthesize_pcm(
         &assets.engine,
@@ -398,11 +404,12 @@ pub fn synthesize_pcm_in_snapshot(
         &assets.language_code,
         text,
         speech_speed,
-        voice_name,
+        voice_name.map(VoiceName::as_str),
         assets.speaker_id,
         is_phonemes,
     )
-    .map(Some)
+    .map(PcmSynthesisOutcome::Ready)
+    .map_err(TranslatorError::tts)
 }
 
 fn derive_japanese_dict_path(support_data_root: &str, language_code: &str) -> Option<PathBuf> {

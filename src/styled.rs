@@ -1,8 +1,9 @@
 use crate::catalog::CatalogSnapshot;
+use crate::language_detect::detect_language_robust_code;
 use crate::ocr::{OverlayColors, Rect, sample_overlay_colors};
-use crate::routing::{NothingReason, detect_language_robust_code};
+use crate::routing::NothingReason;
 use crate::translate::{TokenAlignment, Translator};
-use crate::{BackgroundMode, BergamotEngine};
+use crate::{BackgroundMode, BergamotEngine, LanguageCode};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -97,7 +98,7 @@ pub struct OverlayScreenshot {
     pub height: u32,
 }
 
-pub fn translate_structured_fragments_in_snapshot(
+pub(crate) fn translate_structured_fragments_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     fragments: &[StyledFragment],
@@ -121,9 +122,13 @@ pub fn translate_structured_fragments_in_snapshot(
         .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    let available_language_codes = available_language_codes
+        .iter()
+        .map(|code| LanguageCode::from(code.as_str()))
+        .collect::<Vec<_>>();
     let Some(source_code) = forced_source_code
-        .map(ToOwned::to_owned)
-        .or_else(|| detect_language_robust_code(&combined_text, None, available_language_codes))
+        .map(LanguageCode::from)
+        .or_else(|| detect_language_robust_code(&combined_text, None, &available_language_codes))
     else {
         return Ok(StructuredTranslationResult {
             blocks: Vec::new(),
@@ -132,7 +137,7 @@ pub fn translate_structured_fragments_in_snapshot(
         });
     };
 
-    if source_code == target_code {
+    if source_code.as_str() == target_code {
         return Ok(StructuredTranslationResult {
             blocks: Vec::new(),
             nothing_reason: Some(NothingReason::AlreadyTargetLanguage),
@@ -160,21 +165,21 @@ pub fn translate_structured_fragments_in_snapshot(
         }
     }
 
-    let Some(translations) = Translator::new(engine, snapshot).translate_texts_with_alignment(
-        &source_code,
-        target_code,
-        &all_segment_texts,
-    ) else {
+    let target_code = LanguageCode::from(target_code);
+    let Some(translations) = Translator::new(engine, snapshot)
+        .translate_texts_with_alignment(&source_code, &target_code, &all_segment_texts)
+        .map_err(|err| err.message)?
+    else {
         return Ok(StructuredTranslationResult {
             blocks: Vec::new(),
             nothing_reason: None,
             error_message: Some(format!(
                 "Language pair {} -> {} not installed",
-                source_code, target_code
+                source_code.as_str(),
+                target_code.as_str()
             )),
         });
     };
-    let translations = translations?;
 
     let translated_blocks = blocks
         .iter()

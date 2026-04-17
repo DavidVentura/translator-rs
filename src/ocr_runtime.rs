@@ -10,6 +10,7 @@ use crate::settings::BackgroundMode;
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
 use crate::translate::Translator;
 use crate::{BergamotEngine, PageSegMode, TesseractWrapper};
+use crate::{LanguageCode, TranslatorError};
 
 struct OcrEngineState {
     engine: TesseractWrapper,
@@ -20,34 +21,34 @@ struct OcrEngineState {
 
 static OCR_ENGINE: OnceLock<Mutex<Option<OcrEngineState>>> = OnceLock::new();
 
-pub fn translate_image_rgba_in_snapshot(
+pub(crate) fn translate_image_rgba_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     rgba_bytes: &[u8],
     width: u32,
     height: u32,
-    source_code: &str,
-    target_code: &str,
+    source_code: &LanguageCode,
+    target_code: &LanguageCode,
     min_confidence: u32,
     reading_order: ReadingOrder,
     background_mode: BackgroundMode,
-) -> Result<ImageTranslationOutcome, String> {
+) -> Result<ImageTranslationOutcome, TranslatorError> {
     let bytes_per_pixel = 4i32;
     let i_width = width as i32;
     let i_height = height as i32;
     let bytes_per_line = i_width
         .checked_mul(bytes_per_pixel)
-        .ok_or_else(|| "image width overflow".to_string())?;
+        .ok_or_else(|| TranslatorError::ocr("image width overflow"))?;
 
     let page_seg_mode = match reading_order {
         ReadingOrder::LeftToRight => PageSegMode::PsmAutoOsd,
         ReadingOrder::TopToBottomLeftToRight => PageSegMode::PsmSingleBlockVertText,
     };
 
-    let join_without_spaces = source_code == "ja";
+    let join_without_spaces = source_code.as_str() == "ja";
     let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomLeftToRight;
 
-    let blocks = with_ocr_engine(snapshot, source_code, reading_order, |ocr| {
+    let blocks = with_ocr_engine(snapshot, source_code.as_str(), reading_order, |ocr| {
         ocr.set_page_seg_mode(page_seg_mode);
         ocr.set_frame(
             rgba_bytes,
@@ -70,7 +71,8 @@ pub fn translate_image_rgba_in_snapshot(
             join_without_spaces,
             relax_single_char_confidence,
         ))
-    })?;
+    })
+    .map_err(TranslatorError::ocr)?;
 
     let Some(translated_blocks) =
         translate_block_texts(engine, snapshot, source_code, target_code, &blocks)?
@@ -88,6 +90,7 @@ pub fn translate_image_rgba_in_snapshot(
         reading_order,
     )
     .map(ImageTranslationOutcome::Ready)
+    .map_err(TranslatorError::ocr)
 }
 
 fn map_tesseract_word(word: TesseractDetectedWord) -> DetectedWord {
@@ -109,10 +112,10 @@ fn map_tesseract_word(word: TesseractDetectedWord) -> DetectedWord {
 fn translate_block_texts(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
-    source_code: &str,
-    target_code: &str,
+    source_code: &LanguageCode,
+    target_code: &LanguageCode,
     blocks: &[TextBlock],
-) -> Result<Option<Vec<String>>, String> {
+) -> Result<Option<Vec<String>>, TranslatorError> {
     let block_texts = blocks
         .iter()
         .map(TextBlock::translation_text)
@@ -124,7 +127,7 @@ fn translate_block_texts(
         .collect::<Vec<_>>();
 
     if non_empty_indices.is_empty() {
-        return Err("No text found in image".to_string());
+        return Err(TranslatorError::ocr("No text found in image"));
     }
 
     if source_code == target_code {
@@ -136,12 +139,11 @@ fn translate_block_texts(
         .map(|&index| block_texts[index].clone())
         .collect::<Vec<_>>();
     let translated = match Translator::new(engine, snapshot).translate_texts(
-        source_code,
-        target_code,
+        &source_code,
+        &target_code,
         &texts_to_translate,
-    ) {
-        Some(Ok(values)) => values,
-        Some(Err(message)) => return Err(message),
+    )? {
+        Some(values) => values,
         None => return Ok(None),
     };
 
@@ -179,7 +181,7 @@ where
 {
     let language = snapshot
         .catalog
-        .language_by_code(source_code)
+        .language_by_code(&LanguageCode::from(source_code))
         .ok_or_else(|| format!("unknown source language: {source_code}"))?;
     let tessdata_path = Path::new(&snapshot.base_dir)
         .join("tesseract")

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::BergamotEngine;
+use crate::api::{LanguageCode, TextTranslationOutcome, TranslationWarmOutcome, TranslatorError};
 use crate::catalog::CatalogSnapshot;
 #[cfg(test)]
 use crate::catalog::{
@@ -38,27 +39,34 @@ impl<'a> Translator<'a> {
         Self { engine, snapshot }
     }
 
-    pub fn warm(&mut self, from_code: &str, to_code: &str) -> Result<bool, String> {
-        let Some(plan) = resolve_translation_plan_in_snapshot(self.snapshot, from_code, to_code)
-        else {
-            return Ok(false);
+    pub fn warm(
+        &mut self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+    ) -> Result<TranslationWarmOutcome, TranslatorError> {
+        let Some(plan) = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        ) else {
+            return Ok(TranslationWarmOutcome::MissingLanguagePair);
         };
-        ensure_plan_loaded(self.engine, &plan)?;
-        Ok(true)
+        ensure_plan_loaded(self.engine, &plan).map_err(TranslatorError::translation)?;
+        Ok(TranslationWarmOutcome::Warmed)
     }
 
     pub fn translate_text(
         &mut self,
-        from_code: &str,
-        to_code: &str,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
         text: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<TextTranslationOutcome, TranslatorError> {
         let normalized = text.trim();
         if normalized.is_empty() {
-            return Ok(Some(String::new()));
+            return Ok(TextTranslationOutcome::Passthrough(String::new()));
         }
         if from_code == to_code || normalized.parse::<f32>().is_ok() {
-            return Ok(Some(normalized.to_string()));
+            return Ok(TextTranslationOutcome::Passthrough(normalized.to_string()));
         }
 
         let lines = normalized
@@ -71,72 +79,89 @@ impl<'a> Translator<'a> {
             .filter_map(|(index, line)| (!line.trim().is_empty()).then_some(index))
             .collect::<Vec<_>>();
         if non_empty_indices.is_empty() {
-            return Ok(Some(String::new()));
+            return Ok(TextTranslationOutcome::Passthrough(String::new()));
         }
 
         let texts_to_translate = non_empty_indices
             .iter()
             .map(|&index| lines[index].clone())
             .collect::<Vec<_>>();
-        let translated = match self.translate_texts(from_code, to_code, &texts_to_translate) {
-            Some(Ok(values)) => values,
-            Some(Err(message)) => return Err(message),
-            None => return Ok(None),
+        let translated = match self.translate_texts(from_code, to_code, &texts_to_translate)? {
+            Some(values) => values,
+            None => return Ok(TextTranslationOutcome::MissingLanguagePair),
         };
 
         let mut merged = lines;
         for (index, translated_text) in non_empty_indices.into_iter().zip(translated.into_iter()) {
             merged[index] = translated_text;
         }
-        Ok(Some(merged.join("\n")))
+        Ok(TextTranslationOutcome::Translated(merged.join("\n")))
     }
 
     pub(crate) fn translate_texts(
         &mut self,
-        from_code: &str,
-        to_code: &str,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
         texts: &[String],
-    ) -> Option<Result<Vec<String>, String>> {
-        let plan = resolve_translation_plan_in_snapshot(self.snapshot, from_code, to_code)?;
-        Some(execute_translation_plan(self.engine, &plan, texts))
+    ) -> Result<Option<Vec<String>>, TranslatorError> {
+        let Some(plan) = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        ) else {
+            return Ok(None);
+        };
+        execute_translation_plan(self.engine, &plan, texts)
+            .map(Some)
+            .map_err(TranslatorError::translation)
     }
 
     pub fn translate_mixed_texts(
         &mut self,
         inputs: &[String],
-        forced_source_code: Option<&str>,
-        target_code: &str,
-        available_language_codes: &[String],
-    ) -> Result<MixedTextTranslationResult, String> {
+        forced_source_code: Option<&LanguageCode>,
+        target_code: &LanguageCode,
+        available_language_codes: &[LanguageCode],
+    ) -> Result<MixedTextTranslationResult, TranslatorError> {
+        let available_language_codes = available_language_codes
+            .iter()
+            .map(|code| code.as_str().to_string())
+            .collect::<Vec<_>>();
         translate_mixed_texts_in_snapshot(
             self.engine,
             self.snapshot,
             inputs,
-            forced_source_code,
-            target_code,
-            available_language_codes,
+            forced_source_code.map(LanguageCode::as_str),
+            target_code.as_str(),
+            &available_language_codes,
         )
+        .map_err(TranslatorError::translation)
     }
 
     pub fn translate_structured_fragments(
         &mut self,
         fragments: &[StyledFragment],
-        forced_source_code: Option<&str>,
-        target_code: &str,
-        available_language_codes: &[String],
+        forced_source_code: Option<&LanguageCode>,
+        target_code: &LanguageCode,
+        available_language_codes: &[LanguageCode],
         screenshot: Option<&OverlayScreenshot>,
         background_mode: crate::BackgroundMode,
-    ) -> Result<StructuredTranslationResult, String> {
+    ) -> Result<StructuredTranslationResult, TranslatorError> {
+        let available_language_codes = available_language_codes
+            .iter()
+            .map(|code| code.as_str().to_string())
+            .collect::<Vec<_>>();
         translate_structured_fragments_in_snapshot(
             self.engine,
             self.snapshot,
             fragments,
-            forced_source_code,
-            target_code,
-            available_language_codes,
+            forced_source_code.map(LanguageCode::as_str),
+            target_code.as_str(),
+            &available_language_codes,
             screenshot,
             background_mode,
         )
+        .map_err(TranslatorError::translation)
     }
 
     #[cfg(feature = "tesseract")]
@@ -145,12 +170,12 @@ impl<'a> Translator<'a> {
         rgba_bytes: &[u8],
         width: u32,
         height: u32,
-        source_code: &str,
-        target_code: &str,
+        source_code: &LanguageCode,
+        target_code: &LanguageCode,
         min_confidence: u32,
         reading_order: ReadingOrder,
         background_mode: BackgroundMode,
-    ) -> Result<ImageTranslationOutcome, String> {
+    ) -> Result<ImageTranslationOutcome, TranslatorError> {
         translate_image_rgba_in_snapshot(
             self.engine,
             self.snapshot,
@@ -167,16 +192,20 @@ impl<'a> Translator<'a> {
 
     pub(crate) fn translate_texts_with_alignment(
         &mut self,
-        from_code: &str,
-        to_code: &str,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
         texts: &[String],
-    ) -> Option<Result<Vec<TranslationWithAlignment>, String>> {
-        let plan = resolve_translation_plan_in_snapshot(self.snapshot, from_code, to_code)?;
-        Some(execute_translation_plan_with_alignment(
-            self.engine,
-            &plan,
-            texts,
-        ))
+    ) -> Result<Option<Vec<TranslationWithAlignment>>, TranslatorError> {
+        let Some(plan) = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        ) else {
+            return Ok(None);
+        };
+        execute_translation_plan_with_alignment(self.engine, &plan, texts)
+            .map(Some)
+            .map_err(TranslatorError::translation)
     }
 }
 
@@ -292,7 +321,9 @@ pub(crate) fn resolve_translation_plan_in_snapshot(
         if !status.installed {
             return None;
         }
-        let direction = snapshot.catalog.translation_direction(from, to)?;
+        let direction = snapshot
+            .catalog
+            .translation_direction(&LanguageCode::from(from), &LanguageCode::from(to))?;
         Some(TranslationStep {
             from_code: from.to_string(),
             to_code: to.to_string(),
@@ -362,7 +393,8 @@ where
         return None;
     }
 
-    let direction = catalog.translation_direction(from_code, to_code)?;
+    let direction = catalog
+        .translation_direction(&LanguageCode::from(from_code), &LanguageCode::from(to_code))?;
     Some(TranslationStep {
         from_code: from_code.to_string(),
         to_code: to_code.to_string(),
