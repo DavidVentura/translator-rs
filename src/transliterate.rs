@@ -49,14 +49,19 @@ pub fn transliterate_with_policy_for_language(
     japanese_dict_path: Option<&str>,
     japanese_spaced: bool,
 ) -> Option<String> {
+    let normalized = text.trim();
+    if normalized.is_empty() || normalized.is_ascii() {
+        return None;
+    }
+
     let japanese_preprocessed = if language_code == "ja" {
-        preprocess_japanese(text, japanese_dict_path, japanese_spaced)
+        preprocess_japanese(normalized, japanese_dict_path, japanese_spaced)
     } else {
         None
     };
 
     transliterate_with_policy(
-        text,
+        normalized,
         language_code,
         source_script,
         target_script,
