@@ -7,20 +7,10 @@ use crate::catalog::CatalogSnapshot;
 use crate::catalog::{
     LanguageCatalog, PackInstallChecker, PackResolver, has_translation_direction_installed,
 };
-#[cfg(feature = "tesseract")]
-use crate::ocr::{ImageTranslationOutcome, ReadingOrder};
-use crate::routing::MixedTextTranslationResult;
-#[cfg(not(feature = "tesseract"))]
-use crate::routing::translate_mixed_texts_in_snapshot;
-#[cfg(feature = "tesseract")]
-use crate::settings::BackgroundMode;
+use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use crate::styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment,
     translate_structured_fragments_in_snapshot,
-};
-#[cfg(feature = "tesseract")]
-use crate::{
-    ocr_runtime::translate_image_rgba_in_snapshot, routing::translate_mixed_texts_in_snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,32 +152,6 @@ impl<'a> Translator<'a> {
             background_mode,
         )
         .map_err(TranslatorError::translation)
-    }
-
-    #[cfg(feature = "tesseract")]
-    pub fn translate_image_rgba(
-        &mut self,
-        rgba_bytes: &[u8],
-        width: u32,
-        height: u32,
-        source_code: &LanguageCode,
-        target_code: &LanguageCode,
-        min_confidence: u32,
-        reading_order: ReadingOrder,
-        background_mode: BackgroundMode,
-    ) -> Result<ImageTranslationOutcome, TranslatorError> {
-        translate_image_rgba_in_snapshot(
-            self.engine,
-            self.snapshot,
-            rgba_bytes,
-            width,
-            height,
-            source_code,
-            target_code,
-            min_confidence,
-            reading_order,
-            background_mode,
-        )
     }
 
     pub(crate) fn translate_texts_with_alignment(

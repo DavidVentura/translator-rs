@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use crate::CatalogSnapshot;
 use crate::api::{DictionaryCode, DictionaryLookupOutcome, LanguageCode, TranslatorError};
@@ -9,23 +8,23 @@ use crate::api::{DictionaryCode, DictionaryLookupOutcome, LanguageCode, Translat
 pub use tarkka::WordWithTaggedEntries;
 use tarkka::reader::DictionaryReader;
 
-static DICTIONARY_READERS: OnceLock<Mutex<HashMap<String, DictionaryReader<File>>>> =
-    OnceLock::new();
-
-fn with_reader_cache<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce(&mut HashMap<String, DictionaryReader<File>>) -> Result<T, String>,
-{
-    let mut readers = DICTIONARY_READERS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| "dictionary cache mutex poisoned".to_string())?;
-    f(&mut readers)
+pub struct DictionaryCache {
+    readers: HashMap<String, DictionaryReader<'static, File>>,
 }
 
-fn lookup_dictionary(path: &str, word: &str) -> Result<Option<WordWithTaggedEntries>, String> {
-    with_reader_cache(|readers| {
-        if !readers.contains_key(path) {
+impl DictionaryCache {
+    pub fn new() -> Self {
+        Self {
+            readers: HashMap::new(),
+        }
+    }
+
+    pub fn close(&mut self, path: &str) {
+        self.readers.remove(path);
+    }
+
+    fn lookup(&mut self, path: &str, word: &str) -> Result<Option<WordWithTaggedEntries>, String> {
+        if !self.readers.contains_key(path) {
             let file = File::open(path)
                 .map_err(|err| format!("failed to open dictionary file {path}: {err}"))?;
             let reader = DictionaryReader::open(file)
@@ -35,22 +34,22 @@ fn lookup_dictionary(path: &str, word: &str) -> Result<Option<WordWithTaggedEntr
                 reader.version(),
                 reader.created_at(),
             );
-            readers.insert(path.to_string(), reader);
+            self.readers.insert(path.to_string(), reader);
         }
-        let reader = readers
+        let reader = self
+            .readers
             .get_mut(path)
             .ok_or_else(|| "dictionary reader missing after initialization".to_string())?;
         reader
             .lookup(word)
             .map_err(|err| format!("dictionary lookup failed: {err}"))
-    })
+    }
 }
 
-fn close_dictionary(path: &str) -> Result<(), String> {
-    with_reader_cache(|readers| {
-        readers.remove(path);
-        Ok(())
-    })
+impl Default for DictionaryCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn dictionary_path(base_dir: &str, dictionary_code: &str) -> Option<String> {
@@ -60,8 +59,9 @@ fn dictionary_path(base_dir: &str, dictionary_code: &str) -> Option<String> {
     path.exists().then(|| path.to_string_lossy().into_owned())
 }
 
-pub fn lookup_dictionary_for_code(
+pub(crate) fn lookup_dictionary_for_code(
     base_dir: &str,
+    cache: &mut DictionaryCache,
     dictionary_code: &DictionaryCode,
     word: &str,
 ) -> Result<DictionaryLookupOutcome, TranslatorError> {
@@ -75,9 +75,10 @@ pub fn lookup_dictionary_for_code(
     };
 
     let lowered = normalized.to_lowercase();
-    match lookup_dictionary(&path, normalized) {
+    match cache.lookup(&path, normalized) {
         Ok(Some(word_data)) => Ok(DictionaryLookupOutcome::Found(word_data)),
-        Ok(None) if lowered != normalized => lookup_dictionary(&path, &lowered)
+        Ok(None) if lowered != normalized => cache
+            .lookup(&path, &lowered)
             .map(|result| {
                 result
                     .map(DictionaryLookupOutcome::Found)
@@ -97,8 +98,9 @@ fn dictionary_path_for_language(
     dictionary_path(&snapshot.base_dir, &language.dictionary_code)
 }
 
-pub fn lookup_dictionary_in_snapshot(
+pub(crate) fn lookup_dictionary_in_snapshot(
     snapshot: &CatalogSnapshot,
+    cache: &mut DictionaryCache,
     language_code: &LanguageCode,
     word: &str,
 ) -> Result<DictionaryLookupOutcome, TranslatorError> {
@@ -113,17 +115,18 @@ pub fn lookup_dictionary_in_snapshot(
         })?;
     lookup_dictionary_for_code(
         &snapshot.base_dir,
+        cache,
         &DictionaryCode::from(language.dictionary_code.clone()),
         word,
     )
 }
 
-pub fn close_dictionary_in_snapshot(
+pub(crate) fn close_dictionary_in_snapshot(
     snapshot: &CatalogSnapshot,
+    cache: &mut DictionaryCache,
     language_code: &LanguageCode,
-) -> Result<(), TranslatorError> {
-    let Some(path) = dictionary_path_for_language(snapshot, language_code) else {
-        return Ok(());
-    };
-    close_dictionary(&path).map_err(TranslatorError::dictionary)
+) {
+    if let Some(path) = dictionary_path_for_language(snapshot, language_code) {
+        cache.close(&path);
+    }
 }

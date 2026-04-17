@@ -1,6 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::api::{
@@ -26,7 +24,25 @@ fn log_error(message: impl AsRef<str>) {
     eprintln!("{}", message.as_ref());
 }
 
-static MODEL_CACHE: OnceLock<Mutex<Option<CachedSpeechModel>>> = OnceLock::new();
+pub struct SpeechCache {
+    model: Option<CachedSpeechModel>,
+}
+
+impl SpeechCache {
+    pub fn new() -> Self {
+        Self { model: None }
+    }
+
+    pub fn clear(&mut self) {
+        self.model = None;
+    }
+}
+
+impl Default for SpeechCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn audio_duration_ms(sample_count: usize, sample_rate: u32) -> u64 {
     if sample_rate == 0 {
@@ -327,24 +343,16 @@ fn piper_length_scale_for_speed(speech_speed: f32) -> f32 {
     1.0 / clamp_speech_speed(speech_speed)
 }
 
-fn model_cache() -> &'static Mutex<Option<CachedSpeechModel>> {
-    MODEL_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-pub fn clear_cached_model() {
-    if let Ok(mut cache) = model_cache().lock() {
-        *cache = None;
-    }
-}
-
-pub fn available_tts_voices_in_snapshot(
+pub(crate) fn available_tts_voices_in_snapshot(
     snapshot: &CatalogSnapshot,
+    cache: &mut SpeechCache,
     language_code: &LanguageCode,
 ) -> Result<TtsVoicesOutcome, TranslatorError> {
     let Some(assets) = resolve_speech_assets(snapshot, language_code) else {
         return Ok(TtsVoicesOutcome::MissingLanguage);
     };
     list_voices(
+        cache,
         &assets.engine,
         &assets.model_path,
         &assets.aux_path,
@@ -355,18 +363,20 @@ pub fn available_tts_voices_in_snapshot(
     .map_err(TranslatorError::tts)
 }
 
-pub fn warm_tts_model_in_snapshot(
+pub(crate) fn warm_tts_model_in_snapshot(
     snapshot: &CatalogSnapshot,
+    cache: &mut SpeechCache,
     language_code: &LanguageCode,
 ) -> Result<TtsWarmOutcome, TranslatorError> {
-    match available_tts_voices_in_snapshot(snapshot, language_code)? {
+    match available_tts_voices_in_snapshot(snapshot, cache, language_code)? {
         TtsVoicesOutcome::Available(_) => Ok(TtsWarmOutcome::Warmed),
         TtsVoicesOutcome::MissingLanguage => Ok(TtsWarmOutcome::MissingLanguage),
     }
 }
 
-pub fn plan_speech_chunks_for_text_in_snapshot(
+pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
     snapshot: &CatalogSnapshot,
+    cache: &mut SpeechCache,
     language_code: &LanguageCode,
     text: &str,
 ) -> Result<SpeechChunkPlanningOutcome, TranslatorError> {
@@ -374,6 +384,7 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
         return Ok(SpeechChunkPlanningOutcome::MissingLanguage);
     };
     plan_speech_chunks_for_text(
+        cache,
         &assets.engine,
         &assets.model_path,
         &assets.aux_path,
@@ -385,8 +396,9 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
     .map_err(TranslatorError::tts)
 }
 
-pub fn synthesize_pcm_in_snapshot(
+pub(crate) fn synthesize_pcm_in_snapshot(
     snapshot: &CatalogSnapshot,
+    cache: &mut SpeechCache,
     language_code: &LanguageCode,
     text: &str,
     speech_speed: f32,
@@ -397,6 +409,7 @@ pub fn synthesize_pcm_in_snapshot(
         return Ok(PcmSynthesisOutcome::MissingLanguage);
     };
     synthesize_pcm(
+        cache,
         &assets.engine,
         &assets.model_path,
         &assets.aux_path,
@@ -477,6 +490,7 @@ fn load_speech_model(
 }
 
 fn with_cached_model<T>(
+    cache: &mut SpeechCache,
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -485,11 +499,9 @@ fn with_cached_model<T>(
     f: impl FnOnce(&mut CachedSpeechModel) -> Result<T, String>,
 ) -> Result<T, String> {
     let load_started_at = Instant::now();
-    let mut cache = model_cache()
-        .lock()
-        .map_err(|_| "Failed to lock TTS model cache".to_owned())?;
 
     let cache_hit = cache
+        .model
         .as_ref()
         .map(|cached| {
             cached.engine == engine
@@ -547,7 +559,7 @@ fn with_cached_model<T>(
                 voices.len()
             );
         }
-        *cache = Some(CachedSpeechModel {
+        cache.model = Some(CachedSpeechModel {
             engine: engine.to_owned(),
             model_path: model_path.to_owned(),
             aux_path: aux_path.to_owned(),
@@ -557,9 +569,7 @@ fn with_cached_model<T>(
             default_voice,
             model,
         });
-    }
 
-    if !cache_hit {
         eprintln!(
             "tts.model: ready engine={} language={} total_wait_ms={}",
             engine,
@@ -569,6 +579,7 @@ fn with_cached_model<T>(
     }
 
     let cached = cache
+        .model
         .as_mut()
         .ok_or_else(|| "TTS model cache was unexpectedly empty".to_owned())?;
     f(cached)
@@ -714,7 +725,9 @@ fn synthesize(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthesize_pcm(
+    cache: &mut SpeechCache,
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -738,6 +751,7 @@ fn synthesize_pcm(
         "Synthesizing speech with engine={engine} model={model_path}"
     ));
     let (samples, sample_rate) = with_cached_model(
+        cache,
         engine,
         model_path,
         aux_path,
@@ -795,6 +809,7 @@ fn synthesize_pcm(
 }
 
 fn list_voices(
+    cache: &mut SpeechCache,
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -805,6 +820,7 @@ fn list_voices(
     let support_data_root = support_data_root.unwrap_or_default();
 
     with_cached_model(
+        cache,
         engine,
         model_path,
         aux_path,
@@ -821,6 +837,7 @@ fn list_voices(
 }
 
 pub fn phonemize_chunks(
+    cache: &mut SpeechCache,
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -840,6 +857,7 @@ pub fn phonemize_chunks(
     ));
 
     with_cached_model(
+        cache,
         engine,
         model_path,
         aux_path,
@@ -876,6 +894,7 @@ fn to_phoneme_chunk(chunk: PiperPhonemeChunk) -> PhonemeChunk {
 }
 
 fn plan_speech_chunks_for_text(
+    cache: &mut SpeechCache,
     engine: &str,
     model_path: &str,
     aux_path: &str,
@@ -885,6 +904,7 @@ fn plan_speech_chunks_for_text(
 ) -> Result<Vec<SpeechChunk>, String> {
     plan_speech_chunks(text, |chunk_text| {
         phonemize_chunks(
+            cache,
             engine,
             model_path,
             aux_path,

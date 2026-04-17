@@ -12,6 +12,7 @@ pub mod ocr;
 #[cfg(feature = "tesseract")]
 mod ocr_runtime;
 mod routing;
+pub mod session;
 pub mod settings;
 #[cfg(feature = "tts")]
 mod speech;
@@ -58,20 +59,12 @@ pub use ocr::{
     TextLine, build_text_blocks, prepare_overlay_image, sample_overlay_colors,
 };
 pub use routing::{MixedTextTranslationResult, NothingReason, TextTranslation};
+pub use session::{Feature, TranslatorSession, parse_selected_catalog};
 pub use settings::{AppSettings, BackgroundMode, DEFAULT_CATALOG_INDEX_URL};
-#[cfg(feature = "tts")]
-pub use speech::{
-    available_tts_voices_in_snapshot, clear_cached_model, plan_speech_chunks_for_text_in_snapshot,
-    synthesize_pcm_in_snapshot, warm_tts_model_in_snapshot,
-};
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyleSpan as StructuredStyleSpan,
     StyledFragment as StructuredStyledFragment, TextStyle, TranslatedStyledBlock,
     TranslationSegment,
-};
-#[cfg(feature = "dictionary")]
-pub use tarkka::{
-    close_dictionary_in_snapshot, lookup_dictionary_for_code, lookup_dictionary_in_snapshot,
 };
 #[cfg(feature = "tesseract")]
 pub use tesseract::{PageSegMode, TesseractWrapper};

@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use crate::catalog::CatalogSnapshot;
 use crate::ocr::{
@@ -19,10 +18,25 @@ struct OcrEngineState {
     tessdata_path: String,
 }
 
-static OCR_ENGINE: OnceLock<Mutex<Option<OcrEngineState>>> = OnceLock::new();
+pub struct OcrCache {
+    state: Option<OcrEngineState>,
+}
+
+impl OcrCache {
+    pub fn new() -> Self {
+        Self { state: None }
+    }
+}
+
+impl Default for OcrCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub(crate) fn translate_image_rgba_in_snapshot(
     engine: &mut BergamotEngine,
+    ocr_cache: &mut OcrCache,
     snapshot: &CatalogSnapshot,
     rgba_bytes: &[u8],
     width: u32,
@@ -48,7 +62,7 @@ pub(crate) fn translate_image_rgba_in_snapshot(
     let join_without_spaces = source_code.as_str() == "ja";
     let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomLeftToRight;
 
-    let blocks = with_ocr_engine(snapshot, source_code.as_str(), reading_order, |ocr| {
+    let blocks = with_ocr_engine(ocr_cache, snapshot, source_code.as_str(), reading_order, |ocr| {
         ocr.set_page_seg_mode(page_seg_mode);
         ocr.set_frame(
             rgba_bytes,
@@ -171,6 +185,7 @@ fn merge_translated_block_texts(
 }
 
 fn with_ocr_engine<T, F>(
+    cache: &mut OcrCache,
     snapshot: &CatalogSnapshot,
     source_code: &str,
     reading_order: ReadingOrder,
@@ -193,13 +208,8 @@ where
         _ => format!("{}+eng", language.tess_name),
     };
 
-    let mut slot = OCR_ENGINE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|_| "OCR engine mutex poisoned".to_string())?;
-
     let tessdata_path_string = tessdata_path.to_string_lossy().into_owned();
-    let needs_reinit = slot.as_ref().is_none_or(|state| {
+    let needs_reinit = cache.state.as_ref().is_none_or(|state| {
         state.language_spec != language_spec
             || state.reading_order != reading_order
             || state.tessdata_path != tessdata_path_string
@@ -215,7 +225,7 @@ where
             Some(&language_spec),
         )
         .map_err(|err| format!("failed to initialize tesseract: {err}"))?;
-        *slot = Some(OcrEngineState {
+        cache.state = Some(OcrEngineState {
             engine,
             language_spec,
             reading_order,
@@ -223,7 +233,8 @@ where
         });
     }
 
-    let state = slot
+    let state = cache
+        .state
         .as_mut()
         .ok_or_else(|| "OCR engine unavailable".to_string())?;
     f(&mut state.engine)
