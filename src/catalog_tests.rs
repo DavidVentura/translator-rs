@@ -4,10 +4,10 @@ use crate::api::{DictionaryCode, LanguageCode};
 use crate::catalog::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, LangAvailability, LanguageCatalog,
     LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker, PackRecord,
-    PackResolver, compute_language_availability, plan_language_download,
+    build_catalog_snapshot, plan_language_download,
 };
 use crate::language::Language;
-use crate::translate::resolve_translation_plan;
+use crate::translate::resolve_translation_plan_in_snapshot;
 
 use super::model::{
     DictionaryPack, LanguageInfo, LanguageResources, OcrPack, PackKind, SupportPack,
@@ -449,11 +449,8 @@ fn computes_dependency_closure_and_pack_size_without_double_counting() {
 fn resolves_missing_pack_files_through_install_boundary() {
     let catalog = base_catalog();
     let checker = FakeInstallChecker::with_files(&["bin/model.enes.bin", "bin/shared.bin"]);
-    let plan = plan_language_download(
-        &catalog,
-        &LanguageCode::from("es"),
-        &mut PackResolver::new(&catalog, &checker),
-    );
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+    let plan = plan_language_download(&snapshot, &LanguageCode::from("es"));
     let missing_paths = plan
         .tasks
         .into_iter()
@@ -494,14 +491,10 @@ fn computes_language_availability_from_pack_install_state() {
         "tts/voice-es.onnx",
         "tts/voice-es.onnx.json",
     ]);
-    let mut resolver = PackResolver::new(&catalog, &checker);
-
-    let availability = compute_language_availability(&catalog, &mut resolver);
-    let spanish = catalog.language_by_code(&LanguageCode::from("es")).unwrap();
-    let english = catalog.language_by_code(&LanguageCode::from("en")).unwrap();
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
 
     assert_eq!(
-        availability.get(&spanish),
+        snapshot.availability_by_code.get("es"),
         Some(&LangAvailability {
             has_from_english: true,
             has_to_english: true,
@@ -511,7 +504,7 @@ fn computes_language_availability_from_pack_install_state() {
         })
     );
     assert_eq!(
-        availability.get(&english),
+        snapshot.availability_by_code.get("en"),
         Some(&LangAvailability {
             has_from_english: true,
             has_to_english: true,
@@ -580,16 +573,14 @@ fn resolves_direct_translation_plan_from_installed_catalog() {
         "bin/vocab.zz.spm",
         "bin/shared.bin",
     ]);
-    let mut resolver = PackResolver::new(&catalog, &checker);
+    let snapshot = build_catalog_snapshot(
+        catalog,
+        "/data/user/0/dev.davidv.translator/files".to_string(),
+        &checker,
+    );
 
-    let plan = resolve_translation_plan(
-        &catalog,
-        "/data/user/0/dev.davidv.translator/files",
-        "en",
-        "es",
-        &mut resolver,
-    )
-    .expect("direct plan should resolve");
+    let plan = resolve_translation_plan_in_snapshot(&snapshot, "en", "es")
+        .expect("direct plan should resolve");
 
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].cache_key, "enes");
@@ -688,9 +679,9 @@ fn resolves_pivot_translation_plan_from_installed_catalog() {
         "bin/vocab.dd.spm",
         "bin/shared.bin",
     ]);
-    let mut resolver = PackResolver::new(&catalog, &checker);
+    let snapshot = build_catalog_snapshot(catalog, "/tmp/base".to_string(), &checker);
 
-    let plan = resolve_translation_plan(&catalog, "/tmp/base", "es", "fr", &mut resolver)
+    let plan = resolve_translation_plan_in_snapshot(&snapshot, "es", "fr")
         .expect("pivot plan should resolve");
 
     assert_eq!(plan.steps.len(), 2);
@@ -703,7 +694,7 @@ fn resolves_pivot_translation_plan_from_installed_catalog() {
 fn refuses_translation_plan_when_required_direction_is_missing() {
     let catalog = base_catalog();
     let checker = FakeInstallChecker::with_files(&["bin/model.esen.bin"]);
-    let mut resolver = PackResolver::new(&catalog, &checker);
+    let snapshot = build_catalog_snapshot(catalog, "/tmp/base".to_string(), &checker);
 
-    assert!(resolve_translation_plan(&catalog, "/tmp/base", "es", "en", &mut resolver).is_none());
+    assert!(resolve_translation_plan_in_snapshot(&snapshot, "es", "en").is_none());
 }

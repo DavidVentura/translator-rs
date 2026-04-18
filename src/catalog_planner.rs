@@ -68,7 +68,7 @@ impl PackInstallChecker for FsPackInstallChecker {
     }
 }
 
-pub struct PackResolver<'a, C> {
+pub(crate) struct PackResolver<'a, C> {
     catalog: &'a LanguageCatalog,
     install_checker: &'a C,
     status_cache: HashMap<String, PackInstallStatus>,
@@ -84,7 +84,7 @@ pub struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     pub fn can_translate(&self, from_code: &LanguageCode, to_code: &LanguageCode) -> bool {
-        can_translate_in_snapshot(self, from_code, to_code)
+        self::can_translate(self, from_code, to_code)
     }
 }
 
@@ -99,7 +99,7 @@ impl<'a, C> PackResolver<'a, C>
 where
     C: PackInstallChecker,
 {
-    pub fn new(catalog: &'a LanguageCatalog, install_checker: &'a C) -> Self {
+    pub(crate) fn new(catalog: &'a LanguageCatalog, install_checker: &'a C) -> Self {
         Self {
             catalog,
             install_checker,
@@ -107,7 +107,7 @@ where
         }
     }
 
-    pub fn status(&mut self, pack_id: &str) -> Option<PackInstallStatus> {
+    pub(crate) fn status(&mut self, pack_id: &str) -> Option<PackInstallStatus> {
         if let Some(status) = self.status_cache.get(pack_id) {
             return Some(status.clone());
         }
@@ -145,35 +145,8 @@ where
         Some(status)
     }
 
-    pub fn is_installed(&mut self, pack_id: &str) -> bool {
+    pub(crate) fn is_installed(&mut self, pack_id: &str) -> bool {
         self.status(pack_id).is_some_and(|status| status.installed)
-    }
-
-    fn missing_files<'b, I>(&mut self, pack_ids: I) -> Vec<MissingPackFile>
-    where
-        I: IntoIterator<Item = &'b str>,
-    {
-        let mut missing = Vec::new();
-        let mut seen_install_paths = HashSet::new();
-
-        for pack_id in self.catalog.dependency_closure(pack_ids) {
-            let Some(pack) = self.catalog.pack(&pack_id) else {
-                continue;
-            };
-            let Some(status) = self.status(&pack_id) else {
-                continue;
-            };
-            for file in status.missing_files {
-                if seen_install_paths.insert(file.install_path.clone()) {
-                    missing.push(MissingPackFile {
-                        pack_id: pack.id.clone(),
-                        file,
-                    });
-                }
-            }
-        }
-
-        missing
     }
 }
 
@@ -265,121 +238,7 @@ where
     missing
 }
 
-fn pack_file_present<C>(install_checker: &C, file: &AssetFileV2) -> bool
-where
-    C: PackInstallChecker,
-{
-    match (&file.install_marker_path, file.install_marker_version) {
-        (Some(marker_path), Some(version)) => {
-            install_checker.install_marker_exists(marker_path, version)
-        }
-        _ => install_checker.file_exists(&file.install_path),
-    }
-}
-
-pub fn is_pack_installed<C>(catalog: &LanguageCatalog, install_checker: &C, pack_id: &str) -> bool
-where
-    C: PackInstallChecker,
-{
-    fn visit<C>(
-        catalog: &LanguageCatalog,
-        install_checker: &C,
-        pack_id: &str,
-        seen: &mut HashSet<String>,
-    ) -> bool
-    where
-        C: PackInstallChecker,
-    {
-        if !seen.insert(pack_id.to_string()) {
-            return true;
-        }
-
-        let Some(pack) = catalog.pack(pack_id) else {
-            return false;
-        };
-
-        pack.files
-            .iter()
-            .all(|file| pack_file_present(install_checker, file))
-            && pack
-                .depends_on
-                .iter()
-                .all(|dep_id| visit(catalog, install_checker, dep_id, seen))
-    }
-
-    visit(catalog, install_checker, pack_id, &mut HashSet::new())
-}
-
-pub fn has_translation_direction_installed<C>(
-    catalog: &LanguageCatalog,
-    from_code: &str,
-    to_code: &str,
-    resolver: &mut PackResolver<'_, C>,
-) -> bool
-where
-    C: PackInstallChecker,
-{
-    catalog
-        .translation_pack_id(from_code, to_code)
-        .as_deref()
-        .is_some_and(|pack_id| resolver.is_installed(pack_id))
-}
-
-pub fn can_translate<C>(
-    catalog: &LanguageCatalog,
-    from_code: &LanguageCode,
-    to_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> bool
-where
-    C: PackInstallChecker,
-{
-    if from_code == to_code {
-        return true;
-    }
-
-    if from_code.as_str() == "en" {
-        return has_translation_direction_installed(catalog, "en", to_code.as_str(), resolver);
-    }
-    if to_code.as_str() == "en" {
-        return has_translation_direction_installed(catalog, from_code.as_str(), "en", resolver);
-    }
-
-    has_translation_direction_installed(catalog, from_code.as_str(), "en", resolver)
-        && has_translation_direction_installed(catalog, "en", to_code.as_str(), resolver)
-}
-
-pub fn can_translate_with_checker<C>(
-    catalog: &LanguageCatalog,
-    from_code: &LanguageCode,
-    to_code: &LanguageCode,
-    install_checker: &C,
-) -> bool
-where
-    C: PackInstallChecker,
-{
-    if from_code == to_code {
-        return true;
-    }
-
-    let direction_installed = |from: &str, to: &str| {
-        catalog
-            .translation_pack_id(from, to)
-            .as_deref()
-            .is_some_and(|pack_id| is_pack_installed(catalog, install_checker, pack_id))
-    };
-
-    if from_code.as_str() == "en" {
-        return direction_installed("en", to_code.as_str());
-    }
-    if to_code.as_str() == "en" {
-        return direction_installed(from_code.as_str(), "en");
-    }
-
-    direction_installed(from_code.as_str(), "en") && direction_installed("en", to_code.as_str())
-}
-
-pub fn can_translate_in_snapshot(
+pub fn can_translate(
     snapshot: &CatalogSnapshot,
     from_code: &LanguageCode,
     to_code: &LanguageCode,
@@ -406,23 +265,7 @@ pub fn can_translate_in_snapshot(
     direction_installed(from_code.as_str(), "en") && direction_installed("en", to_code.as_str())
 }
 
-pub fn can_swap_languages_installed<C>(
-    catalog: &LanguageCatalog,
-    from_code: &LanguageCode,
-    to_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> bool
-where
-    C: PackInstallChecker,
-{
-    let to_can_be_source = to_code.as_str() == "en"
-        || has_translation_direction_installed(catalog, to_code.as_str(), "en", resolver);
-    let from_can_be_target = from_code.as_str() == "en"
-        || has_translation_direction_installed(catalog, "en", from_code.as_str(), resolver);
-    to_can_be_source && from_can_be_target
-}
-
-pub fn installed_tts_pack_id_for_language<C>(
+pub(crate) fn installed_tts_pack_id_for_language<C>(
     catalog: &LanguageCatalog,
     language_code: &LanguageCode,
     resolver: &mut PackResolver<'_, C>,
@@ -436,7 +279,7 @@ where
         .find(|pack_id| resolver.is_installed(pack_id))
 }
 
-pub fn compute_language_availability<C>(
+pub(crate) fn compute_language_availability<C>(
     catalog: &LanguageCatalog,
     resolver: &mut PackResolver<'_, C>,
 ) -> HashMap<Language, LangAvailability>
@@ -497,44 +340,7 @@ where
     rows
 }
 
-pub fn resolve_tts_voice_files<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> Option<ResolvedTtsVoiceFiles>
-where
-    C: PackInstallChecker,
-{
-    let voice_pack_id = installed_tts_pack_id_for_language(catalog, language_code, resolver)?;
-    let voice_pack = catalog.pack(&voice_pack_id)?;
-    let PackKind::Tts(tts) = &voice_pack.kind else {
-        return None;
-    };
-    let pack_files = catalog.pack_files_with_dependencies(&voice_pack_id);
-    let model_asset = pack_files
-        .iter()
-        .find(|file| file.name.ends_with(".onnx") && !file.name.ends_with(".onnx.json"))?;
-    let engine = tts.engine.clone().unwrap_or_else(|| "piper".to_string());
-    let aux_asset = match engine.as_str() {
-        "kokoro" => pack_files.iter().find(|file| file.name.ends_with(".bin")),
-        "mms" => pack_files
-            .iter()
-            .find(|file| file.name.ends_with("tokens.txt")),
-        "coqui_vits" | "sherpa_vits" => pack_files.iter().find(|file| file.name == "config.json"),
-        _ => pack_files
-            .iter()
-            .find(|file| file.name.ends_with(".onnx.json")),
-    }?;
-    Some(ResolvedTtsVoiceFiles {
-        engine,
-        model_install_path: model_asset.install_path.clone(),
-        aux_install_path: aux_asset.install_path.clone(),
-        language_code: language_code.as_str().to_string(),
-        speaker_id: tts.default_speaker_id,
-    })
-}
-
-pub fn resolve_tts_voice_files_in_snapshot(
+pub fn resolve_tts_voice_files(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Option<ResolvedTtsVoiceFiles> {
@@ -593,50 +399,7 @@ fn download_task_for(pack: &PackRecord, file: &AssetFileV2) -> DownloadTask {
     }
 }
 
-fn download_plan_for_root_packs<C, I>(
-    catalog: &LanguageCatalog,
-    root_pack_ids: I,
-    resolver: &mut PackResolver<'_, C>,
-) -> DownloadPlan
-where
-    C: PackInstallChecker,
-    I: IntoIterator,
-    I::Item: AsRef<str>,
-{
-    let root_pack_ids = root_pack_ids
-        .into_iter()
-        .map(|id| id.as_ref().to_string())
-        .collect::<Vec<_>>();
-    let tasks = resolver
-        .missing_files(root_pack_ids.iter().map(String::as_str))
-        .into_iter()
-        .filter_map(|item| {
-            let pack = catalog.pack(&item.pack_id)?;
-            Some(download_task_for(pack, &item.file))
-        })
-        .collect::<Vec<_>>();
-    DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    }
-}
-
-pub fn plan_language_download<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> DownloadPlan
-where
-    C: PackInstallChecker,
-{
-    download_plan_for_root_packs(
-        catalog,
-        catalog.core_pack_ids_for_language(language_code.as_str()),
-        resolver,
-    )
-}
-
-pub fn plan_language_download_in_snapshot(
+pub fn plan_language_download(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> DownloadPlan {
@@ -656,19 +419,7 @@ pub fn plan_language_download_in_snapshot(
     }
 }
 
-pub fn plan_dictionary_download<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> Option<DownloadPlan>
-where
-    C: PackInstallChecker,
-{
-    let pack_id = catalog.dictionary_pack_id_for_language(language_code.as_str())?;
-    Some(download_plan_for_root_packs(catalog, [pack_id], resolver))
-}
-
-pub fn plan_dictionary_download_in_snapshot(
+pub fn plan_dictionary_download(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Option<DownloadPlan> {
@@ -688,35 +439,7 @@ pub fn plan_dictionary_download_in_snapshot(
     })
 }
 
-pub fn plan_tts_download<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    selected_pack_id: Option<&str>,
-    resolver: &mut PackResolver<'_, C>,
-) -> Option<DownloadPlan>
-where
-    C: PackInstallChecker,
-{
-    let selected_pack_id = match selected_pack_id {
-        Some(pack_id)
-            if catalog
-                .tts_pack_ids_for_language(language_code)
-                .iter()
-                .any(|candidate| candidate == pack_id) =>
-        {
-            pack_id.to_string()
-        }
-        Some(_) => return None,
-        None => catalog.default_tts_pack_id_for_language(language_code)?,
-    };
-    Some(download_plan_for_root_packs(
-        catalog,
-        [selected_pack_id],
-        resolver,
-    ))
-}
-
-pub fn plan_tts_download_in_snapshot(
+pub fn plan_tts_download(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
     selected_pack_id: Option<&str>,
@@ -803,29 +526,7 @@ where
     target.difference(&keep).cloned().collect()
 }
 
-pub fn plan_delete_dictionary<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> DeletePlan
-where
-    C: PackInstallChecker,
-{
-    let Some(target_pack) = catalog.dictionary_pack_id_for_language(language_code.as_str()) else {
-        return DeletePlan::default();
-    };
-    let keep_root_packs = catalog
-        .languages
-        .keys()
-        .filter(|code| code.as_str() != language_code.as_str())
-        .filter_map(|code| catalog.dictionary_pack_id_for_language(code))
-        .filter(|pack_id| pack_id != &target_pack && resolver.is_installed(pack_id))
-        .collect::<HashSet<_>>();
-    let delete_pack_ids = delete_pack_ids(catalog, [target_pack.as_str()], keep_root_packs);
-    delete_plan_for_pack_ids(catalog, delete_pack_ids.iter().map(String::as_str))
-}
-
-pub fn plan_delete_dictionary_in_snapshot(
+pub fn plan_delete_dictionary(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> DeletePlan {
@@ -851,31 +552,7 @@ pub fn plan_delete_dictionary_in_snapshot(
     )
 }
 
-pub fn plan_delete_language<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> DeletePlan
-where
-    C: PackInstallChecker,
-{
-    let target_root_packs = catalog.core_pack_ids_for_language(language_code.as_str());
-    let keep_root_packs = catalog
-        .languages
-        .keys()
-        .filter(|code| code.as_str() != language_code.as_str())
-        .flat_map(|code| catalog.core_pack_ids_for_language(code))
-        .filter(|pack_id| resolver.is_installed(pack_id))
-        .collect::<HashSet<_>>();
-    let delete_pack_ids = delete_pack_ids(
-        catalog,
-        target_root_packs.iter().map(String::as_str),
-        keep_root_packs,
-    );
-    delete_plan_for_pack_ids(catalog, delete_pack_ids.iter().map(String::as_str))
-}
-
-pub fn plan_delete_language_in_snapshot(
+pub fn plan_delete_language(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> DeletePlan {
@@ -901,41 +578,7 @@ pub fn plan_delete_language_in_snapshot(
     )
 }
 
-pub fn plan_delete_tts<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    resolver: &mut PackResolver<'_, C>,
-) -> DeletePlan
-where
-    C: PackInstallChecker,
-{
-    let target_root_packs = catalog
-        .tts_pack_ids_for_language(language_code)
-        .into_iter()
-        .filter(|pack_id| resolver.is_installed(pack_id))
-        .collect::<HashSet<_>>();
-    if target_root_packs.is_empty() {
-        return DeletePlan::default();
-    }
-    let keep_root_packs = catalog
-        .languages
-        .keys()
-        .filter(|code| code.as_str() != language_code.as_str())
-        .flat_map(|code| catalog.tts_pack_ids_for_language(&LanguageCode::from(code.as_str())))
-        .filter(|pack_id| resolver.is_installed(pack_id))
-        .collect::<HashSet<_>>();
-    let delete_pack_ids = delete_pack_ids(
-        catalog,
-        target_root_packs.iter().map(String::as_str),
-        keep_root_packs,
-    );
-    delete_plan_for_pack_ids(catalog, delete_pack_ids.iter().map(String::as_str))
-}
-
-pub fn plan_delete_tts_in_snapshot(
-    snapshot: &CatalogSnapshot,
-    language_code: &LanguageCode,
-) -> DeletePlan {
+pub fn plan_delete_tts(snapshot: &CatalogSnapshot, language_code: &LanguageCode) -> DeletePlan {
     let target_root_packs = snapshot
         .catalog
         .tts_pack_ids_for_language(language_code)
@@ -968,49 +611,7 @@ pub fn plan_delete_tts_in_snapshot(
     )
 }
 
-pub fn plan_delete_superseded_tts<C>(
-    catalog: &LanguageCatalog,
-    language_code: &LanguageCode,
-    selected_pack_id: &str,
-    resolver: &mut PackResolver<'_, C>,
-) -> DeletePlan
-where
-    C: PackInstallChecker,
-{
-    let installed_language_packs = catalog
-        .tts_pack_ids_for_language(language_code)
-        .into_iter()
-        .filter(|pack_id| resolver.is_installed(pack_id))
-        .collect::<HashSet<_>>();
-    let superseded_root_packs = catalog
-        .tts_pack_ids_for_language(language_code)
-        .into_iter()
-        .filter(|pack_id| pack_id != selected_pack_id && installed_language_packs.contains(pack_id))
-        .collect::<HashSet<_>>();
-    if superseded_root_packs.is_empty() {
-        return DeletePlan::default();
-    }
-    let mut keep_root_packs = HashSet::new();
-    if resolver.is_installed(selected_pack_id) {
-        keep_root_packs.insert(selected_pack_id.to_string());
-    }
-    keep_root_packs.extend(
-        catalog
-            .languages
-            .keys()
-            .filter(|code| code.as_str() != language_code.as_str())
-            .flat_map(|code| catalog.tts_pack_ids_for_language(&LanguageCode::from(code.as_str())))
-            .filter(|pack_id| resolver.is_installed(pack_id)),
-    );
-    let delete_pack_ids = delete_pack_ids(
-        catalog,
-        superseded_root_packs.iter().map(String::as_str),
-        keep_root_packs,
-    );
-    delete_plan_for_pack_ids(catalog, delete_pack_ids.iter().map(String::as_str))
-}
-
-pub fn plan_delete_superseded_tts_in_snapshot(
+pub fn plan_delete_superseded_tts(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
     selected_pack_id: &str,

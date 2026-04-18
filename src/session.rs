@@ -5,10 +5,8 @@ use crate::bergamot::BergamotEngine;
 use crate::catalog::{
     CatalogSnapshot, DeletePlan, DownloadPlan, LanguageAvailabilityRow, PackInstallChecker,
     build_catalog_snapshot, language_rows_in_snapshot, parse_and_validate_catalog,
-    plan_delete_dictionary_in_snapshot, plan_delete_language_in_snapshot,
-    plan_delete_superseded_tts_in_snapshot, plan_delete_tts_in_snapshot,
-    plan_dictionary_download_in_snapshot, plan_language_download_in_snapshot,
-    plan_tts_download_in_snapshot, select_best_catalog,
+    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts, plan_delete_tts,
+    plan_dictionary_download, plan_language_download, plan_tts_download, select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
@@ -218,9 +216,9 @@ impl TranslatorSession {
         let snap = self.snapshot();
         let code = LanguageCode::from(language_code);
         match feature {
-            Feature::Core => Some(plan_language_download_in_snapshot(&snap, &code)),
-            Feature::Dictionary => plan_dictionary_download_in_snapshot(&snap, &code),
-            Feature::Tts => plan_tts_download_in_snapshot(&snap, &code, selected_tts_pack_id),
+            Feature::Core => Some(plan_language_download(&snap, &code)),
+            Feature::Dictionary => plan_dictionary_download(&snap, &code),
+            Feature::Tts => plan_tts_download(&snap, &code, selected_tts_pack_id),
         }
     }
 
@@ -239,17 +237,17 @@ impl TranslatorSession {
                 self.close_dictionary(&snap, &code);
                 #[cfg(feature = "tts")]
                 self.clear_speech_cache();
-                plan_delete_language_in_snapshot(&snap, &code)
+                plan_delete_language(&snap, &code)
             }
             Feature::Dictionary => {
                 #[cfg(feature = "dictionary")]
                 self.close_dictionary(&snap, &code);
-                plan_delete_dictionary_in_snapshot(&snap, &code)
+                plan_delete_dictionary(&snap, &code)
             }
             Feature::Tts => {
                 #[cfg(feature = "tts")]
                 self.clear_speech_cache();
-                plan_delete_tts_in_snapshot(&snap, &code)
+                plan_delete_tts(&snap, &code)
             }
         }
     }
@@ -269,7 +267,7 @@ impl TranslatorSession {
         let code = LanguageCode::from(language_code);
         #[cfg(feature = "tts")]
         self.clear_speech_cache();
-        plan_delete_superseded_tts_in_snapshot(&snap, &code, selected_pack_id)
+        plan_delete_superseded_tts(&snap, &code, selected_pack_id)
     }
 
     #[cfg(feature = "tts")]

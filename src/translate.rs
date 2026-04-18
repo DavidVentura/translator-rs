@@ -3,10 +3,6 @@ use std::path::Path;
 use crate::BergamotEngine;
 use crate::api::{LanguageCode, TranslatorError};
 use crate::catalog::CatalogSnapshot;
-#[cfg(test)]
-use crate::catalog::{
-    LanguageCatalog, PackInstallChecker, PackResolver, has_translation_direction_installed,
-};
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use crate::styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment,
@@ -241,39 +237,6 @@ fn cache_key(from_code: &str, to_code: &str) -> String {
     format!("{from_code}-{to_code}")
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_translation_plan<C>(
-    catalog: &LanguageCatalog,
-    base_dir: &str,
-    from_code: &str,
-    to_code: &str,
-    resolver: &mut PackResolver<'_, C>,
-) -> Option<TranslationPlan>
-where
-    C: PackInstallChecker,
-{
-    if from_code == to_code {
-        return Some(TranslationPlan::default());
-    }
-
-    let steps = if from_code == "en" {
-        vec![resolve_translation_step(
-            catalog, base_dir, "en", to_code, resolver,
-        )?]
-    } else if to_code == "en" {
-        vec![resolve_translation_step(
-            catalog, base_dir, from_code, "en", resolver,
-        )?]
-    } else {
-        vec![
-            resolve_translation_step(catalog, base_dir, from_code, "en", resolver)?,
-            resolve_translation_step(catalog, base_dir, "en", to_code, resolver)?,
-        ]
-    };
-
-    Some(TranslationPlan { steps })
-}
-
 pub(crate) fn resolve_translation_plan_in_snapshot(
     snapshot: &CatalogSnapshot,
     from_code: &str,
@@ -344,29 +307,4 @@ fn ensure_plan_loaded(engine: &mut BergamotEngine, plan: &TranslationPlan) -> Re
         engine.load_model_into_cache(&step.config, &step.cache_key)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn resolve_translation_step<C>(
-    catalog: &LanguageCatalog,
-    base_dir: &str,
-    from_code: &str,
-    to_code: &str,
-    resolver: &mut PackResolver<'_, C>,
-) -> Option<TranslationStep>
-where
-    C: PackInstallChecker,
-{
-    if !has_translation_direction_installed(catalog, from_code, to_code, resolver) {
-        return None;
-    }
-
-    let direction = catalog
-        .translation_direction(&LanguageCode::from(from_code), &LanguageCode::from(to_code))?;
-    Some(TranslationStep {
-        from_code: from_code.to_string(),
-        to_code: to_code.to_string(),
-        cache_key: cache_key(from_code, to_code),
-        config: build_bergamot_config(base_dir, &direction),
-    })
 }

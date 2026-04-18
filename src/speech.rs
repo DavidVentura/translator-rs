@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::api::{LanguageCode, TranslatorError, VoiceName};
 use crate::{
     CatalogSnapshot, PcmAudio, PhonemeChunk, ResolvedTtsVoiceFiles, SpeechChunk,
-    SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks, resolve_tts_voice_files_in_snapshot,
+    SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks, resolve_tts_voice_files,
 };
 use piper_rs::{
     Backend, BoundaryAfter, CoquiVitsModel, KokoroModel, MmsModel,
@@ -316,7 +316,7 @@ fn resolve_speech_assets(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Option<ResolvedSpeechAssets> {
-    let files = resolve_tts_voice_files_in_snapshot(snapshot, language_code)?;
+    let files = resolve_tts_voice_files(snapshot, language_code)?;
     let support_data_root = support_data_root(snapshot, &files);
     let model_path = absolute_install_path(snapshot, &files.model_install_path);
     if !Path::new(&model_path).exists() {
