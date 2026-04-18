@@ -8,8 +8,9 @@ use crate::ocr::{
 use crate::settings::BackgroundMode;
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
 use crate::translate::Translator;
-use crate::{BergamotEngine, PageSegMode, TesseractWrapper};
-use crate::{LanguageCode, TranslatorError};
+use crate::api::{LanguageCode, TranslatorError};
+use crate::bergamot::BergamotEngine;
+use crate::tesseract::{PageSegMode, TesseractWrapper};
 
 struct OcrEngineState {
     engine: TesseractWrapper,

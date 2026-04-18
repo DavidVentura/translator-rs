@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::BergamotEngine;
+use crate::bergamot::BergamotEngine;
 use crate::api::{LanguageCode, TranslatorError};
 use crate::catalog::CatalogSnapshot;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
@@ -8,12 +8,6 @@ use crate::styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment,
     translate_structured_fragments_in_snapshot,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranslatedText {
-    pub translated: String,
-    pub transliterated: Option<String>,
-}
 
 pub struct Translator<'a> {
     engine: &'a mut BergamotEngine,

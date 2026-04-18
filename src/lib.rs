@@ -26,40 +26,19 @@ mod translate;
 pub mod transliterate;
 pub mod tts;
 
-pub use api::{
-    DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind, VoiceName,
-};
-pub use bergamot::BergamotEngine;
+pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{
-    AssetFileV2, AssetPackMetadataV2, CatalogSnapshot, CatalogSourcesV2, DeletePlan,
-    DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker, LangAvailability,
-    LanguageAvailabilityRow, LanguageCatalog, LanguageFeature, LanguageOverview,
-    LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker, PackInstallStatus, PackKind,
-    PackRecord, ResolvedTtsVoiceFiles, TtsVoiceOverview, TtsVoicePackInfo, TtsVoicePickerRegion,
-    TtsVoiceRegionOverview, build_catalog_snapshot, build_language_overview, can_translate,
-    language_rows_in_snapshot, parse_and_validate_catalog, parse_language_catalog,
-    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts, plan_delete_tts,
-    plan_dictionary_download, plan_language_download, plan_tts_download, resolve_tts_voice_files,
-    select_best_catalog,
+    CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker,
+    LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, TtsVoicePickerRegion,
+    language_rows_in_snapshot, parse_and_validate_catalog,
 };
-pub use language::Language;
-pub use language_detect::{DetectionResult, detect_language};
-pub use ocr::{
-    DetectedWord, OverlayColors, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay,
-    PreparedTextBlock, PreparedTextLine, ReadingOrder, Rect, TextBlock, TextLine,
-    build_text_blocks, prepare_overlay_image, sample_overlay_colors,
-};
-pub use routing::{MixedTextTranslationResult, NothingReason, TextTranslation};
-pub use session::{Feature, TranslatorSession, parse_selected_catalog};
-pub use settings::{AppSettings, BackgroundMode, DEFAULT_CATALOG_INDEX_URL};
+pub use language_detect::DetectionResult;
+pub use ocr::{OverlayColors, PreparedImageOverlay, ReadingOrder, Rect, sample_overlay_colors};
+pub use routing::MixedTextTranslationResult;
+pub use session::{Feature, TranslatorSession};
+pub use settings::BackgroundMode;
 pub use styled::{
-    OverlayScreenshot, StructuredTranslationResult, StyleSpan as StructuredStyleSpan,
-    StyledFragment as StructuredStyledFragment, TextStyle, TranslatedStyledBlock,
-    TranslationSegment,
+    OverlayScreenshot, StructuredTranslationResult,
+    StyledFragment as StructuredStyledFragment,
 };
-#[cfg(feature = "tesseract")]
-pub use tesseract::{PageSegMode, TesseractWrapper};
-pub use translate::{TokenAlignment, TranslatedText, TranslationWithAlignment, Translator};
-pub use tts::{
-    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
-};
+pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};

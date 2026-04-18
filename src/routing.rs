@@ -6,7 +6,8 @@ use regex::Regex;
 use crate::api::LanguageCode;
 use crate::language_detect::detect_language_robust_code;
 use crate::translate::{execute_translation_plan, resolve_translation_plan_in_snapshot};
-use crate::{BergamotEngine, CatalogSnapshot};
+use crate::bergamot::BergamotEngine;
+use crate::catalog::CatalogSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]

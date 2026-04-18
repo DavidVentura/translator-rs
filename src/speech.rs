@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::api::{LanguageCode, TranslatorError, VoiceName};
-use crate::{
-    CatalogSnapshot, PcmAudio, PhonemeChunk, ResolvedTtsVoiceFiles, SpeechChunk,
-    SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks, resolve_tts_voice_files,
+use crate::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles, resolve_tts_voice_files};
+use crate::tts::{
+    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
 };
 use piper_rs::{
     Backend, BoundaryAfter, CoquiVitsModel, KokoroModel, MmsModel,
