@@ -5,7 +5,7 @@ use crate::language::Language;
 
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, LangAvailability, LanguageCatalog,
-    PackKind, PackRecord, ResolvedTtsVoiceFiles,
+    PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsVoicePackInfo,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +93,34 @@ impl CatalogSnapshot {
 pub struct LanguageAvailabilityRow {
     pub language: Language,
     pub availability: LangAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct LanguageOverview {
+    pub language: Language,
+    pub availability: LangAvailability,
+    pub core_size_bytes: u64,
+    pub core_installed: bool,
+    pub dictionary_size_bytes: u64,
+    pub dictionary_installed: bool,
+    pub tts_size_bytes: u64,
+    pub tts_voice_regions: Vec<TtsVoiceRegionOverview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TtsVoiceRegionOverview {
+    pub code: String,
+    pub display_name: String,
+    pub voices: Vec<TtsVoiceOverview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TtsVoiceOverview {
+    pub pack_info: TtsVoicePackInfo,
+    pub installed: bool,
 }
 
 impl<'a, C> PackResolver<'a, C>
@@ -196,6 +224,68 @@ pub fn language_rows_in_snapshot(snapshot: &CatalogSnapshot) -> Vec<LanguageAvai
             LanguageAvailabilityRow {
                 language,
                 availability,
+            }
+        })
+        .collect()
+}
+
+pub fn build_language_overview(snapshot: &CatalogSnapshot) -> Vec<LanguageOverview> {
+    let catalog = &snapshot.catalog;
+    language_rows_in_snapshot(snapshot)
+        .into_iter()
+        .map(|row| {
+            let language = row.language;
+            let language_code = LanguageCode::from(language.code.as_str());
+
+            let core_size_bytes = catalog.translation_size_bytes_for_language(&language_code);
+            let dictionary_size_bytes = catalog
+                .dictionary_info_for(&language)
+                .map(|info| info.size)
+                .unwrap_or(0);
+            let tts_size_bytes = catalog.tts_size_bytes_for_language(&language_code);
+
+            let core_installed = core_size_bytes > 0
+                && plan_language_download(snapshot, &language_code)
+                    .tasks
+                    .is_empty();
+            let dictionary_installed = dictionary_size_bytes > 0
+                && plan_dictionary_download(snapshot, &language_code)
+                    .is_some_and(|plan| plan.tasks.is_empty());
+
+            let tts_voice_regions = catalog
+                .tts_voice_picker_regions(&language_code)
+                .into_iter()
+                .map(|region| TtsVoiceRegionOverview {
+                    code: region.code,
+                    display_name: region.display_name,
+                    voices: region
+                        .voices
+                        .into_iter()
+                        .map(|pack_info| {
+                            let installed = plan_tts_download(
+                                snapshot,
+                                &language_code,
+                                Some(pack_info.pack_id.as_str()),
+                            )
+                            .is_some_and(|plan| plan.tasks.is_empty());
+                            TtsVoiceOverview {
+                                pack_info,
+                                installed,
+                            }
+                        })
+                        .collect(),
+                })
+                .collect();
+
+            LanguageOverview {
+                language,
+                availability: row.availability,
+                core_size_bytes,
+                core_installed,
+                dictionary_size_bytes,
+                dictionary_installed,
+                tts_size_bytes,
+                tts_voice_regions,
             }
         })
         .collect()

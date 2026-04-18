@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
 use crate::catalog::{
-    CatalogSnapshot, DeletePlan, DownloadPlan, LanguageAvailabilityRow, PackInstallChecker,
-    build_catalog_snapshot, language_rows_in_snapshot, parse_and_validate_catalog,
-    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts, plan_delete_tts,
-    plan_dictionary_download, plan_language_download, plan_tts_download, select_best_catalog,
+    CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
+    LanguageOverview, PackInstallChecker, build_catalog_snapshot, build_language_overview,
+    language_rows_in_snapshot, parse_and_validate_catalog, plan_delete_dictionary,
+    plan_delete_language, plan_delete_superseded_tts, plan_delete_tts, plan_dictionary_download,
+    plan_language_download, plan_tts_download, select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
@@ -67,6 +68,12 @@ impl TranslatorSession {
         }
     }
 
+    pub fn from_catalog(catalog: crate::catalog::LanguageCatalog, base_dir: String) -> Self {
+        let checker = FsPackInstallChecker::new(&base_dir);
+        let snapshot = build_catalog_snapshot(catalog, base_dir, &checker);
+        Self::from_snapshot(snapshot)
+    }
+
     fn engine(&self) -> &'static Mutex<BergamotEngine> {
         BERGAMOT_ENGINE.get_or_init(|| Mutex::new(BergamotEngine::new()))
     }
@@ -97,24 +104,59 @@ impl TranslatorSession {
             .clone()
     }
 
-    pub fn replace_snapshot(&self, snapshot: CatalogSnapshot) {
+    fn set_snapshot(&self, snapshot: CatalogSnapshot) {
         *self.snapshot.write().expect("snapshot lock poisoned") = Arc::new(snapshot);
     }
 
-    pub fn rebuild_snapshot<C>(&self, install_checker: &C)
-    where
-        C: PackInstallChecker,
-    {
+    pub fn refresh_snapshot(&self) {
         let current = self.snapshot();
         let catalog = current.catalog.clone();
         let base_dir = current.base_dir.clone();
         drop(current);
-        let snapshot = build_catalog_snapshot(catalog, base_dir, install_checker);
-        self.replace_snapshot(snapshot);
+        let checker = FsPackInstallChecker::new(&base_dir);
+        self.set_snapshot(build_catalog_snapshot(catalog, base_dir, &checker));
+    }
+
+    pub fn apply_delete_plan(&self, plan: &DeletePlan) {
+        use std::collections::HashSet;
+        use std::path::Path;
+
+        let base_dir = self.snapshot().base_dir.clone();
+        let base = Path::new(&base_dir);
+
+        let mut files = plan
+            .file_paths
+            .iter()
+            .map(|path| base.join(path))
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        for file in files {
+            let _ = std::fs::remove_file(file);
+        }
+
+        let mut directories = plan
+            .directory_paths
+            .iter()
+            .map(|path| base.join(path))
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        let mut seen = HashSet::new();
+        for directory in directories {
+            if seen.insert(directory.clone()) {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        }
+
+        self.refresh_snapshot();
     }
 
     pub fn language_rows(&self) -> Vec<LanguageAvailabilityRow> {
         language_rows_in_snapshot(&self.snapshot())
+    }
+
+    pub fn language_overview(&self) -> Vec<LanguageOverview> {
+        build_language_overview(&self.snapshot())
     }
 
     pub fn warm(&self, from_code: &str, to_code: &str) -> Result<(), TranslatorError> {

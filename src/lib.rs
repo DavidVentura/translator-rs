@@ -33,9 +33,10 @@ pub use bergamot::BergamotEngine;
 pub use catalog::{
     AssetFileV2, AssetPackMetadataV2, CatalogSnapshot, CatalogSourcesV2, DeletePlan,
     DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker, LangAvailability,
-    LanguageAvailabilityRow, LanguageCatalog, LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2,
-    PackInstallChecker, PackInstallStatus, PackKind, PackRecord, ResolvedTtsVoiceFiles,
-    TtsVoicePackInfo, TtsVoicePickerRegion, build_catalog_snapshot, can_translate,
+    LanguageAvailabilityRow, LanguageCatalog, LanguageFeature, LanguageOverview,
+    LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker, PackInstallStatus, PackKind,
+    PackRecord, ResolvedTtsVoiceFiles, TtsVoiceOverview, TtsVoicePackInfo, TtsVoicePickerRegion,
+    TtsVoiceRegionOverview, build_catalog_snapshot, build_language_overview, can_translate,
     language_rows_in_snapshot, parse_and_validate_catalog, parse_language_catalog,
     plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts, plan_delete_tts,
     plan_dictionary_download, plan_language_download, plan_tts_download, resolve_tts_voice_files,
