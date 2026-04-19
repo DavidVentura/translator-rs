@@ -13,23 +13,30 @@ use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use image::{ImageReader, RgbaImage};
 
 use translator::ocr::{
-    DetectedWord, Rect, ReadingOrder, TextBlock, build_text_blocks, prepare_overlay_image,
+    DetectedWord, ReadingOrder, Rect, TextBlock, build_text_blocks, prepare_overlay_image,
 };
 use translator::settings::BackgroundMode;
 use translator::tesseract::TesseractWrapper;
 
 const TESSDATA: &str = "/usr/share/tesseract-ocr/5/tessdata";
 const FONT_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-const INPUT: &str = "data/kindle.jpg";
 const OUTPUT_DIR: &str = "target/overpaint_visual";
-const OUTPUT_FILE: &str = "kindle.overpaint.png";
 
 #[test]
 fn overpaint_visual_kindle() {
-    let decoded = ImageReader::open(INPUT)
-        .expect("open kindle.jpg")
+    run_case("data/kindle.jpg", "kindle.overpaint.png");
+}
+
+#[test]
+fn overpaint_visual_lobsters() {
+    run_case("data/lobsters.png", "lobsters.overpaint.png");
+}
+
+fn run_case(input: &str, output_file: &str) {
+    let decoded = ImageReader::open(input)
+        .unwrap_or_else(|err| panic!("open {input}: {err}"))
         .decode()
-        .expect("decode kindle.jpg")
+        .unwrap_or_else(|err| panic!("decode {input}: {err}"))
         .to_rgba8();
     let (width, height) = decoded.dimensions();
     let rgba = decoded.into_raw();
@@ -80,11 +87,10 @@ fn overpaint_visual_kindle() {
     }
 
     swap_r_b(&mut out_bgra);
-    let output_image =
-        RgbaImage::from_raw(width, height, out_bgra).expect("rebuild rgba image");
+    let output_image = RgbaImage::from_raw(width, height, out_bgra).expect("rebuild rgba image");
     let out_dir = PathBuf::from(OUTPUT_DIR);
     std::fs::create_dir_all(&out_dir).expect("create output dir");
-    let out_path = out_dir.join(OUTPUT_FILE);
+    let out_path = out_dir.join(output_file);
     output_image.save(&out_path).expect("save png");
     eprintln!("wrote {}", out_path.display());
 }
@@ -96,8 +102,7 @@ fn swap_r_b(buf: &mut [u8]) {
 }
 
 fn run_tesseract(rgba: &[u8], width: u32, height: u32) -> Vec<translator::tesseract::DetectedWord> {
-    let mut engine =
-        TesseractWrapper::new(Some(TESSDATA), Some("eng")).expect("init tesseract");
+    let mut engine = TesseractWrapper::new(Some(TESSDATA), Some("eng")).expect("init tesseract");
     let bpp = 4i32;
     let bpl = (width as i32) * bpp;
     engine
