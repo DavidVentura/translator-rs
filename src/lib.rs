@@ -38,7 +38,6 @@ pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
 pub use settings::BackgroundMode;
 pub use styled::{
-    OverlayScreenshot, StructuredTranslationResult,
-    StyledFragment as StructuredStyledFragment,
+    OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
 };
 pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};

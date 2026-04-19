@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::bergamot::BergamotEngine;
 use crate::api::{LanguageCode, TranslatorError};
+use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use crate::styled::{

@@ -1,11 +1,11 @@
+use crate::api::LanguageCode;
+use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 use crate::language_detect::detect_language_robust_code;
 use crate::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use crate::routing::NothingReason;
-use crate::translate::{TokenAlignment, Translator};
-use crate::api::LanguageCode;
-use crate::bergamot::BergamotEngine;
 use crate::settings::BackgroundMode;
+use crate::translate::{TokenAlignment, Translator};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]

@@ -609,35 +609,81 @@ fn autodetect_paint(image: &RasterImage<'_>, bounds: Rect) -> AutoDetectPaint {
     let mut bg_quad = [Accum::default(); 4];
     let mut fg_total = Accum::default();
 
-    let mid_x = (bounds.left + bounds.right) / 2;
-    let mid_y = (bounds.top + bounds.bottom) / 2;
+    // FG is sampled from the interior — that's where the ink lives.
     for y in bounds.top..bounds.bottom {
         for x in bounds.left..bounds.right {
             let pixel = image.pixel_argb(x, y);
             let lum = luminance_u8(pixel);
-            let r = channel_r(pixel) as u64;
-            let g = channel_g(pixel) as u64;
-            let b = channel_b(pixel) as u64;
-
-            if lum.abs_diff(paper_peak) <= BG_BAND {
-                let qi = (usize::from(x >= mid_x)) | (usize::from(y >= mid_y) << 1);
-                let a = &mut bg_quad[qi];
-                a.r += r;
-                a.g += g;
-                a.b += b;
-                a.n += 1;
-            }
-
             let is_core_fg = if bg_is_bright {
                 lum <= fg_cutoff
             } else {
                 lum >= fg_cutoff
             };
             if is_core_fg {
-                fg_total.r += r;
-                fg_total.g += g;
-                fg_total.b += b;
+                fg_total.r += channel_r(pixel) as u64;
+                fg_total.g += channel_g(pixel) as u64;
+                fg_total.b += channel_b(pixel) as u64;
                 fg_total.n += 1;
+            }
+        }
+    }
+
+    // BG = per-corner sample from a small L-shaped window of paper immediately
+    // around each corner. Keeping each sample corner-local means the fill
+    // matches the paper at that exact edge — important when the page has
+    // horizontal gradients or lighting bands that vary across the text column.
+    const SURROUND_MARGIN: u32 = 6;
+    const CORNER_EXTENT: u32 = 8;
+    let add_bg = |bg_quad: &mut [Accum; 4], pixel: u32, qi: usize| {
+        let lum = luminance_u8(pixel);
+        if lum.abs_diff(paper_peak) > BG_BAND {
+            return;
+        }
+        let a = &mut bg_quad[qi];
+        a.r += channel_r(pixel) as u64;
+        a.g += channel_g(pixel) as u64;
+        a.b += channel_b(pixel) as u64;
+        a.n += 1;
+    };
+    let windows: [(u32, u32, u32, u32); 4] = [
+        // tl: x in [left-margin, left+extent], y in [top-margin, top+extent]
+        (
+            bounds.left.saturating_sub(SURROUND_MARGIN),
+            (bounds.left + CORNER_EXTENT).min(bounds.right),
+            bounds.top.saturating_sub(SURROUND_MARGIN),
+            (bounds.top + CORNER_EXTENT).min(bounds.bottom),
+        ),
+        // tr
+        (
+            bounds.right.saturating_sub(CORNER_EXTENT).max(bounds.left),
+            (bounds.right + SURROUND_MARGIN).min(image.width),
+            bounds.top.saturating_sub(SURROUND_MARGIN),
+            (bounds.top + CORNER_EXTENT).min(bounds.bottom),
+        ),
+        // bl
+        (
+            bounds.left.saturating_sub(SURROUND_MARGIN),
+            (bounds.left + CORNER_EXTENT).min(bounds.right),
+            bounds.bottom.saturating_sub(CORNER_EXTENT).max(bounds.top),
+            (bounds.bottom + SURROUND_MARGIN).min(image.height),
+        ),
+        // br
+        (
+            bounds.right.saturating_sub(CORNER_EXTENT).max(bounds.left),
+            (bounds.right + SURROUND_MARGIN).min(image.width),
+            bounds.bottom.saturating_sub(CORNER_EXTENT).max(bounds.top),
+            (bounds.bottom + SURROUND_MARGIN).min(image.height),
+        ),
+    ];
+
+    for (qi, (x0, x1, y0, y1)) in windows.iter().copied().enumerate() {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // Skip the text-rect interior — those pixels carry ink.
+                if x >= bounds.left && x < bounds.right && y >= bounds.top && y < bounds.bottom {
+                    continue;
+                }
+                add_bg(&mut bg_quad, image.pixel_argb(x, y), qi);
             }
         }
     }

@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::api::{LanguageCode, TranslatorError};
+use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 use crate::ocr::{
     DetectedWord, PreparedImageOverlay, ReadingOrder, Rect, TextBlock, build_text_blocks,
@@ -7,10 +9,8 @@ use crate::ocr::{
 };
 use crate::settings::BackgroundMode;
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
-use crate::translate::Translator;
-use crate::api::{LanguageCode, TranslatorError};
-use crate::bergamot::BergamotEngine;
 use crate::tesseract::{PageSegMode, TesseractWrapper};
+use crate::translate::Translator;
 
 struct OcrEngineState {
     engine: TesseractWrapper,
