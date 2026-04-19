@@ -263,6 +263,60 @@ impl RasterImageMut {
             }
         }
     }
+
+    fn fill_bilinear(&mut self, rect: Rect, tl: u32, tr: u32, bl: u32, br: u32) {
+        let Some(rect) = clamp_rect(rect, self.width, self.height) else {
+            return;
+        };
+        let w = rect.width();
+        let h = rect.height();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let max_u = (w.saturating_sub(1).max(1)) as f32;
+        let max_v = (h.saturating_sub(1).max(1)) as f32;
+        let rgb = |c: u32| -> [f32; 3] {
+            [
+                channel_r(c) as f32,
+                channel_g(c) as f32,
+                channel_b(c) as f32,
+            ]
+        };
+        let tl_c = rgb(tl);
+        let tr_c = rgb(tr);
+        let bl_c = rgb(bl);
+        let br_c = rgb(br);
+
+        for y in rect.top..rect.bottom {
+            let v = (y - rect.top) as f32 / max_v;
+            let left = [
+                tl_c[0] + (bl_c[0] - tl_c[0]) * v,
+                tl_c[1] + (bl_c[1] - tl_c[1]) * v,
+                tl_c[2] + (bl_c[2] - tl_c[2]) * v,
+            ];
+            let right = [
+                tr_c[0] + (br_c[0] - tr_c[0]) * v,
+                tr_c[1] + (br_c[1] - tr_c[1]) * v,
+                tr_c[2] + (br_c[2] - tr_c[2]) * v,
+            ];
+            for x in rect.left..rect.right {
+                let u = (x - rect.left) as f32 / max_u;
+                let r = (left[0] + (right[0] - left[0]) * u).clamp(0.0, 255.0) as u8;
+                let g = (left[1] + (right[1] - left[1]) * u).clamp(0.0, 255.0) as u8;
+                let b = (left[2] + (right[2] - left[2]) * u).clamp(0.0, 255.0) as u8;
+                let bytes = argb(r, g, b).to_ne_bytes();
+                let idx = ((y * self.width + x) * 4) as usize;
+                self.rgba[idx..idx + 4].copy_from_slice(&bytes);
+            }
+        }
+    }
+
+    fn apply_fill_plan(&mut self, rect: Rect, plan: FillPlan) {
+        match plan {
+            FillPlan::Flat(color) => self.fill_rect(rect, color),
+            FillPlan::Bilinear { tl, tr, bl, br } => self.fill_bilinear(rect, tl, tr, bl, br),
+        }
+    }
 }
 
 fn channel_r(color: u32) -> u8 {
@@ -279,14 +333,6 @@ fn channel_b(color: u32) -> u8 {
 
 fn argb(r: u8, g: u8, b: u8) -> u32 {
     0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
-}
-
-fn quantized_rgb(color: u32) -> u32 {
-    argb(
-        channel_r(color) & 0xF0,
-        channel_g(color) & 0xF0,
-        channel_b(color) & 0xF0,
-    )
 }
 
 fn clamp_rect(rect: Rect, width: u32, height: u32) -> Option<Rect> {
@@ -310,54 +356,6 @@ fn clamp_rect(rect: Rect, width: u32, height: u32) -> Option<Rect> {
     }
 }
 
-fn sample_dominant_color(image: &RasterImage<'_>, bounds: Rect) -> u32 {
-    let Some(bounds) = clamp_rect(bounds, image.width, image.height) else {
-        return argb(255, 255, 255);
-    };
-    let area = bounds.width() * bounds.height();
-    if area == 0 {
-        return argb(255, 255, 255);
-    }
-
-    #[derive(Default)]
-    struct Bucket {
-        count: u32,
-        r_sum: u64,
-        g_sum: u64,
-        b_sum: u64,
-    }
-
-    let step = (area as usize / 500).max(1);
-    let mut buckets = std::collections::HashMap::<u32, Bucket>::new();
-    let mut seen = 0usize;
-    for y in bounds.top..bounds.bottom {
-        for x in bounds.left..bounds.right {
-            if seen % step != 0 {
-                seen += 1;
-                continue;
-            }
-            let pixel = image.pixel_argb(x, y);
-            let key = quantized_rgb(pixel);
-            let bucket = buckets.entry(key).or_default();
-            bucket.count += 1;
-            bucket.r_sum += channel_r(pixel) as u64;
-            bucket.g_sum += channel_g(pixel) as u64;
-            bucket.b_sum += channel_b(pixel) as u64;
-            seen += 1;
-        }
-    }
-
-    let Some(best) = buckets.into_values().max_by_key(|bucket| bucket.count) else {
-        return argb(255, 255, 255);
-    };
-
-    argb(
-        (best.r_sum / best.count as u64) as u8,
-        (best.g_sum / best.count as u64) as u8,
-        (best.b_sum / best.count as u64) as u8,
-    )
-}
-
 pub fn luminance(color: u32) -> f32 {
     let r = channel_r(color) as f32 / 255.0;
     let g = channel_g(color) as f32 / 255.0;
@@ -365,11 +363,11 @@ pub fn luminance(color: u32) -> f32 {
     0.299 * r + 0.587 * g + 0.114 * b
 }
 
-fn get_color_contrast(color: u32, bg_luminance: f32) -> f32 {
-    let lum = luminance(color);
-    let brighter = lum.max(bg_luminance);
-    let darker = lum.min(bg_luminance);
-    (brighter + 0.05) / (darker + 0.05)
+fn luminance_u8(color: u32) -> u8 {
+    let r = channel_r(color) as u32;
+    let g = channel_g(color) as u32;
+    let b = channel_b(color) as u32;
+    ((77 * r + 150 * g + 29 * b) >> 8).min(255) as u8
 }
 
 fn get_surrounding_average_color(image: &RasterImage<'_>, text_bounds: Rect) -> u32 {
@@ -432,136 +430,263 @@ fn get_surrounding_average_color(image: &RasterImage<'_>, text_bounds: Rect) -> 
     }
 }
 
-fn get_background_color_excluding_words(
-    image: &RasterImage<'_>,
-    text_bounds: Rect,
-    word_rects: &[Rect],
-) -> u32 {
-    let Some(text_bounds) = clamp_rect(text_bounds, image.width, image.height) else {
-        return get_surrounding_average_color(image, text_bounds);
-    };
-    let width = text_bounds.width();
-    let height = text_bounds.height();
-    if width == 0 || height == 0 {
-        return get_surrounding_average_color(image, text_bounds);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillPlan {
+    Flat(u32),
+    Bilinear { tl: u32, tr: u32, bl: u32, br: u32 },
+}
 
-    let mut mask = vec![true; (width * height) as usize];
-    for exclude_rect in word_rects {
-        let left = exclude_rect.left.max(text_bounds.left);
-        let top = exclude_rect.top.max(text_bounds.top);
-        let right = exclude_rect.right.min(text_bounds.right);
-        let bottom = exclude_rect.bottom.min(text_bounds.bottom);
-        if left >= right || top >= bottom {
+struct AutoDetectPaint {
+    fill: FillPlan,
+    colors: OverlayColors,
+}
+
+// Corner colors are considered uniform enough for a flat fill when every
+// channel is within this many units of the 4-corner average.
+const FLAT_FILL_DELTA: u32 = 4;
+
+fn otsu_threshold(histogram: &[u64; 256]) -> u8 {
+    let total: u64 = histogram.iter().sum();
+    if total == 0 {
+        return 127;
+    }
+    let total_sum: f64 = histogram
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| i as f64 * c as f64)
+        .sum();
+
+    let mut w_bg = 0u64;
+    let mut sum_bg = 0f64;
+    let mut best_variance = -1f64;
+    let mut best_threshold = 127u8;
+    for t in 0..256 {
+        w_bg += histogram[t];
+        if w_bg == 0 {
             continue;
         }
-        for y in top..bottom {
-            let offset_top = y - text_bounds.top;
-            let row_start = (offset_top * width + (left - text_bounds.left)) as usize;
-            let row_end = row_start + (right - left) as usize;
-            mask[row_start..row_end].fill(false);
+        let w_fg = total - w_bg;
+        if w_fg == 0 {
+            break;
+        }
+        sum_bg += t as f64 * histogram[t] as f64;
+        let mean_bg = sum_bg / w_bg as f64;
+        let mean_fg = (total_sum - sum_bg) / w_fg as f64;
+        let variance = w_bg as f64 * w_fg as f64 * (mean_bg - mean_fg).powi(2);
+        if variance > best_variance {
+            best_variance = variance;
+            best_threshold = t as u8;
         }
     }
+    best_threshold
+}
 
-    let mut total_r = 0u64;
-    let mut total_g = 0u64;
-    let mut total_b = 0u64;
-    let mut count = 0u64;
-    for y in text_bounds.top..text_bounds.bottom {
-        for x in text_bounds.left..text_bounds.right {
-            let mask_index = ((y - text_bounds.top) * width + (x - text_bounds.left)) as usize;
-            if !mask[mask_index] {
-                continue;
-            }
-            let pixel = image.pixel_argb(x, y);
-            total_r += channel_r(pixel) as u64;
-            total_g += channel_g(pixel) as u64;
-            total_b += channel_b(pixel) as u64;
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        get_surrounding_average_color(image, text_bounds)
+fn mean_color(r: u64, g: u64, b: u64, n: u64) -> Option<u32> {
+    if n == 0 {
+        None
     } else {
-        argb(
-            (total_r / count) as u8,
-            (total_g / count) as u8,
-            (total_b / count) as u8,
-        )
+        Some(argb((r / n) as u8, (g / n) as u8, (b / n) as u8))
     }
 }
 
-fn get_foreground_color_by_contrast(
-    image: &RasterImage<'_>,
-    text_bounds: Rect,
-    background_color: u32,
-) -> u32 {
-    let bg_luminance = luminance(background_color);
-    let best_naive_color = if bg_luminance > 0.5 {
-        argb(0, 0, 0)
-    } else {
-        argb(255, 255, 255)
+fn average_corner_color(corners: [u32; 4]) -> u32 {
+    let mut r = 0u32;
+    let mut g = 0u32;
+    let mut b = 0u32;
+    for c in corners {
+        r += channel_r(c) as u32;
+        g += channel_g(c) as u32;
+        b += channel_b(c) as u32;
+    }
+    argb((r / 4) as u8, (g / 4) as u8, (b / 4) as u8)
+}
+
+fn max_channel_delta(a: u32, b: u32) -> u32 {
+    let dr = (channel_r(a) as i32 - channel_r(b) as i32).unsigned_abs();
+    let dg = (channel_g(a) as i32 - channel_g(b) as i32).unsigned_abs();
+    let db = (channel_b(a) as i32 - channel_b(b) as i32).unsigned_abs();
+    dr.max(dg).max(db)
+}
+
+fn peak_luminance(histogram: &[u64; 256], low: usize, high_exclusive: usize) -> u8 {
+    let mut best_count = 0u64;
+    let mut best = ((low + high_exclusive.saturating_sub(1)) / 2) as u8;
+    for i in low..high_exclusive {
+        if histogram[i] > best_count {
+            best_count = histogram[i];
+            best = i as u8;
+        }
+    }
+    best
+}
+
+fn autodetect_paint(image: &RasterImage<'_>, bounds: Rect) -> AutoDetectPaint {
+    let fallback = |bg: u32| {
+        let fg = if luminance(bg) > 0.5 {
+            argb(0, 0, 0)
+        } else {
+            argb(255, 255, 255)
+        };
+        AutoDetectPaint {
+            fill: FillPlan::Flat(bg),
+            colors: OverlayColors {
+                background_argb: bg,
+                foreground_argb: fg,
+            },
+        }
     };
 
-    let Some(bounds) = clamp_rect(text_bounds, image.width, image.height) else {
-        return best_naive_color;
+    let Some(bounds) = clamp_rect(bounds, image.width, image.height) else {
+        return fallback(argb(255, 255, 255));
     };
-    let width = bounds.width();
-    let height = bounds.height();
-    if width == 0 || height == 0 {
-        return best_naive_color;
+    if bounds.width() < 2 || bounds.height() < 2 {
+        return fallback(get_surrounding_average_color(image, bounds));
     }
 
-    let step = (width.min(height) / 5).max(1);
-    let mut color_data = std::collections::HashMap::<u32, (u32, f32, u32)>::new();
-
-    let mut index = 0usize;
+    let mut histogram = [0u64; 256];
     for y in bounds.top..bounds.bottom {
         for x in bounds.left..bounds.right {
-            if index % step as usize != 0 {
-                index += 1;
-                continue;
-            }
             let pixel = image.pixel_argb(x, y);
-            let contrast = get_color_contrast(pixel, bg_luminance);
-            if contrast <= 1.5 {
-                index += 1;
-                continue;
+            histogram[luminance_u8(pixel) as usize] += 1;
+        }
+    }
+    let threshold = otsu_threshold(&histogram);
+
+    let surround = get_surrounding_average_color(image, bounds);
+    let bg_is_bright = luminance_u8(surround) > threshold;
+
+    // BG = pixels within a narrow band around the paper's modal luminance.
+    // Rejects specular highlights (too bright) and anti-aliased stroke
+    // transitions (near threshold).
+    let (bg_lo, bg_hi) = if bg_is_bright {
+        (threshold as usize + 1, 256)
+    } else {
+        (0, threshold as usize + 1)
+    };
+    let paper_peak = peak_luminance(&histogram, bg_lo, bg_hi);
+    const BG_BAND: u8 = 12;
+
+    // FG = extreme 5% of fg-cluster by luminance. This captures core-ink
+    // even on low-contrast lines where most fg pixels are anti-aliased
+    // greys (the peak of the fg cluster can sit in the anti-aliased band).
+    let fg_total_count: u64 = if bg_is_bright {
+        histogram[0..=threshold as usize].iter().sum()
+    } else {
+        histogram[threshold as usize + 1..256].iter().sum()
+    };
+    let fg_percentile_target = (fg_total_count / 20).max(1);
+    let fg_cutoff: u8 = if bg_is_bright {
+        let mut cumulative = 0u64;
+        let mut cutoff = threshold;
+        for i in 0..=threshold as usize {
+            cumulative += histogram[i];
+            if cumulative >= fg_percentile_target {
+                cutoff = i as u8;
+                break;
+            }
+        }
+        cutoff
+    } else {
+        let mut cumulative = 0u64;
+        let mut cutoff = threshold.saturating_add(1);
+        for i in (threshold as usize + 1..256).rev() {
+            cumulative += histogram[i];
+            if cumulative >= fg_percentile_target {
+                cutoff = i as u8;
+                break;
+            }
+        }
+        cutoff
+    };
+
+    #[derive(Default, Clone, Copy)]
+    struct Accum {
+        r: u64,
+        g: u64,
+        b: u64,
+        n: u64,
+    }
+    let mut bg_quad = [Accum::default(); 4];
+    let mut fg_total = Accum::default();
+
+    let mid_x = (bounds.left + bounds.right) / 2;
+    let mid_y = (bounds.top + bounds.bottom) / 2;
+    for y in bounds.top..bounds.bottom {
+        for x in bounds.left..bounds.right {
+            let pixel = image.pixel_argb(x, y);
+            let lum = luminance_u8(pixel);
+            let r = channel_r(pixel) as u64;
+            let g = channel_g(pixel) as u64;
+            let b = channel_b(pixel) as u64;
+
+            if lum.abs_diff(paper_peak) <= BG_BAND {
+                let qi = (usize::from(x >= mid_x)) | (usize::from(y >= mid_y) << 1);
+                let a = &mut bg_quad[qi];
+                a.r += r;
+                a.g += g;
+                a.b += b;
+                a.n += 1;
             }
 
-            let quantized = quantized_rgb(pixel);
-            let entry = color_data.entry(quantized).or_insert((0, 0.0, pixel));
-            entry.0 += 1;
-            entry.1 += contrast;
-            index += 1;
+            let is_core_fg = if bg_is_bright {
+                lum <= fg_cutoff
+            } else {
+                lum >= fg_cutoff
+            };
+            if is_core_fg {
+                fg_total.r += r;
+                fg_total.g += g;
+                fg_total.b += b;
+                fg_total.n += 1;
+            }
         }
     }
 
-    if color_data.is_empty() {
-        return best_naive_color;
-    }
+    let quad_color = |q: &Accum| mean_color(q.r, q.g, q.b, q.n).unwrap_or(surround);
+    let corners = [
+        quad_color(&bg_quad[0]),
+        quad_color(&bg_quad[1]),
+        quad_color(&bg_quad[2]),
+        quad_color(&bg_quad[3]),
+    ];
+    let foreground_argb = mean_color(fg_total.r, fg_total.g, fg_total.b, fg_total.n).unwrap_or({
+        if bg_is_bright {
+            argb(0, 0, 0)
+        } else {
+            argb(255, 255, 255)
+        }
+    });
 
-    let mut best_color = best_naive_color;
-    let mut best_score = 0.0f32;
-    for (_, (count, contrast_sum, original)) in color_data {
-        if count <= 3 {
-            continue;
+    let avg_bg = average_corner_color(corners);
+    let max_delta = corners
+        .iter()
+        .map(|&c| max_channel_delta(c, avg_bg))
+        .max()
+        .unwrap_or(0);
+    let fill = if max_delta <= FLAT_FILL_DELTA {
+        FillPlan::Flat(avg_bg)
+    } else {
+        FillPlan::Bilinear {
+            tl: corners[0],
+            tr: corners[1],
+            bl: corners[2],
+            br: corners[3],
         }
-        let score = count as f32 * (contrast_sum / count as f32);
-        if score > best_score {
-            best_score = score;
-            best_color = original;
-        }
+    };
+
+    AutoDetectPaint {
+        fill,
+        colors: OverlayColors {
+            background_argb: avg_bg,
+            foreground_argb,
+        },
     }
-    best_color
 }
 
 fn get_overlay_colors(
     image: &RasterImage<'_>,
     bounds: Rect,
     background_mode: crate::BackgroundMode,
-    word_rects: Option<&[Rect]>,
 ) -> OverlayColors {
     match background_mode {
         crate::BackgroundMode::WhiteOnBlack => OverlayColors {
@@ -572,20 +697,7 @@ fn get_overlay_colors(
             background_argb: argb(255, 255, 255),
             foreground_argb: argb(0, 0, 0),
         },
-        crate::BackgroundMode::AutoDetect => {
-            let background_argb = match word_rects {
-                Some(word_rects) if word_rects.len() > 1 => {
-                    get_background_color_excluding_words(image, bounds, word_rects)
-                }
-                Some(_) => get_surrounding_average_color(image, bounds),
-                None => sample_dominant_color(image, bounds),
-            };
-            let foreground_argb = get_foreground_color_by_contrast(image, bounds, background_argb);
-            OverlayColors {
-                background_argb,
-                foreground_argb,
-            }
-        }
+        crate::BackgroundMode::AutoDetect => autodetect_paint(image, bounds).colors,
     }
 }
 
@@ -595,40 +707,40 @@ pub fn sample_overlay_colors(
     height: u32,
     bounds: Rect,
     background_mode: crate::BackgroundMode,
-    word_rects: Option<&[Rect]>,
+    _word_rects: Option<&[Rect]>,
 ) -> Result<OverlayColors, String> {
     let image = RasterImage::new(rgba_bytes, width, height)?;
-    Ok(get_overlay_colors(
-        &image,
-        bounds,
-        background_mode,
-        word_rects,
-    ))
-}
-
-fn expand_rect(rect: Rect, amount: u32) -> Rect {
-    Rect {
-        left: rect.left.saturating_sub(amount),
-        top: rect.top.saturating_sub(amount),
-        right: rect.right + amount,
-        bottom: rect.bottom + amount,
-    }
+    Ok(get_overlay_colors(&image, bounds, background_mode))
 }
 
 fn erase_text_region(
     image: &mut RasterImageMut,
     text_bounds: Rect,
-    words: &[Rect],
     background_mode: crate::BackgroundMode,
 ) -> OverlayColors {
-    let colors = get_overlay_colors(&image.as_image(), text_bounds, background_mode, Some(words));
-    if background_mode == crate::BackgroundMode::AutoDetect {
-        for word in words {
-            image.fill_rect(expand_rect(*word, 2), colors.background_argb);
+    match background_mode {
+        crate::BackgroundMode::WhiteOnBlack => {
+            let colors = OverlayColors {
+                background_argb: argb(0, 0, 0),
+                foreground_argb: argb(255, 255, 255),
+            };
+            image.fill_rect(text_bounds, colors.background_argb);
+            colors
+        }
+        crate::BackgroundMode::BlackOnWhite => {
+            let colors = OverlayColors {
+                background_argb: argb(255, 255, 255),
+                foreground_argb: argb(0, 0, 0),
+            };
+            image.fill_rect(text_bounds, colors.background_argb);
+            colors
+        }
+        crate::BackgroundMode::AutoDetect => {
+            let paint = autodetect_paint(&image.as_image(), text_bounds);
+            image.apply_fill_plan(text_bounds, paint.fill);
+            paint.colors
         }
     }
-    image.fill_rect(text_bounds, colors.background_argb);
-    colors
 }
 
 pub fn prepare_overlay_image(
@@ -652,12 +764,7 @@ pub fn prepare_overlay_image(
                 let mut block_background = argb(255, 255, 255);
                 let mut block_foreground = argb(0, 0, 0);
                 for (index, line) in block.lines.iter().enumerate() {
-                    let colors = erase_text_region(
-                        &mut image,
-                        line.bounding_box,
-                        &line.word_rects,
-                        background_mode,
-                    );
+                    let colors = erase_text_region(&mut image, line.bounding_box, background_mode);
                     if index == 0 {
                         block_background = colors.background_argb;
                         block_foreground = colors.foreground_argb;
@@ -681,13 +788,7 @@ pub fn prepare_overlay_image(
                 });
             }
             ReadingOrder::TopToBottomLeftToRight => {
-                let all_word_rects = block
-                    .lines
-                    .iter()
-                    .flat_map(|line| line.word_rects.iter().copied())
-                    .collect::<Vec<_>>();
-                let colors =
-                    erase_text_region(&mut image, block_bounds, &all_word_rects, background_mode);
+                let colors = erase_text_region(&mut image, block_bounds, background_mode);
                 let prepared_lines = block
                     .lines
                     .iter()
