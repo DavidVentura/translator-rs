@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "bergamot-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/bergamot-sys#7ab9c71340fc7603d1a915758035b482ea65527e"
+source = "git+https://github.com/DavidVentura/bergamot-sys#d6edf233328d30663b7decbc1f60ac5fd3f0115a"
 dependencies = [
  "cmake",
 ]
