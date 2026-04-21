@@ -8,6 +8,11 @@ license = "MIT"
 name = "translator"
 path = "src/lib.rs"
 
+[[bin]]
+name = "bucket_samples"
+path = "src/bin/bucket_samples.rs"
+required-features = ["tts"]
+
 [features]
 uniffi = ["dep:uniffi"]
 dictionary = ["dep:tarkka"]
@@ -38,3 +43,6 @@ ab_glyph = "0.2"
 name = "overpaint_visual"
 path = "tests/overpaint_visual.rs"
 required-features = ["tesseract"]
+
+# [patch."https://github.com/DavidVentura/piper-rs"]
+# piper-rs = { path = "../piper-rs" }

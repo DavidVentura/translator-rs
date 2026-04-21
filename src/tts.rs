@@ -48,9 +48,9 @@ pub struct SpeechChunk {
     pub pause_after_ms: Option<i32>,
 }
 
-const CLAUSE_PAUSE_MS: i32 = 120;
-const SENTENCE_PAUSE_MS: i32 = 180;
-const PARAGRAPH_PAUSE_MS: i32 = 320;
+const CLAUSE_PAUSE_MS: i32 = 0;
+const SENTENCE_PAUSE_MS: i32 = 0;
+const PARAGRAPH_PAUSE_MS: i32 = 0;
 const MIN_PAUSE_SPLIT_CHARS: usize = 12;
 const MAX_DIRECT_PHONEME_CHARS: usize = 100;
 const SENTENCE_BOUNDARY_CHARS: [char; 6] = ['.', '?', '!', '。', '？', '！'];

@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "bergamot-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/bergamot-sys#a610826011938b94d1b67b806a5a2b0365d1dfde"
+source = "git+https://github.com/DavidVentura/bergamot-sys#7ab9c71340fc7603d1a915758035b482ea65527e"
 dependencies = [
  "cmake",
 ]
@@ -496,7 +496,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#8736f8d16240749ee780ffaff92c8134756fda2b"
+source = "git+https://github.com/DavidVentura/piper-rs#942c591f9b98c668397a25f3d7b767684f9b1023"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -504,7 +504,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#8736f8d16240749ee780ffaff92c8134756fda2b"
+source = "git+https://github.com/DavidVentura/piper-rs#942c591f9b98c668397a25f3d7b767684f9b1023"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -1345,7 +1345,7 @@ dependencies = [
  "num-complex",
  "num-traits",
  "py_literal",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -1524,7 +1524,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#8736f8d16240749ee780ffaff92c8134756fda2b"
+source = "git+https://github.com/DavidVentura/piper-rs#942c591f9b98c668397a25f3d7b767684f9b1023"
 dependencies = [
  "espeak-rs",
  "mucab",
@@ -1535,7 +1535,6 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-normalization",
- "zip 0.6.6",
 ]
 
 [[package]]
@@ -2794,18 +2793,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "zip"
-version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760394e246e4c28189f19d488c058bf16f564016aefac5d32bb1f3b51d5e9261"
-dependencies = [
- "byteorder",
- "crc32fast",
- "crossbeam-utils",
- "flate2",
 ]
 
 [[package]]

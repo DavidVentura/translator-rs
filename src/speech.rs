@@ -11,8 +11,6 @@ use piper_rs::{
     PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
 };
 
-const ESPEAK_DATA_ENV: &str = "PIPER_ESPEAKNG_DATA_DIRECTORY";
-
 fn log_debug(message: impl AsRef<str>) {
     let _ = message.as_ref();
 }
@@ -596,12 +594,27 @@ fn configure_support_data_root(support_data_root: Option<&str>) {
         "eSpeak data probe root={support_data_root} direct_layout_ok={direct_layout_ok} nested_layout_ok={nested_layout_ok}"
     ));
 
-    unsafe {
-        std::env::set_var(ESPEAK_DATA_ENV, support_data_root);
+    // piper-rs's espeak expects the PARENT directory of `espeak-ng-data/`;
+    // if the caller passed us the parent directly, use it, otherwise strip.
+    let init_dir = if nested_layout_ok {
+        data_root.to_path_buf()
+    } else {
+        data_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| data_root.to_path_buf())
+    };
+
+    match piper_rs::init_espeak(&init_dir) {
+        Ok(()) => log_debug(format!(
+            "Configured eSpeak data directory at {}",
+            init_dir.display()
+        )),
+        Err(err) => log_error(format!(
+            "Failed to initialize eSpeak with data directory `{}`: {err}",
+            init_dir.display()
+        )),
     }
-    log_debug(format!(
-        "Configured eSpeak data directory at {support_data_root}"
-    ));
 }
 
 fn phonemize(model: &mut SpeechModel, text: &str) -> Result<String, String> {
