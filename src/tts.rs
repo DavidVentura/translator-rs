@@ -77,8 +77,12 @@ where
     let source_chunks = split_text_into_speech_chunks(text);
     if source_chunks.len() > 1 {
         let mut requests = Vec::new();
-        for source_chunk in source_chunks {
-            requests.extend(plan_speech_chunks_internal(&source_chunk, phonemize_text)?);
+        for (source_chunk, boundary) in source_chunks {
+            let mut recursive = plan_speech_chunks_internal(&source_chunk, phonemize_text)?;
+            if let Some(last) = recursive.last_mut() {
+                last.pause_after_ms = boundary_pause_ms(boundary);
+            }
+            requests.extend(recursive);
         }
         return Ok(requests);
     }
@@ -145,11 +149,25 @@ where
     Ok(Some(requests))
 }
 
-fn split_text_into_speech_chunks(text: &str) -> Vec<String> {
-    split_into_paragraphs(text)
-        .into_iter()
-        .flat_map(|paragraph| split_paragraph_into_sentenceish_segments(&paragraph))
-        .collect()
+fn split_text_into_speech_chunks(text: &str) -> Vec<(String, SpeechChunkBoundary)> {
+    let paragraphs = split_into_paragraphs(text);
+    let paragraph_count = paragraphs.len();
+    let mut out = Vec::new();
+    for (paragraph_index, paragraph) in paragraphs.into_iter().enumerate() {
+        let is_last_paragraph = paragraph_index + 1 == paragraph_count;
+        let sentences = split_paragraph_into_sentenceish_segments(&paragraph);
+        let sentence_count = sentences.len();
+        for (sentence_index, sentence) in sentences.into_iter().enumerate() {
+            let is_last_sentence = sentence_index + 1 == sentence_count;
+            let boundary = match (is_last_sentence, is_last_paragraph) {
+                (false, _) => SpeechChunkBoundary::Sentence,
+                (true, false) => SpeechChunkBoundary::Paragraph,
+                (true, true) => SpeechChunkBoundary::None,
+            };
+            out.push((sentence, boundary));
+        }
+    }
+    out
 }
 
 fn split_into_paragraphs(text: &str) -> Vec<String> {
@@ -292,8 +310,23 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].content, "Hello.");
-        assert_eq!(chunks[0].pause_after_ms, None);
+        assert_eq!(chunks[0].pause_after_ms, Some(SENTENCE_PAUSE_MS));
         assert_eq!(chunks[1].content, "World!");
+        assert_eq!(chunks[1].pause_after_ms, None);
+    }
+
+    #[test]
+    fn paragraphs_use_paragraph_pause() {
+        let chunks = plan_speech_chunks("Hello.\n\nWorld!", |_| {
+            Ok(vec![PhonemeChunk {
+                content: "abc".to_owned(),
+                boundary_after: SpeechChunkBoundary::Paragraph,
+            }])
+        })
+        .unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].pause_after_ms, Some(PARAGRAPH_PAUSE_MS));
         assert_eq!(chunks[1].pause_after_ms, None);
     }
 
