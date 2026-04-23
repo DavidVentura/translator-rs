@@ -349,7 +349,7 @@ dependencies = [
 [[package]]
 name = "cld2"
 version = "1.0.2"
-source = "git+https://github.com/DavidVentura/rust-cld2#4ce5167d0c51b0e2dd8553b7e69c0dbfb1406dbe"
+source = "git+https://github.com/DavidVentura/rust-cld2#236becdba05ef7a5ee7d460bffe8f21d1b172936"
 dependencies = [
  "cld2-sys",
  "libc",
@@ -358,7 +358,7 @@ dependencies = [
 [[package]]
 name = "cld2-sys"
 version = "1.0.2"
-source = "git+https://github.com/DavidVentura/rust-cld2#4ce5167d0c51b0e2dd8553b7e69c0dbfb1406dbe"
+source = "git+https://github.com/DavidVentura/rust-cld2#236becdba05ef7a5ee7d460bffe8f21d1b172936"
 dependencies = [
  "cc",
  "libc",
