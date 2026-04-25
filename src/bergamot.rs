@@ -6,9 +6,9 @@ use bergamot_sys::{
     TranslationWithAlignment as BergamotTranslationWithAlignment,
 };
 
-use crate::translate::{TokenAlignment, TranslationWithAlignment};
+use crate::translate::{TokenAlignment, TranslationMode, TranslationWithAlignment};
 
-const DEFAULT_CACHE_SIZE: usize = 256;
+const DEFAULT_CACHE_SIZE: usize = 8192;
 
 pub struct BergamotEngine {
     service: BlockingService,
@@ -44,10 +44,16 @@ impl BergamotEngine {
             .retain(|key, _| !key.starts_with(&needle_from) && !key.ends_with(&needle_to));
     }
 
-    pub fn translate_multiple(&self, inputs: &[String], key: &str) -> Result<Vec<String>, String> {
+    pub fn translate_multiple(
+        &self,
+        inputs: &[String],
+        key: &str,
+        mode: TranslationMode,
+    ) -> Result<Vec<String>, String> {
         let model = self.model(key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-        catch_bergamot_panic(|| Ok(self.service.translate(model, &refs)))
+        let html = matches!(mode, TranslationMode::Html);
+        catch_bergamot_panic(|| Ok(self.service.translate(model, &refs, html)))
     }
 
     pub fn translate_multiple_with_alignment(
@@ -72,11 +78,13 @@ impl BergamotEngine {
         first_key: &str,
         second_key: &str,
         inputs: &[String],
+        mode: TranslationMode,
     ) -> Result<Vec<String>, String> {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-        catch_bergamot_panic(|| Ok(self.service.pivot(first_model, second_model, &refs)))
+        let html = matches!(mode, TranslationMode::Html);
+        catch_bergamot_panic(|| Ok(self.service.pivot(first_model, second_model, &refs, html)))
     }
 
     pub fn pivot_multiple_with_alignment(

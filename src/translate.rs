@@ -97,7 +97,36 @@ impl<'a> Translator<'a> {
                 to_code.as_str()
             ))
         })?;
-        execute_translation_plan(self.engine, &plan, texts).map_err(TranslatorError::translation)
+        execute_translation_plan(self.engine, &plan, texts, TranslationMode::PlainText)
+            .map_err(TranslatorError::translation)
+    }
+
+    pub fn translate_html_fragments(
+        &mut self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+        fragments: &[String],
+    ) -> Result<Vec<String>, TranslatorError> {
+        if fragments.is_empty() {
+            return Ok(Vec::new());
+        }
+        if from_code == to_code {
+            return Ok(fragments.to_vec());
+        }
+        let plan = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        )
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "translation pack not installed for {}->{}",
+                from_code.as_str(),
+                to_code.as_str()
+            ))
+        })?;
+        execute_translation_plan(self.engine, &plan, fragments, TranslationMode::Html)
+            .map_err(TranslatorError::translation)
     }
 
     pub fn translate_mixed_texts(
@@ -165,6 +194,13 @@ impl<'a> Translator<'a> {
             .map(Some)
             .map_err(TranslatorError::translation)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum TranslationMode {
+    PlainText,
+    Html,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,11 +308,12 @@ pub(crate) fn execute_translation_plan(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     texts: &[String],
+    mode: TranslationMode,
 ) -> Result<Vec<String>, String> {
     ensure_plan_loaded(engine, plan)?;
     match plan.steps.as_slice() {
-        [step] => engine.translate_multiple(texts, &step.cache_key),
-        [first, second] => engine.pivot_multiple(&first.cache_key, &second.cache_key, texts),
+        [step] => engine.translate_multiple(texts, &step.cache_key, mode),
+        [first, second] => engine.pivot_multiple(&first.cache_key, &second.cache_key, texts, mode),
         _ => Ok(Vec::new()),
     }
 }

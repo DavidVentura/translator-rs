@@ -181,6 +181,21 @@ impl TranslatorSession {
         )
     }
 
+    pub fn translate_html_fragments(
+        &self,
+        from_code: &str,
+        to_code: &str,
+        fragments: &[String],
+    ) -> Result<Vec<String>, TranslatorError> {
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap).translate_html_fragments(
+            &LanguageCode::from(from_code),
+            &LanguageCode::from(to_code),
+            fragments,
+        )
+    }
+
     pub fn translate_mixed_texts(
         &self,
         inputs: &[String],

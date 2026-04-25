@@ -291,9 +291,7 @@ fn process_packs(
                 let engine = pack.engine.as_deref().unwrap_or("unknown");
                 let voice = pack.voice.as_deref().unwrap_or("unknown");
                 let quality = pack.quality.as_deref().unwrap_or("unknown");
-                println!(
-                    "[worker {worker_id}] {language} | {engine} | {voice} | {quality}"
-                );
+                println!("[worker {worker_id}] {language} | {engine} | {voice} | {quality}");
 
                 match synthesize_pack_sample(&pack_key, pack, &catalog, &bucket_dir, &output_dir) {
                     Ok(path) => {
