@@ -15,8 +15,9 @@ pub use planner::{
     CatalogSnapshot, FsPackInstallChecker, LanguageAvailabilityRow, LanguageOverview,
     PackInstallChecker, PackInstallStatus, TtsVoiceOverview, TtsVoiceRegionOverview,
     build_catalog_snapshot, build_language_overview, can_translate, language_rows_in_snapshot,
-    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts, plan_delete_tts,
-    plan_dictionary_download, plan_language_download, plan_tts_download, resolve_tts_voice_files,
+    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts,
+    plan_delete_support_by_kind, plan_delete_tts, plan_dictionary_download, plan_language_download,
+    plan_support_download_by_kind, plan_tts_download, resolve_tts_voice_files,
 };
 pub use wire::{parse_and_validate_catalog, parse_language_catalog, select_best_catalog};
 

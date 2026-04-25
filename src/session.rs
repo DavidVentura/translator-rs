@@ -6,8 +6,9 @@ use crate::catalog::{
     CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
     LanguageOverview, PackInstallChecker, build_catalog_snapshot, build_language_overview,
     language_rows_in_snapshot, parse_and_validate_catalog, plan_delete_dictionary,
-    plan_delete_language, plan_delete_superseded_tts, plan_delete_tts, plan_dictionary_download,
-    plan_language_download, plan_tts_download, select_best_catalog,
+    plan_delete_language, plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts,
+    plan_dictionary_download, plan_language_download, plan_support_download_by_kind,
+    plan_tts_download, select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
@@ -279,6 +280,11 @@ impl TranslatorSession {
         }
     }
 
+    pub fn plan_support_download_by_kind(&self, support_kind: &str) -> Option<DownloadPlan> {
+        let snap = self.snapshot();
+        plan_support_download_by_kind(&snap, support_kind)
+    }
+
     pub fn prepare_delete(&self, language_code: &str, feature: Feature) -> DeletePlan {
         let snap = self.snapshot();
         let code = LanguageCode::from(language_code);
@@ -307,6 +313,11 @@ impl TranslatorSession {
                 plan_delete_tts(&snap, &code)
             }
         }
+    }
+
+    pub fn prepare_delete_support_by_kind(&self, support_kind: &str) -> DeletePlan {
+        let snap = self.snapshot();
+        plan_delete_support_by_kind(&snap, support_kind)
     }
 
     #[cfg(feature = "dictionary")]
@@ -350,6 +361,12 @@ impl TranslatorSession {
                 .map(|info| info.size as u64)
                 .unwrap_or(0),
         }
+    }
+
+    pub fn support_size_bytes_by_kind(&self, support_kind: &str) -> u64 {
+        self.snapshot()
+            .catalog
+            .support_size_bytes_by_kind(support_kind)
     }
 
     #[cfg(feature = "dictionary")]

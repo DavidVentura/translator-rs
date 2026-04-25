@@ -558,6 +558,28 @@ impl LanguageCatalog {
         files
     }
 
+    pub fn support_pack_ids_by_kind(&self, support_kind: &str) -> Vec<String> {
+        let mut pack_ids = self
+            .packs
+            .values()
+            .filter(|pack| match &pack.kind {
+                PackKind::Support(support) => support.kind.as_deref() == Some(support_kind),
+                _ => false,
+            })
+            .map(|pack| pack.id.clone())
+            .collect::<Vec<_>>();
+        pack_ids.sort();
+        pack_ids
+    }
+
+    pub fn support_size_bytes_by_kind(&self, support_kind: &str) -> u64 {
+        let pack_ids = self.support_pack_ids_by_kind(support_kind);
+        self.unique_files_in_dependency_closure(pack_ids.iter().map(String::as_str))
+            .into_iter()
+            .map(|file| file.size_bytes)
+            .sum()
+    }
+
     pub(crate) fn unique_files_in_dependency_closure<'a, I>(
         &'a self,
         root_pack_ids: I,

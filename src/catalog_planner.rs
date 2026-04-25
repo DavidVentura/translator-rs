@@ -562,6 +562,27 @@ pub fn plan_tts_download(
     })
 }
 
+pub fn plan_support_download_by_kind(
+    snapshot: &CatalogSnapshot,
+    support_kind: &str,
+) -> Option<DownloadPlan> {
+    let pack_ids = snapshot.catalog.support_pack_ids_by_kind(support_kind);
+    if pack_ids.is_empty() {
+        return None;
+    }
+    let tasks = missing_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
+        .into_iter()
+        .filter_map(|item| {
+            let pack = snapshot.catalog.pack(&item.pack_id)?;
+            Some(download_task_for(pack, &item.file))
+        })
+        .collect::<Vec<_>>();
+    Some(DownloadPlan {
+        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
+        tasks,
+    })
+}
+
 fn delete_plan_for_pack_ids<'a, I>(catalog: &LanguageCatalog, pack_ids: I) -> DeletePlan
 where
     I: IntoIterator<Item = &'a str>,
@@ -699,6 +720,15 @@ pub fn plan_delete_tts(snapshot: &CatalogSnapshot, language_code: &LanguageCode)
         &snapshot.catalog,
         delete_pack_ids.iter().map(String::as_str),
     )
+}
+
+pub fn plan_delete_support_by_kind(snapshot: &CatalogSnapshot, support_kind: &str) -> DeletePlan {
+    let pack_ids = snapshot
+        .catalog
+        .support_pack_ids_by_kind(support_kind)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    delete_plan_for_pack_ids(&snapshot.catalog, pack_ids.iter().map(String::as_str))
 }
 
 pub fn plan_delete_superseded_tts(
