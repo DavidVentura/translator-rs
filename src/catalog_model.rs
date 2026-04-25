@@ -535,6 +535,29 @@ impl LanguageCatalog {
             .collect()
     }
 
+    pub fn support_files_by_kind(&self, support_kind: &str) -> Vec<AssetFileV2> {
+        let mut packs = self
+            .packs
+            .values()
+            .filter(|pack| match &pack.kind {
+                PackKind::Support(support) => support.kind.as_deref() == Some(support_kind),
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        packs.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut seen_install_paths = HashSet::new();
+        let mut files = Vec::new();
+        for pack in packs {
+            for file in self.pack_files_with_dependencies(&pack.id) {
+                if seen_install_paths.insert(file.install_path.clone()) {
+                    files.push(file.clone());
+                }
+            }
+        }
+        files
+    }
+
     pub(crate) fn unique_files_in_dependency_closure<'a, I>(
         &'a self,
         root_pack_ids: I,

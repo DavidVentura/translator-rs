@@ -530,6 +530,67 @@ fn builds_languages_and_dictionary_info_from_catalog() {
 }
 
 #[test]
+fn returns_support_files_by_kind() {
+    let mut catalog = base_catalog();
+    catalog.packs.insert(
+        "support-adblock-easylist".to_string(),
+        pack_record(
+            "support-adblock-easylist",
+            PackKind::Support(SupportPack {
+                language: None,
+                languages: vec![],
+                aliases: vec![],
+                kind: Some("adblock".to_string()),
+                metadata: None,
+            }),
+            vec![asset_file("easylist.txt", "adblock/easylist.txt", 100)],
+            vec!["support-adblock-shared"],
+        ),
+    );
+    catalog.packs.insert(
+        "support-adblock-shared".to_string(),
+        pack_record(
+            "support-adblock-shared",
+            PackKind::Support(SupportPack {
+                language: None,
+                languages: vec![],
+                aliases: vec![],
+                kind: Some("adblock".to_string()),
+                metadata: None,
+            }),
+            vec![asset_file("shared.txt", "adblock/shared.txt", 101)],
+            vec![],
+        ),
+    );
+    catalog.packs.insert(
+        "support-other".to_string(),
+        pack_record(
+            "support-other",
+            PackKind::Support(SupportPack {
+                language: None,
+                languages: vec![],
+                aliases: vec![],
+                kind: Some("other".to_string()),
+                metadata: None,
+            }),
+            vec![asset_file("other.txt", "support/other.txt", 102)],
+            vec![],
+        ),
+    );
+
+    let files = catalog.support_files_by_kind("adblock");
+    let install_paths = files
+        .iter()
+        .map(|file| file.install_path.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        install_paths,
+        vec!["adblock/easylist.txt", "adblock/shared.txt"]
+    );
+}
+
+#[test]
 fn parses_bundled_catalog_asset() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let asset_path = manifest_dir
