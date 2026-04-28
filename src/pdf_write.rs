@@ -39,7 +39,7 @@ const COURIER_BOLD_OBLIQUE: &[u8] = b"TrCourBI";
 /// Style sampled from the original Tjs that fell inside a removal rect.
 /// Used to pick a font variant, a fill color, a target font size, and a
 /// baseline anchor for the translation.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct SampledBlockStyle {
     bold: bool,
     italic: bool,
@@ -57,6 +57,27 @@ struct SampledBlockStyle {
     /// how many lines the original text actually occupied. More reliable
     /// than deriving from bbox height.
     original_line_count: usize,
+    /// `(a, b, c, d)` of the original Tj's combined `text_matrix × CTM`.
+    /// We reuse it for our emitted glyphs so the new text inherits the
+    /// producer's orientation (essential for /Rotate-compensating producers
+    /// and Y-flip top-left-origin streams). Defaults to identity (no
+    /// orientation change) when no samples are available.
+    text_orientation: (f32, f32, f32, f32),
+}
+
+impl Default for SampledBlockStyle {
+    fn default() -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            monospace: false,
+            fill_rgb: (0.0, 0.0, 0.0),
+            font_size: None,
+            anchor: None,
+            original_line_count: 0,
+            text_orientation: (1.0, 0.0, 0.0, 1.0),
+        }
+    }
 }
 
 impl SampledBlockStyle {
@@ -505,6 +526,14 @@ fn resolve_block_styles(
             visual_ys.dedup_by(|a, b| (*a - *b).abs() < 1.0);
             let original_line_count = visual_ys.len().max(1);
 
+            // Pick the orientation of the first sample. Producers almost
+            // always use one orientation per block; if it's mixed, the first
+            // is as good as any and the others would visually clash anyway.
+            let text_orientation = samples
+                .first()
+                .map(|s| s.text_orientation)
+                .unwrap_or((1.0, 0.0, 0.0, 1.0));
+
             SampledBlockStyle {
                 bold,
                 italic,
@@ -513,6 +542,7 @@ fn resolve_block_styles(
                 font_size,
                 anchor,
                 original_line_count,
+                text_orientation,
             }
         })
         .collect()
@@ -620,6 +650,12 @@ struct RawStyleSample {
     /// User-space origin of the Tj — i.e. the baseline-leading-edge of the
     /// original text, after CTM has been applied.
     origin: (f32, f32),
+    /// `(a, b, c, d)` of the *combined* `text_matrix × CTM` at this Tj —
+    /// captures whatever rotation/flip the producer applied. Used to keep
+    /// our emitted glyphs in the same orientation. Pure translation
+    /// originals come out as `(1, 0, 0, 1)`, Y-flip producers as
+    /// `(1, 0, 0, -1)`, /Rotate-compensating producers as `(0, 1, -1, 0)`.
+    text_orientation: (f32, f32, f32, f32),
 }
 
 /// Track text/graphics state across `ops` and drop any text-show op whose
@@ -730,11 +766,28 @@ fn filter_text_ops(
                     .iter()
                     .position(|r| r.contains(origin.0, origin.1))
                 {
+                    let combined = state.text_matrix.mul(state.current.ctm);
+                    // Combined `text_matrix × CTM` carries both the producer's
+                    // glyph orientation *and* whatever scale the CTM applied
+                    // (a `.75 0 0 .75 ... cm` pre-scale is common). Split:
+                    // store the orientation as a unit-length rotation/flip,
+                    // and bake the scale into `font_size` so the value we
+                    // record is the effective user-space size.
+                    let x_scale = (combined.a * combined.a + combined.b * combined.b).sqrt();
+                    let y_scale = (combined.c * combined.c + combined.d * combined.d).sqrt();
+                    let safe_x = if x_scale > 1e-6 { x_scale } else { 1.0 };
+                    let safe_y = if y_scale > 1e-6 { y_scale } else { 1.0 };
                     samples[rect_index].push(RawStyleSample {
                         font_resource: state.current.font_resource.clone(),
                         fill_rgb: state.current.fill_rgb,
-                        font_size: state.font_size,
+                        font_size: state.font_size * safe_x,
                         origin,
+                        text_orientation: (
+                            combined.a / safe_x,
+                            combined.b / safe_x,
+                            combined.c / safe_y,
+                            combined.d / safe_y,
+                        ),
                     });
                     // Drop the op; do not advance Tm by the string's width.
                     // Skipping that advance is safe because nothing downstream
@@ -1114,8 +1167,25 @@ fn emit_block(
         let off = (i as f32) * leading;
         let user_x = first_baseline_x + off * line_dx;
         let user_y = first_baseline_y + off * line_dy;
-        let (local_x, local_y) = inv_ctm.transform_point(user_x, user_y);
-        let _ = writeln!(out, "1 0 0 1 {local_x:.2} {local_y:.2} Tm");
+        // We want the *combined* `Tm × CTM` to match the producer's combined
+        // matrix at this anchor: the orientation we sampled (a, b, c, d) plus
+        // a translation to (user_x, user_y). So set Tm = combined × inv(CTM).
+        // For producers whose combined was pure translation (most), this
+        // collapses to `1 0 0 1 ux uy`.
+        let combined = Matrix {
+            a: style.text_orientation.0,
+            b: style.text_orientation.1,
+            c: style.text_orientation.2,
+            d: style.text_orientation.3,
+            e: user_x,
+            f: user_y,
+        };
+        let tm = combined.mul(*inv_ctm);
+        let _ = writeln!(
+            out,
+            "{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm",
+            tm.a, tm.b, tm.c, tm.d, tm.e, tm.f
+        );
         if let Some(embedded) = embed {
             // Type-0 / Identity-H: each glyph is a 16-bit CID. The subsetter
             // compacts the GID space, so look up the original GID from the
