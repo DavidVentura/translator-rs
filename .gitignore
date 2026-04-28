@@ -1,3 +1,5 @@
 target/*
 samples/*
 espeak-ng-data/*
+.test-assets/
+*.pdf

@@ -11,6 +11,16 @@ pub mod mucab;
 pub mod ocr;
 #[cfg(feature = "tesseract")]
 mod ocr_runtime;
+#[cfg(feature = "pdf")]
+pub mod pdf;
+#[cfg(feature = "pdf")]
+pub mod pdf_layout;
+#[cfg(feature = "pdf")]
+pub mod pdf_text;
+#[cfg(feature = "pdf")]
+pub mod pdf_translate;
+#[cfg(feature = "pdf")]
+pub mod pdf_write;
 mod routing;
 pub mod session;
 pub mod settings;
