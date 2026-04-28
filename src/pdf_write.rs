@@ -206,22 +206,35 @@ pub fn write_translated_pdf(
     }
 
     // ----- Pass 2: walk every block, group by (FontRequest, FontHandle) and
-    // accumulate the union of every char that font needs to render.
+    // accumulate the union of every char that font needs to render. Each
+    // block contributes a request for its dominant style **plus** one per
+    // distinct (bold, italic) variant in its style_spans, so intra-block
+    // bold / italic words have a font ready when we emit them.
     let mut union_text: std::collections::HashMap<FontKey, String> =
         std::collections::HashMap::new();
     for work in &works {
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
-            let req = FontRequest {
-                language: work.translation.target_language.clone(),
-                bold: style.bold,
-                italic: style.italic,
-                monospace: style.monospace,
-            };
-            if let Some(handle) = fonts.locate(&req) {
-                union_text
-                    .entry((req, handle))
-                    .or_default()
-                    .push_str(&block.text);
+            let mut variants: std::collections::HashSet<(bool, bool)> =
+                std::collections::HashSet::new();
+            variants.insert((style.bold, style.italic));
+            for span in &block.style_spans {
+                if let Some(s) = &span.style {
+                    variants.insert((s.bold, s.italic));
+                }
+            }
+            for (bold, italic) in variants {
+                let req = FontRequest {
+                    language: work.translation.target_language.clone(),
+                    bold,
+                    italic,
+                    monospace: style.monospace,
+                };
+                if let Some(handle) = fonts.locate(&req) {
+                    union_text
+                        .entry((req, handle))
+                        .or_default()
+                        .push_str(&block.text);
+                }
             }
         }
     }
@@ -266,39 +279,63 @@ pub fn write_translated_pdf(
     let helvetica_fallback = crate::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
     let courier_fallback = crate::font_metrics::FontMetrics::approx(0.6);
     for work in &works {
-        let mut block_metrics: Vec<crate::font_metrics::FontMetrics> =
+        // Per block: a small map `(bold, italic) -> (FontMetrics, Option<Embed>)`
+        // covering every variant seen in style_spans plus the dominant.
+        let mut block_resources: Vec<BlockResources> =
             Vec::with_capacity(work.translation.blocks.len());
-        let mut block_embeds: Vec<Option<crate::pdf_font_embed::EmbeddedFont>> =
-            Vec::with_capacity(work.translation.blocks.len());
-        for style in &work.block_styles {
-            let req = FontRequest {
-                language: work.translation.target_language.clone(),
-                bold: style.bold,
-                italic: style.italic,
+        for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
+            let mut variants: std::collections::HashSet<(bool, bool)> =
+                std::collections::HashSet::new();
+            variants.insert((style.bold, style.italic));
+            for span in &block.style_spans {
+                if let Some(s) = &span.style {
+                    variants.insert((s.bold, s.italic));
+                }
+            }
+            let mut by_flags: std::collections::HashMap<
+                (bool, bool),
+                (
+                    crate::font_metrics::FontMetrics,
+                    Option<crate::pdf_font_embed::EmbeddedFont>,
+                ),
+            > = std::collections::HashMap::new();
+            for (bold, italic) in variants {
+                let req = FontRequest {
+                    language: work.translation.target_language.clone(),
+                    bold,
+                    italic,
+                    monospace: style.monospace,
+                };
+                let key = fonts.locate(&req).map(|handle| (req, handle));
+                let metrics = key
+                    .as_ref()
+                    .and_then(|k| metrics_cache.get(k).cloned())
+                    .unwrap_or_else(|| {
+                        if style.monospace {
+                            courier_fallback.clone()
+                        } else {
+                            helvetica_fallback.clone()
+                        }
+                    });
+                let embed = key.as_ref().and_then(|k| embed_cache.get(k).cloned());
+                by_flags.insert((bold, italic), (metrics, embed));
+            }
+            block_resources.push(BlockResources {
+                by_flags,
+                default_flags: (style.bold, style.italic),
                 monospace: style.monospace,
-            };
-            let key = fonts.locate(&req).map(|handle| (req, handle));
-            let metrics = key
-                .as_ref()
-                .and_then(|k| metrics_cache.get(k).cloned())
-                .unwrap_or_else(|| {
-                    if style.monospace {
-                        courier_fallback.clone()
-                    } else {
-                        helvetica_fallback.clone()
-                    }
-                });
-            let embed = key.as_ref().and_then(|k| embed_cache.get(k).cloned());
-            block_metrics.push(metrics);
-            block_embeds.push(embed);
+            });
         }
+        let block_embeds: Vec<Option<crate::pdf_font_embed::EmbeddedFont>> = block_resources
+            .iter()
+            .flat_map(|r| r.by_flags.values().map(|(_, e)| e.clone()))
+            .collect();
         attach_embedded_fonts_to_page(&mut doc, work.page_id, &block_embeds)?;
         let overlay_stream = build_overlay_stream(
             &work.translation.blocks,
             &work.removal_rects,
             &work.block_styles,
-            &block_metrics,
-            &block_embeds,
+            &block_resources,
             work.geom,
             work.final_ctm,
         );
@@ -1039,25 +1076,65 @@ fn attach_embedded_fonts_to_page(
     Ok(())
 }
 
+/// Per-block resolved fonts: one `(FontMetrics, EmbeddedFont)` entry per
+/// `(bold, italic)` variant the block actually uses (its dominant style
+/// plus whatever appears in `style_spans`). Wrapping always uses the
+/// dominant variant for width estimation; emit picks per segment.
+struct BlockResources {
+    by_flags: std::collections::HashMap<
+        (bool, bool),
+        (
+            crate::font_metrics::FontMetrics,
+            Option<crate::pdf_font_embed::EmbeddedFont>,
+        ),
+    >,
+    default_flags: (bool, bool),
+    monospace: bool,
+}
+
+impl BlockResources {
+    fn dominant_metrics(&self) -> &crate::font_metrics::FontMetrics {
+        &self
+            .by_flags
+            .get(&self.default_flags)
+            .expect("dominant variant is always inserted")
+            .0
+    }
+
+    fn for_flags(
+        &self,
+        flags: (bool, bool),
+    ) -> (
+        &crate::font_metrics::FontMetrics,
+        Option<&crate::pdf_font_embed::EmbeddedFont>,
+    ) {
+        let entry = self
+            .by_flags
+            .get(&flags)
+            .or_else(|| self.by_flags.get(&self.default_flags))
+            .expect("at least the dominant variant exists");
+        (&entry.0, entry.1.as_ref())
+    }
+}
+
 fn build_overlay_stream(
     blocks: &[TranslatedStyledBlock],
     user_rects: &[UserRect],
     block_styles: &[SampledBlockStyle],
-    block_metrics: &[crate::font_metrics::FontMetrics],
-    block_embeds: &[Option<crate::pdf_font_embed::EmbeddedFont>],
+    block_resources: &[BlockResources],
     geom: PageGeometry,
     final_ctm: Matrix,
 ) -> Vec<u8> {
     let mut out = Vec::<u8>::new();
     out.extend_from_slice(b"q\n");
     let inv_ctm = final_ctm.inverse().unwrap_or_else(Matrix::identity);
-    let fallback_metrics = crate::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
     for (i, (block, user_rect)) in blocks.iter().zip(user_rects.iter()).enumerate() {
         let style = block_styles.get(i).copied().unwrap_or_default();
-        let metrics = block_metrics.get(i).unwrap_or(&fallback_metrics);
-        let embed = block_embeds.get(i).and_then(|e| e.as_ref());
+        let Some(resources) = block_resources.get(i) else {
+            continue;
+        };
         emit_block(
-            &mut out, block, *user_rect, &style, metrics, embed, geom, &inv_ctm,
+            &mut out, block, *user_rect, &style, resources, geom, &inv_ctm,
         );
     }
     out.extend_from_slice(b"Q\n");
@@ -1073,8 +1150,7 @@ fn emit_block(
     block: &TranslatedStyledBlock,
     user_rect: UserRect,
     style: &SampledBlockStyle,
-    metrics: &crate::font_metrics::FontMetrics,
-    embed: Option<&crate::pdf_font_embed::EmbeddedFont>,
+    resources: &BlockResources,
     geom: PageGeometry,
     inv_ctm: &Matrix,
 ) {
@@ -1088,32 +1164,28 @@ fn emit_block(
         return;
     }
 
-    // Visual block dimensions: for /Rotate=±90 the user-space rect's x and y
-    // swap their visual roles.
     let (vis_w, vis_h) = match geom.rotate {
         90 | 270 => (user_h, user_w),
         _ => (user_w, user_h),
     };
 
-    // Prefer the actual font size sampled from the original Tjs over
-    // deriving one from the bbox height: mupdf's ACCURATE_BBOXES clamps to
-    // glyph ink, so identically-sized text can report bbox heights varying
-    // by a few points per row. When we have a sampled size, trust it and
-    // only wrap by width — accepting slight vertical overflow if the
-    // translation needs more lines than the original.
+    let dominant_metrics = resources.dominant_metrics();
     let (font_size, lines) = match style.font_size {
-        Some(size) if size.is_finite() && size > 0.0 => {
-            fit_with_sampled_size(text, vis_w, vis_h, size, metrics, style.original_line_count)
-        }
+        Some(size) if size.is_finite() && size > 0.0 => fit_with_sampled_size(
+            text,
+            vis_w,
+            vis_h,
+            size,
+            dominant_metrics,
+            style.original_line_count,
+        ),
         _ => {
             let initial = (vis_h * (1.0 - TEXT_BASELINE_PAD)).max(4.0);
-            wrap_to_fit(text, vis_w, vis_h, initial, metrics)
+            wrap_to_fit(text, vis_w, vis_h, initial, dominant_metrics)
         }
     };
     let leading = font_size * LINE_HEIGHT_FACTOR;
 
-    // User-space direction vector for "next line down" (visually). Derived
-    // from the forward user→display rotation in `user_rect_from_display`.
     let (line_dx, line_dy) = match geom.rotate {
         0 => (0.0, -1.0),
         90 => (1.0, 0.0),
@@ -1122,10 +1194,6 @@ fn emit_block(
         _ => (0.0, -1.0),
     };
 
-    // Anchor the first baseline. Prefer the actual sampled origin from the
-    // original Tjs — that places translated text exactly on the producer's
-    // baseline, regardless of mupdf bbox quirks. Fall back to centering
-    // inside the bbox when no sample is available.
     let (first_baseline_x, first_baseline_y) = match style.anchor {
         Some((ax, ay)) => (ax, ay),
         None => {
@@ -1152,62 +1220,226 @@ fn emit_block(
         style.fill_rgb.0, style.fill_rgb.1, style.fill_rgb.2
     );
     out.extend_from_slice(b"BT\n");
-    let resource_name: &[u8] = match embed {
-        Some(e) => &e.resource_name,
-        None => style.font_resource(),
-    };
-    let _ = writeln!(
-        out,
-        "/{} {:.2} Tf",
-        std::str::from_utf8(resource_name).unwrap(),
-        font_size
-    );
 
-    for (i, line) in lines.iter().enumerate() {
+    // Map each wrapped line back to its byte ranges in `block.text` so we
+    // can intersect with `block.style_spans` and produce styled segments.
+    let line_word_ranges = line_byte_ranges(&block.text, &lines);
+
+    for (i, _line) in lines.iter().enumerate() {
         let off = (i as f32) * leading;
-        let user_x = first_baseline_x + off * line_dx;
-        let user_y = first_baseline_y + off * line_dy;
-        // We want the *combined* `Tm × CTM` to match the producer's combined
-        // matrix at this anchor: the orientation we sampled (a, b, c, d) plus
-        // a translation to (user_x, user_y). So set Tm = combined × inv(CTM).
-        // For producers whose combined was pure translation (most), this
-        // collapses to `1 0 0 1 ux uy`.
-        let combined = Matrix {
-            a: style.text_orientation.0,
-            b: style.text_orientation.1,
-            c: style.text_orientation.2,
-            d: style.text_orientation.3,
-            e: user_x,
-            f: user_y,
-        };
-        let tm = combined.mul(*inv_ctm);
-        let _ = writeln!(
-            out,
-            "{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm",
-            tm.a, tm.b, tm.c, tm.d, tm.e, tm.f
+        let line_x = first_baseline_x + off * line_dx;
+        let line_y = first_baseline_y + off * line_dy;
+
+        // Per-segment "advance right" vector in user space: row 1 of the
+        // sampled orientation matrix. For pure translation that's (1, 0); for
+        // 90° rotated producers it's (0, 1); etc.
+        let advance_dx = style.text_orientation.0;
+        let advance_dy = style.text_orientation.1;
+
+        let segments = segments_for_line(
+            &block.text,
+            &line_word_ranges[i],
+            &block.style_spans,
+            resources.default_flags,
         );
-        if let Some(embedded) = embed {
-            // Type-0 / Identity-H: each glyph is a 16-bit CID. The subsetter
-            // compacts the GID space, so look up the original GID from the
-            // metrics, then translate it to the subset GID before emitting.
-            out.push(b'<');
-            for c in line.chars() {
-                let original = metrics.glyph_for(c).map(|g| g.gid).unwrap_or(0);
-                let gid = embedded
-                    .gid_remap
-                    .get(&original)
-                    .copied()
-                    .unwrap_or(original);
-                let _ = write!(out, "{:04X}", gid);
+
+        let mut cumulative = 0.0_f32;
+        for seg in segments {
+            if seg.text.is_empty() {
+                continue;
             }
-            out.extend_from_slice(b"> Tj\n");
-        } else {
-            out.extend_from_slice(b"(");
-            write_pdf_string_body(out, line);
-            out.extend_from_slice(b") Tj\n");
+            let (seg_metrics, seg_embed) = resources.for_flags(seg.flags);
+            let seg_resource_name: &[u8] = match seg_embed {
+                Some(e) => &e.resource_name,
+                None => SampledBlockStyle {
+                    bold: seg.flags.0,
+                    italic: seg.flags.1,
+                    monospace: resources.monospace,
+                    ..SampledBlockStyle::default()
+                }
+                .font_resource(),
+            };
+            let seg_x = line_x + cumulative * advance_dx;
+            let seg_y = line_y + cumulative * advance_dy;
+            let combined = Matrix {
+                a: style.text_orientation.0,
+                b: style.text_orientation.1,
+                c: style.text_orientation.2,
+                d: style.text_orientation.3,
+                e: seg_x,
+                f: seg_y,
+            };
+            let tm = combined.mul(*inv_ctm);
+            let _ = writeln!(
+                out,
+                "/{} {:.2} Tf",
+                std::str::from_utf8(seg_resource_name).unwrap(),
+                font_size
+            );
+            let _ = writeln!(
+                out,
+                "{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm",
+                tm.a, tm.b, tm.c, tm.d, tm.e, tm.f
+            );
+            emit_tj_for_segment(out, &seg.text, seg_metrics, seg_embed);
+
+            cumulative += seg_metrics.measure(&seg.text, font_size);
         }
     }
     out.extend_from_slice(b"ET\n\n");
+}
+
+/// One run of consecutive characters from a wrapped line that share the
+/// same `(bold, italic)` style flags.
+struct LineSegment {
+    text: String,
+    flags: (bool, bool),
+}
+
+/// Walk the line's words (located in `block_text` via `word_ranges`),
+/// snap each word's style to its **majority** char flag (Bergamot's
+/// token alignment often spans whitespace, so going char-by-char produces
+/// off-by-one bold edges; snapping to whole words makes bold/italic
+/// word-aligned), then group consecutive same-flag words into segments.
+fn segments_for_line(
+    block_text: &str,
+    word_ranges: &[(usize, usize)],
+    style_spans: &[crate::styled::StyleSpan],
+    default_flags: (bool, bool),
+) -> Vec<LineSegment> {
+    let lookup = |byte: usize| -> (bool, bool) {
+        for span in style_spans {
+            if byte >= span.start as usize && byte < span.end as usize {
+                if let Some(s) = &span.style {
+                    return (s.bold, s.italic);
+                }
+            }
+        }
+        default_flags
+    };
+
+    // Per-word majority flag.
+    let mut word_flags: Vec<(bool, bool)> = Vec::with_capacity(word_ranges.len());
+    for (start, end) in word_ranges {
+        let mut counts: std::collections::HashMap<(bool, bool), usize> =
+            std::collections::HashMap::new();
+        let mut byte = *start;
+        for c in block_text[*start..*end].chars() {
+            *counts.entry(lookup(byte)).or_default() += 1;
+            byte += c.len_utf8();
+        }
+        let majority = counts
+            .into_iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(f, _)| f)
+            .unwrap_or(default_flags);
+        word_flags.push(majority);
+    }
+
+    // Group consecutive same-flag words into segments. Word-separator
+    // spaces stay attached to the *previous* segment so that breaking
+    // segments (bold→regular transition) doesn't drop them.
+    let mut segments: Vec<LineSegment> = Vec::new();
+    let mut current = String::new();
+    let mut current_flags = default_flags;
+    for (i, ((start, end), flags)) in word_ranges.iter().zip(word_flags.iter()).enumerate() {
+        let word = &block_text[*start..*end];
+        // Bergamot's SentencePiece detokenizer emits a space before
+        // closing punctuation (`,`, `.`, `)`, etc.) — visually fine when
+        // the surrounding text shares one font, but the bold transitions
+        // we now add make the gap obvious. Suppress the separator before
+        // any token that starts with a closing-punctuation glyph.
+        let hugs_previous = word
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, ',' | '.' | ')' | ']' | '}' | ':' | ';' | '?' | '!'));
+        let separator = i > 0 && !hugs_previous;
+        let need_break = !current.is_empty() && *flags != current_flags;
+        if need_break {
+            if separator {
+                current.push(' ');
+            }
+            segments.push(LineSegment {
+                text: std::mem::take(&mut current),
+                flags: current_flags,
+            });
+            current_flags = *flags;
+        } else if separator {
+            current.push(' ');
+        }
+        if current.is_empty() {
+            current_flags = *flags;
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        segments.push(LineSegment {
+            text: current,
+            flags: current_flags,
+        });
+    }
+    segments
+}
+
+/// Locate each wrapped line's word byte ranges back inside `block_text`.
+/// `wrap_lines` produces `Vec<String>` whose words appear in order in the
+/// source; we forward-scan, skipping whitespace, matching each word.
+fn line_byte_ranges(block_text: &str, lines: &[String]) -> Vec<Vec<(usize, usize)>> {
+    let mut cursor = 0usize;
+    let mut all = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut line_ranges = Vec::new();
+        for word in line.split_whitespace() {
+            // Skip whitespace.
+            while cursor < block_text.len() {
+                let c = match block_text[cursor..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                if c.is_whitespace() {
+                    cursor += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let word_bytes = word.as_bytes();
+            let end = cursor + word_bytes.len();
+            if end <= block_text.len() && &block_text.as_bytes()[cursor..end] == word_bytes {
+                line_ranges.push((cursor, end));
+                cursor = end;
+            }
+            // If mismatch (shouldn't happen since wrap_lines preserves words),
+            // we just skip and keep going. Style attribution may be slightly
+            // off for that one word.
+        }
+        all.push(line_ranges);
+    }
+    all
+}
+
+fn emit_tj_for_segment(
+    out: &mut Vec<u8>,
+    text: &str,
+    metrics: &crate::font_metrics::FontMetrics,
+    embed: Option<&crate::pdf_font_embed::EmbeddedFont>,
+) {
+    if let Some(embedded) = embed {
+        out.push(b'<');
+        for c in text.chars() {
+            let original = metrics.glyph_for(c).map(|g| g.gid).unwrap_or(0);
+            let gid = embedded
+                .gid_remap
+                .get(&original)
+                .copied()
+                .unwrap_or(original);
+            let _ = write!(out, "{:04X}", gid);
+        }
+        out.extend_from_slice(b"> Tj\n");
+    } else {
+        out.extend_from_slice(b"(");
+        write_pdf_string_body(out, text);
+        out.extend_from_slice(b") Tj\n");
+    }
 }
 
 fn write_pdf_string_body(out: &mut Vec<u8>, text: &str) {

@@ -429,8 +429,31 @@ fn map_styles_to_segmented_translation(
             .map(|(_, alignments)| alignments.as_slice())
             .unwrap_or(&[]);
 
+        // `TokenAlignment` is in CHARACTER offsets (bergamot-sys converts
+        // from Marian's byte offsets), but `style_spans` are byte offsets
+        // (built from `text.len()`). Build per-segment lookup tables so we
+        // can convert each alignment's char offsets back to bytes; otherwise
+        // every non-ASCII char before a styled run shifts the bold range
+        // left by one byte (== one accent = off-by-one bold).
+        let segment_start = segment.start as usize;
+        let segment_end = segment.end as usize;
+        let segment_text = &source_block.text[segment_start..segment_end];
+        let src_byte_at_char = char_to_byte_offsets(segment_text);
+        let tgt_byte_at_char = char_to_byte_offsets(translated);
+
         for alignment in alignments {
-            let src_mid = segment.start + ((alignment.src_begin + alignment.src_end) / 2) as u32;
+            // Convert char-indexed alignment to source-byte offsets. Clamp
+            // out-of-range indices to the table length so we don't panic on
+            // alignment edges that point past the end of the segment.
+            let src_b_byte = src_byte_at_char
+                .get(alignment.src_begin as usize)
+                .copied()
+                .unwrap_or(segment_text.len());
+            let src_e_byte = src_byte_at_char
+                .get(alignment.src_end as usize)
+                .copied()
+                .unwrap_or(segment_text.len());
+            let src_mid = segment.start + ((src_b_byte + src_e_byte) / 2) as u32;
             let Some(matching_span) = source_block
                 .style_spans
                 .iter()
@@ -438,9 +461,17 @@ fn map_styles_to_segmented_translation(
             else {
                 continue;
             };
+            let tgt_b_byte = tgt_byte_at_char
+                .get(alignment.tgt_begin as usize)
+                .copied()
+                .unwrap_or(translated.len());
+            let tgt_e_byte = tgt_byte_at_char
+                .get(alignment.tgt_end as usize)
+                .copied()
+                .unwrap_or(translated.len());
             result.push(StyleSpan {
-                start: target_offset + alignment.tgt_begin as u32,
-                end: target_offset + alignment.tgt_end as u32,
+                start: target_offset + tgt_b_byte as u32,
+                end: target_offset + tgt_e_byte as u32,
                 style: matching_span.style.clone(),
             });
         }
@@ -449,6 +480,14 @@ fn map_styles_to_segmented_translation(
     }
 
     merge_style_spans(result)
+}
+
+/// Build `char_idx -> byte_idx` lookup. `table[n]` is the byte offset of
+/// the start of the n-th char (or `s.len()` for `n == char_count`).
+fn char_to_byte_offsets(s: &str) -> Vec<usize> {
+    let mut table: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
+    table.push(s.len());
+    table
 }
 
 fn merge_style_spans(mut spans: Vec<StyleSpan>) -> Vec<StyleSpan> {

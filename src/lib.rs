@@ -22,6 +22,8 @@ pub mod pdf_font_embed;
 #[cfg(feature = "pdf")]
 pub mod pdf_layout;
 #[cfg(feature = "pdf")]
+pub mod pdf_style_probe;
+#[cfg(feature = "pdf")]
 pub mod pdf_text;
 #[cfg(feature = "pdf")]
 pub mod pdf_translate;
