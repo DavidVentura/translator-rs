@@ -81,13 +81,14 @@ pub fn probe_pages(pdf_bytes: &[u8]) -> Result<Vec<PageStyles>, StyleProbeError>
 fn probe_page(doc: &Document, page_id: ObjectId) -> Result<PageStyles, StyleProbeError> {
     let content = doc.get_and_decode_page_content(page_id)?;
     let fonts = doc.get_page_fonts(page_id).ok();
+    let font_advances = FontAdvanceMap::from_page(doc, page_id);
     let (rotate, user_w, user_h) = read_page_geometry(doc, page_id);
 
     // Memoise font_resource -> (bold, italic, monospace) so we resolve each
     // font dict once per page.
     let mut flag_cache: HashMap<Vec<u8>, (bool, bool, bool)> = HashMap::new();
     let mut samples = Vec::new();
-    walk_content(&content, |state, _op| {
+    walk_content(&content, &font_advances, |state, _op| {
         let flags = match &state.font_resource {
             Some(name) => {
                 if let Some(cached) = flag_cache.get(name) {
@@ -150,6 +151,193 @@ fn read_page_geometry(doc: &Document, page_id: ObjectId) -> (i32, f32, f32) {
     (rotate, user_w, user_h)
 }
 
+#[derive(Debug, Clone)]
+struct FontAdvance {
+    code_bytes: usize,
+    default_width: f32,
+    widths: HashMap<u16, f32>,
+}
+
+impl Default for FontAdvance {
+    fn default() -> Self {
+        Self {
+            code_bytes: 1,
+            default_width: 500.0,
+            widths: HashMap::new(),
+        }
+    }
+}
+
+impl FontAdvance {
+    fn from_font_dict(doc: &Document, font: &Dictionary) -> Self {
+        let subtype = font
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .unwrap_or(b"");
+        if subtype == b"Type0" {
+            return Self::from_type0(doc, font);
+        }
+        Self::from_simple_font(font)
+    }
+
+    fn from_simple_font(font: &Dictionary) -> Self {
+        let first = font
+            .get(b"FirstChar")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(0)
+            .max(0) as u16;
+        let mut widths = HashMap::new();
+        if let Ok(Object::Array(arr)) = font.get(b"Widths") {
+            for (i, width) in arr.iter().enumerate() {
+                if let Some(w) = object_as_f32(width) {
+                    widths.insert(first.saturating_add(i as u16), w);
+                }
+            }
+        }
+        Self {
+            code_bytes: 1,
+            default_width: 500.0,
+            widths,
+        }
+    }
+
+    fn from_type0(doc: &Document, font: &Dictionary) -> Self {
+        let descendant = font
+            .get(b"DescendantFonts")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .and_then(|arr| arr.first())
+            .and_then(|obj| match obj {
+                Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                Object::Dictionary(d) => Some(d),
+                _ => None,
+            });
+        let Some(descendant) = descendant else {
+            return Self {
+                code_bytes: 2,
+                default_width: 1000.0,
+                widths: HashMap::new(),
+            };
+        };
+        let default_width = descendant
+            .get(b"DW")
+            .ok()
+            .and_then(object_as_f32)
+            .unwrap_or(1000.0);
+        let mut out = Self {
+            code_bytes: 2,
+            default_width,
+            widths: HashMap::new(),
+        };
+        if let Ok(Object::Array(w_array)) = descendant.get(b"W") {
+            parse_cid_widths(w_array, &mut out.widths);
+        }
+        out
+    }
+
+    fn string_width_1000(&self, bytes: &[u8]) -> (f32, usize, usize) {
+        let mut width = 0.0;
+        let mut glyphs = 0usize;
+        let mut spaces = 0usize;
+        if self.code_bytes == 2 {
+            for chunk in bytes.chunks(2) {
+                let code = if chunk.len() == 2 {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                } else {
+                    chunk[0] as u16
+                };
+                width += self
+                    .widths
+                    .get(&code)
+                    .copied()
+                    .unwrap_or(self.default_width);
+                glyphs += 1;
+                if code == 32 {
+                    spaces += 1;
+                }
+            }
+        } else {
+            for &b in bytes {
+                width += self
+                    .widths
+                    .get(&(b as u16))
+                    .copied()
+                    .unwrap_or(self.default_width);
+                glyphs += 1;
+                if b == b' ' {
+                    spaces += 1;
+                }
+            }
+        }
+        (width, glyphs, spaces)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct FontAdvanceMap {
+    by_resource: HashMap<Vec<u8>, FontAdvance>,
+}
+
+impl FontAdvanceMap {
+    fn from_page(doc: &Document, page_id: ObjectId) -> Self {
+        let mut by_resource = HashMap::new();
+        if let Ok(fonts) = doc.get_page_fonts(page_id) {
+            for (name, font) in fonts {
+                by_resource.insert(name, FontAdvance::from_font_dict(doc, font));
+            }
+        }
+        Self { by_resource }
+    }
+
+    fn get(&self, name: Option<&Vec<u8>>) -> FontAdvance {
+        name.and_then(|n| self.by_resource.get(n))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn parse_cid_widths(w_array: &[Object], widths: &mut HashMap<u16, f32>) {
+    let mut i = 0usize;
+    while i < w_array.len() {
+        let Some(first) = w_array
+            .get(i)
+            .and_then(object_as_f32)
+            .map(|v| v.max(0.0) as u16)
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(next) = w_array.get(i + 1) else {
+            break;
+        };
+        match next {
+            Object::Array(arr) => {
+                for (offset, width) in arr.iter().enumerate() {
+                    if let Some(w) = object_as_f32(width) {
+                        widths.insert(first.saturating_add(offset as u16), w);
+                    }
+                }
+                i += 2;
+            }
+            _ => {
+                if let (Some(last), Some(width)) = (
+                    w_array.get(i + 1).and_then(object_as_f32),
+                    w_array.get(i + 2).and_then(object_as_f32),
+                ) {
+                    for code in first..=(last.max(first as f32) as u16) {
+                        widths.insert(code, width);
+                    }
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Minimal content-stream state machine (style-only, no graphics-state stack
 // payload beyond CTM + font). filter_text_ops in pdf_write does the full
@@ -210,6 +398,9 @@ struct GraphicsState {
     ctm: Matrix,
     font_resource: Option<Vec<u8>>,
     font_size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    horizontal_scaling: f32,
 }
 
 impl Default for GraphicsState {
@@ -218,6 +409,9 @@ impl Default for GraphicsState {
             ctm: Matrix::identity(),
             font_resource: None,
             font_size: 12.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
         }
     }
 }
@@ -241,6 +435,7 @@ pub(crate) struct SampleView<'a> {
 
 fn walk_content(
     content: &Content,
+    font_advances: &FontAdvanceMap,
     mut on_show: impl FnMut(SampleView<'_>, &lopdf::content::Operation),
 ) {
     let mut state = WalkState {
@@ -274,6 +469,21 @@ fn walk_content(
                         object_as_f32(size).unwrap_or(state.current.font_size);
                 }
             }
+            "Tc" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.current.char_spacing = v;
+                }
+            }
+            "Tw" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.current.word_spacing = v;
+                }
+            }
+            "Tz" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.current.horizontal_scaling = v / 100.0;
+                }
+            }
             "Tm" => {
                 if let Some(m) = matrix_from_operands(&op.operands) {
                     state.text_matrix = m;
@@ -305,8 +515,11 @@ fn walk_content(
             }
             "'" | "\"" => {
                 if op.operator == "\"" {
-                    if let Some(leading) = op.operands.first().and_then(object_as_f32) {
-                        state.text_leading = leading;
+                    if let Some(word_spacing) = op.operands.first().and_then(object_as_f32) {
+                        state.current.word_spacing = word_spacing;
+                    }
+                    if let Some(char_spacing) = op.operands.get(1).and_then(object_as_f32) {
+                        state.current.char_spacing = char_spacing;
                     }
                 }
                 let leading = state.text_leading;
@@ -322,6 +535,8 @@ fn walk_content(
                     },
                     op,
                 );
+                let advance = text_show_advance(op, &state, font_advances);
+                state.text_matrix = Matrix::translate(advance, 0.0).mul(state.text_matrix);
                 continue;
             }
             "Tj" | "TJ" => {
@@ -334,10 +549,58 @@ fn walk_content(
                     },
                     op,
                 );
+                let advance = text_show_advance(op, &state, font_advances);
+                state.text_matrix = Matrix::translate(advance, 0.0).mul(state.text_matrix);
             }
             _ => {}
         }
     }
+}
+
+fn text_show_advance(
+    op: &lopdf::content::Operation,
+    state: &WalkState,
+    font_advances: &FontAdvanceMap,
+) -> f32 {
+    let font = font_advances.get(state.current.font_resource.as_ref());
+    let mut text_advance = 0.0f32;
+    let add_string = |bytes: &[u8]| {
+        let (width_1000, glyphs, spaces) = font.string_width_1000(bytes);
+        width_1000 * state.current.font_size / 1000.0
+            + state.current.char_spacing * glyphs as f32
+            + state.current.word_spacing * spaces as f32
+    };
+
+    match op.operator.as_str() {
+        "Tj" | "'" => {
+            if let Some(bytes) = op.operands.last().and_then(|o| o.as_str().ok()) {
+                text_advance += add_string(bytes);
+            }
+        }
+        "\"" => {
+            if let Some(bytes) = op.operands.get(2).and_then(|o| o.as_str().ok()) {
+                text_advance += add_string(bytes);
+            }
+        }
+        "TJ" => {
+            if let Some(items) = op.operands.first().and_then(|o| o.as_array().ok()) {
+                for item in items {
+                    match item {
+                        Object::String(bytes, _) => text_advance += add_string(bytes),
+                        Object::Integer(_) | Object::Real(_) => {
+                            if let Some(adjustment) = object_as_f32(item) {
+                                text_advance -= adjustment * state.current.font_size / 1000.0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    text_advance * state.current.horizontal_scaling
 }
 
 fn matrix_from_operands(ops: &[Object]) -> Option<Matrix> {

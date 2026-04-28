@@ -51,21 +51,23 @@ pub fn embed_font(doc: &mut Document, metrics: &FontMetrics, slot: usize) -> Opt
     for (gid, _, _) in &used {
         remapper.remap(*gid);
     }
-    let subset_bytes = match subsetter::subset(bytes.as_ref(), ttc_index, &remapper) {
-        Ok(b) => b.to_vec(),
+    let (subset_bytes, remap_gids) = match subsetter::subset(bytes.as_ref(), ttc_index, &remapper) {
+        Ok(b) => (b.to_vec(), true),
         Err(e) => {
             eprintln!(
                 "[pdf_font_embed] subset failed for {} (ttc_index={}): {e}; embedding full font",
                 descriptor.postscript_name, ttc_index,
             );
-            bytes.as_ref().clone()
+            (bytes.as_ref().clone(), false)
         }
     };
 
     let mut gid_remap: HashMap<u16, u16> = HashMap::with_capacity(used.len());
-    for (gid, _, _) in &used {
-        if let Some(new_gid) = remapper.get(*gid) {
-            gid_remap.insert(*gid, new_gid);
+    if remap_gids {
+        for (gid, _, _) in &used {
+            if let Some(new_gid) = remapper.get(*gid) {
+                gid_remap.insert(*gid, new_gid);
+            }
         }
     }
     // Re-key the used list by the *new* GIDs so /W and ToUnicode emit them.

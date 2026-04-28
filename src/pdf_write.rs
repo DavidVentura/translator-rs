@@ -39,7 +39,7 @@ const COURIER_BOLD_OBLIQUE: &[u8] = b"TrCourBI";
 /// Style sampled from the original Tjs that fell inside a removal rect.
 /// Used to pick a font variant, a fill color, a target font size, and a
 /// baseline anchor for the translation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SampledBlockStyle {
     bold: bool,
     italic: bool,
@@ -63,6 +63,10 @@ struct SampledBlockStyle {
     /// and Y-flip top-left-origin streams). Defaults to identity (no
     /// orientation change) when no samples are available.
     text_orientation: (f32, f32, f32, f32),
+    /// Visually top-to-bottom baseline starts sampled from the original text.
+    /// These preserve hanging indents where continuation lines start further
+    /// left than the first line.
+    line_anchors: Vec<(f32, f32)>,
 }
 
 impl Default for SampledBlockStyle {
@@ -76,6 +80,7 @@ impl Default for SampledBlockStyle {
             anchor: None,
             original_line_count: 0,
             text_orientation: (1.0, 0.0, 0.0, 1.0),
+            line_anchors: Vec::new(),
         }
     }
 }
@@ -173,6 +178,7 @@ pub fn write_translated_pdf(
     }
 
     let mut works: Vec<PageWork> = Vec::new();
+    let mut modified_pages = std::collections::HashSet::new();
     for translation in translations {
         let Some((_, page_id)) = pages
             .iter()
@@ -195,6 +201,7 @@ pub fn write_translated_pdf(
         let (final_ctm, block_styles) =
             rewrite_page_content(&mut doc, *page_id, &removal_rects, geom)?;
         ensure_fonts_in_page_resources(&mut doc, *page_id)?;
+        modified_pages.insert(*page_id);
         works.push(PageWork {
             page_id: *page_id,
             translation,
@@ -342,7 +349,7 @@ pub fn write_translated_pdf(
         append_content_stream(&mut doc, work.page_id, overlay_stream)?;
     }
 
-    prune_unused_fonts(&mut doc)?;
+    prune_unused_fonts(&mut doc, &modified_pages)?;
 
     let mut out = Vec::new();
     doc.save_to(&mut out)?;
@@ -469,7 +476,9 @@ fn rewrite_page_content(
     geom: PageGeometry,
 ) -> Result<(Matrix, Vec<SampledBlockStyle>), PdfWriteError> {
     let content = doc.get_and_decode_page_content(page_id)?;
-    let (filtered, final_ctm, raw_samples) = filter_text_ops(content.operations, removal_rects);
+    let font_advances = FontAdvanceMap::from_page(doc, page_id);
+    let (filtered, final_ctm, raw_samples) =
+        filter_text_ops(content.operations, removal_rects, &font_advances);
     let new_bytes = Content {
         operations: filtered,
     }
@@ -552,16 +561,8 @@ fn resolve_block_styles(
                 })
                 .map(|s| s.origin);
 
-            // Count distinct visual baselines — the actual original line
-            // count, derived from where Tjs landed rather than guessed
-            // from the bbox.
-            let mut visual_ys: Vec<f32> = samples
-                .iter()
-                .map(|s| visual_position(s.origin, geom).1)
-                .collect();
-            visual_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            visual_ys.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-            let original_line_count = visual_ys.len().max(1);
+            let line_anchors = original_line_anchors(samples, geom);
+            let original_line_count = line_anchors.len().max(1);
 
             // Pick the orientation of the first sample. Producers almost
             // always use one orientation per block; if it's mixed, the first
@@ -580,9 +581,50 @@ fn resolve_block_styles(
                 anchor,
                 original_line_count,
                 text_orientation,
+                line_anchors,
             }
         })
         .collect()
+}
+
+fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<(f32, f32)> {
+    let mut positioned: Vec<(f32, f32, (f32, f32))> = samples
+        .iter()
+        .map(|s| {
+            let (vx, vy) = visual_position(s.origin, geom);
+            (vy, vx, s.origin)
+        })
+        .collect();
+    positioned.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut anchors = Vec::new();
+    let mut current_y: Option<f32> = None;
+    let mut best_x = f32::INFINITY;
+    let mut best_origin = (0.0, 0.0);
+    for (vy, vx, origin) in positioned {
+        if current_y.is_some_and(|y| (vy - y).abs() >= 1.0) {
+            anchors.push(best_origin);
+            current_y = Some(vy);
+            best_x = vx;
+            best_origin = origin;
+            continue;
+        }
+        if current_y.is_none() {
+            current_y = Some(vy);
+        }
+        if vx < best_x {
+            best_x = vx;
+            best_origin = origin;
+        }
+    }
+    if current_y.is_some() {
+        anchors.push(best_origin);
+    }
+    anchors
 }
 
 /// Map a PDF user-space point to a "visual" coordinate where smaller is
@@ -678,6 +720,192 @@ fn detect_from_name(base_font: &[u8]) -> (bool, bool, bool) {
     (bold, italic, monospace)
 }
 
+#[derive(Debug, Clone)]
+struct FontAdvance {
+    code_bytes: usize,
+    default_width: f32,
+    widths: std::collections::HashMap<u16, f32>,
+}
+
+impl Default for FontAdvance {
+    fn default() -> Self {
+        Self {
+            code_bytes: 1,
+            default_width: 500.0,
+            widths: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl FontAdvance {
+    fn from_font_dict(doc: &Document, font: &Dictionary) -> Self {
+        let subtype = font
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .unwrap_or(b"");
+        if subtype == b"Type0" {
+            return Self::from_type0(doc, font);
+        }
+        Self::from_simple_font(font)
+    }
+
+    fn from_simple_font(font: &Dictionary) -> Self {
+        let first = font
+            .get(b"FirstChar")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(0)
+            .max(0) as u16;
+        let mut widths = std::collections::HashMap::new();
+        if let Ok(Object::Array(arr)) = font.get(b"Widths") {
+            for (i, width) in arr.iter().enumerate() {
+                if let Some(w) = object_as_f32(width) {
+                    widths.insert(first.saturating_add(i as u16), w);
+                }
+            }
+        }
+        Self {
+            code_bytes: 1,
+            default_width: 500.0,
+            widths,
+        }
+    }
+
+    fn from_type0(doc: &Document, font: &Dictionary) -> Self {
+        let descendant = font
+            .get(b"DescendantFonts")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .and_then(|arr| arr.first())
+            .and_then(|obj| match obj {
+                Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                Object::Dictionary(d) => Some(d),
+                _ => None,
+            });
+        let Some(descendant) = descendant else {
+            return Self {
+                code_bytes: 2,
+                default_width: 1000.0,
+                widths: std::collections::HashMap::new(),
+            };
+        };
+        let default_width = descendant
+            .get(b"DW")
+            .ok()
+            .and_then(object_as_f32)
+            .unwrap_or(1000.0);
+        let mut out = Self {
+            code_bytes: 2,
+            default_width,
+            widths: std::collections::HashMap::new(),
+        };
+        if let Ok(Object::Array(w_array)) = descendant.get(b"W") {
+            parse_cid_widths(w_array, &mut out.widths);
+        }
+        out
+    }
+
+    fn width_for_code(&self, code: u16) -> f32 {
+        self.widths
+            .get(&code)
+            .copied()
+            .unwrap_or(self.default_width)
+    }
+
+    fn string_width_1000(&self, bytes: &[u8]) -> (f32, usize, usize) {
+        let mut width = 0.0;
+        let mut glyphs = 0usize;
+        let mut spaces = 0usize;
+        if self.code_bytes == 2 {
+            for chunk in bytes.chunks(2) {
+                let code = if chunk.len() == 2 {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                } else {
+                    chunk[0] as u16
+                };
+                width += self.width_for_code(code);
+                glyphs += 1;
+                if code == 32 {
+                    spaces += 1;
+                }
+            }
+        } else {
+            for &b in bytes {
+                width += self.width_for_code(b as u16);
+                glyphs += 1;
+                if b == b' ' {
+                    spaces += 1;
+                }
+            }
+        }
+        (width, glyphs, spaces)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct FontAdvanceMap {
+    by_resource: std::collections::HashMap<Vec<u8>, FontAdvance>,
+}
+
+impl FontAdvanceMap {
+    fn from_page(doc: &Document, page_id: ObjectId) -> Self {
+        let mut by_resource = std::collections::HashMap::new();
+        if let Ok(fonts) = doc.get_page_fonts(page_id) {
+            for (name, font) in fonts {
+                by_resource.insert(name, FontAdvance::from_font_dict(doc, font));
+            }
+        }
+        Self { by_resource }
+    }
+
+    fn get(&self, name: Option<&Vec<u8>>) -> FontAdvance {
+        name.and_then(|n| self.by_resource.get(n))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn parse_cid_widths(w_array: &[Object], widths: &mut std::collections::HashMap<u16, f32>) {
+    let mut i = 0usize;
+    while i < w_array.len() {
+        let Some(first) = w_array
+            .get(i)
+            .and_then(object_as_f32)
+            .map(|v| v.max(0.0) as u16)
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(next) = w_array.get(i + 1) else {
+            break;
+        };
+        match next {
+            Object::Array(arr) => {
+                for (offset, width) in arr.iter().enumerate() {
+                    if let Some(w) = object_as_f32(width) {
+                        widths.insert(first.saturating_add(offset as u16), w);
+                    }
+                }
+                i += 2;
+            }
+            _ => {
+                if let (Some(last), Some(width)) = (
+                    w_array.get(i + 1).and_then(object_as_f32),
+                    w_array.get(i + 2).and_then(object_as_f32),
+                ) {
+                    for code in first..=(last.max(first as f32) as u16) {
+                        widths.insert(code, width);
+                    }
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
 /// One observation of original-text style for a single removal rect.
 #[derive(Debug, Clone)]
 struct RawStyleSample {
@@ -703,6 +931,7 @@ struct RawStyleSample {
 fn filter_text_ops(
     ops: Vec<Operation>,
     removal_rects: &[UserRect],
+    font_advances: &FontAdvanceMap,
 ) -> (Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>) {
     let mut state = State::new();
     let mut out = Vec::with_capacity(ops.len());
@@ -728,6 +957,21 @@ fn filter_text_ops(
                 }
                 if let Some(size) = op.operands.get(1).and_then(object_as_f32) {
                     state.font_size = size;
+                }
+            }
+            "Tc" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.char_spacing = v;
+                }
+            }
+            "Tw" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.word_spacing = v;
+                }
+            }
+            "Tz" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.horizontal_scaling = v / 100.0;
                 }
             }
             // Non-stroking fill colour. We sample only the most common color
@@ -791,18 +1035,21 @@ fn filter_text_ops(
                     let leading = state.text_leading;
                     state.move_text(0.0, -leading);
                 } else if op.operator == "\"" {
-                    if let Some(leading) = op.operands.first().and_then(object_as_f32) {
-                        state.text_leading = leading;
+                    if let Some(word_spacing) = op.operands.first().and_then(object_as_f32) {
+                        state.word_spacing = word_spacing;
+                    }
+                    if let Some(char_spacing) = op.operands.get(1).and_then(object_as_f32) {
+                        state.char_spacing = char_spacing;
                     }
                     let leading = state.text_leading;
                     state.move_text(0.0, -leading);
                 }
 
                 let origin = state.current_text_origin();
-                if let Some(rect_index) = removal_rects
+                let dropped_rect = removal_rects
                     .iter()
-                    .position(|r| r.contains(origin.0, origin.1))
-                {
+                    .position(|r| r.contains(origin.0, origin.1));
+                if let Some(rect_index) = dropped_rect {
                     let combined = state.text_matrix.mul(state.current.ctm);
                     // Combined `text_matrix × CTM` carries both the producer's
                     // glyph orientation *and* whatever scale the CTM applied
@@ -826,12 +1073,15 @@ fn filter_text_ops(
                             combined.d / safe_y,
                         ),
                     });
-                    // Drop the op; do not advance Tm by the string's width.
-                    // Skipping that advance is safe because nothing downstream
-                    // relies on the "post-show" cursor inside this BT/ET (PDF
-                    // producers either explicitly set Tm/Td or end the BT block).
+                    let advance = text_show_advance(&op, &state, font_advances);
+                    state.advance_text(advance);
+                    // Drop the op after advancing the text cursor, so any
+                    // later show operators in the same BT/ET block are tested
+                    // at their true origin.
                     continue;
                 }
+                let advance = text_show_advance(&op, &state, font_advances);
+                state.advance_text(advance);
             }
             _ => {}
         }
@@ -949,6 +1199,9 @@ struct State {
     text_matrix: Matrix,
     text_line_matrix: Matrix,
     font_size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    horizontal_scaling: f32,
     text_leading: f32,
 }
 
@@ -961,6 +1214,9 @@ impl State {
             text_matrix: Matrix::identity(),
             text_line_matrix: Matrix::identity(),
             font_size: 12.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
             text_leading: 0.0,
         }
     }
@@ -1002,11 +1258,59 @@ impl State {
         self.text_matrix = new_lm;
     }
 
+    fn advance_text(&mut self, tx: f32) {
+        self.text_matrix = Matrix::translate(tx, 0.0).mul(self.text_matrix);
+    }
+
     fn current_text_origin(&self) -> (f32, f32) {
         // text origin = text_matrix × (0, 0) → then map through CTM.
         let (tx, ty) = self.text_matrix.transform_point(0.0, 0.0);
         self.current.ctm.transform_point(tx, ty)
     }
+}
+
+fn text_show_advance(op: &Operation, state: &State, font_advances: &FontAdvanceMap) -> f32 {
+    let font = font_advances.get(state.current.font_resource.as_ref());
+    let scale = state.horizontal_scaling;
+
+    let mut text_advance = 0.0f32;
+    let add_string = |bytes: &[u8]| {
+        let (width_1000, glyphs, spaces) = font.string_width_1000(bytes);
+        width_1000 * state.font_size / 1000.0
+            + state.char_spacing * glyphs as f32
+            + state.word_spacing * spaces as f32
+    };
+
+    match op.operator.as_str() {
+        "Tj" | "'" => {
+            if let Some(bytes) = op.operands.last().and_then(|o| o.as_str().ok()) {
+                text_advance += add_string(bytes);
+            }
+        }
+        "\"" => {
+            if let Some(bytes) = op.operands.get(2).and_then(|o| o.as_str().ok()) {
+                text_advance += add_string(bytes);
+            }
+        }
+        "TJ" => {
+            if let Some(items) = op.operands.first().and_then(|o| o.as_array().ok()) {
+                for item in items {
+                    match item {
+                        Object::String(bytes, _) => text_advance += add_string(bytes),
+                        Object::Integer(_) | Object::Real(_) => {
+                            if let Some(adjustment) = object_as_f32(item) {
+                                text_advance -= adjustment * state.font_size / 1000.0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    text_advance * scale
 }
 
 fn object_as_f32(obj: &Object) -> Option<f32> {
@@ -1129,7 +1433,7 @@ fn build_overlay_stream(
     out.extend_from_slice(b"q\n");
     let inv_ctm = final_ctm.inverse().unwrap_or_else(Matrix::identity);
     for (i, (block, user_rect)) in blocks.iter().zip(user_rects.iter()).enumerate() {
-        let style = block_styles.get(i).copied().unwrap_or_default();
+        let style = block_styles.get(i).cloned().unwrap_or_default();
         let Some(resources) = block_resources.get(i) else {
             continue;
         };
@@ -1168,12 +1472,13 @@ fn emit_block(
         90 | 270 => (user_h, user_w),
         _ => (user_w, user_h),
     };
+    let line_widths = line_available_widths(style, user_rect, geom, vis_w);
 
     let dominant_metrics = resources.dominant_metrics();
     let (font_size, lines) = match style.font_size {
         Some(size) if size.is_finite() && size > 0.0 => fit_with_sampled_size(
             text,
-            vis_w,
+            &line_widths,
             vis_h,
             size,
             dominant_metrics,
@@ -1181,7 +1486,7 @@ fn emit_block(
         ),
         _ => {
             let initial = (vis_h * (1.0 - TEXT_BASELINE_PAD)).max(4.0);
-            wrap_to_fit(text, vis_w, vis_h, initial, dominant_metrics)
+            wrap_to_fit(text, &line_widths, vis_h, initial, dominant_metrics)
         }
     };
     let leading = font_size * LINE_HEIGHT_FACTOR;
@@ -1226,9 +1531,15 @@ fn emit_block(
     let line_word_ranges = line_byte_ranges(&block.text, &lines);
 
     for (i, _line) in lines.iter().enumerate() {
-        let off = (i as f32) * leading;
-        let line_x = first_baseline_x + off * line_dx;
-        let line_y = first_baseline_y + off * line_dy;
+        let (line_x, line_y) = line_origin(
+            style,
+            i,
+            first_baseline_x,
+            first_baseline_y,
+            leading,
+            line_dx,
+            line_dy,
+        );
 
         // Per-segment "advance right" vector in user space: row 1 of the
         // sampled orientation matrix. For pure translation that's (1, 0); for
@@ -1287,6 +1598,68 @@ fn emit_block(
         }
     }
     out.extend_from_slice(b"ET\n\n");
+}
+
+fn line_origin(
+    style: &SampledBlockStyle,
+    line_index: usize,
+    first_x: f32,
+    first_y: f32,
+    leading: f32,
+    line_dx: f32,
+    line_dy: f32,
+) -> (f32, f32) {
+    if let Some(anchor) = style.line_anchors.get(line_index) {
+        return *anchor;
+    }
+    if let Some(last) = style.line_anchors.last() {
+        let extra = (line_index + 1 - style.line_anchors.len()) as f32 * leading;
+        return (last.0 + extra * line_dx, last.1 + extra * line_dy);
+    }
+    let off = line_index as f32 * leading;
+    (first_x + off * line_dx, first_y + off * line_dy)
+}
+
+fn line_available_widths(
+    style: &SampledBlockStyle,
+    user_rect: UserRect,
+    geom: PageGeometry,
+    fallback: f32,
+) -> Vec<f32> {
+    if style.line_anchors.is_empty() {
+        return vec![fallback.max(1.0)];
+    }
+
+    let visual_right = user_rect_visual_bounds(user_rect, geom).2;
+    style
+        .line_anchors
+        .iter()
+        .map(|origin| {
+            let (vx, _) = visual_position(*origin, geom);
+            (visual_right - vx).max(fallback * 0.25).min(fallback)
+        })
+        .collect()
+}
+
+fn user_rect_visual_bounds(rect: UserRect, geom: PageGeometry) -> (f32, f32, f32, f32) {
+    let points = [
+        (rect.x0, rect.y0),
+        (rect.x0, rect.y1),
+        (rect.x1, rect.y0),
+        (rect.x1, rect.y1),
+    ];
+    let mut left = f32::INFINITY;
+    let mut top = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for point in points {
+        let (x, y) = visual_position(point, geom);
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    (left, top, right, bottom)
 }
 
 /// One run of consecutive characters from a wrapped line that share the
@@ -1473,7 +1846,7 @@ const MIN_SHRINK_FRACTION: f32 = 0.7;
 /// sampled size — beyond that we'd produce unreadable output.
 fn fit_with_sampled_size(
     text: &str,
-    vis_w: f32,
+    line_widths: &[f32],
     vis_h: f32,
     sampled: f32,
     metrics: &crate::font_metrics::FontMetrics,
@@ -1484,6 +1857,7 @@ fn fit_with_sampled_size(
     if original_lines <= 1 {
         // Originally one line. Don't introduce wraps — keep one line and
         // shrink the font if it'd overflow the bbox by more than tolerance.
+        let vis_w = line_width_at(line_widths, 0);
         let width_at_sampled = metrics.measure(text, sampled);
         let allowed = vis_w * OVERHANG_TOLERANCE;
         let final_size = if width_at_sampled <= allowed || width_at_sampled == 0.0 {
@@ -1500,13 +1874,13 @@ fn fit_with_sampled_size(
         // what actually mattered: bbox height is just the union of glyph
         // ink and may include slack at top/bottom.
         let mut size = sampled;
-        let mut lines = wrap_lines(text, vis_w, size, metrics);
+        let mut lines = wrap_lines_to_widths(text, line_widths, size, metrics);
         for _ in 0..6 {
             if lines.len() <= original_lines || size <= min_size {
                 break;
             }
             size = (size * 0.9).max(min_size);
-            lines = wrap_lines(text, vis_w, size, metrics);
+            lines = wrap_lines_to_widths(text, line_widths, size, metrics);
         }
         // Final safety: if even at min_size we'd still exceed the bbox
         // height substantially, accept it — at least the text is readable.
@@ -1517,13 +1891,13 @@ fn fit_with_sampled_size(
 
 fn wrap_to_fit(
     text: &str,
-    max_width: f32,
+    line_widths: &[f32],
     max_height: f32,
     mut font_size: f32,
     metrics: &crate::font_metrics::FontMetrics,
 ) -> (f32, Vec<String>) {
     for _ in 0..6 {
-        let lines = wrap_lines(text, max_width, font_size, metrics);
+        let lines = wrap_lines_to_widths(text, line_widths, font_size, metrics);
         let total_height = font_size * LINE_HEIGHT_FACTOR * lines.len() as f32;
         if total_height <= max_height || font_size <= 4.0 {
             return (font_size, lines);
@@ -1531,12 +1905,25 @@ fn wrap_to_fit(
         font_size *= 0.85;
     }
     let final_size = font_size.max(4.0);
-    (final_size, wrap_lines(text, max_width, final_size, metrics))
+    (
+        final_size,
+        wrap_lines_to_widths(text, line_widths, final_size, metrics),
+    )
 }
 
+#[cfg(test)]
 fn wrap_lines(
     text: &str,
     max_width: f32,
+    font_size: f32,
+    metrics: &crate::font_metrics::FontMetrics,
+) -> Vec<String> {
+    wrap_lines_to_widths(text, &[max_width], font_size, metrics)
+}
+
+fn wrap_lines_to_widths(
+    text: &str,
+    line_widths: &[f32],
     font_size: f32,
     metrics: &crate::font_metrics::FontMetrics,
 ) -> Vec<String> {
@@ -1548,6 +1935,7 @@ fn wrap_lines(
         } else {
             format!("{current} {word}")
         };
+        let max_width = line_width_at(line_widths, lines.len());
         if metrics.measure(&candidate, font_size) <= max_width || current.is_empty() {
             current = candidate;
         } else {
@@ -1562,6 +1950,15 @@ fn wrap_lines(
         lines.push(String::new());
     }
     lines
+}
+
+fn line_width_at(line_widths: &[f32], index: usize) -> f32 {
+    line_widths
+        .get(index)
+        .copied()
+        .or_else(|| line_widths.last().copied())
+        .unwrap_or(1.0)
+        .max(1.0)
 }
 
 /// Map a Unicode codepoint to its WinAnsi (CP1252) byte, or `b'?'` if there
@@ -1667,13 +2064,7 @@ fn ensure_inline_resources(
         }
     }
 
-    let inline_resources = {
-        let page = doc.get_object(page_id).and_then(Object::as_dict)?;
-        match page.get(b"Resources") {
-            Ok(Object::Dictionary(d)) => d.clone(),
-            _ => Dictionary::new(),
-        }
-    };
+    let inline_resources = effective_page_resources(doc, page_id)?;
 
     let new_id = doc.add_object(Object::Dictionary(inline_resources));
     let page_mut = doc.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
@@ -1681,14 +2072,46 @@ fn ensure_inline_resources(
     Ok(new_id)
 }
 
+fn effective_page_resources(
+    doc: &Document,
+    page_id: ObjectId,
+) -> Result<Dictionary, PdfWriteError> {
+    let mut current_id = page_id;
+    let mut seen = std::collections::HashSet::new();
+
+    loop {
+        if !seen.insert(current_id) {
+            return Err(PdfWriteError::Other(format!(
+                "cycle while resolving page resources at object {current_id:?}"
+            )));
+        }
+
+        let node = doc.get_object(current_id).and_then(Object::as_dict)?;
+        if let Ok(resources) = node.get(b"Resources") {
+            return match resources {
+                Object::Dictionary(d) => Ok(d.clone()),
+                Object::Reference(id) => Ok(doc.get_dictionary(*id)?.clone()),
+                _ => Ok(Dictionary::new()),
+            };
+        }
+
+        let Ok(parent_id) = node.get(b"Parent").and_then(Object::as_reference) else {
+            return Ok(Dictionary::new());
+        };
+        current_id = parent_id;
+    }
+}
+
 /// Strip every `/Resources/Font` entry that no surviving `Tj`/`TJ`/`'`/`"`
 /// references, then garbage-collect orphaned font dicts and their embedded
 /// font streams. This is what reclaims the original PDF's font payload —
 /// surgery removed the *operators* that drew the original glyphs but left
 /// the font dictionaries reachable through the resources dict.
-fn prune_unused_fonts(doc: &mut Document) -> Result<(), PdfWriteError> {
-    let pages: Vec<ObjectId> = doc.get_pages().into_iter().map(|(_, id)| id).collect();
-    for page_id in pages {
+fn prune_unused_fonts(
+    doc: &mut Document,
+    modified_pages: &std::collections::HashSet<ObjectId>,
+) -> Result<(), PdfWriteError> {
+    for page_id in modified_pages.iter().copied() {
         let used = used_font_resource_names(doc, page_id)?;
         let resources_id = ensure_inline_resources(doc, page_id)?;
         let resources = doc
@@ -1697,7 +2120,9 @@ fn prune_unused_fonts(doc: &mut Document) -> Result<(), PdfWriteError> {
         let to_remove: Vec<Vec<u8>> = match resources.get(b"Font") {
             Ok(Object::Dictionary(d)) => d
                 .iter()
-                .filter_map(|(k, _)| (!used.contains(k)).then(|| k.clone()))
+                .filter_map(|(k, _)| {
+                    (is_translator_font_resource(k) && !used.contains(k)).then(|| k.clone())
+                })
                 .collect(),
             _ => Vec::new(),
         };
@@ -1715,6 +2140,10 @@ fn prune_unused_fonts(doc: &mut Document) -> Result<(), PdfWriteError> {
     // collects them.
     doc.prune_objects();
     Ok(())
+}
+
+fn is_translator_font_resource(name: &[u8]) -> bool {
+    name.starts_with(b"Tr")
 }
 
 fn used_font_resource_names(
@@ -1872,7 +2301,7 @@ mod tests {
             x1: 200.0,
             y1: 750.0,
         };
-        let (filtered, _, _) = filter_text_ops(ops.clone(), &[rect]);
+        let (filtered, _, _) = filter_text_ops(ops.clone(), &[rect], &FontAdvanceMap::default());
         // BT, Tf, Td, ET — the Tj should have been dropped.
         assert_eq!(filtered.len(), 4);
         assert!(filtered.iter().all(|o| o.operator != "Tj"));
@@ -1897,8 +2326,70 @@ mod tests {
             x1: 50.0,
             y1: 50.0,
         };
-        let (filtered, _, _) = filter_text_ops(ops, &[rect]);
+        let (filtered, _, _) = filter_text_ops(ops, &[rect], &FontAdvanceMap::default());
         assert!(filtered.iter().any(|o| o.operator == "Tj"));
+    }
+
+    #[test]
+    fn filter_advances_between_consecutive_text_shows() {
+        let ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Real(10.0)]),
+            Operation::new("Td", vec![Object::Real(100.0), Object::Real(700.0)]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(
+                    b"hello".to_vec(),
+                    lopdf::StringFormat::Literal,
+                )],
+            ),
+            Operation::new(
+                "Tj",
+                vec![Object::String(b"!".to_vec(), lopdf::StringFormat::Literal)],
+            ),
+            Operation::new("ET", vec![]),
+        ];
+        let rect = UserRect {
+            x0: 124.0,
+            y0: 690.0,
+            x1: 130.0,
+            y1: 710.0,
+        };
+        let (filtered, _, _) = filter_text_ops(ops, &[rect], &FontAdvanceMap::default());
+        assert_eq!(filtered.iter().filter(|op| op.operator == "Tj").count(), 1);
+    }
+
+    #[test]
+    fn ensure_inline_resources_clones_inherited_resources() {
+        let mut doc = Document::with_version("1.5");
+        let resources_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("XObject", Object::Dictionary(Dictionary::new()));
+            Object::Dictionary(d)
+        });
+        let pages_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", Object::Name(b"Pages".to_vec()));
+            d.set("Resources", Object::Reference(resources_id));
+            d.set("Kids", Object::Array(Vec::new()));
+            d.set("Count", Object::Integer(1));
+            Object::Dictionary(d)
+        });
+        let page_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", Object::Name(b"Page".to_vec()));
+            d.set("Parent", Object::Reference(pages_id));
+            Object::Dictionary(d)
+        });
+
+        let local_resources_id = ensure_inline_resources(&mut doc, page_id).unwrap();
+        assert_ne!(local_resources_id, resources_id);
+        let local = doc
+            .get_object(local_resources_id)
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        assert!(matches!(local.get(b"XObject"), Ok(Object::Dictionary(_))));
     }
 
     #[test]

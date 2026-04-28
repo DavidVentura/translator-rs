@@ -249,7 +249,7 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
     }
 
     let line_height = lower_quartile_height(fragments);
-    let block_gap_threshold = ((line_height as f32) * 0.5) as u32;
+    let block_gap_threshold = ((line_height as f32) * 0.75) as u32;
 
     let mut block_groups: Vec<Vec<StyledFragment>> = Vec::new();
     let mut block_bounds: Vec<Rect> = Vec::new();
@@ -257,7 +257,8 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
     let mut block_cluster_group_ids = Vec::new();
 
     for fragment in fragments {
-        let mut merged = false;
+        let mut same_line_match = None;
+        let mut next_line_match = None;
         for i in 0..block_groups.len() {
             if block_layout_group_ids[i] != fragment.layout_group {
                 continue;
@@ -279,18 +280,23 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
                 .left
                 .max(fragment.bounding_box.left)
                 .saturating_sub(bb.right.min(fragment.bounding_box.right));
-            let horizontal_nearby = horizontal_gap <= line_height;
+            let same_line_nearby = horizontal_gap <= line_height.saturating_mul(3);
 
-            if (vertical_overlap > 0 && horizontal_nearby)
-                || (vertical_gap <= block_gap_threshold && horizontal_overlap > 0)
-            {
-                block_groups[i].push(fragment.clone());
-                block_bounds[i].union(fragment.bounding_box);
-                merged = true;
+            if vertical_overlap > 0 && same_line_nearby {
+                same_line_match = Some(i);
                 break;
             }
+            if vertical_gap <= block_gap_threshold
+                && horizontal_overlap > 0
+                && next_line_match.is_none()
+            {
+                next_line_match = Some(i);
+            }
         }
-        if !merged {
+        if let Some(i) = same_line_match.or(next_line_match) {
+            block_groups[i].push(fragment.clone());
+            block_bounds[i].union(fragment.bounding_box);
+        } else {
             block_groups.push(vec![fragment.clone()]);
             block_bounds.push(fragment.bounding_box);
             block_layout_group_ids.push(fragment.layout_group);
@@ -300,18 +306,47 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
 
     block_groups
         .into_iter()
-        .zip(block_bounds)
-        .map(|(group, bounds)| build_block(&group, bounds))
+        .flat_map(|group| build_blocks(&group))
         .collect()
 }
 
-fn build_block(fragments: &[StyledFragment], bounds: Rect) -> TranslatableBlock {
+fn build_blocks(fragments: &[StyledFragment]) -> Vec<TranslatableBlock> {
     let lines = cluster_into_lines(fragments);
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut start = 0usize;
+    for i in 0..lines.len().saturating_sub(1) {
+        if is_section_heading_line(&lines[i]) && starts_subsection_line(&lines[i + 1]) {
+            blocks.push(build_block_from_lines(&lines[start..=i]));
+            start = i + 1;
+        }
+    }
+    if start < lines.len() {
+        blocks.push(build_block_from_lines(&lines[start..]));
+    }
+    blocks
+}
+
+fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
     let mut text = String::new();
     let mut spans = Vec::new();
     let mut segments = Vec::new();
-    let mut current_trans_group = fragments
-        .first()
+    let mut bounds = lines
+        .iter()
+        .flatten()
+        .next()
+        .map(|fragment| fragment.bounding_box)
+        .unwrap_or_default();
+    for fragment in lines.iter().flatten() {
+        bounds.union(fragment.bounding_box);
+    }
+    let mut current_trans_group = lines
+        .iter()
+        .flatten()
+        .next()
         .map(|fragment| fragment.translation_group)
         .unwrap_or_default();
     let mut segment_start = 0u32;
@@ -364,6 +399,43 @@ fn build_block(fragments: &[StyledFragment], bounds: Rect) -> TranslatableBlock 
         style_spans: spans,
         segments,
     }
+}
+
+fn line_plain_text(line: &[StyledFragment]) -> String {
+    let mut text = String::new();
+    for (i, fragment) in line.iter().enumerate() {
+        if i > 0 && !text.chars().last().is_some_and(char::is_whitespace) {
+            text.push(' ');
+        }
+        text.push_str(&fragment.text);
+    }
+    text
+}
+
+fn is_section_heading_line(line: &[StyledFragment]) -> bool {
+    let text = line_plain_text(line);
+    let trimmed = text.trim();
+    let Some((prefix, rest)) = trimmed.split_once('.') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_digit())
+        && rest.starts_with(char::is_whitespace)
+        && !matches!(trimmed.chars().last(), Some('.' | ';' | ':'))
+}
+
+fn starts_subsection_line(line: &[StyledFragment]) -> bool {
+    let text = line_plain_text(line);
+    let trimmed = text.trim_start();
+    let Some(dot) = trimmed.find('.') else {
+        return false;
+    };
+    if dot == 0 || !trimmed[..dot].chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let rest = &trimmed[dot + 1..];
+    let digit_count = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    digit_count > 0
 }
 
 fn cluster_into_lines(fragments: &[StyledFragment]) -> Vec<Vec<StyledFragment>> {
