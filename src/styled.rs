@@ -255,42 +255,49 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
     let mut block_bounds: Vec<Rect> = Vec::new();
     let mut block_layout_group_ids = Vec::new();
     let mut block_cluster_group_ids = Vec::new();
+    let mut force_new_block = false;
 
     for fragment in fragments {
+        if is_standalone_list_marker(fragment) {
+            force_new_block = true;
+            continue;
+        }
         let mut same_line_match = None;
         let mut next_line_match = None;
-        for i in 0..block_groups.len() {
-            if block_layout_group_ids[i] != fragment.layout_group {
-                continue;
-            }
-            if block_cluster_group_ids[i] != fragment.cluster_group {
-                continue;
-            }
-            let bb: Rect = block_bounds[i];
-            let vertical_overlap = bb
-                .bottom
-                .min(fragment.bounding_box.bottom)
-                .saturating_sub(bb.top.max(fragment.bounding_box.top));
-            let vertical_gap = fragment.bounding_box.top.saturating_sub(bb.bottom);
-            let horizontal_overlap = bb
-                .right
-                .min(fragment.bounding_box.right)
-                .saturating_sub(bb.left.max(fragment.bounding_box.left));
-            let horizontal_gap = bb
-                .left
-                .max(fragment.bounding_box.left)
-                .saturating_sub(bb.right.min(fragment.bounding_box.right));
-            let same_line_nearby = horizontal_gap <= line_height.saturating_mul(3);
+        if !force_new_block {
+            for i in 0..block_groups.len() {
+                if block_layout_group_ids[i] != fragment.layout_group {
+                    continue;
+                }
+                if block_cluster_group_ids[i] != fragment.cluster_group {
+                    continue;
+                }
+                let bb: Rect = block_bounds[i];
+                let vertical_overlap = bb
+                    .bottom
+                    .min(fragment.bounding_box.bottom)
+                    .saturating_sub(bb.top.max(fragment.bounding_box.top));
+                let vertical_gap = fragment.bounding_box.top.saturating_sub(bb.bottom);
+                let horizontal_overlap = bb
+                    .right
+                    .min(fragment.bounding_box.right)
+                    .saturating_sub(bb.left.max(fragment.bounding_box.left));
+                let horizontal_gap = bb
+                    .left
+                    .max(fragment.bounding_box.left)
+                    .saturating_sub(bb.right.min(fragment.bounding_box.right));
+                let same_line_nearby = horizontal_gap <= line_height.saturating_mul(3);
 
-            if vertical_overlap > 0 && same_line_nearby {
-                same_line_match = Some(i);
-                break;
-            }
-            if vertical_gap <= block_gap_threshold
-                && horizontal_overlap > 0
-                && next_line_match.is_none()
-            {
-                next_line_match = Some(i);
+                if vertical_overlap > 0 && same_line_nearby {
+                    same_line_match = Some(i);
+                    break;
+                }
+                if vertical_gap <= block_gap_threshold
+                    && horizontal_overlap > 0
+                    && next_line_match.is_none()
+                {
+                    next_line_match = Some(i);
+                }
             }
         }
         if let Some(i) = same_line_match.or(next_line_match) {
@@ -302,12 +309,20 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
             block_layout_group_ids.push(fragment.layout_group);
             block_cluster_group_ids.push(fragment.cluster_group);
         }
+        force_new_block = false;
     }
 
     block_groups
         .into_iter()
         .flat_map(|group| build_blocks(&group))
         .collect()
+}
+
+fn is_standalone_list_marker(fragment: &StyledFragment) -> bool {
+    let text = fragment.text.trim();
+    !text.is_empty()
+        && text.chars().all(|c| matches!(c, '●' | '•' | '▪' | '◦'))
+        && fragment.bounding_box.width() <= 2
 }
 
 fn build_blocks(fragments: &[StyledFragment]) -> Vec<TranslatableBlock> {
