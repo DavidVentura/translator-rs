@@ -4,6 +4,10 @@ uniffi::setup_scaffolding!();
 pub mod api;
 pub mod bergamot;
 pub mod catalog;
+#[cfg(feature = "pdf")]
+pub mod font_metrics;
+#[cfg(feature = "pdf")]
+pub mod font_provider;
 pub mod language;
 pub mod language_detect;
 #[cfg(feature = "mucab")]
@@ -13,6 +17,8 @@ pub mod ocr;
 mod ocr_runtime;
 #[cfg(feature = "pdf")]
 pub mod pdf;
+#[cfg(feature = "pdf")]
+pub mod pdf_font_embed;
 #[cfg(feature = "pdf")]
 pub mod pdf_layout;
 #[cfg(feature = "pdf")]

@@ -159,7 +159,11 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
         for segment in &block.segments {
             let start = segment.start as usize;
             let end = segment.end as usize;
-            all_segment_texts.push(block.text[start..end].to_string());
+            // Marian treats '\n' as a hard sentence break, so soft line wraps
+            // inside a paragraph would translate line-per-line and lose
+            // cross-line context. Flatten to spaces — '\n' and ' ' are both
+            // 1 byte, so alignment offsets remain valid for style mapping.
+            all_segment_texts.push(block.text[start..end].replace('\n', " "));
             segment_refs.push(SegmentRef {
                 block_index,
                 segment: segment.clone(),

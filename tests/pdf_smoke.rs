@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use image::{ImageBuffer, Rgba, RgbaImage};
 
+use translator::font_provider::{FontHandle, FontProvider, FontRequest, NoFontProvider};
 use translator::pdf::{PageTransform, render_pages_for_layout};
 use translator::pdf_layout::{Backend, LayoutClass, LayoutRegion, build_session, detect_regions};
 use translator::pdf_text::extract_text;
@@ -279,7 +280,32 @@ fn smoke_translate_and_write_pdf() {
 
     assert!(total_blocks > 0, "no blocks were translated");
 
-    let out_pdf = write_translated_pdf(&pdf_bytes, &translations).expect("write_translated_pdf");
+    // Hard-coded host font path for the integration test. Real consumer apps
+    // (Android, native Linux) implement [`FontProvider`] via their own
+    // platform shim; this test stub stands in for that.
+    let dejavu_dir = PathBuf::from("/usr/share/fonts/truetype/dejavu");
+    let dejavu = |req: &FontRequest| -> Option<FontHandle> {
+        if !dejavu_dir.is_dir() {
+            return None;
+        }
+        let leaf = match (req.monospace, req.bold, req.italic) {
+            (true, true, true) => "DejaVuSansMono-BoldOblique.ttf",
+            (true, true, false) => "DejaVuSansMono-Bold.ttf",
+            (true, false, true) => "DejaVuSansMono-Oblique.ttf",
+            (true, false, false) => "DejaVuSansMono.ttf",
+            (false, true, true) => "DejaVuSans-BoldOblique.ttf",
+            (false, true, false) => "DejaVuSans-Bold.ttf",
+            (false, false, true) => "DejaVuSans-Oblique.ttf",
+            (false, false, false) => "DejaVuSans.ttf",
+        };
+        Some(FontHandle::from(dejavu_dir.join(leaf)))
+    };
+    // `dyn FontProvider` accepts the closure via the blanket impl in
+    // `crate::font_provider`.
+    let provider: &dyn FontProvider = &dejavu;
+    let _ = NoFontProvider;
+    let out_pdf =
+        write_translated_pdf(&pdf_bytes, &translations, provider).expect("write_translated_pdf");
     assert!(!out_pdf.is_empty());
     eprintln!("[pdf_smoke] translated pdf bytes: {}", out_pdf.len());
 

@@ -25,8 +25,54 @@ use crate::pdf::{PageDims, PdfError};
 use crate::pdf_translate::PageTranslationResult;
 use crate::styled::TranslatedStyledBlock;
 
-/// PDF resource name we register Helvetica under.
-const HELVETICA_RESOURCE_NAME: &[u8] = b"TrHelv";
+/// PDF resource names for our font variants. All eight are PDF standard-14
+/// base fonts, so no embedding is needed.
+const HELVETICA_REGULAR: &[u8] = b"TrHelv";
+const HELVETICA_BOLD: &[u8] = b"TrHelvB";
+const HELVETICA_OBLIQUE: &[u8] = b"TrHelvI";
+const HELVETICA_BOLD_OBLIQUE: &[u8] = b"TrHelvBI";
+const COURIER_REGULAR: &[u8] = b"TrCour";
+const COURIER_BOLD: &[u8] = b"TrCourB";
+const COURIER_OBLIQUE: &[u8] = b"TrCourI";
+const COURIER_BOLD_OBLIQUE: &[u8] = b"TrCourBI";
+
+/// Style sampled from the original Tjs that fell inside a removal rect.
+/// Used to pick a font variant, a fill color, a target font size, and a
+/// baseline anchor for the translation.
+#[derive(Debug, Clone, Copy, Default)]
+struct SampledBlockStyle {
+    bold: bool,
+    italic: bool,
+    monospace: bool,
+    /// Non-stroking fill colour as RGB in `[0, 1]`.
+    fill_rgb: (f32, f32, f32),
+    /// Median font size (in points) of the dropped Tjs, or `None` if no
+    /// Tjs were dropped for this rect.
+    font_size: Option<f32>,
+    /// User-space baseline-leading-edge anchor of the visually-top-left line
+    /// among the dropped Tjs. Used to place the first translated line at the
+    /// same baseline as the original.
+    anchor: Option<(f32, f32)>,
+    /// Number of distinct visual baselines across the dropped Tjs — i.e.
+    /// how many lines the original text actually occupied. More reliable
+    /// than deriving from bbox height.
+    original_line_count: usize,
+}
+
+impl SampledBlockStyle {
+    fn font_resource(&self) -> &'static [u8] {
+        match (self.monospace, self.bold, self.italic) {
+            (true, true, true) => COURIER_BOLD_OBLIQUE,
+            (true, true, false) => COURIER_BOLD,
+            (true, false, true) => COURIER_OBLIQUE,
+            (true, false, false) => COURIER_REGULAR,
+            (false, true, true) => HELVETICA_BOLD_OBLIQUE,
+            (false, true, false) => HELVETICA_BOLD,
+            (false, false, true) => HELVETICA_OBLIQUE,
+            (false, false, false) => HELVETICA_REGULAR,
+        }
+    }
+}
 
 /// Approximate average Helvetica glyph width as a fraction of font size.
 const HELVETICA_AVG_ADVANCE: f32 = 0.5;
@@ -78,14 +124,34 @@ impl std::error::Error for PdfWriteError {}
 
 /// Build a translated PDF by removing the original text from each page and
 /// appending the translated text in the same bbox positions.
+///
+/// `fonts` is consulted for non-Standard-14 scripts and for accurate wrap
+/// metrics. Pass [`crate::font_provider::NoFontProvider`] (or `&|_| None`) to
+/// keep the current Standard-14-only behavior.
 pub fn write_translated_pdf(
     original_pdf_bytes: &[u8],
     translations: &[PageTranslationResult],
+    fonts: &dyn crate::font_provider::FontProvider,
 ) -> Result<Vec<u8>, PdfWriteError> {
+    use crate::font_provider::{FontHandle, FontRequest};
+    type FontKey = (FontRequest, FontHandle);
+
     let mut doc = Document::load_mem(original_pdf_bytes)?;
 
     let pages: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().collect();
 
+    // ----- Pass 1: surgery + style sampling per page. We need styles before
+    // we can build font requests, so do all surgery first; defer overlays.
+    struct PageWork<'a> {
+        page_id: ObjectId,
+        translation: &'a PageTranslationResult,
+        removal_rects: Vec<UserRect>,
+        block_styles: Vec<SampledBlockStyle>,
+        final_ctm: Matrix,
+        geom: PageGeometry,
+    }
+
+    let mut works: Vec<PageWork> = Vec::new();
     for translation in translations {
         let Some((_, page_id)) = pages
             .iter()
@@ -96,26 +162,129 @@ pub fn write_translated_pdf(
                 translation.page_index
             )));
         };
-
         if translation.blocks.is_empty() {
             continue;
         }
-
         let geom = PageGeometry::read(&doc, *page_id, translation.page);
-        // mupdf bboxes are in display coords (post-`/Rotate`, top-left
-        // origin). Convert to PDF user space for the surgery pass.
         let removal_rects: Vec<UserRect> = translation
             .blocks
             .iter()
             .map(|b| user_rect_from_display(b.bounding_box, geom))
             .collect();
-
-        let final_ctm = rewrite_page_content(&mut doc, *page_id, &removal_rects)?;
-        ensure_helvetica_in_page_resources(&mut doc, *page_id)?;
-        let overlay_stream =
-            build_overlay_stream(&translation.blocks, &removal_rects, geom, final_ctm);
-        append_content_stream(&mut doc, *page_id, overlay_stream)?;
+        let (final_ctm, block_styles) =
+            rewrite_page_content(&mut doc, *page_id, &removal_rects, geom)?;
+        ensure_fonts_in_page_resources(&mut doc, *page_id)?;
+        works.push(PageWork {
+            page_id: *page_id,
+            translation,
+            removal_rects,
+            block_styles,
+            final_ctm,
+            geom,
+        });
     }
+
+    // ----- Pass 2: walk every block, group by (FontRequest, FontHandle) and
+    // accumulate the union of every char that font needs to render.
+    let mut union_text: std::collections::HashMap<FontKey, String> =
+        std::collections::HashMap::new();
+    for work in &works {
+        for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
+            let req = FontRequest {
+                language: work.translation.target_language.clone(),
+                bold: style.bold,
+                italic: style.italic,
+                monospace: style.monospace,
+            };
+            if let Some(handle) = fonts.locate(&req) {
+                union_text
+                    .entry((req, handle))
+                    .or_default()
+                    .push_str(&block.text);
+            }
+        }
+    }
+
+    // ----- Pass 3: parse each unique font once with its document-wide union
+    // text so the subset embedded later covers every page that uses it.
+    let mut metrics_cache: std::collections::HashMap<FontKey, crate::font_metrics::FontMetrics> =
+        std::collections::HashMap::new();
+    for (key, text) in &union_text {
+        let (_req, handle) = key;
+        match crate::font_metrics::FontMetrics::from_file_for_text(
+            &handle.path,
+            handle.ttc_index,
+            text,
+        ) {
+            Ok(m) => {
+                metrics_cache.insert(key.clone(), m);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[pdf_write] could not parse {} (ttc_index={}): {e}",
+                    handle.path.display(),
+                    handle.ttc_index,
+                );
+            }
+        }
+    }
+
+    // ----- Pass 4: embed each unique font once. Single subset per font is
+    // shared across every page that references it.
+    let mut embed_cache: std::collections::HashMap<FontKey, crate::pdf_font_embed::EmbeddedFont> =
+        std::collections::HashMap::new();
+    let mut next_slot = 0usize;
+    for (key, metrics) in &metrics_cache {
+        if let Some(e) = crate::pdf_font_embed::embed_font(&mut doc, metrics, next_slot) {
+            embed_cache.insert(key.clone(), e);
+            next_slot += 1;
+        }
+    }
+
+    // ----- Pass 5: per-page emit overlay using cached metrics + embeds.
+    let helvetica_fallback = crate::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+    let courier_fallback = crate::font_metrics::FontMetrics::approx(0.6);
+    for work in &works {
+        let mut block_metrics: Vec<crate::font_metrics::FontMetrics> =
+            Vec::with_capacity(work.translation.blocks.len());
+        let mut block_embeds: Vec<Option<crate::pdf_font_embed::EmbeddedFont>> =
+            Vec::with_capacity(work.translation.blocks.len());
+        for style in &work.block_styles {
+            let req = FontRequest {
+                language: work.translation.target_language.clone(),
+                bold: style.bold,
+                italic: style.italic,
+                monospace: style.monospace,
+            };
+            let key = fonts.locate(&req).map(|handle| (req, handle));
+            let metrics = key
+                .as_ref()
+                .and_then(|k| metrics_cache.get(k).cloned())
+                .unwrap_or_else(|| {
+                    if style.monospace {
+                        courier_fallback.clone()
+                    } else {
+                        helvetica_fallback.clone()
+                    }
+                });
+            let embed = key.as_ref().and_then(|k| embed_cache.get(k).cloned());
+            block_metrics.push(metrics);
+            block_embeds.push(embed);
+        }
+        attach_embedded_fonts_to_page(&mut doc, work.page_id, &block_embeds)?;
+        let overlay_stream = build_overlay_stream(
+            &work.translation.blocks,
+            &work.removal_rects,
+            &work.block_styles,
+            &block_metrics,
+            &block_embeds,
+            work.geom,
+            work.final_ctm,
+        );
+        append_content_stream(&mut doc, work.page_id, overlay_stream)?;
+    }
+
+    prune_unused_fonts(&mut doc)?;
 
     let mut out = Vec::new();
     doc.save_to(&mut out)?;
@@ -239,24 +408,232 @@ fn rewrite_page_content(
     doc: &mut Document,
     page_id: ObjectId,
     removal_rects: &[UserRect],
-) -> Result<Matrix, PdfWriteError> {
+    geom: PageGeometry,
+) -> Result<(Matrix, Vec<SampledBlockStyle>), PdfWriteError> {
     let content = doc.get_and_decode_page_content(page_id)?;
-    let (filtered, final_ctm) = filter_text_ops(content.operations, removal_rects);
+    let (filtered, final_ctm, raw_samples) = filter_text_ops(content.operations, removal_rects);
     let new_bytes = Content {
         operations: filtered,
     }
     .encode()?;
+    let block_styles = resolve_block_styles(doc, page_id, &raw_samples, geom);
     doc.change_page_content(page_id, new_bytes)?;
-    Ok(final_ctm)
+    Ok((final_ctm, block_styles))
+}
+
+/// For each removal rect, pick the dominant raw style sample (most common
+/// font + the median fill colour) and resolve its font resource to a
+/// `SampledBlockStyle` with bold/italic flags.
+fn resolve_block_styles(
+    doc: &Document,
+    page_id: ObjectId,
+    raw: &[Vec<RawStyleSample>],
+    geom: PageGeometry,
+) -> Vec<SampledBlockStyle> {
+    let fonts = doc.get_page_fonts(page_id).ok();
+    raw.iter()
+        .map(|samples| {
+            if samples.is_empty() {
+                return SampledBlockStyle::default();
+            }
+
+            // Dominant font resource = mode of font_resource values.
+            let mut font_counts: std::collections::HashMap<Vec<u8>, usize> =
+                std::collections::HashMap::new();
+            for sample in samples {
+                if let Some(name) = &sample.font_resource {
+                    *font_counts.entry(name.clone()).or_default() += 1;
+                }
+            }
+            let dominant_font = font_counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(name, _)| name);
+
+            // Mean fill color across samples.
+            let n = samples.len() as f32;
+            let mut r = 0.0f32;
+            let mut g = 0.0f32;
+            let mut b = 0.0f32;
+            for s in samples {
+                r += s.fill_rgb.0;
+                g += s.fill_rgb.1;
+                b += s.fill_rgb.2;
+            }
+            let fill_rgb = (r / n, g / n, b / n);
+
+            let flags = dominant_font.as_deref().and_then(|res_name| {
+                let fonts = fonts.as_ref()?;
+                let font_dict = fonts.get(res_name)?;
+                Some(font_flags(doc, font_dict))
+            });
+            let (bold, italic, monospace) = flags.unwrap_or_default();
+
+            // Median font size across the rect's samples. Median (not mean)
+            // is robust against the occasional outlier Tj that doesn't
+            // belong to the main run of text in this block.
+            let mut sizes: Vec<f32> = samples.iter().map(|s| s.font_size).collect();
+            sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let font_size = if sizes.is_empty() {
+                None
+            } else {
+                Some(sizes[sizes.len() / 2])
+            };
+
+            // Anchor = the visually top-left baseline among the sampled Tjs.
+            // We sort by visual y first (smallest visual_y = visually
+            // topmost line), then by visual x (leftmost on that line).
+            let anchor = samples
+                .iter()
+                .min_by(|a, b| {
+                    let (ax, ay) = visual_position(a.origin, geom);
+                    let (bx, by) = visual_position(b.origin, geom);
+                    ay.partial_cmp(&by)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal))
+                })
+                .map(|s| s.origin);
+
+            // Count distinct visual baselines — the actual original line
+            // count, derived from where Tjs landed rather than guessed
+            // from the bbox.
+            let mut visual_ys: Vec<f32> = samples
+                .iter()
+                .map(|s| visual_position(s.origin, geom).1)
+                .collect();
+            visual_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            visual_ys.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+            let original_line_count = visual_ys.len().max(1);
+
+            SampledBlockStyle {
+                bold,
+                italic,
+                monospace,
+                fill_rgb,
+                font_size,
+                anchor,
+                original_line_count,
+            }
+        })
+        .collect()
+}
+
+/// Map a PDF user-space point to a "visual" coordinate where smaller is
+/// more visually top-left. Used to pick the anchor among multiple Tjs.
+fn visual_position(user: (f32, f32), geom: PageGeometry) -> (f32, f32) {
+    // Forward mapping user → display (smaller display y/x = visually top/left).
+    //   R=0:    Dx=Ux,           Dy=H-Uy
+    //   R=90:   Dx=Uy,           Dy=Ux
+    //   R=180:  Dx=W-Ux,         Dy=Uy
+    //   R=270:  Dx=H-Uy,         Dy=W-Ux
+    match geom.rotate {
+        0 => (user.0, geom.user_h - user.1),
+        90 => (user.1, user.0),
+        180 => (geom.user_w - user.0, user.1),
+        270 => (geom.user_h - user.1, geom.user_w - user.0),
+        _ => (user.0, geom.user_h - user.1),
+    }
+}
+
+/// Detect (bold, italic, monospace) for a font.
+///
+/// Monospace is read from the FontDescriptor `/Flags` bit 1 (`FixedPitch`)
+/// when a descriptor is present; otherwise we fall back to name patterns
+/// (the PDF standard-14 Couriers don't ship a descriptor). Bold/italic come
+/// from the `/Flags` `ForceBold`/`Italic` bits when present, with name
+/// patterns as a fallback.
+fn font_flags(doc: &Document, font_dict: &Dictionary) -> (bool, bool, bool) {
+    let mut flags_int: Option<i64> = None;
+    if let Ok(descriptor_ref) = font_dict.get(b"FontDescriptor") {
+        let descriptor = match descriptor_ref {
+            Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            Object::Dictionary(d) => Some(d),
+            _ => None,
+        };
+        if let Some(d) = descriptor {
+            flags_int = d.get(b"Flags").ok().and_then(|o| o.as_i64().ok());
+        }
+    }
+
+    // Per PDF spec table 123:
+    //   bit 1  = FixedPitch (1 << 0)
+    //   bit 7  = Italic     (1 << 6)
+    //   bit 19 = ForceBold  (1 << 18)
+    let mut monospace = flags_int.map(|f| f & (1 << 0) != 0).unwrap_or(false);
+    let italic_flag = flags_int.map(|f| f & (1 << 6) != 0).unwrap_or(false);
+    let bold_flag = flags_int.map(|f| f & (1 << 18) != 0).unwrap_or(false);
+
+    let base_font = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .unwrap_or(b"");
+    let (name_bold, name_italic, name_monospace) = detect_from_name(base_font);
+
+    monospace = monospace || name_monospace;
+    let bold = bold_flag || name_bold;
+    let italic = italic_flag || name_italic;
+    (bold, italic, monospace)
+}
+
+/// Heuristic name-pattern detection for bold/italic/monospace, used as a
+/// fallback when the FontDescriptor flags aren't available (e.g. standard
+/// 14 fonts) or to catch producers that don't set the flags.
+fn detect_from_name(base_font: &[u8]) -> (bool, bool, bool) {
+    // Strip the optional 6-letter subset tag prefix (`AAAAAA+ArialMT`).
+    let name = match base_font.iter().position(|&b| b == b'+') {
+        Some(idx) if idx == 6 => &base_font[idx + 1..],
+        _ => base_font,
+    };
+    let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let lower_str = std::str::from_utf8(&lower).unwrap_or("");
+    let bold = ["bold", "heavy", "black", "semibold", "demibold"]
+        .iter()
+        .any(|kw| lower_str.contains(kw));
+    let italic = lower_str.contains("italic") || lower_str.contains("oblique");
+    let monospace = [
+        "courier",
+        "mono",
+        "consolas",
+        "menlo",
+        "monaco",
+        "inconsolata",
+        "sourcecodepro",
+        "firacode",
+        "jetbrainsmono",
+        "robotomono",
+        "hack",
+        "fixedsys",
+        "lucidaconsole",
+    ]
+    .iter()
+    .any(|kw| lower_str.contains(kw));
+    (bold, italic, monospace)
+}
+
+/// One observation of original-text style for a single removal rect.
+#[derive(Debug, Clone)]
+struct RawStyleSample {
+    font_resource: Option<Vec<u8>>,
+    fill_rgb: (f32, f32, f32),
+    font_size: f32,
+    /// User-space origin of the Tj — i.e. the baseline-leading-edge of the
+    /// original text, after CTM has been applied.
+    origin: (f32, f32),
 }
 
 /// Track text/graphics state across `ops` and drop any text-show op whose
-/// current origin lies inside a removal rect. Returns the filtered op list
-/// alongside the CTM still active after the (balanced) graphics-state stack
-/// has unwound — i.e. what the appended content stream will inherit.
-fn filter_text_ops(ops: Vec<Operation>, removal_rects: &[UserRect]) -> (Vec<Operation>, Matrix) {
+/// current origin lies inside a removal rect. Returns the filtered op list,
+/// the CTM still active after the (balanced) graphics-state stack has
+/// unwound, and per-rect samples of the dropped Tjs' font + fill colour so
+/// the appended translation can mimic the producer's style.
+fn filter_text_ops(
+    ops: Vec<Operation>,
+    removal_rects: &[UserRect],
+) -> (Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>) {
     let mut state = State::new();
     let mut out = Vec::with_capacity(ops.len());
+    let mut samples: Vec<Vec<RawStyleSample>> = vec![Vec::new(); removal_rects.len()];
 
     for op in ops {
         match op.operator.as_str() {
@@ -273,8 +650,41 @@ fn filter_text_ops(ops: Vec<Operation>, removal_rects: &[UserRect]) -> (Vec<Oper
             "ET" => state.end_text(),
             // Text state.
             "Tf" => {
+                if let Some(Object::Name(name)) = op.operands.first() {
+                    state.current.font_resource = Some(name.clone());
+                }
                 if let Some(size) = op.operands.get(1).and_then(object_as_f32) {
                     state.font_size = size;
+                }
+            }
+            // Non-stroking fill colour. We sample only the most common color
+            // spaces; rg/g/k cover ~all real PDFs.
+            "rg" => {
+                if let (Some(r), Some(g), Some(b)) = (
+                    op.operands.first().and_then(object_as_f32),
+                    op.operands.get(1).and_then(object_as_f32),
+                    op.operands.get(2).and_then(object_as_f32),
+                ) {
+                    state.current.fill_rgb = (r, g, b);
+                }
+            }
+            "g" => {
+                if let Some(v) = op.operands.first().and_then(object_as_f32) {
+                    state.current.fill_rgb = (v, v, v);
+                }
+            }
+            "k" => {
+                if let (Some(c), Some(m), Some(y), Some(k)) = (
+                    op.operands.first().and_then(object_as_f32),
+                    op.operands.get(1).and_then(object_as_f32),
+                    op.operands.get(2).and_then(object_as_f32),
+                    op.operands.get(3).and_then(object_as_f32),
+                ) {
+                    // Naive CMYK→RGB; good enough for catching black text.
+                    let r = (1.0 - c) * (1.0 - k);
+                    let g = (1.0 - m) * (1.0 - k);
+                    let b = (1.0 - y) * (1.0 - k);
+                    state.current.fill_rgb = (r, g, b);
                 }
             }
             "Tm" => {
@@ -316,7 +726,16 @@ fn filter_text_ops(ops: Vec<Operation>, removal_rects: &[UserRect]) -> (Vec<Oper
                 }
 
                 let origin = state.current_text_origin();
-                if removal_rects.iter().any(|r| r.contains(origin.0, origin.1)) {
+                if let Some(rect_index) = removal_rects
+                    .iter()
+                    .position(|r| r.contains(origin.0, origin.1))
+                {
+                    samples[rect_index].push(RawStyleSample {
+                        font_resource: state.current.font_resource.clone(),
+                        fill_rgb: state.current.fill_rgb,
+                        font_size: state.font_size,
+                        origin,
+                    });
                     // Drop the op; do not advance Tm by the string's width.
                     // Skipping that advance is safe because nothing downstream
                     // relies on the "post-show" cursor inside this BT/ET (PDF
@@ -329,7 +748,7 @@ fn filter_text_ops(ops: Vec<Operation>, removal_rects: &[UserRect]) -> (Vec<Oper
         out.push(op);
     }
 
-    (out, state.current.ctm)
+    (out, state.current.ctm, samples)
 }
 
 // ---------------------------------------------------------------------------
@@ -413,9 +832,23 @@ impl Matrix {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GraphicsState {
     ctm: Matrix,
+    /// Current non-stroking fill color in RGB (`[0, 1]`).
+    fill_rgb: (f32, f32, f32),
+    /// Current font resource name in the page's /Font dict (e.g. `b"F1"`).
+    font_resource: Option<Vec<u8>>,
+}
+
+impl Default for GraphicsState {
+    fn default() -> Self {
+        Self {
+            ctm: Matrix::identity(),
+            fill_rgb: (0.0, 0.0, 0.0),
+            font_resource: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -433,9 +866,7 @@ impl State {
     fn new() -> Self {
         Self {
             stack: Vec::new(),
-            current: GraphicsState {
-                ctm: Matrix::identity(),
-            },
+            current: GraphicsState::default(),
             in_text: false,
             text_matrix: Matrix::identity(),
             text_line_matrix: Matrix::identity(),
@@ -445,7 +876,7 @@ impl State {
     }
 
     fn push(&mut self) {
-        self.stack.push(self.current);
+        self.stack.push(self.current.clone());
     }
 
     fn pop(&mut self) {
@@ -514,17 +945,67 @@ fn matrix_from_operands(operands: &[Object]) -> Option<Matrix> {
 // Translated-text content stream.
 // ---------------------------------------------------------------------------
 
+/// Resolve a [`FontMetrics`] for each translated block. Blocks whose
+/// `(language, style)` map to the same font file share a parsed face — we
+/// memoise per-`FontRequest` and pre-resolve advances for the union of texts
+/// using that font, so the wrap loop is a hashmap lookup per character.
+///
+
+/// Add every [`EmbeddedFont`] used on a page to its `/Resources/Font` dict
+/// (deduplicated by resource name).
+fn attach_embedded_fonts_to_page(
+    doc: &mut Document,
+    page_id: ObjectId,
+    embeds: &[Option<crate::pdf_font_embed::EmbeddedFont>],
+) -> Result<(), PdfWriteError> {
+    let unique: std::collections::HashMap<Vec<u8>, ObjectId> = embeds
+        .iter()
+        .filter_map(|e| e.as_ref().map(|e| (e.resource_name.clone(), e.type0_id)))
+        .collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+    let resources_id = ensure_inline_resources(doc, page_id)?;
+    let resources = doc
+        .get_object_mut(resources_id)
+        .and_then(Object::as_dict_mut)?;
+    let font_dict = match resources.get_mut(b"Font") {
+        Ok(Object::Dictionary(d)) => d,
+        _ => {
+            resources.set("Font", Object::Dictionary(Dictionary::new()));
+            resources
+                .get_mut(b"Font")
+                .expect("just inserted")
+                .as_dict_mut()
+                .expect("just inserted as dict")
+        }
+    };
+    for (name, id) in unique {
+        font_dict.set(name, Object::Reference(id));
+    }
+    Ok(())
+}
+
 fn build_overlay_stream(
     blocks: &[TranslatedStyledBlock],
     user_rects: &[UserRect],
+    block_styles: &[SampledBlockStyle],
+    block_metrics: &[crate::font_metrics::FontMetrics],
+    block_embeds: &[Option<crate::pdf_font_embed::EmbeddedFont>],
     geom: PageGeometry,
     final_ctm: Matrix,
 ) -> Vec<u8> {
     let mut out = Vec::<u8>::new();
     out.extend_from_slice(b"q\n");
     let inv_ctm = final_ctm.inverse().unwrap_or_else(Matrix::identity);
-    for (block, user_rect) in blocks.iter().zip(user_rects.iter()) {
-        emit_block(&mut out, block, *user_rect, geom, &inv_ctm);
+    let fallback_metrics = crate::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+    for (i, (block, user_rect)) in blocks.iter().zip(user_rects.iter()).enumerate() {
+        let style = block_styles.get(i).copied().unwrap_or_default();
+        let metrics = block_metrics.get(i).unwrap_or(&fallback_metrics);
+        let embed = block_embeds.get(i).and_then(|e| e.as_ref());
+        emit_block(
+            &mut out, block, *user_rect, &style, metrics, embed, geom, &inv_ctm,
+        );
     }
     out.extend_from_slice(b"Q\n");
     out
@@ -538,6 +1019,9 @@ fn emit_block(
     out: &mut Vec<u8>,
     block: &TranslatedStyledBlock,
     user_rect: UserRect,
+    style: &SampledBlockStyle,
+    metrics: &crate::font_metrics::FontMetrics,
+    embed: Option<&crate::pdf_font_embed::EmbeddedFont>,
     geom: PageGeometry,
     inv_ctm: &Matrix,
 ) {
@@ -558,43 +1042,100 @@ fn emit_block(
         _ => (user_w, user_h),
     };
 
-    let initial_font_size = (vis_h * (1.0 - TEXT_BASELINE_PAD)).max(4.0);
-    let (font_size, lines) = wrap_to_fit(text, vis_w, vis_h, initial_font_size);
+    // Prefer the actual font size sampled from the original Tjs over
+    // deriving one from the bbox height: mupdf's ACCURATE_BBOXES clamps to
+    // glyph ink, so identically-sized text can report bbox heights varying
+    // by a few points per row. When we have a sampled size, trust it and
+    // only wrap by width — accepting slight vertical overflow if the
+    // translation needs more lines than the original.
+    let (font_size, lines) = match style.font_size {
+        Some(size) if size.is_finite() && size > 0.0 => {
+            fit_with_sampled_size(text, vis_w, vis_h, size, metrics, style.original_line_count)
+        }
+        _ => {
+            let initial = (vis_h * (1.0 - TEXT_BASELINE_PAD)).max(4.0);
+            wrap_to_fit(text, vis_w, vis_h, initial, metrics)
+        }
+    };
     let leading = font_size * LINE_HEIGHT_FACTOR;
-    let total_height = leading * lines.len() as f32;
-    let top_pad = ((vis_h - total_height).max(0.0)) * 0.5;
-    // Distance from visual top of block to baseline of first line.
-    let first_baseline_offset = top_pad + font_size;
 
-    // Visual top-left corner expressed in user space, plus the user-space
-    // direction vector for "next line down" (visually). Derived from the
-    // forward user→display rotation in `user_rect_from_display`.
-    let (visual_top_left_x, visual_top_left_y, line_dx, line_dy) = match geom.rotate {
-        0 => (user_rect.x0, user_rect.y1, 0.0, -1.0),
-        90 => (user_rect.x0, user_rect.y0, 1.0, 0.0),
-        180 => (user_rect.x1, user_rect.y0, 0.0, 1.0),
-        270 => (user_rect.x1, user_rect.y1, -1.0, 0.0),
-        _ => (user_rect.x0, user_rect.y1, 0.0, -1.0),
+    // User-space direction vector for "next line down" (visually). Derived
+    // from the forward user→display rotation in `user_rect_from_display`.
+    let (line_dx, line_dy) = match geom.rotate {
+        0 => (0.0, -1.0),
+        90 => (1.0, 0.0),
+        180 => (0.0, 1.0),
+        270 => (-1.0, 0.0),
+        _ => (0.0, -1.0),
     };
 
-    let _ = writeln!(out, "0 0 0 rg");
+    // Anchor the first baseline. Prefer the actual sampled origin from the
+    // original Tjs — that places translated text exactly on the producer's
+    // baseline, regardless of mupdf bbox quirks. Fall back to centering
+    // inside the bbox when no sample is available.
+    let (first_baseline_x, first_baseline_y) = match style.anchor {
+        Some((ax, ay)) => (ax, ay),
+        None => {
+            let total_height = leading * lines.len() as f32;
+            let top_pad = ((vis_h - total_height).max(0.0)) * 0.5;
+            let first_baseline_offset = top_pad + font_size;
+            let (top_x, top_y) = match geom.rotate {
+                0 => (user_rect.x0, user_rect.y1),
+                90 => (user_rect.x0, user_rect.y0),
+                180 => (user_rect.x1, user_rect.y0),
+                270 => (user_rect.x1, user_rect.y1),
+                _ => (user_rect.x0, user_rect.y1),
+            };
+            (
+                top_x + first_baseline_offset * line_dx,
+                top_y + first_baseline_offset * line_dy,
+            )
+        }
+    };
+
+    let _ = writeln!(
+        out,
+        "{:.3} {:.3} {:.3} rg",
+        style.fill_rgb.0, style.fill_rgb.1, style.fill_rgb.2
+    );
     out.extend_from_slice(b"BT\n");
+    let resource_name: &[u8] = match embed {
+        Some(e) => &e.resource_name,
+        None => style.font_resource(),
+    };
     let _ = writeln!(
         out,
         "/{} {:.2} Tf",
-        std::str::from_utf8(HELVETICA_RESOURCE_NAME).unwrap(),
+        std::str::from_utf8(resource_name).unwrap(),
         font_size
     );
 
     for (i, line) in lines.iter().enumerate() {
-        let off = first_baseline_offset + (i as f32) * leading;
-        let user_x = visual_top_left_x + off * line_dx;
-        let user_y = visual_top_left_y + off * line_dy;
+        let off = (i as f32) * leading;
+        let user_x = first_baseline_x + off * line_dx;
+        let user_y = first_baseline_y + off * line_dy;
         let (local_x, local_y) = inv_ctm.transform_point(user_x, user_y);
         let _ = writeln!(out, "1 0 0 1 {local_x:.2} {local_y:.2} Tm");
-        out.extend_from_slice(b"(");
-        write_pdf_string_body(out, line);
-        out.extend_from_slice(b") Tj\n");
+        if let Some(embedded) = embed {
+            // Type-0 / Identity-H: each glyph is a 16-bit CID. The subsetter
+            // compacts the GID space, so look up the original GID from the
+            // metrics, then translate it to the subset GID before emitting.
+            out.push(b'<');
+            for c in line.chars() {
+                let original = metrics.glyph_for(c).map(|g| g.gid).unwrap_or(0);
+                let gid = embedded
+                    .gid_remap
+                    .get(&original)
+                    .copied()
+                    .unwrap_or(original);
+                let _ = write!(out, "{:04X}", gid);
+            }
+            out.extend_from_slice(b"> Tj\n");
+        } else {
+            out.extend_from_slice(b"(");
+            write_pdf_string_body(out, line);
+            out.extend_from_slice(b") Tj\n");
+        }
     }
     out.extend_from_slice(b"ET\n\n");
 }
@@ -615,8 +1156,61 @@ fn write_pdf_string_body(out: &mut Vec<u8>, text: &str) {
     }
 }
 
-fn approx_text_width(text: &str, font_size: f32) -> f32 {
-    text.chars().count() as f32 * font_size * HELVETICA_AVG_ADVANCE
+/// Tolerated horizontal overhang past the bbox right edge before we shrink
+/// the font (covers the case where our 0.5em advance is mildly pessimistic
+/// against the real Helvetica metrics).
+const OVERHANG_TOLERANCE: f32 = 1.05;
+/// Floor for shrink-to-fit (fraction of the sampled size). Below this the
+/// text becomes unreadable so we accept overflow instead.
+const MIN_SHRINK_FRACTION: f32 = 0.7;
+
+/// Fit `text` inside (`vis_w`, `vis_h`) starting from the original sampled
+/// `font_size`. Distinguishes single-line from multi-line originals and
+/// chooses between width-shrink (single-line) and wrap-then-shrink
+/// (multi-line). Refuses to shrink below `MIN_SHRINK_FRACTION` of the
+/// sampled size — beyond that we'd produce unreadable output.
+fn fit_with_sampled_size(
+    text: &str,
+    vis_w: f32,
+    vis_h: f32,
+    sampled: f32,
+    metrics: &crate::font_metrics::FontMetrics,
+    original_lines: usize,
+) -> (f32, Vec<String>) {
+    let min_size = (sampled * MIN_SHRINK_FRACTION).max(4.0);
+
+    if original_lines <= 1 {
+        // Originally one line. Don't introduce wraps — keep one line and
+        // shrink the font if it'd overflow the bbox by more than tolerance.
+        let width_at_sampled = metrics.measure(text, sampled);
+        let allowed = vis_w * OVERHANG_TOLERANCE;
+        let final_size = if width_at_sampled <= allowed || width_at_sampled == 0.0 {
+            sampled
+        } else {
+            (sampled * vis_w / width_at_sampled).max(min_size)
+        };
+        (final_size, vec![text.to_string()])
+    } else {
+        // Originally multi-line. Wrap at the sampled size, and if the
+        // wrap produces more lines than the original used, shrink and
+        // re-wrap. Targeting the original line count is better than
+        // checking against `vis_h` because the producer's column width is
+        // what actually mattered: bbox height is just the union of glyph
+        // ink and may include slack at top/bottom.
+        let mut size = sampled;
+        let mut lines = wrap_lines(text, vis_w, size, metrics);
+        for _ in 0..6 {
+            if lines.len() <= original_lines || size <= min_size {
+                break;
+            }
+            size = (size * 0.9).max(min_size);
+            lines = wrap_lines(text, vis_w, size, metrics);
+        }
+        // Final safety: if even at min_size we'd still exceed the bbox
+        // height substantially, accept it — at least the text is readable.
+        let _ = vis_h;
+        (size, lines)
+    }
 }
 
 fn wrap_to_fit(
@@ -624,9 +1218,10 @@ fn wrap_to_fit(
     max_width: f32,
     max_height: f32,
     mut font_size: f32,
+    metrics: &crate::font_metrics::FontMetrics,
 ) -> (f32, Vec<String>) {
     for _ in 0..6 {
-        let lines = wrap_lines(text, max_width, font_size);
+        let lines = wrap_lines(text, max_width, font_size, metrics);
         let total_height = font_size * LINE_HEIGHT_FACTOR * lines.len() as f32;
         if total_height <= max_height || font_size <= 4.0 {
             return (font_size, lines);
@@ -634,10 +1229,15 @@ fn wrap_to_fit(
         font_size *= 0.85;
     }
     let final_size = font_size.max(4.0);
-    (final_size, wrap_lines(text, max_width, final_size))
+    (final_size, wrap_lines(text, max_width, final_size, metrics))
 }
 
-fn wrap_lines(text: &str, max_width: f32, font_size: f32) -> Vec<String> {
+fn wrap_lines(
+    text: &str,
+    max_width: f32,
+    font_size: f32,
+    metrics: &crate::font_metrics::FontMetrics,
+) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
@@ -646,7 +1246,7 @@ fn wrap_lines(text: &str, max_width: f32, font_size: f32) -> Vec<String> {
         } else {
             format!("{current} {word}")
         };
-        if approx_text_width(&candidate, font_size) <= max_width || current.is_empty() {
+        if metrics.measure(&candidate, font_size) <= max_width || current.is_empty() {
             current = candidate;
         } else {
             lines.push(current);
@@ -703,18 +1303,35 @@ fn unicode_to_winansi(c: char) -> u8 {
 // Resource and content-array housekeeping.
 // ---------------------------------------------------------------------------
 
-fn ensure_helvetica_in_page_resources(
+fn ensure_fonts_in_page_resources(
     doc: &mut Document,
     page_id: ObjectId,
 ) -> Result<(), PdfWriteError> {
-    let helv_id = doc.add_object({
-        let mut d = Dictionary::new();
-        d.set("Type", Object::Name(b"Font".to_vec()));
-        d.set("Subtype", Object::Name(b"Type1".to_vec()));
-        d.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
-        d.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
-        Object::Dictionary(d)
-    });
+    // Register Helvetica + Courier variants so we can mimic bold / italic /
+    // monospace styles sampled from the original. All eight are PDF
+    // standard-14 base fonts; no embedding needed.
+    let variants: [(&[u8], &[u8]); 8] = [
+        (HELVETICA_REGULAR, b"Helvetica"),
+        (HELVETICA_BOLD, b"Helvetica-Bold"),
+        (HELVETICA_OBLIQUE, b"Helvetica-Oblique"),
+        (HELVETICA_BOLD_OBLIQUE, b"Helvetica-BoldOblique"),
+        (COURIER_REGULAR, b"Courier"),
+        (COURIER_BOLD, b"Courier-Bold"),
+        (COURIER_OBLIQUE, b"Courier-Oblique"),
+        (COURIER_BOLD_OBLIQUE, b"Courier-BoldOblique"),
+    ];
+    let mut new_refs = Vec::with_capacity(variants.len());
+    for (resource_name, base_font) in variants {
+        let id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", Object::Name(b"Font".to_vec()));
+            d.set("Subtype", Object::Name(b"Type1".to_vec()));
+            d.set("BaseFont", Object::Name(base_font.to_vec()));
+            d.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
+            Object::Dictionary(d)
+        });
+        new_refs.push((resource_name, id));
+    }
 
     let resources_id = ensure_inline_resources(doc, page_id)?;
     let resources = doc
@@ -732,7 +1349,9 @@ fn ensure_helvetica_in_page_resources(
                 .expect("just inserted as dict")
         }
     };
-    font_dict.set(HELVETICA_RESOURCE_NAME, Object::Reference(helv_id));
+    for (resource_name, id) in new_refs {
+        font_dict.set(resource_name, Object::Reference(id));
+    }
     Ok(())
 }
 
@@ -758,6 +1377,68 @@ fn ensure_inline_resources(
     let page_mut = doc.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
     page_mut.set("Resources", Object::Reference(new_id));
     Ok(new_id)
+}
+
+/// Strip every `/Resources/Font` entry that no surviving `Tj`/`TJ`/`'`/`"`
+/// references, then garbage-collect orphaned font dicts and their embedded
+/// font streams. This is what reclaims the original PDF's font payload —
+/// surgery removed the *operators* that drew the original glyphs but left
+/// the font dictionaries reachable through the resources dict.
+fn prune_unused_fonts(doc: &mut Document) -> Result<(), PdfWriteError> {
+    let pages: Vec<ObjectId> = doc.get_pages().into_iter().map(|(_, id)| id).collect();
+    for page_id in pages {
+        let used = used_font_resource_names(doc, page_id)?;
+        let resources_id = ensure_inline_resources(doc, page_id)?;
+        let resources = doc
+            .get_object_mut(resources_id)
+            .and_then(Object::as_dict_mut)?;
+        let to_remove: Vec<Vec<u8>> = match resources.get(b"Font") {
+            Ok(Object::Dictionary(d)) => d
+                .iter()
+                .filter_map(|(k, _)| (!used.contains(k)).then(|| k.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if to_remove.is_empty() {
+            continue;
+        }
+        if let Ok(Object::Dictionary(font_dict)) = resources.get_mut(b"Font") {
+            for k in &to_remove {
+                font_dict.remove(k);
+            }
+        }
+    }
+    // Now that no /Resources/Font entry references them, the font dicts and
+    // their /FontFile streams are unreachable from /Root and prune_objects()
+    // collects them.
+    doc.prune_objects();
+    Ok(())
+}
+
+fn used_font_resource_names(
+    doc: &Document,
+    page_id: ObjectId,
+) -> Result<std::collections::HashSet<Vec<u8>>, PdfWriteError> {
+    let content = doc.get_and_decode_page_content(page_id)?;
+    let mut used = std::collections::HashSet::new();
+    let mut current: Option<Vec<u8>> = None;
+    for op in &content.operations {
+        match op.operator.as_str() {
+            "Tf" => {
+                if let Some(Object::Name(n)) = op.operands.first() {
+                    current = Some(n.clone());
+                }
+            }
+            // Any text-show operator counts the active font as used.
+            "Tj" | "TJ" | "'" | "\"" => {
+                if let Some(name) = &current {
+                    used.insert(name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(used)
 }
 
 fn append_content_stream(
@@ -819,11 +1500,12 @@ mod tests {
     #[test]
     fn wraps_long_text_into_multiple_lines() {
         let text = "the quick brown fox jumps over the lazy dog repeatedly";
-        let lines = wrap_lines(text, 60.0, 10.0);
+        let metrics = crate::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+        let lines = wrap_lines(text, 60.0, 10.0, &metrics);
         assert!(lines.len() > 1);
         for line in &lines {
             if line.contains(' ') {
-                let w = approx_text_width(line, 10.0);
+                let w = metrics.measure(line, 10.0);
                 assert!(w <= 60.0, "line too wide: {line:?} width {w}");
             }
         }
@@ -831,7 +1513,7 @@ mod tests {
 
     #[test]
     fn empty_translations_does_not_touch_pdf() {
-        let result = write_translated_pdf(b"", &[]);
+        let result = write_translated_pdf(b"", &[], &crate::font_provider::NoFontProvider);
         assert!(result.is_err());
     }
 
@@ -843,14 +1525,14 @@ mod tests {
             d.set("Type", Object::Name(b"Page".to_vec()));
             Object::Dictionary(d)
         });
-        ensure_helvetica_in_page_resources(&mut doc, page_id).unwrap();
+        ensure_fonts_in_page_resources(&mut doc, page_id).unwrap();
 
         let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
         let resources_ref = page.get(b"Resources").unwrap();
         let resources_id = resources_ref.as_reference().unwrap();
         let resources = doc.get_object(resources_id).unwrap().as_dict().unwrap();
         let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
-        let helv_ref = fonts.get(HELVETICA_RESOURCE_NAME).unwrap();
+        let helv_ref = fonts.get(HELVETICA_REGULAR).unwrap();
         let helv_id = helv_ref.as_reference().unwrap();
         let helv = doc.get_object(helv_id).unwrap().as_dict().unwrap();
         assert_eq!(
@@ -888,7 +1570,7 @@ mod tests {
             x1: 200.0,
             y1: 750.0,
         };
-        let (filtered, _) = filter_text_ops(ops.clone(), &[rect]);
+        let (filtered, _, _) = filter_text_ops(ops.clone(), &[rect]);
         // BT, Tf, Td, ET — the Tj should have been dropped.
         assert_eq!(filtered.len(), 4);
         assert!(filtered.iter().all(|o| o.operator != "Tj"));
@@ -913,8 +1595,41 @@ mod tests {
             x1: 50.0,
             y1: 50.0,
         };
-        let (filtered, _) = filter_text_ops(ops, &[rect]);
+        let (filtered, _, _) = filter_text_ops(ops, &[rect]);
         assert!(filtered.iter().any(|o| o.operator == "Tj"));
+    }
+
+    #[test]
+    fn detects_style_from_basefont_name() {
+        assert_eq!(detect_from_name(b"ArialMT"), (false, false, false));
+        assert_eq!(detect_from_name(b"Arial-BoldMT"), (true, false, false));
+        assert_eq!(detect_from_name(b"Arial-ItalicMT"), (false, true, false));
+        assert_eq!(detect_from_name(b"Arial-BoldItalicMT"), (true, true, false));
+        assert_eq!(detect_from_name(b"Helvetica"), (false, false, false));
+        assert_eq!(detect_from_name(b"Helvetica-Bold"), (true, false, false));
+        assert_eq!(detect_from_name(b"Helvetica-Oblique"), (false, true, false));
+        assert_eq!(
+            detect_from_name(b"Helvetica-BoldOblique"),
+            (true, true, false)
+        );
+        // Subset-tag prefix handling.
+        assert_eq!(
+            detect_from_name(b"AAAAAA+Helvetica-Bold"),
+            (true, false, false)
+        );
+        // Monospace detection.
+        assert_eq!(detect_from_name(b"Courier"), (false, false, true));
+        assert_eq!(detect_from_name(b"Courier-Bold"), (true, false, true));
+        assert_eq!(detect_from_name(b"Courier-BoldOblique"), (true, true, true));
+        assert_eq!(detect_from_name(b"Consolas"), (false, false, true));
+        assert_eq!(
+            detect_from_name(b"JetBrainsMono-Regular"),
+            (false, false, true)
+        );
+        assert_eq!(
+            detect_from_name(b"SourceCodePro-Regular"),
+            (false, false, true)
+        );
     }
 
     #[test]
