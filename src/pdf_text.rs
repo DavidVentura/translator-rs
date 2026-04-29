@@ -51,12 +51,23 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
     // the same handful of fonts.
     let mut italic_by_font: HashMap<String, bool> = HashMap::new();
 
+    // We bump `group_id` on every mupdf-block boundary AND on every
+    // opaqueness transition within a block. mupdf groups display equations
+    // with the surrounding paragraph (in this PDF, "...has the form" sits in
+    // the same block as the formula glyphs that follow); without splitting
+    // on the opaque flip, the whole thing becomes one TranslatableBlock —
+    // surgery erases the formula's bbox and the translated prose paints over
+    // it. Splitting on the flip gives the formula its own all-opaque block,
+    // which surgery and overlay both leave alone.
+    let mut group_id: u32 = 0;
+    let mut prev_block_index: Option<usize> = None;
+    let mut prev_opaque: Option<bool> = None;
+
     for (block_index, block) in stext
         .blocks()
         .filter(|b| matches!(b.r#type(), TextBlockType::Text))
         .enumerate()
     {
-        let translation_group = block_index as u32;
         for line in block.lines() {
             let line_rect = rect_from_mupdf(line.bounds());
 
@@ -108,6 +119,14 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                 }
             }
 
+            let block_changed = prev_block_index.is_some_and(|prev| prev != block_index);
+            let opaque_changed = prev_opaque.is_some_and(|prev| prev != opaque);
+            if block_changed || opaque_changed {
+                group_id += 1;
+            }
+            prev_block_index = Some(block_index);
+            prev_opaque = Some(opaque);
+
             for run in split_line_by_style(&typed_chars, line_rect) {
                 if run.text.trim().is_empty() {
                     continue;
@@ -117,8 +136,8 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                     bounding_box: run.bbox,
                     style: Some(run.style.into()),
                     layout_group: 0,
-                    translation_group,
-                    cluster_group: translation_group,
+                    translation_group: group_id,
+                    cluster_group: group_id,
                     opaque,
                 });
             }
@@ -248,10 +267,15 @@ fn finish_run(
 /// stable: variable letters land in `CMMI*`, operators/relations/binders
 /// in `CMSY*`, large delimiters in `CMEX*`, blackboard/script in `MSAM*`
 /// / `MSBM*`. Anything in a Roman / italic-text / typewriter / bold
-/// extended family is prose. We require a strong majority of math-font
-/// chars (≥70%) so an algorithmic line that mixes a few math letters with
-/// CMR keywords (`if`, `then`) doesn't trip this — those still go through
-/// the prose pipeline.
+/// extended family is prose.
+///
+/// A line counts as math when it has zero text-font chars (so even a
+/// single big-paren `(` from CMEX or a lone CMMI comma qualifies — mupdf
+/// emits these as their own one-char "lines" because they sit at
+/// different baselines than the surrounding glyphs), or when at least 3
+/// chars are present and ≥70% are math-class (so an algorithmic line
+/// that mixes a few math letters with CMR keywords like `if`/`then`
+/// stays in the prose pipeline).
 fn looks_like_display_math(chars: &[TypedChar]) -> bool {
     let mut math = 0usize;
     let mut text = 0usize;
@@ -265,6 +289,12 @@ fn looks_like_display_math(chars: &[TypedChar]) -> bool {
             text += 1;
         }
         // Unknown font families don't vote either way.
+    }
+    if math == 0 {
+        return false;
+    }
+    if text == 0 {
+        return true;
     }
     let counted = math + text;
     counted >= 3 && math * 10 >= counted * 7
