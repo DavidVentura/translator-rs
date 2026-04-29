@@ -70,6 +70,7 @@ pub struct TranslationSegment {
 struct TranslatableBlock {
     text: String,
     bounds: Rect,
+    source_rects: Vec<Rect>,
     style_spans: Vec<StyleSpan>,
     segments: Vec<TranslationSegment>,
 }
@@ -79,6 +80,7 @@ struct TranslatableBlock {
 pub struct TranslatedStyledBlock {
     pub text: String,
     pub bounding_box: Rect,
+    pub source_rects: Vec<Rect>,
     pub style_spans: Vec<StyleSpan>,
     pub background_argb: u32,
     pub foreground_argb: u32,
@@ -229,6 +231,7 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
             Ok(TranslatedStyledBlock {
                 text: translated_text,
                 bounding_box: source_block.bounds,
+                source_rects: source_block.source_rects.clone(),
                 style_spans,
                 background_argb: colors.background_argb,
                 foreground_argb: colors.foreground_argb,
@@ -263,6 +266,7 @@ fn identity_translated_blocks(
             Ok(TranslatedStyledBlock {
                 text: source_block.text.clone(),
                 bounding_box: source_block.bounds,
+                source_rects: source_block.source_rects.clone(),
                 style_spans: source_block.style_spans.clone(),
                 background_argb: colors.background_argb,
                 foreground_argb: colors.foreground_argb,
@@ -462,6 +466,7 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
     let mut text = String::new();
     let mut spans = Vec::new();
     let mut segments = Vec::new();
+    let mut source_rects = Vec::new();
     let mut bounds = lines
         .iter()
         .flatten()
@@ -470,6 +475,7 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
         .unwrap_or_default();
     for fragment in lines.iter().flatten() {
         bounds.union(fragment.bounding_box);
+        source_rects.push(fragment.bounding_box);
     }
     let mut current_trans_group = lines
         .iter()
@@ -519,6 +525,7 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
     TranslatableBlock {
         text,
         bounds,
+        source_rects,
         style_spans: spans,
         segments,
     }
@@ -1199,6 +1206,7 @@ mod tests {
         let source_block = TranslatableBlock {
             text: "blue".into(),
             bounds: Rect::default(),
+            source_rects: Vec::new(),
             style_spans: vec![StyleSpan {
                 start: 0,
                 end: 4,
@@ -1250,6 +1258,7 @@ mod tests {
         let source_block = TranslatableBlock {
             text: "thin dashed blue) and thick dashed blue)".into(),
             bounds: Rect::default(),
+            source_rects: Vec::new(),
             style_spans: vec![
                 StyleSpan {
                     start: 12,

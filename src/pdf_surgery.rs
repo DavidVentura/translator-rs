@@ -1,16 +1,16 @@
 //! Content-stream surgery: walk a page's operators and drop every text-show
-//! whose origin lies inside a translated-block bbox, sampling the dropped
+//! whose origin lies inside a translated source fragment, sampling the dropped
 //! Tjs' style/geometry on the way through so the writeback can mimic the
 //! producer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, ObjectId};
+use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::pdf_content::{
     ContentState, FontAdvanceMap, FontStyleFlags, Matrix, PageGeometry, UserRect, font_flags,
-    is_text_show_operator,
+    is_text_show_operator, matrix_from_operands,
 };
 use crate::pdf_write::{BlockGeometry, BlockTypography, PdfWriteError, SampledBlockStyle};
 
@@ -28,13 +28,19 @@ const DISTINCT_BASELINE_PT: f32 = 1.0;
 pub(crate) fn rewrite_page_content(
     doc: &mut Document,
     page_id: ObjectId,
-    removal_rects: &[UserRect],
+    removal_rects: &[Vec<UserRect>],
     geom: PageGeometry,
 ) -> Result<(Matrix, Vec<SampledBlockStyle>), PdfWriteError> {
     let content = doc.get_and_decode_page_content(page_id)?;
-    let font_advances = FontAdvanceMap::from_page(doc, page_id);
-    let (filtered, final_ctm, raw_samples) =
-        filter_text_ops(content.operations, removal_rects, &font_advances);
+    let resources = ResourceContext::from_page(doc, page_id);
+    let (filtered, final_ctm, raw_samples) = filter_text_ops(
+        doc,
+        content.operations,
+        removal_rects,
+        &resources,
+        ContentState::new(),
+        &mut HashSet::new(),
+    )?;
     let new_bytes = Content {
         operations: filtered,
     }
@@ -42,6 +48,60 @@ pub(crate) fn rewrite_page_content(
     let block_styles = resolve_block_styles(doc, page_id, &raw_samples, geom);
     doc.change_page_content(page_id, new_bytes)?;
     Ok((final_ctm, block_styles))
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResourceContext {
+    font_advances: FontAdvanceMap,
+    xobjects: HashMap<Vec<u8>, ObjectId>,
+}
+
+impl ResourceContext {
+    fn from_page(doc: &Document, page_id: ObjectId) -> Self {
+        let mut context = Self {
+            font_advances: FontAdvanceMap::from_page(doc, page_id),
+            xobjects: HashMap::new(),
+        };
+        if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
+            if let Some(resources) = resource_dict {
+                context.collect_xobjects(doc, resources);
+            }
+            for resource_id in resource_ids {
+                if let Ok(resources) = doc.get_dictionary(resource_id) {
+                    context.collect_xobjects(doc, resources);
+                }
+            }
+        }
+        context
+    }
+
+    fn from_resources(doc: &Document, resources: &Dictionary) -> Self {
+        let mut context = Self {
+            font_advances: FontAdvanceMap::from_resources(doc, resources),
+            xobjects: HashMap::new(),
+        };
+        context.collect_xobjects(doc, resources);
+        context
+    }
+
+    fn collect_xobjects(&mut self, doc: &Document, resources: &Dictionary) {
+        let xobjects = match resources.get(b"XObject") {
+            Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+            Ok(Object::Dictionary(dict)) => Some(dict),
+            _ => None,
+        };
+        let Some(xobjects) = xobjects else {
+            return;
+        };
+        for (name, value) in xobjects.iter() {
+            if self.xobjects.contains_key(name) {
+                continue;
+            }
+            if let Ok(id) = value.as_reference() {
+                self.xobjects.insert(name.clone(), id);
+            }
+        }
+    }
 }
 
 /// For each removal rect, pick the dominant raw style sample (most common
@@ -219,24 +279,39 @@ struct RawStyleSample {
 /// unwound, and per-rect samples of the dropped Tjs' font + fill colour so
 /// the appended translation can mimic the producer's style.
 fn filter_text_ops(
+    doc: &mut Document,
     ops: Vec<Operation>,
-    removal_rects: &[UserRect],
-    font_advances: &FontAdvanceMap,
-) -> (Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>) {
-    let mut state = ContentState::new();
+    removal_rects: &[Vec<UserRect>],
+    resources: &ResourceContext,
+    mut state: ContentState,
+    xobject_stack: &mut HashSet<ObjectId>,
+) -> Result<(Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>), PdfWriteError> {
     let mut out = Vec::with_capacity(ops.len());
     let mut samples: Vec<Vec<RawStyleSample>> = vec![Vec::new(); removal_rects.len()];
 
     for op in ops {
         if !is_text_show_operator(&op.operator) {
+            if op.operator == "Do" {
+                rewrite_form_xobject(
+                    doc,
+                    &op,
+                    &state,
+                    resources,
+                    removal_rects,
+                    &mut samples,
+                    xobject_stack,
+                )?;
+            }
             state.apply_non_show_op(&op);
             out.push(op);
             continue;
         }
-        let snapshot = state.process_text_show(&op, font_advances);
-        let dropped_rect = removal_rects
-            .iter()
-            .position(|r| r.contains(snapshot.origin.0, snapshot.origin.1));
+        let snapshot = state.process_text_show(&op, &resources.font_advances);
+        let dropped_rect = removal_rects.iter().position(|rects| {
+            rects
+                .iter()
+                .any(|r| text_show_touches_source_rect(snapshot, *r))
+        });
         let Some(rect_index) = dropped_rect else {
             out.push(op);
             continue;
@@ -270,13 +345,172 @@ fn filter_text_ops(
         // same BT/ET block see their true origin.
     }
 
-    (out, state.current_ctm(), samples)
+    Ok((out, state.current_ctm(), samples))
+}
+
+fn rewrite_form_xobject(
+    doc: &mut Document,
+    op: &Operation,
+    state: &ContentState,
+    resources: &ResourceContext,
+    removal_rects: &[Vec<UserRect>],
+    samples: &mut [Vec<RawStyleSample>],
+    xobject_stack: &mut HashSet<ObjectId>,
+) -> Result<(), PdfWriteError> {
+    let Some(Object::Name(name)) = op.operands.first() else {
+        return Ok(());
+    };
+    let Some(xobject_id) = resources.xobjects.get(name).copied() else {
+        return Ok(());
+    };
+    if !xobject_stack.insert(xobject_id) {
+        return Ok(());
+    }
+
+    let object = doc.get_object(xobject_id)?.clone();
+    let Object::Stream(mut stream) = object else {
+        xobject_stack.remove(&xobject_id);
+        return Ok(());
+    };
+    let is_form = stream
+        .dict
+        .get(b"Subtype")
+        .and_then(Object::as_name)
+        .is_ok_and(|subtype| subtype == b"Form");
+    if !is_form {
+        xobject_stack.remove(&xobject_id);
+        return Ok(());
+    }
+
+    let form_resources = form_resource_context(doc, &stream.dict);
+    let form_matrix = stream
+        .dict
+        .get(b"Matrix")
+        .ok()
+        .and_then(|obj| obj.as_array().ok())
+        .and_then(|arr| matrix_from_operands(arr))
+        .unwrap_or_else(Matrix::identity);
+    let form_state = ContentState::with_ctm(form_matrix.mul(state.current_ctm()));
+
+    let decoded = stream.decompressed_content()?;
+    let content = Content::decode(&decoded)?;
+    let (filtered, _, nested_samples) = filter_text_ops(
+        doc,
+        content.operations,
+        removal_rects,
+        &form_resources,
+        form_state,
+        xobject_stack,
+    )?;
+    for (dst, src) in samples.iter_mut().zip(nested_samples) {
+        dst.extend(src);
+    }
+    stream.set_plain_content(
+        Content {
+            operations: filtered,
+        }
+        .encode()?,
+    );
+    *doc.get_object_mut(xobject_id)? = Object::Stream(stream);
+    xobject_stack.remove(&xobject_id);
+    Ok(())
+}
+
+fn form_resource_context(doc: &Document, dict: &Dictionary) -> ResourceContext {
+    match dict.get(b"Resources") {
+        Ok(Object::Reference(id)) => doc
+            .get_dictionary(*id)
+            .map(|resources| ResourceContext::from_resources(doc, resources))
+            .unwrap_or_default(),
+        Ok(Object::Dictionary(resources)) => ResourceContext::from_resources(doc, resources),
+        _ => ResourceContext::default(),
+    }
+}
+
+fn text_show_touches_source_rect(
+    snapshot: crate::pdf_content::ShowSnapshot,
+    rect: UserRect,
+) -> bool {
+    if rect.contains(snapshot.origin.0, snapshot.origin.1) {
+        return true;
+    }
+    if snapshot.advance.abs() <= f32::EPSILON {
+        return false;
+    }
+    let start = snapshot.combined.transform_point(0.0, 0.0);
+    let end = snapshot.combined.transform_point(snapshot.advance, 0.0);
+    segment_intersects_rect(start, end, rect)
+}
+
+fn segment_intersects_rect(start: (f32, f32), end: (f32, f32), rect: UserRect) -> bool {
+    if rect.contains(start.0, start.1) || rect.contains(end.0, end.1) {
+        return true;
+    }
+    let edges = [
+        ((rect.x0, rect.y0), (rect.x1, rect.y0)),
+        ((rect.x1, rect.y0), (rect.x1, rect.y1)),
+        ((rect.x1, rect.y1), (rect.x0, rect.y1)),
+        ((rect.x0, rect.y1), (rect.x0, rect.y0)),
+    ];
+    edges
+        .iter()
+        .any(|(edge_start, edge_end)| segments_intersect(start, end, *edge_start, *edge_end))
+}
+
+fn segments_intersect(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> bool {
+    const EPS: f32 = 1e-4;
+    let d1 = cross(a0, a1, b0);
+    let d2 = cross(a0, a1, b1);
+    let d3 = cross(b0, b1, a0);
+    let d4 = cross(b0, b1, a1);
+
+    if d1.abs() <= EPS && point_on_segment(b0, a0, a1) {
+        return true;
+    }
+    if d2.abs() <= EPS && point_on_segment(b1, a0, a1) {
+        return true;
+    }
+    if d3.abs() <= EPS && point_on_segment(a0, b0, b1) {
+        return true;
+    }
+    if d4.abs() <= EPS && point_on_segment(a1, b0, b1) {
+        return true;
+    }
+
+    (d1 > 0.0) != (d2 > 0.0) && (d3 > 0.0) != (d4 > 0.0)
+}
+
+fn cross(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
+fn point_on_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> bool {
+    const EPS: f32 = 1e-4;
+    p.0 >= a.0.min(b.0) - EPS
+        && p.0 <= a.0.max(b.0) + EPS
+        && p.1 >= a.1.min(b.1) - EPS
+        && p.1 <= a.1.max(b.1) + EPS
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lopdf::Object;
+
+    fn run_filter(
+        ops: Vec<Operation>,
+        rects: &[Vec<UserRect>],
+    ) -> (Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>) {
+        filter_text_ops(
+            &mut Document::with_version("1.5"),
+            ops,
+            rects,
+            &ResourceContext::default(),
+            ContentState::new(),
+            &mut HashSet::new(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn matrix_mul_identity() {
@@ -306,7 +540,7 @@ mod tests {
             x1: 200.0,
             y1: 750.0,
         };
-        let (filtered, _, _) = filter_text_ops(ops.clone(), &[rect], &FontAdvanceMap::default());
+        let (filtered, _, _) = run_filter(ops.clone(), &[vec![rect]]);
         // BT, Tf, Td, ET — the Tj should have been dropped.
         assert_eq!(filtered.len(), 4);
         assert!(filtered.iter().all(|o| o.operator != "Tj"));
@@ -331,8 +565,34 @@ mod tests {
             x1: 50.0,
             y1: 50.0,
         };
-        let (filtered, _, _) = filter_text_ops(ops, &[rect], &FontAdvanceMap::default());
+        let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
         assert!(filtered.iter().any(|o| o.operator == "Tj"));
+    }
+
+    #[test]
+    fn filter_drops_text_show_when_baseline_crosses_rect() {
+        let ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Real(10.0)]),
+            Operation::new("Td", vec![Object::Real(100.0), Object::Real(700.0)]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(
+                    b"hello".to_vec(),
+                    lopdf::StringFormat::Literal,
+                )],
+            ),
+            Operation::new("ET", vec![]),
+        ];
+
+        let rect = UserRect {
+            x0: 110.0,
+            y0: 699.0,
+            x1: 115.0,
+            y1: 701.0,
+        };
+        let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
+        assert!(filtered.iter().all(|op| op.operator != "Tj"));
     }
 
     #[test]
@@ -355,12 +615,12 @@ mod tests {
             Operation::new("ET", vec![]),
         ];
         let rect = UserRect {
-            x0: 124.0,
+            x0: 127.0,
             y0: 690.0,
-            x1: 130.0,
+            x1: 129.0,
             y1: 710.0,
         };
-        let (filtered, _, _) = filter_text_ops(ops, &[rect], &FontAdvanceMap::default());
+        let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
         assert_eq!(filtered.iter().filter(|op| op.operator == "Tj").count(), 1);
     }
 }

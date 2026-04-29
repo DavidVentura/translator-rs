@@ -366,10 +366,44 @@ impl FontAdvanceMap {
         Self { by_resource }
     }
 
+    pub(crate) fn from_resources(doc: &Document, resources: &Dictionary) -> Self {
+        let mut by_resource = HashMap::new();
+        collect_font_advances_from_resources(doc, resources, &mut by_resource);
+        Self { by_resource }
+    }
+
     fn get(&self, name: Option<&Vec<u8>>) -> FontAdvance {
         name.and_then(|n| self.by_resource.get(n))
             .cloned()
             .unwrap_or_default()
+    }
+}
+
+fn collect_font_advances_from_resources(
+    doc: &Document,
+    resources: &Dictionary,
+    out: &mut HashMap<Vec<u8>, FontAdvance>,
+) {
+    let font_dict = match resources.get(b"Font") {
+        Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+        Ok(Object::Dictionary(dict)) => Some(dict),
+        _ => None,
+    };
+    let Some(font_dict) = font_dict else {
+        return;
+    };
+    for (name, value) in font_dict.iter() {
+        if out.contains_key(name) {
+            continue;
+        }
+        let font = match value {
+            Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            Object::Dictionary(dict) => Some(dict),
+            _ => None,
+        };
+        if let Some(font) = font {
+            out.insert(name.clone(), FontAdvance::from_font_dict(doc, font));
+        }
     }
 }
 
@@ -463,6 +497,12 @@ impl ContentState {
             horizontal_scaling: 1.0,
             text_leading: 0.0,
         }
+    }
+
+    pub(crate) fn with_ctm(ctm: Matrix) -> Self {
+        let mut state = Self::new();
+        state.current.ctm = ctm;
+        state
     }
 
     pub(crate) fn apply_non_show_op(&mut self, op: &Operation) {
@@ -594,11 +634,12 @@ impl ContentState {
         font_advances: &FontAdvanceMap,
     ) -> ShowSnapshot {
         self.prepare_text_show_op(op);
+        let advance = text_show_advance(op, self, font_advances);
         let snapshot = ShowSnapshot {
             origin: self.current_text_origin(),
             combined: self.combined_text_matrix(),
+            advance,
         };
-        let advance = text_show_advance(op, self, font_advances);
         self.advance_text(advance);
         snapshot
     }
@@ -639,6 +680,7 @@ impl ContentState {
 pub(crate) struct ShowSnapshot {
     pub origin: (f32, f32),
     pub combined: Matrix,
+    pub advance: f32,
 }
 
 pub(crate) fn is_text_show_operator(operator: &str) -> bool {

@@ -193,7 +193,7 @@ impl std::error::Error for PdfWriteError {}
 struct PageWork<'a> {
     page_id: ObjectId,
     translation: &'a PageTranslationResult,
-    removal_rects: Vec<UserRect>,
+    layout_rects: Vec<UserRect>,
     block_styles: Vec<SampledBlockStyle>,
     final_ctm: Matrix,
     geom: PageGeometry,
@@ -267,19 +267,35 @@ fn run_surgery<'a>(
             continue;
         }
         let geom = PageGeometry::read(doc, *page_id, Some(translation.page));
-        let removal_rects: Vec<UserRect> = translation
+        let layout_rects: Vec<UserRect> = translation
             .blocks
             .iter()
             .map(|b| geom.user_rect_from_display(b.bounding_box))
             .collect();
+        let removal_rects: Vec<Vec<UserRect>> = translation
+            .blocks
+            .iter()
+            .map(|b| {
+                let source_rects = if b.source_rects.is_empty() {
+                    std::slice::from_ref(&b.bounding_box)
+                } else {
+                    b.source_rects.as_slice()
+                };
+                source_rects
+                    .iter()
+                    .map(|rect| geom.user_rect_from_display(*rect))
+                    .collect()
+            })
+            .collect();
         let (final_ctm, block_styles) = rewrite_page_content(doc, *page_id, &removal_rects, geom)?;
-        prune_link_annotations(doc, *page_id, &removal_rects)?;
+        let flat_removal_rects = removal_rects.iter().flatten().copied().collect::<Vec<_>>();
+        prune_link_annotations(doc, *page_id, &flat_removal_rects)?;
         ensure_fonts_in_page_resources(doc, *page_id)?;
         modified_pages.insert(*page_id);
         works.push(PageWork {
             page_id: *page_id,
             translation,
-            removal_rects,
+            layout_rects,
             block_styles,
             final_ctm,
             geom,
@@ -422,7 +438,7 @@ fn emit_pages(
         attach_embedded_fonts_to_page(doc, work.page_id, &block_embeds)?;
         let overlay_stream = build_overlay_stream(
             &work.translation.blocks,
-            &work.removal_rects,
+            &work.layout_rects,
             &work.block_styles,
             &block_resources,
             work.geom,
