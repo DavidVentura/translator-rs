@@ -1,10 +1,7 @@
 //! Digital-PDF translation pipeline (extraction side).
 //!
-//! Renders pages to bitmaps for the DocLayout-YOLO ONNX model and exposes the
-//! geometric transform needed to map detection bboxes back to PDF user-space
-//! points.
-//!
-//! mupdf is the rasterizer; lopdf will own the editing/save side later.
+//! MuPDF provides the page geometry, text extraction, and optional debug
+//! rendering used by the PDF smoke tests.
 
 use mupdf::{Colorspace, Document, Error as MupdfError, Matrix};
 
@@ -14,11 +11,10 @@ pub struct PageDims {
     pub height_pts: f32,
 }
 
-/// Maps coordinates between the letterboxed model-input bitmap and the PDF
-/// page in user-space points.
+/// Maps coordinates between a letterboxed debug bitmap and the PDF page in
+/// points.
 ///
 /// Image axes: x→right, y→down, origin top-left.
-/// PDF axes:   x→right, y→up,   origin bottom-left.
 #[derive(Debug, Clone, Copy)]
 pub struct PageTransform {
     pub page: PageDims,
@@ -42,45 +38,6 @@ impl PageTransform {
             pad_y: (target - scaled_h) * 0.5,
         }
     }
-
-    /// PDF user-space rect (points, bottom-left origin) → image-space bbox
-    /// `(x0, y0, x1, y1)` in pixels (top-left origin), with `x0 ≤ x1, y0 ≤ y1`.
-    pub fn pdf_bbox_to_image(&self, rect: &PdfRectPts) -> (f32, f32, f32, f32) {
-        let x0 = rect.left * self.scale + self.pad_x;
-        let x1 = rect.right * self.scale + self.pad_x;
-        // PDF top is high y in points; image top is low y in pixels.
-        let img_y_top = (self.page.height_pts - rect.top) * self.scale + self.pad_y;
-        let img_y_bot = (self.page.height_pts - rect.bottom) * self.scale + self.pad_y;
-        (
-            x0.min(x1),
-            img_y_top.min(img_y_bot),
-            x0.max(x1),
-            img_y_top.max(img_y_bot),
-        )
-    }
-
-    /// Image-space bbox (pixels, top-left origin) → PDF user-space rect (points, bottom-left origin).
-    pub fn image_bbox_to_pdf(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> PdfRectPts {
-        let pdf_x0 = (x0 - self.pad_x) / self.scale;
-        let pdf_x1 = (x1 - self.pad_x) / self.scale;
-        let pdf_top_y = (y0 - self.pad_y) / self.scale;
-        let pdf_bot_y = (y1 - self.pad_y) / self.scale;
-        PdfRectPts {
-            left: pdf_x0.clamp(0.0, self.page.width_pts),
-            right: pdf_x1.clamp(0.0, self.page.width_pts),
-            top: (self.page.height_pts - pdf_top_y).clamp(0.0, self.page.height_pts),
-            bottom: (self.page.height_pts - pdf_bot_y).clamp(0.0, self.page.height_pts),
-        }
-    }
-}
-
-/// PDF user-space rectangle (points, bottom-left origin), with `top > bottom`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PdfRectPts {
-    pub left: f32,
-    pub right: f32,
-    pub top: f32,
-    pub bottom: f32,
 }
 
 #[derive(Debug)]
@@ -114,8 +71,8 @@ impl std::fmt::Display for PdfError {
 impl std::error::Error for PdfError {}
 
 /// Renders every page of `pdf_bytes` into a square `bitmap_size × bitmap_size`
-/// RGBA letterboxed bitmap suitable as DocLayout-YOLO input.
-pub fn render_pages_for_layout(
+/// RGBA letterboxed bitmap for diagnostics and smoke-test dumps.
+pub fn render_pages_for_debug(
     pdf_bytes: &[u8],
     bitmap_size: u32,
 ) -> Result<Vec<RenderedPage>, PdfError> {
@@ -124,12 +81,12 @@ pub fn render_pages_for_layout(
     let mut pages = Vec::with_capacity(page_count as usize);
     for i in 0..page_count {
         let page = document.load_page(i)?;
-        pages.push(render_page_for_layout(&page, bitmap_size)?);
+        pages.push(render_page_for_debug(&page, bitmap_size)?);
     }
     Ok(pages)
 }
 
-fn render_page_for_layout(page: &mupdf::Page, bitmap_size: u32) -> Result<RenderedPage, PdfError> {
+fn render_page_for_debug(page: &mupdf::Page, bitmap_size: u32) -> Result<RenderedPage, PdfError> {
     let bounds = page.bounds()?;
     let dims = PageDims {
         width_pts: bounds.x1 - bounds.x0,
@@ -189,7 +146,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transform_round_trip_corners() {
+    fn letterbox_portrait_pads_horizontally() {
         let t = PageTransform::new(
             PageDims {
                 width_pts: 612.0,
@@ -201,39 +158,6 @@ mod tests {
         // Page is taller than wide → fits to height; pad_x > 0, pad_y == 0.
         assert!(t.pad_y.abs() < 0.5);
         assert!(t.pad_x > 0.0);
-
-        // top-left of page in image → (pad_x, 0)
-        let r = t.image_bbox_to_pdf(t.pad_x, 0.0, t.pad_x + 1.0, 1.0);
-        assert!((r.left - 0.0).abs() < 0.01);
-        assert!((r.top - 792.0).abs() < 0.01);
-
-        // bottom-right of page in image → (pad_x + scaled_w, 1024)
-        let scaled_w = 612.0 * t.scale;
-        let r = t.image_bbox_to_pdf(t.pad_x + scaled_w - 1.0, 1023.0, t.pad_x + scaled_w, 1024.0);
-        assert!((r.right - 612.0).abs() < 0.05);
-        assert!((r.bottom - 0.0).abs() < 0.05);
-    }
-
-    #[test]
-    fn pdf_to_image_round_trips_image_to_pdf() {
-        let t = PageTransform::new(
-            PageDims {
-                width_pts: 612.0,
-                height_pts: 792.0,
-            },
-            1024,
-        );
-        // Coordinates strictly inside the rendered page region (avoiding the
-        // letterbox padding so the round-trip isn't clamped at the edge).
-        let pad_x = t.pad_x.ceil();
-        let scaled_w = 612.0 * t.scale;
-        let img = (pad_x + 50.0, 50.0, pad_x + scaled_w - 50.0, 600.0);
-        let pdf_rect = t.image_bbox_to_pdf(img.0, img.1, img.2, img.3);
-        let back = t.pdf_bbox_to_image(&pdf_rect);
-        assert!((back.0 - img.0).abs() < 0.05, "x0 {} vs {}", back.0, img.0);
-        assert!((back.1 - img.1).abs() < 0.05, "y0 {} vs {}", back.1, img.1);
-        assert!((back.2 - img.2).abs() < 0.05, "x1 {} vs {}", back.2, img.2);
-        assert!((back.3 - img.3).abs() < 0.05, "y1 {} vs {}", back.3, img.3);
     }
 
     #[test]

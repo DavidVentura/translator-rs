@@ -24,8 +24,6 @@ mod pdf_content;
 #[cfg(feature = "pdf")]
 pub mod pdf_font_embed;
 #[cfg(feature = "pdf")]
-pub mod pdf_layout;
-#[cfg(feature = "pdf")]
 mod pdf_overlay;
 #[cfg(feature = "pdf")]
 mod pdf_resources;

@@ -49,6 +49,13 @@ pub struct StyledFragment {
     pub layout_group: u32,
     pub translation_group: u32,
     pub cluster_group: u32,
+    /// Treat this fragment as a black box: don't translate, don't re-render,
+    /// don't erase the original glyphs. Used for display-math lines (LaTeX
+    /// formulas) where mupdf's per-char font analysis says the line is
+    /// drawn predominantly in CMSY/CMMI/CMEX. The original glyphs survive
+    /// in their original PDF font and position.
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
+    pub opaque: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +80,10 @@ struct TranslatableBlock {
     source_rects: Vec<Rect>,
     style_spans: Vec<StyleSpan>,
     segments: Vec<TranslationSegment>,
+    /// True iff every fragment in this block was tagged opaque. Set on
+    /// extraction for display-math blocks; carried through translation
+    /// untouched so the writer can leave the original glyphs intact.
+    opaque: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +95,11 @@ pub struct TranslatedStyledBlock {
     pub style_spans: Vec<StyleSpan>,
     pub background_argb: u32,
     pub foreground_argb: u32,
+    /// Display-math (or otherwise pass-through) block. The writer leaves
+    /// the original PDF glyphs alone — no overlay, no surgery rect — so
+    /// the original CMSY/CMMI/etc. typesetting survives verbatim.
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
+    pub opaque: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -158,6 +174,13 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
     let mut all_segment_texts = Vec::new();
     let mut segment_refs = Vec::new();
     for (block_index, block) in blocks.iter().enumerate() {
+        // Opaque blocks (display math) bypass bergamot — their text is the
+        // original, and we want it preserved exactly. They still carry
+        // through to `translated_blocks` so the writer knows to leave them
+        // alone instead of erasing the area.
+        if block.opaque {
+            continue;
+        }
         for segment in &block.segments {
             let start = segment.start as usize;
             let end = segment.end as usize;
@@ -193,6 +216,26 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
         .iter()
         .enumerate()
         .map(|(block_index, source_block)| {
+            if source_block.opaque {
+                let colors = resolve_block_colors(
+                    screenshot,
+                    source_block.bounds,
+                    source_block
+                        .style_spans
+                        .first()
+                        .and_then(|span| span.style.as_ref()),
+                    background_mode,
+                )?;
+                return Ok(TranslatedStyledBlock {
+                    text: source_block.text.clone(),
+                    bounding_box: source_block.bounds,
+                    source_rects: source_block.source_rects.clone(),
+                    style_spans: source_block.style_spans.clone(),
+                    background_argb: colors.background_argb,
+                    foreground_argb: colors.foreground_argb,
+                    opaque: true,
+                });
+            }
             let block_segment_results = translations
                 .iter()
                 .zip(segment_refs.iter())
@@ -235,6 +278,7 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
                 style_spans,
                 background_argb: colors.background_argb,
                 foreground_argb: colors.foreground_argb,
+                opaque: source_block.opaque,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -270,6 +314,7 @@ fn identity_translated_blocks(
                 style_spans: source_block.style_spans.clone(),
                 background_argb: colors.background_argb,
                 foreground_argb: colors.foreground_argb,
+                opaque: source_block.opaque,
             })
         })
         .collect()
@@ -540,6 +585,7 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
     }
 
     let text = normalize_pdf_math_sequences(&text);
+    let opaque = !lines.is_empty() && lines.iter().flatten().all(|f| f.opaque);
 
     TranslatableBlock {
         text,
@@ -547,6 +593,7 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
         source_rects,
         style_spans: spans,
         segments,
+        opaque,
     }
 }
 
@@ -957,6 +1004,7 @@ mod tests {
             layout_group: 0,
             translation_group: 0,
             cluster_group: 0,
+            opaque: false,
         }
     }
 
@@ -1004,6 +1052,7 @@ mod tests {
                 layout_group: 0,
                 translation_group: 0,
                 cluster_group: 0,
+                opaque: false,
             },
             StyledFragment {
                 text: "with a styled middle run".into(),
@@ -1017,6 +1066,7 @@ mod tests {
                 layout_group: 0,
                 translation_group: 0,
                 cluster_group: 0,
+                opaque: false,
             },
             StyledFragment {
                 text: "again on the next line".into(),
@@ -1030,6 +1080,7 @@ mod tests {
                 layout_group: 0,
                 translation_group: 0,
                 cluster_group: 0,
+                opaque: false,
             },
         ];
 
@@ -1261,6 +1312,7 @@ mod tests {
                 end: 4,
                 translation_group: 0,
             }],
+            opaque: false,
         };
         let segment = source_block.segments[0].clone();
 
@@ -1320,6 +1372,7 @@ mod tests {
                 end: 40,
                 translation_group: 0,
             }],
+            opaque: false,
         };
         let segment = source_block.segments[0].clone();
 

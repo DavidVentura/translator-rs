@@ -65,11 +65,16 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                 let Some(c) = ch.char() else {
                     continue;
                 };
-                let italic = ch
-                    .font()
+                let font = ch.font();
+                let font_name = font
+                    .as_ref()
+                    .map(|f| f.name().to_string())
+                    .unwrap_or_default();
+                let italic = font
+                    .as_ref()
                     .map(|f| {
                         *italic_by_font
-                            .entry(f.name().to_string())
+                            .entry(font_name.clone())
                             .or_insert_with(|| f.is_italic())
                     })
                     .unwrap_or(false);
@@ -81,15 +86,26 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                         italic,
                         fill_argb: ch.argb(),
                     },
+                    font_name,
                 });
             }
 
             if typed_chars.iter().all(|tc| tc.c.is_whitespace()) {
                 continue;
             }
-            let line_text: String = typed_chars.iter().map(|tc| tc.c).collect();
-            if should_skip_pdf_line(&line_text, line_rect, dims) {
-                continue;
+            // Primary opacity signal: lines drawn predominantly in
+            // math-class fonts (CMSY/CMMI/CMEX/...) are display equations
+            // from TeX producers — extract them so the layout knows they
+            // exist, but tag them opaque so translation/surgery/overlay
+            // all leave the originals alone. The text-based heuristic
+            // below is a fallback for non-TeX producers and edge cases;
+            // it still fully drops the line.
+            let opaque = looks_like_display_math(&typed_chars);
+            if !opaque {
+                let line_text: String = typed_chars.iter().map(|tc| tc.c).collect();
+                if should_skip_pdf_line(&line_text, line_rect, dims) {
+                    continue;
+                }
             }
 
             for run in split_line_by_style(&typed_chars, line_rect) {
@@ -103,6 +119,7 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                     layout_group: 0,
                     translation_group,
                     cluster_group: translation_group,
+                    opaque,
                 });
             }
         }
@@ -140,6 +157,10 @@ struct TypedChar {
     c: char,
     x: f32,
     style: PdfCharStyle,
+    /// mupdf-reported font name. We look at this to decide whether the line
+    /// is display math (drawn in a math-class font like CMSY/CMMI) versus
+    /// prose. Cheap to populate — we already have the font handle in scope.
+    font_name: String,
 }
 
 #[derive(Debug)]
@@ -222,6 +243,58 @@ fn finish_run(
     }
 }
 
+/// Lines drawn predominantly in a math-class font are LaTeX display
+/// equations or formula references. The TeX font naming convention is
+/// stable: variable letters land in `CMMI*`, operators/relations/binders
+/// in `CMSY*`, large delimiters in `CMEX*`, blackboard/script in `MSAM*`
+/// / `MSBM*`. Anything in a Roman / italic-text / typewriter / bold
+/// extended family is prose. We require a strong majority of math-font
+/// chars (≥70%) so an algorithmic line that mixes a few math letters with
+/// CMR keywords (`if`, `then`) doesn't trip this — those still go through
+/// the prose pipeline.
+fn looks_like_display_math(chars: &[TypedChar]) -> bool {
+    let mut math = 0usize;
+    let mut text = 0usize;
+    for tc in chars {
+        if tc.c.is_whitespace() {
+            continue;
+        }
+        if is_math_font(&tc.font_name) {
+            math += 1;
+        } else if is_text_font(&tc.font_name) {
+            text += 1;
+        }
+        // Unknown font families don't vote either way.
+    }
+    let counted = math + text;
+    counted >= 3 && math * 10 >= counted * 7
+}
+
+/// Strip the 6-char `XXXXXX+` subset prefix that TeX/PDF producers use
+/// for embedded font subsets (`AAAAAA+CMSY9` → `CMSY9`).
+fn font_stem(name: &str) -> &str {
+    name.rsplit_once('+').map(|(_, s)| s).unwrap_or(name)
+}
+
+fn is_math_font(name: &str) -> bool {
+    let stem = font_stem(name).to_ascii_uppercase();
+    [
+        "CMMI", "CMSY", "CMEX", "CMBSY", "CMMIB", "MSAM", "MSBM", "EUFM", "EUSM",
+    ]
+    .iter()
+    .any(|prefix| stem.starts_with(prefix))
+}
+
+fn is_text_font(name: &str) -> bool {
+    let stem = font_stem(name).to_ascii_uppercase();
+    [
+        "CMR", "CMTI", "CMSS", "CMTT", "CMBX", "CMSL", "CMU", "CMCSC", "CMITT", "CMFF", "CMFI",
+        "CMFIB", "CMVTT", "CMTEX",
+    ]
+    .iter()
+    .any(|prefix| stem.starts_with(prefix))
+}
+
 fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -242,25 +315,18 @@ fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {
 
     let words = trimmed.split_whitespace().count();
     let letters = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    // Operators-only — no `[`, `]`, `{`, `}`, `(`, `)`. Brackets/braces are
+    // routinely used in non-math contexts (citations like `[14, 18, 27]`,
+    // set notation, array indexing) and were tripping false positives. Real
+    // display math is caught upstream by the font-based detector
+    // (`looks_like_display_math`); this heuristic is just for non-TeX
+    // producers and edge cases.
     let symbols = trimmed
         .chars()
         .filter(|c| {
             matches!(
                 c,
-                '=' | '<'
-                    | '>'
-                    | '{'
-                    | '}'
-                    | '['
-                    | ']'
-                    | '∑'
-                    | 'Σ'
-                    | 'σ'
-                    | '≤'
-                    | '≥'
-                    | '→'
-                    | '←'
-                    | '↔'
+                '=' | '<' | '>' | '∑' | 'Σ' | 'σ' | '≤' | '≥' | '→' | '←' | '↔'
             )
         })
         .count();

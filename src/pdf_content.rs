@@ -253,10 +253,10 @@ impl FontAdvance {
         if subtype == b"Type0" {
             return Self::from_type0(doc, font);
         }
-        Self::from_simple_font(font)
+        Self::from_simple_font(doc, font)
     }
 
-    fn from_simple_font(font: &Dictionary) -> Self {
+    fn from_simple_font(doc: &Document, font: &Dictionary) -> Self {
         let first = font
             .get(b"FirstChar")
             .ok()
@@ -264,10 +264,12 @@ impl FontAdvance {
             .unwrap_or(0)
             .max(0) as u16;
         let mut widths = HashMap::new();
-        if let Ok(Object::Array(arr)) = font.get(b"Widths") {
-            for (i, width) in arr.iter().enumerate() {
-                if let Some(w) = object_as_f32(width) {
-                    widths.insert(first.saturating_add(i as u16), w);
+        if let Ok(widths_obj) = font.get(b"Widths") {
+            if let Some(arr) = resolve_array(doc, widths_obj) {
+                for (i, width) in arr.iter().enumerate() {
+                    if let Some(w) = object_as_f32(width) {
+                        widths.insert(first.saturating_add(i as u16), w);
+                    }
                 }
             }
         }
@@ -307,8 +309,10 @@ impl FontAdvance {
             default_width,
             widths: HashMap::new(),
         };
-        if let Ok(Object::Array(w_array)) = descendant.get(b"W") {
-            parse_cid_widths(w_array, &mut out.widths);
+        if let Ok(w_obj) = descendant.get(b"W") {
+            if let Some(w_array) = resolve_array(doc, w_obj) {
+                parse_cid_widths(w_array, &mut out.widths);
+            }
         }
         out
     }
@@ -665,6 +669,10 @@ impl ContentState {
         self.font_size
     }
 
+    pub(crate) fn horizontal_scaling(&self) -> f32 {
+        self.horizontal_scaling
+    }
+
     pub(crate) fn fill_rgb(&self) -> (f32, f32, f32) {
         self.current.fill_rgb
     }
@@ -727,6 +735,23 @@ fn text_show_advance(op: &Operation, state: &ContentState, font_advances: &FontA
     }
 
     text_advance * state.horizontal_scaling
+}
+
+/// Follow one level of indirection if `obj` is a `Reference`, returning a
+/// borrow of the resulting array. PDF font dictionaries routinely store
+/// `/Widths` as an indirect array (`/Widths 123 0 R`) — match-only-on-
+/// `Object::Array` callers would silently see them as missing.
+fn resolve_array<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a [Object]> {
+    match obj {
+        Object::Array(arr) => Some(arr.as_slice()),
+        Object::Reference(id) => doc
+            .get_object(*id)
+            .ok()?
+            .as_array()
+            .ok()
+            .map(|v| v.as_slice()),
+        _ => None,
+    }
 }
 
 pub(crate) fn object_as_f32(obj: &Object) -> Option<f32> {

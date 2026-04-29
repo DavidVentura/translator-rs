@@ -276,6 +276,13 @@ fn run_surgery<'a>(
             .blocks
             .iter()
             .map(|b| {
+                // Opaque blocks (display math) keep their original glyphs —
+                // surgery is told the block has no source rects, so the
+                // original Tjs survive untouched. The writer also skips
+                // overlay emission for these in `pdf_overlay::emit_block`.
+                if b.opaque {
+                    return Vec::new();
+                }
                 let source_rects = if b.source_rects.is_empty() {
                     std::slice::from_ref(&b.bounding_box)
                 } else {

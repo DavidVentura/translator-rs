@@ -384,9 +384,28 @@ fn filter_text_ops(
                 f: 0.0,
             },
         });
-        // Drop the op (don't push), keeping the cursor advance that
-        // process_text_show already applied so subsequent show ops in the
-        // same BT/ET block see their true origin.
+        // Drop the glyphs but emit a cursor-advance-only TJ in their place
+        // so subsequent text-show operators in the same BT/ET still draw at
+        // the correct x. Without this, dropping a Tj `(hello) Tj` removes
+        // both the glyphs and the cursor advance the next Tj relied on —
+        // and any *surviving* later Tj on the same line ends up at the
+        // wrong x.
+        //
+        // `[N] TJ` with a single number advances the text-matrix cursor by
+        // `-N * font_size * horizontal_scaling / 1000` user-space units
+        // and draws nothing. We solve for N from the dropped op's advance.
+        let font_size = state.font_size();
+        let scaling = state.horizontal_scaling();
+        if snapshot.advance.abs() > f32::EPSILON
+            && font_size.abs() > f32::EPSILON
+            && scaling.abs() > f32::EPSILON
+        {
+            let tj_units = -snapshot.advance * 1000.0 / (font_size * scaling);
+            out.push(Operation::new(
+                "TJ",
+                vec![Object::Array(vec![Object::Real(tj_units)])],
+            ));
+        }
     }
 
     Ok((out, state.current_ctm(), samples))
@@ -585,9 +604,30 @@ mod tests {
             y1: 750.0,
         };
         let (filtered, _, _) = run_filter(ops.clone(), &[vec![rect]]);
-        // BT, Tf, Td, ET — the Tj should have been dropped.
-        assert_eq!(filtered.len(), 4);
+        // The Tj is replaced by a glyphless `[N] TJ` that preserves the
+        // cursor advance for any subsequent text-show on the same line.
         assert!(filtered.iter().all(|o| o.operator != "Tj"));
+        let tj_advance = filtered
+            .iter()
+            .find(|o| o.operator == "TJ")
+            .expect("dropped Tj is replaced by an advance-only TJ");
+        let array = tj_advance
+            .operands
+            .first()
+            .and_then(|o| o.as_array().ok())
+            .expect("TJ has an array operand");
+        // Single negative number, no strings — the cursor moves but
+        // nothing is drawn.
+        assert_eq!(array.len(), 1);
+        let value = match &array[0] {
+            Object::Real(r) => Some(*r),
+            Object::Integer(i) => Some(*i as f32),
+            _ => None,
+        };
+        assert!(
+            value.is_some_and(|v| v < 0.0),
+            "advance-only TJ should be a single negative number"
+        );
     }
 
     #[test]

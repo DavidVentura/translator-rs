@@ -20,7 +20,7 @@ mucab = ["dep:mucab"]
 tesseract = ["dep:tesseract"]
 tts = ["dep:piper-rs"]
 transliterate = ["dep:icu", "dep:icu_experimental"]
-pdf = ["dep:mupdf", "dep:lopdf", "dep:ort", "dep:ndarray", "dep:image", "dep:ttf-parser", "dep:subsetter"]
+pdf = ["dep:mupdf", "dep:lopdf", "dep:ttf-parser", "dep:subsetter"]
 odt = ["dep:zip"]
 
 [dependencies]
@@ -38,9 +38,6 @@ icu_experimental = { version = "0.4", features = ["compiled_data"], optional = t
 icu = { version = "2.1", optional = true }
 mupdf = { path = "../mupdf-rs", optional = true, default-features = false }
 lopdf = { version = "0.40", optional = true, default-features = false }
-ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = ["load-dynamic", "ndarray"] }
-ndarray = { version = "0.16.1", optional = true }
-image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
 subsetter = { version = "0.2", optional = true }
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }

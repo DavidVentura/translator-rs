@@ -94,6 +94,11 @@ pub(crate) fn build_overlay_stream(
     builder.save_state();
     let inv_ctm = final_ctm.inverse().unwrap_or_else(Matrix::identity);
     for (i, (block, user_rect)) in blocks.iter().zip(user_rects.iter()).enumerate() {
+        // Opaque blocks (display math) keep their original glyphs — surgery
+        // didn't erase them and we don't draw an overlay over them either.
+        if block.opaque {
+            continue;
+        }
         let style = block_styles.get(i).cloned().unwrap_or_default();
         let Some(resources) = block_resources.get(i) else {
             continue;

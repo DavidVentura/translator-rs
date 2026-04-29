@@ -2416,8 +2416,6 @@ dependencies = [
  "lopdf",
  "mucab",
  "mupdf",
- "ndarray 0.16.1",
- "ort",
  "piper-rs",
  "regex 1.12.3",
  "serde",
