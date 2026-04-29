@@ -228,6 +228,18 @@ fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {
         return true;
     }
 
+    // Veto markers — these signal "this is code or prose with logic, not a
+    // display equation". A `;` terminator, a dotted identifier like
+    // `p.view`, or two-plus runs of 4+ alphabetic characters (real words
+    // like `then`, `votes`, `view`) all rule out the symbol/letter-density
+    // shortcuts below. Real display equations don't have any of these.
+    if trimmed.contains(';')
+        || has_dotted_identifier(trimmed)
+        || count_long_alpha_runs(trimmed, 4) >= 2
+    {
+        return false;
+    }
+
     let words = trimmed.split_whitespace().count();
     let letters = trimmed.chars().filter(|c| c.is_alphabetic()).count();
     let symbols = trimmed
@@ -253,9 +265,22 @@ fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {
         })
         .count();
     let underscores = trimmed.matches('_').count();
+    // Truly-centered display equations sit at page center *and* have
+    // roughly balanced left/right padding. Lines that are merely indented
+    // (algorithm bodies, code blocks) often sit in the central 40% of the
+    // page width but are anchored to the left margin — `is_centered` here
+    // rejects those by demanding both small center-offset AND symmetric
+    // padding. Without this, a 4-word indented body like
+    // `"vote ← Alg. 6.CreateVote(...)"` would trigger the skip below and
+    // disappear from the translated output.
     let centered = {
-        let center = (rect.left + rect.right) as f32 * 0.5;
-        (center - page.width_pts * 0.5).abs() < page.width_pts * 0.2
+        let line_center = (rect.left + rect.right) as f32 * 0.5;
+        let center_offset = (line_center - page.width_pts * 0.5).abs();
+        let left_pad = rect.left as f32;
+        let right_pad = (page.width_pts - rect.right as f32).max(0.0);
+        let pad_imbalance = (left_pad - right_pad).abs();
+        let avg_pad = (left_pad + right_pad) * 0.5;
+        center_offset < page.width_pts * 0.05 && (avg_pad <= 0.0 || pad_imbalance < avg_pad * 0.3)
     };
 
     // Display equations/code signatures in papers should stay verbatim. They
@@ -264,6 +289,47 @@ fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {
     (centered && symbols > 0 && words <= 8)
         || (symbols >= 2 && letters < 24)
         || (underscores >= 2 && words <= 8)
+}
+
+/// True if `text` contains a `<lower>+ . <lower>+` sequence — i.e. a field
+/// access like `p.view` or `local_tip.block`. Used to flag code-like lines
+/// before they hit the equation-skip heuristics.
+fn has_dotted_identifier(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    for i in 1..chars.len().saturating_sub(1) {
+        if chars[i] != '.' {
+            continue;
+        }
+        let prev_is_lower = chars[i - 1].is_ascii_lowercase();
+        let next_is_lower = chars[i + 1].is_ascii_lowercase();
+        if prev_is_lower && next_is_lower {
+            return true;
+        }
+    }
+    false
+}
+
+/// Count maximal runs of `min_len` or more consecutive alphabetic chars.
+/// `count_long_alpha_runs("if |votes[proposal id]| then", 4)` returns 3
+/// (`votes`, `proposal`, `then`). A real word in code or prose; equations
+/// rarely have any.
+fn count_long_alpha_runs(text: &str, min_len: usize) -> usize {
+    let mut count = 0;
+    let mut run = 0usize;
+    for c in text.chars() {
+        if c.is_alphabetic() {
+            run += 1;
+        } else {
+            if run >= min_len {
+                count += 1;
+            }
+            run = 0;
+        }
+    }
+    if run >= min_len {
+        count += 1;
+    }
+    count
 }
 
 /// mupdf::Rect (top-left origin, points, f32) → our Rect (top-left origin, u32).
