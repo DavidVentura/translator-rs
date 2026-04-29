@@ -8,6 +8,7 @@ use mupdf::{Document, Page, TextPageFlags};
 
 use crate::ocr::Rect;
 use crate::pdf::{PageDims, PdfError};
+use crate::pdf_content::FontStyleFlags;
 use crate::pdf_style_probe::{PageStyles, TjSample, probe_pages};
 use crate::styled::{StyledFragment, TextStyle};
 
@@ -24,6 +25,17 @@ const STEXT_FLAGS: TextPageFlags = TextPageFlags::from_bits_truncate(
         | TextPageFlags::DEHYPHENATE.bits()
         | TextPageFlags::ACCURATE_BBOXES.bits(),
 );
+
+/// Vertical slack (in PDF points) when associating Tj samples with a stext
+/// line. Wide enough to catch the baseline of an ascender-heavy line, narrow
+/// enough that adjacent lines (e.g. a 9pt heading just above a 12pt body)
+/// don't bleed their style into one another.
+const LINE_TJ_VERTICAL_TOLERANCE_PT: f32 = 2.0;
+
+/// Horizontal slack (in PDF points) when matching a char to the latest Tj at
+/// or before its display-x. Allows for sub-point rounding without spilling
+/// into the next Tj's run of glyphs.
+const TJ_X_MATCH_TOLERANCE_PT: f32 = 0.5;
 
 pub fn extract_text(pdf_bytes: &[u8]) -> Result<Vec<PageTextFragments>, PdfError> {
     let document = Document::from_bytes(pdf_bytes, "application/pdf")?;
@@ -144,7 +156,9 @@ fn split_line_by_style(
         .iter()
         .filter_map(|s| {
             let (dx, dy) = page_styles.to_display(s.origin);
-            if dy >= line_top - 2.0 && dy <= line_bottom + 2.0 {
+            if dy >= line_top - LINE_TJ_VERTICAL_TOLERANCE_PT
+                && dy <= line_bottom + LINE_TJ_VERTICAL_TOLERANCE_PT
+            {
                 Some((dx, s))
             } else {
                 None
@@ -159,24 +173,23 @@ fn split_line_by_style(
 
     // For each char, find the latest Tj whose display-x ≤ char's display-x.
     // That Tj's flags become the char's style.
-    fn flags_at(on_line: &[(f32, &TjSample)], x: f32) -> (bool, bool, bool) {
+    fn flags_at(on_line: &[(f32, &TjSample)], x: f32) -> FontStyleFlags {
         let mut last: Option<&TjSample> = None;
         for (sx, s) in on_line {
-            if *sx <= x + 0.5 {
+            if *sx <= x + TJ_X_MATCH_TOLERANCE_PT {
                 last = Some(*s);
             } else {
                 break;
             }
         }
-        let s = last.unwrap_or(on_line[0].1);
-        (s.bold, s.italic, s.monospace)
+        last.unwrap_or(on_line[0].1).flags
     }
 
     let mut runs: Vec<LineRun> = Vec::new();
     let mut run_text = String::new();
     let mut run_start_x: Option<f32> = None;
     let mut run_end_x: f32 = line_rect.left as f32;
-    let mut run_flags: Option<(bool, bool, bool)> = None;
+    let mut run_flags: Option<FontStyleFlags> = None;
 
     for (c, x) in chars {
         let flags = flags_at(&on_line, *x);
@@ -215,7 +228,7 @@ fn split_line_by_style(
 
 fn finish_run(
     text: &str,
-    flags: Option<(bool, bool, bool)>,
+    flags: Option<FontStyleFlags>,
     start_x: Option<f32>,
     end_x: f32,
     line_rect: Rect,
@@ -223,12 +236,12 @@ fn finish_run(
     // TextStyle has no `monospace` field — that gets re-derived from the
     // font name on the write side. Bold/italic are what survive translation
     // alignment.
-    let style = flags.map(|(bold, italic, _monospace)| TextStyle {
+    let style = flags.map(|f| TextStyle {
         text_color: None,
         bg_color: None,
         text_size: None,
-        bold,
-        italic,
+        bold: f.bold,
+        italic: f.italic,
         underline: false,
         strikethrough: false,
     });
