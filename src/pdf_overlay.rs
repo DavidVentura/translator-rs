@@ -579,22 +579,21 @@ fn fit_with_sampled_size(
     } else {
         // Originally multi-line. Wrap at the sampled size, and if the
         // wrap produces more lines than the original used, shrink and
-        // re-wrap. Targeting the original line count is better than
-        // checking against `vis_h` because the producer's column width is
-        // what actually mattered: bbox height is just the union of glyph
-        // ink and may include slack at top/bottom.
+        // re-wrap. Targeting the original line count is what actually
+        // matters: the original bbox height is just the union of glyph
+        // ink. Keep iterating until we fit or hit the absolute readability
+        // floor — a soft per-block fraction floor is too restrictive for
+        // dense pages where the substitute font (DejaVu) is wider than
+        // the producer's font (CMR/CMTI) and the sampled size already
+        // packs the column tight.
         let mut size = sampled;
         let mut lines = wrap_lines_to_widths(text, line_widths, size, metrics);
-        for _ in 0..FIT_RETRY_LIMIT {
-            if lines.len() <= original_lines || size <= min_size {
-                break;
-            }
-            size = (size * MULTILINE_SHRINK_FACTOR).max(min_size);
+        let absolute_min = MIN_FIT_FONT_SIZE_PT;
+        while lines.len() > original_lines && size > absolute_min {
+            size = (size * MULTILINE_SHRINK_FACTOR).max(absolute_min);
             lines = wrap_lines_to_widths(text, line_widths, size, metrics);
         }
-        // Final safety: if even at min_size we'd still exceed the bbox
-        // height substantially, accept it — at least the text is readable.
-        let _ = vis_h;
+        let _ = (vis_h, min_size);
         (size, lines)
     }
 }

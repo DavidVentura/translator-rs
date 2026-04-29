@@ -283,6 +283,38 @@ fn original_line_anchors(
     if current_y.is_some() {
         push_anchor(&mut anchors, best_origin);
     }
+
+    // Post-merge near-duplicate anchors. The greedy bucketing above compares
+    // each sample's vy against the bucket's *start* y, which means a tightly
+    // packed run of samples at vy = (start, start+T-ε, start+T+ε, …) splits
+    // at the second cell even when the latest accepted sample was within the
+    // threshold. In TeX papers that's how subscripts/superscripts orphan
+    // themselves into their own anchor (a subscript baseline 3pt below the
+    // main baseline misses the bucket, becomes its own anchor, and the
+    // overlay then renders two wrap-lines stacked on top of each other at
+    // ≈3pt apart). Walk the resulting anchors and merge any two whose
+    // y-gap is smaller than half the dominant inter-line gap — that floor
+    // catches sub/super orphans without collapsing genuine tight math
+    // line-spacing into one anchor.
+    if anchors.len() >= 3 {
+        let mut gaps: Vec<f32> = anchors
+            .windows(2)
+            .map(|w| (w[0].1 - w[1].1).abs())
+            .collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let typical_gap = gaps[gaps.len() * 3 / 4];
+        let merge_threshold = (typical_gap * 0.5).max(baseline_threshold);
+        let mut merged: Vec<(f32, f32)> = Vec::with_capacity(anchors.len());
+        merged.push(anchors[0]);
+        for next in anchors.iter().skip(1) {
+            let last = merged.last().copied().expect("merged seeded above");
+            if (last.1 - next.1).abs() < merge_threshold {
+                continue;
+            }
+            merged.push(*next);
+        }
+        anchors = merged;
+    }
     anchors
 }
 

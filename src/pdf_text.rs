@@ -45,24 +45,22 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
     };
 
     let stext = page.to_text_page(STEXT_FLAGS)?;
-    let mut fragments = Vec::new();
     // Cache italic lookups per font name. fz_font_name is stable per font and
     // calling fz_font_is_italic per char is wasteful when a paragraph reuses
     // the same handful of fonts.
     let mut italic_by_font: HashMap<String, bool> = HashMap::new();
 
-    // We bump `group_id` on every mupdf-block boundary AND on every
-    // opaqueness transition within a block. mupdf groups display equations
-    // with the surrounding paragraph (in this PDF, "...has the form" sits in
-    // the same block as the formula glyphs that follow); without splitting
-    // on the opaque flip, the whole thing becomes one TranslatableBlock —
-    // surgery erases the formula's bbox and the translated prose paints over
-    // it. Splitting on the flip gives the formula its own all-opaque block,
-    // which surgery and overlay both leave alone.
-    let mut group_id: u32 = 0;
-    let mut prev_block_index: Option<usize> = None;
-    let mut prev_opaque: Option<bool> = None;
-
+    // First pass: collect every non-empty line, with an upfront math-class
+    // classification per line. We cannot finalise the `opaque` flag yet —
+    // mupdf reports inline subscripts/superscripts (a single CMMI `i`, a big
+    // CMEX paren) as their own one-char "lines" because they sit at a
+    // different baseline than the surrounding glyphs, and a 1-char
+    // math-class line in isolation is just an inline glyph belonging to
+    // prose, not a display equation. So we defer the decision until we can
+    // see the whole sequence and only mark Weak math runs opaque when they
+    // sit inside a contiguous run that includes at least one Strong (≥3
+    // math-class chars) line — i.e. an actual display equation.
+    let mut pre_lines: Vec<PreLine> = Vec::new();
     for (block_index, block) in stext
         .blocks()
         .filter(|b| matches!(b.r#type(), TextBlockType::Text))
@@ -70,7 +68,6 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
     {
         for line in block.lines() {
             let line_rect = rect_from_mupdf(line.bounds());
-
             let mut typed_chars: Vec<TypedChar> = Vec::new();
             for ch in line.chars() {
                 let Some(c) = ch.char() else {
@@ -100,47 +97,67 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                     font_name,
                 });
             }
-
             if typed_chars.iter().all(|tc| tc.c.is_whitespace()) {
                 continue;
             }
-            // Primary opacity signal: lines drawn predominantly in
-            // math-class fonts (CMSY/CMMI/CMEX/...) are display equations
-            // from TeX producers — extract them so the layout knows they
-            // exist, but tag them opaque so translation/surgery/overlay
-            // all leave the originals alone. The text-based heuristic
-            // below is a fallback for non-TeX producers and edge cases;
-            // it still fully drops the line.
-            let opaque = looks_like_display_math(&typed_chars);
-            if !opaque {
-                let line_text: String = typed_chars.iter().map(|tc| tc.c).collect();
-                if should_skip_pdf_line(&line_text, line_rect, dims) {
-                    continue;
-                }
-            }
+            let math_kind = classify_math_line(&typed_chars);
+            pre_lines.push(PreLine {
+                block_index,
+                typed_chars,
+                line_rect,
+                math_kind,
+            });
+        }
+    }
 
-            let block_changed = prev_block_index.is_some_and(|prev| prev != block_index);
-            let opaque_changed = prev_opaque.is_some_and(|prev| prev != opaque);
-            if block_changed || opaque_changed {
-                group_id += 1;
-            }
-            prev_block_index = Some(block_index);
-            prev_opaque = Some(opaque);
+    // Second pass: walk pre_lines and mark a math-class line opaque iff its
+    // contiguous run of math-class lines (broken by Prose) contains at least
+    // one Strong line. This keeps lone subscripts (mupdf splits a `τ qc i +
+    // δ` paragraph into the prose body + a one-char `i` line + more prose)
+    // tied to the surrounding prose, while still tagging the multi-line
+    // display equation on page 7 (`Bk ←` + big-paren `(` + `bk, P(Bk−1)`
+    // + big-paren `)` + trailing `,`) as a single opaque run.
+    let opaque_flags = compute_opaque_flags(&pre_lines);
 
-            for run in split_line_by_style(&typed_chars, line_rect) {
-                if run.text.trim().is_empty() {
-                    continue;
-                }
-                fragments.push(StyledFragment {
-                    text: run.text,
-                    bounding_box: run.bbox,
-                    style: Some(run.style.into()),
-                    layout_group: 0,
-                    translation_group: group_id,
-                    cluster_group: group_id,
-                    opaque,
-                });
+    // Third pass: drop non-opaque lines that look like display math under the
+    // text-only heuristic (catch-all for non-TeX producers), then emit
+    // fragments. `group_id` bumps on every mupdf-block boundary AND on every
+    // opaqueness transition so opaque math gets its own TranslatableBlock —
+    // surgery and overlay both leave opaque blocks alone, while the prose
+    // around them is translated and rendered normally.
+    let mut fragments = Vec::new();
+    let mut group_id: u32 = 0;
+    let mut prev_block_index: Option<usize> = None;
+    let mut prev_opaque: Option<bool> = None;
+    for (i, pre) in pre_lines.iter().enumerate() {
+        let opaque = opaque_flags[i];
+        if !opaque {
+            let line_text: String = pre.typed_chars.iter().map(|tc| tc.c).collect();
+            if should_skip_pdf_line(&line_text, pre.line_rect, dims) {
+                continue;
             }
+        }
+        let block_changed = prev_block_index.is_some_and(|prev| prev != pre.block_index);
+        let opaque_changed = prev_opaque.is_some_and(|prev| prev != opaque);
+        if block_changed || opaque_changed {
+            group_id += 1;
+        }
+        prev_block_index = Some(pre.block_index);
+        prev_opaque = Some(opaque);
+
+        for run in split_line_by_style(&pre.typed_chars, pre.line_rect) {
+            if run.text.trim().is_empty() {
+                continue;
+            }
+            fragments.push(StyledFragment {
+                text: run.text,
+                bounding_box: run.bbox,
+                style: Some(run.style.into()),
+                layout_group: 0,
+                translation_group: group_id,
+                cluster_group: group_id,
+                opaque,
+            });
         }
     }
 
@@ -149,6 +166,81 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
         page: dims,
         fragments,
     })
+}
+
+struct PreLine {
+    block_index: usize,
+    typed_chars: Vec<TypedChar>,
+    line_rect: Rect,
+    math_kind: MathKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MathKind {
+    /// No math-class chars, or math is a minority alongside text-class
+    /// chars. Treated like prose for opaqueness.
+    Prose,
+    /// At least 3 chars and ≥70% math-class — a real display equation
+    /// fragment. Always opaque on its own.
+    Strong,
+    /// Math-class chars only (no text-class chars), but too few to be a
+    /// Strong line on its own. Could be a one-char inline subscript that
+    /// mupdf split out, or a big delimiter from CMEX that's part of a
+    /// larger display equation. Becomes opaque only when adjacent (within
+    /// a contiguous non-Prose run) to a Strong line.
+    Weak,
+}
+
+fn classify_math_line(chars: &[TypedChar]) -> MathKind {
+    let mut math = 0usize;
+    let mut text = 0usize;
+    for tc in chars {
+        if tc.c.is_whitespace() {
+            continue;
+        }
+        if is_math_font(&tc.font_name) {
+            math += 1;
+        } else if is_text_font(&tc.font_name) {
+            text += 1;
+        }
+        // Unknown font families don't vote either way.
+    }
+    if math == 0 {
+        return MathKind::Prose;
+    }
+    let counted = math + text;
+    if counted >= 3 && math * 10 >= counted * 7 {
+        return MathKind::Strong;
+    }
+    if text == 0 {
+        return MathKind::Weak;
+    }
+    MathKind::Prose
+}
+
+fn compute_opaque_flags(pre_lines: &[PreLine]) -> Vec<bool> {
+    let mut flags = vec![false; pre_lines.len()];
+    let mut i = 0;
+    while i < pre_lines.len() {
+        if matches!(pre_lines[i].math_kind, MathKind::Prose) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut has_strong = false;
+        while i < pre_lines.len() && !matches!(pre_lines[i].math_kind, MathKind::Prose) {
+            if matches!(pre_lines[i].math_kind, MathKind::Strong) {
+                has_strong = true;
+            }
+            i += 1;
+        }
+        if has_strong {
+            for j in start..i {
+                flags[j] = true;
+            }
+        }
+    }
+    flags
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,44 +352,6 @@ fn finish_run(
         style,
         bbox,
     }
-}
-
-/// Lines drawn predominantly in a math-class font are LaTeX display
-/// equations or formula references. The TeX font naming convention is
-/// stable: variable letters land in `CMMI*`, operators/relations/binders
-/// in `CMSY*`, large delimiters in `CMEX*`, blackboard/script in `MSAM*`
-/// / `MSBM*`. Anything in a Roman / italic-text / typewriter / bold
-/// extended family is prose.
-///
-/// A line counts as math when it has zero text-font chars (so even a
-/// single big-paren `(` from CMEX or a lone CMMI comma qualifies — mupdf
-/// emits these as their own one-char "lines" because they sit at
-/// different baselines than the surrounding glyphs), or when at least 3
-/// chars are present and ≥70% are math-class (so an algorithmic line
-/// that mixes a few math letters with CMR keywords like `if`/`then`
-/// stays in the prose pipeline).
-fn looks_like_display_math(chars: &[TypedChar]) -> bool {
-    let mut math = 0usize;
-    let mut text = 0usize;
-    for tc in chars {
-        if tc.c.is_whitespace() {
-            continue;
-        }
-        if is_math_font(&tc.font_name) {
-            math += 1;
-        } else if is_text_font(&tc.font_name) {
-            text += 1;
-        }
-        // Unknown font families don't vote either way.
-    }
-    if math == 0 {
-        return false;
-    }
-    if text == 0 {
-        return true;
-    }
-    let counted = math + text;
-    counted >= 3 && math * 10 >= counted * 7
 }
 
 /// Strip the 6-char `XXXXXX+` subset prefix that TeX/PDF producers use
