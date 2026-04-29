@@ -15,6 +15,8 @@ pub mod mucab;
 pub mod ocr;
 #[cfg(feature = "tesseract")]
 mod ocr_runtime;
+#[cfg(feature = "odt")]
+pub mod odt;
 #[cfg(feature = "pdf")]
 pub mod pdf;
 #[cfg(feature = "pdf")]
@@ -64,4 +66,5 @@ pub use settings::BackgroundMode;
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
 };
+pub use translate::{TokenAlignment, TranslationWithAlignment};
 pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};

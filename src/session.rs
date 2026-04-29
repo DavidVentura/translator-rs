@@ -13,6 +13,8 @@ use crate::catalog::{
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
 use crate::styled::{OverlayScreenshot, StructuredTranslationResult, StyledFragment};
+#[cfg(feature = "odt")]
+use crate::translate::TranslationWithAlignment;
 use crate::translate::Translator;
 
 #[cfg(feature = "dictionary")]
@@ -233,6 +235,19 @@ impl TranslatorSession {
             screenshot,
             background_mode,
         )
+    }
+
+    #[cfg(feature = "odt")]
+    pub(crate) fn translate_texts_with_alignment(
+        &self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+        texts: &[String],
+    ) -> Result<Option<Vec<TranslationWithAlignment>>, TranslatorError> {
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap)
+            .translate_texts_with_alignment(from_code, to_code, texts)
     }
 
     #[cfg(feature = "tesseract")]

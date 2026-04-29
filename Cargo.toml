@@ -21,6 +21,7 @@ tesseract = ["dep:tesseract"]
 tts = ["dep:piper-rs"]
 transliterate = ["dep:icu", "dep:icu_experimental"]
 pdf = ["dep:mupdf", "dep:lopdf", "dep:ort", "dep:ndarray", "dep:image", "dep:ttf-parser", "dep:subsetter"]
+odt = ["dep:zip"]
 
 [dependencies]
 bergamot-sys = { git = "https://github.com/DavidVentura/bergamot-sys" }
@@ -42,6 +43,7 @@ ndarray = { version = "0.16.1", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
 subsetter = { version = "0.2", optional = true }
+zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -56,6 +58,11 @@ required-features = ["tesseract"]
 name = "pdf_smoke"
 path = "tests/pdf_smoke.rs"
 required-features = ["pdf"]
+
+[[test]]
+name = "odt_smoke"
+path = "tests/odt_smoke.rs"
+required-features = ["odt"]
 
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }
