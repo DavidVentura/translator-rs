@@ -378,7 +378,24 @@ fn should_merge_same_line(
 
     let existing_text = joined_fragment_text(existing);
     let next_text = next.text.trim();
-    looks_like_prose(&existing_text) || looks_like_enumerated_prose_start(&existing_text, next_text)
+    if looks_like_prose(&existing_text) {
+        return true;
+    }
+    if looks_like_enumerated_prose_start(&existing_text, next_text) {
+        // Pure-digit markers ("4" or "12", no `.`/`)`/`(`) are ambiguous —
+        // they could be a numbered-list bullet OR an algorithm gutter column.
+        // Real list bullets sit one word-space from their content; algorithm
+        // gutters sit a tab-stop+ away. So: require a tight gap for digit-only
+        // markers, but keep the loose tolerance for unambiguous list markers
+        // like "1." or "1)".
+        let marker = existing_text.trim();
+        let pure_digit_marker = !marker.is_empty() && marker.chars().all(|c| c.is_ascii_digit());
+        if pure_digit_marker {
+            return horizontal_gap <= line_height;
+        }
+        return true;
+    }
+    false
 }
 
 fn should_merge_next_line(
@@ -522,6 +539,8 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
         });
     }
 
+    let text = normalize_pdf_math_sequences(&text);
+
     TranslatableBlock {
         text,
         bounds,
@@ -529,6 +548,15 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
         style_spans: spans,
         segments,
     }
+}
+
+fn normalize_pdf_math_sequences(text: &str) -> String {
+    // TeX PDFs often paint a relation and its negation slash as separate
+    // glyphs. MuPDF exposes the slash as U+0338; if we emit that directly,
+    // shaping attaches it to the previous letter instead of the relation.
+    text.replace("\u{0338}=", "≠")
+        .replace("\u{0338} =", "≠")
+        .replace("=\u{0338}", "≠")
 }
 
 fn line_plain_text(line: &[StyledFragment]) -> String {
@@ -1010,6 +1038,22 @@ mod tests {
         assert_eq!(
             blocks[0].text,
             "Hello world this is a wrapped paragraph with a styled middle run\nagain on the next line"
+        );
+    }
+
+    #[test]
+    fn normalizes_pdf_negated_equals_combining_mark() {
+        assert_eq!(
+            normalize_pdf_math_sequences("tc.high qc \u{0338}= ⊥"),
+            "tc.high qc ≠ ⊥"
+        );
+        assert_eq!(
+            normalize_pdf_math_sequences("tc.high qc \u{0338} = ⊥"),
+            "tc.high qc ≠ ⊥"
+        );
+        assert_eq!(
+            normalize_pdf_math_sequences("tc.high qc =\u{0338} ⊥"),
+            "tc.high qc ≠ ⊥"
         );
     }
 

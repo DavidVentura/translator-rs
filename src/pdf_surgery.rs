@@ -14,10 +14,12 @@ use crate::pdf_content::{
 };
 use crate::pdf_write::{BlockGeometry, BlockTypography, PdfWriteError, SampledBlockStyle};
 
-/// Minimum vertical separation (in PDF points) between two Tj samples for them
-/// to be treated as belonging to distinct lines when reconstructing original
-/// line anchors. Anything closer is the same baseline + sub-point jitter.
-const DISTINCT_BASELINE_PT: f32 = 1.0;
+/// Minimum vertical separation floor (in PDF points) between two Tj samples
+/// for them to be treated as belonging to distinct lines. The effective
+/// threshold scales with sampled font size so TeX superscripts/subscripts
+/// stay attached to their main text baseline.
+const DISTINCT_BASELINE_PT_FLOOR: f32 = 1.0;
+const DISTINCT_BASELINE_FONT_FRACTION: f32 = 0.55;
 
 /// Walk the page's decoded content stream, drop every text-show operator
 /// whose origin lies inside any of `removal_rects`, and write the result
@@ -216,6 +218,7 @@ fn resolve_block_styles(
 }
 
 fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<(f32, f32)> {
+    let baseline_threshold = distinct_baseline_threshold(samples);
     let mut positioned: Vec<(f32, f32, (f32, f32))> = samples
         .iter()
         .map(|s| {
@@ -234,7 +237,7 @@ fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<
     let mut best_x = f32::INFINITY;
     let mut best_origin = (0.0, 0.0);
     for (vy, vx, origin) in positioned {
-        if current_y.is_some_and(|y| (vy - y).abs() >= DISTINCT_BASELINE_PT) {
+        if current_y.is_some_and(|y| (vy - y).abs() >= baseline_threshold) {
             anchors.push(best_origin);
             current_y = Some(vy);
             best_x = vx;
@@ -253,6 +256,19 @@ fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<
         anchors.push(best_origin);
     }
     anchors
+}
+
+fn distinct_baseline_threshold(samples: &[RawStyleSample]) -> f32 {
+    let mut sizes: Vec<f32> = samples
+        .iter()
+        .map(|s| s.font_size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .collect();
+    if sizes.is_empty() {
+        return DISTINCT_BASELINE_PT_FLOOR;
+    }
+    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    (sizes[sizes.len() / 2] * DISTINCT_BASELINE_FONT_FRACTION).max(DISTINCT_BASELINE_PT_FLOOR)
 }
 
 /// One observation of original-text style for a single removal rect.
@@ -622,5 +638,40 @@ mod tests {
         };
         let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
         assert_eq!(filtered.iter().filter(|op| op.operator == "Tj").count(), 1);
+    }
+
+    #[test]
+    fn line_anchors_group_superscripts_with_main_baseline() {
+        let geom = PageGeometry {
+            user_w: 612.0,
+            user_h: 792.0,
+            rotate: 0,
+        };
+        let samples = vec![
+            RawStyleSample {
+                font_resource: None,
+                fill_rgb: (0.0, 0.0, 0.0),
+                font_size: 10.0,
+                origin: (282.0, 714.0),
+                text_orientation: Matrix::identity(),
+            },
+            RawStyleSample {
+                font_resource: None,
+                fill_rgb: (0.0, 0.0, 0.0),
+                font_size: 10.0,
+                origin: (72.0, 710.0),
+                text_orientation: Matrix::identity(),
+            },
+            RawStyleSample {
+                font_resource: None,
+                fill_rgb: (0.0, 0.0, 0.0),
+                font_size: 10.0,
+                origin: (72.0, 698.0),
+                text_orientation: Matrix::identity(),
+            },
+        ];
+
+        let anchors = original_line_anchors(&samples, geom);
+        assert_eq!(anchors, vec![(72.0, 710.0), (72.0, 698.0)]);
     }
 }

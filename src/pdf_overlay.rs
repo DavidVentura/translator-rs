@@ -623,23 +623,25 @@ fn wrap_lines_to_widths(
     metrics: &FontMetrics,
 ) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        let max_width = line_width_at(line_widths, lines.len());
-        if metrics.measure(&candidate, font_size) <= max_width || current.is_empty() {
-            current = candidate;
-        } else {
-            lines.push(current);
-            current = word.to_string();
+    for hard_line in text.split('\n') {
+        let mut current = String::new();
+        for word in hard_line.split_whitespace() {
+            let candidate = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current} {word}")
+            };
+            let max_width = line_width_at(line_widths, lines.len());
+            if metrics.measure(&candidate, font_size) <= max_width || current.is_empty() {
+                current = candidate;
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
         }
-    }
-    if !current.is_empty() {
-        lines.push(current);
+        if !current.is_empty() {
+            lines.push(current);
+        }
     }
     if lines.is_empty() {
         lines.push(String::new());
@@ -705,5 +707,13 @@ mod tests {
                 assert!(w <= 60.0, "line too wide: {line:?} width {w}");
             }
         }
+    }
+
+    #[test]
+    fn preserves_hard_line_breaks_when_wrapping() {
+        let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+        let lines =
+            wrap_lines_to_widths("alpha beta\ngamma delta", &[200.0, 200.0], 10.0, &metrics);
+        assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
     }
 }
