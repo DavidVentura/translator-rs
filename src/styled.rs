@@ -141,8 +141,8 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
 
     if source_code.as_str() == target_code {
         return Ok(StructuredTranslationResult {
-            blocks: Vec::new(),
-            nothing_reason: Some(NothingReason::AlreadyTargetLanguage),
+            blocks: identity_translated_blocks(&blocks, screenshot, background_mode)?,
+            nothing_reason: None,
             error_message: None,
         });
     }
@@ -243,6 +243,34 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
     })
 }
 
+fn identity_translated_blocks(
+    blocks: &[TranslatableBlock],
+    screenshot: Option<&OverlayScreenshot>,
+    background_mode: BackgroundMode,
+) -> Result<Vec<TranslatedStyledBlock>, String> {
+    blocks
+        .iter()
+        .map(|source_block| {
+            let colors = resolve_block_colors(
+                screenshot,
+                source_block.bounds,
+                source_block
+                    .style_spans
+                    .first()
+                    .and_then(|span| span.style.as_ref()),
+                background_mode,
+            )?;
+            Ok(TranslatedStyledBlock {
+                text: source_block.text.clone(),
+                bounding_box: source_block.bounds,
+                style_spans: source_block.style_spans.clone(),
+                background_argb: colors.background_argb,
+                foreground_argb: colors.foreground_argb,
+            })
+        })
+        .collect()
+}
+
 fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<TranslatableBlock> {
     if fragments.is_empty() {
         return Vec::new();
@@ -295,6 +323,7 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
                 }
                 if vertical_gap <= block_gap_threshold
                     && horizontal_overlap > 0
+                    && !starts_list_item_marker(&fragment.text)
                     && should_merge_next_line(&block_groups[i], bb, fragment, line_height)
                     && next_line_match.is_none()
                 {
@@ -394,6 +423,14 @@ fn looks_like_enumerated_prose_start(existing: &str, next: &str) -> bool {
         && next.chars().any(|c| c.is_alphabetic())
 }
 
+fn starts_list_item_marker(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    matches!(first, '-' | '–' | '—' | '•' | '∙' | '◦')
+}
+
 fn is_standalone_list_marker(fragment: &StyledFragment) -> bool {
     let text = fragment.text.trim();
     !text.is_empty()
@@ -459,19 +496,14 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
                 segment_start = text.len() as u32;
             }
             if fragment_index > 0
-                && !text.is_empty()
-                && !text.chars().last().is_some_and(char::is_whitespace)
+                && should_insert_space_between_fragments(&line[fragment_index - 1], fragment)
             {
                 text.push(' ');
             }
             let start = text.len() as u32;
             text.push_str(&fragment.text);
             if fragment.style.is_some() {
-                spans.push(StyleSpan {
-                    start,
-                    end: text.len() as u32,
-                    style: fragment.style.clone(),
-                });
+                spans.extend(style_spans_for_fragment(fragment, start));
             }
         }
     }
@@ -495,12 +527,80 @@ fn build_block_from_lines(lines: &[Vec<StyledFragment>]) -> TranslatableBlock {
 fn line_plain_text(line: &[StyledFragment]) -> String {
     let mut text = String::new();
     for (i, fragment) in line.iter().enumerate() {
-        if i > 0 && !text.chars().last().is_some_and(char::is_whitespace) {
+        if i > 0 && should_insert_space_between_fragments(&line[i - 1], fragment) {
             text.push(' ');
         }
         text.push_str(&fragment.text);
     }
     text
+}
+
+fn should_insert_space_between_fragments(left: &StyledFragment, right: &StyledFragment) -> bool {
+    if left.text.is_empty()
+        || right.text.is_empty()
+        || left.text.chars().last().is_some_and(char::is_whitespace)
+        || right.text.chars().next().is_some_and(char::is_whitespace)
+    {
+        return false;
+    }
+    if right
+        .text
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, ',' | '.' | ')' | ']' | '}' | ':' | ';' | '?' | '!'))
+    {
+        return false;
+    }
+
+    let gap = right
+        .bounding_box
+        .left
+        .saturating_sub(left.bounding_box.right);
+    gap > 1
+}
+
+fn style_spans_for_fragment(fragment: &StyledFragment, block_start: u32) -> Vec<StyleSpan> {
+    let Some(style) = &fragment.style else {
+        return Vec::new();
+    };
+    if style
+        .normalized_text_color()
+        .is_some_and(is_non_default_color)
+    {
+        let end = first_text_token_end(&fragment.text).unwrap_or(fragment.text.len());
+        return (end > 0)
+            .then(|| StyleSpan {
+                start: block_start,
+                end: block_start + end as u32,
+                style: Some(style.clone()),
+            })
+            .into_iter()
+            .collect();
+    }
+
+    vec![StyleSpan {
+        start: block_start,
+        end: block_start + fragment.text.len() as u32,
+        style: Some(style.clone()),
+    }]
+}
+
+fn is_non_default_color(argb: u32) -> bool {
+    (argb & 0x00FF_FFFF) != 0
+}
+
+fn first_text_token_end(text: &str) -> Option<usize> {
+    let mut saw_non_whitespace = false;
+    for (byte, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if saw_non_whitespace {
+                return Some(byte);
+            }
+        } else {
+            saw_non_whitespace = true;
+        }
+    }
+    saw_non_whitespace.then_some(text.len())
 }
 
 fn is_section_heading_line(line: &[StyledFragment]) -> bool {
@@ -642,7 +742,14 @@ fn map_styles_to_segmented_translation(
         target_offset += translated.len() as u32;
     }
 
-    merge_style_spans(result)
+    let translated_text = translated_segments
+        .iter()
+        .map(|(_, translated)| translated.as_str())
+        .collect::<String>();
+    merge_style_spans(expand_style_spans_to_word_boundaries(
+        result,
+        &translated_text,
+    ))
 }
 
 /// Build `char_idx -> byte_idx` lookup. `table[n]` is the byte offset of
@@ -651,6 +758,73 @@ fn char_to_byte_offsets(s: &str) -> Vec<usize> {
     let mut table: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
     table.push(s.len());
     table
+}
+
+fn expand_style_spans_to_word_boundaries(spans: Vec<StyleSpan>, text: &str) -> Vec<StyleSpan> {
+    spans
+        .into_iter()
+        .map(|mut span| {
+            let (start, end) =
+                expand_byte_range_to_first_word(text, span.start as usize, span.end as usize);
+            span.start = start as u32;
+            span.end = end as u32;
+            span
+        })
+        .filter(|span| span.start < span.end)
+        .collect()
+}
+
+fn expand_byte_range_to_first_word(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut word_byte = None;
+    for (byte, ch) in text.char_indices() {
+        let ch_end = byte + ch.len_utf8();
+        if ch_end <= start {
+            continue;
+        }
+        if byte >= end {
+            break;
+        }
+        if is_style_word_char(ch) {
+            word_byte = Some(byte);
+            break;
+        }
+    }
+
+    let Some(mut expanded_start) = word_byte else {
+        return (start.min(text.len()), end.min(text.len()));
+    };
+    let mut expanded_end = expanded_start
+        + text[expanded_start..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or_default();
+
+    while let Some((prev_start, prev)) = prev_char(text, expanded_start) {
+        if !is_style_word_char(prev) {
+            break;
+        }
+        expanded_start = prev_start;
+    }
+    while expanded_end < text.len() {
+        let Some(next) = text[expanded_end..].chars().next() else {
+            break;
+        };
+        if !is_style_word_char(next) {
+            break;
+        }
+        expanded_end += next.len_utf8();
+    }
+
+    (expanded_start, expanded_end)
+}
+
+fn prev_char(text: &str, index: usize) -> Option<(usize, char)> {
+    text.get(..index)?.char_indices().next_back()
+}
+
+fn is_style_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
 }
 
 fn merge_style_spans(mut spans: Vec<StyleSpan>) -> Vec<StyleSpan> {
@@ -766,7 +940,7 @@ fn lower_quartile_height(fragments: &[StyledFragment]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, StyledFragment, TextStyle, cluster_fragments_into_blocks};
+    use super::*;
 
     fn fragment(text: &str, left: u32, top: u32, right: u32, bottom: u32) -> StyledFragment {
         StyledFragment {
@@ -782,6 +956,27 @@ mod tests {
             translation_group: 0,
             cluster_group: 0,
         }
+    }
+
+    fn colored_fragment(
+        text: &str,
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+        color: u32,
+    ) -> StyledFragment {
+        let mut fragment = fragment(text, left, top, right, bottom);
+        fragment.style = Some(TextStyle {
+            text_color: Some(color),
+            bg_color: None,
+            text_size: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        });
+        fragment
     }
 
     #[test]
@@ -969,6 +1164,197 @@ mod tests {
         assert_eq!(
             blocks[0].text,
             "This paragraph is already wide enough to be prose\nshort continuation after a justified line break."
+        );
+    }
+
+    #[test]
+    fn list_item_marker_starts_new_vertical_block() {
+        let fragments = vec![
+            fragment("Components are defined as follows:", 72, 100, 340, 112),
+            fragment("- first item has prose", 90, 116, 260, 128),
+            fragment("continuation of first item", 108, 132, 300, 144),
+            fragment("- second item starts separately", 90, 148, 330, 160),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].text, "Components are defined as follows:");
+        assert_eq!(
+            blocks[1].text,
+            "- first item has prose\ncontinuation of first item"
+        );
+        assert_eq!(blocks[2].text, "- second item starts separately");
+    }
+
+    #[test]
+    fn adjacent_style_split_inside_word_does_not_insert_space() {
+        let fragments = vec![
+            fragment("blu", 10, 10, 28, 22),
+            colored_fragment("e", 28, 10, 34, 22, 0xFF00_00FF),
+            fragment(")", 34, 10, 38, 22),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "blue)");
+        assert_eq!(blocks[0].style_spans[0].start, 3);
+        assert_eq!(blocks[0].style_spans[0].end, 4);
+    }
+
+    #[test]
+    fn style_split_between_words_still_inserts_space() {
+        let fragments = vec![
+            fragment("thin dashed", 10, 10, 70, 22),
+            colored_fragment("blue", 76, 10, 100, 22, 0xFF00_00FF),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "thin dashed blue");
+        assert_eq!(blocks[0].style_spans[0].start, 12);
+        assert_eq!(blocks[0].style_spans[0].end, 16);
+    }
+
+    #[test]
+    fn drifted_color_fragment_only_styles_first_token() {
+        let fragments = vec![
+            fragment("thin dashed", 10, 10, 70, 22),
+            colored_fragment("blue) fo", 76, 10, 118, 22, 0xFF00_00FF),
+            fragment("r its own block", 118, 10, 190, 22),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "thin dashed blue) for its own block");
+        assert_eq!(blocks[0].style_spans[0].start, 12);
+        assert_eq!(blocks[0].style_spans[0].end, 17);
+    }
+
+    #[test]
+    fn mapped_style_span_expands_to_target_word_boundaries() {
+        let source_style = TextStyle {
+            text_color: Some(0xFF00_00FF),
+            bg_color: None,
+            text_size: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        };
+        let source_block = TranslatableBlock {
+            text: "blue".into(),
+            bounds: Rect::default(),
+            style_spans: vec![StyleSpan {
+                start: 0,
+                end: 4,
+                style: Some(source_style.clone()),
+            }],
+            segments: vec![TranslationSegment {
+                start: 0,
+                end: 4,
+                translation_group: 0,
+            }],
+        };
+        let segment = source_block.segments[0].clone();
+
+        let spans = map_styles_to_segmented_translation(
+            &source_block,
+            &[(
+                segment.clone(),
+                vec![TokenAlignment {
+                    src_begin: 3,
+                    src_end: 4,
+                    tgt_begin: 3,
+                    tgt_end: 4,
+                }],
+            )],
+            &[(segment, "azul)".into())],
+        );
+
+        assert_eq!(
+            spans,
+            vec![StyleSpan {
+                start: 0,
+                end: 4,
+                style: Some(source_style),
+            }]
+        );
+    }
+
+    #[test]
+    fn mapped_color_span_does_not_absorb_punctuation_or_next_word() {
+        let blue_style = TextStyle {
+            text_color: Some(0xFF00_00FF),
+            bg_color: None,
+            text_size: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        };
+        let source_block = TranslatableBlock {
+            text: "thin dashed blue) and thick dashed blue)".into(),
+            bounds: Rect::default(),
+            style_spans: vec![
+                StyleSpan {
+                    start: 12,
+                    end: 16,
+                    style: Some(blue_style.clone()),
+                },
+                StyleSpan {
+                    start: 35,
+                    end: 39,
+                    style: Some(blue_style.clone()),
+                },
+            ],
+            segments: vec![TranslationSegment {
+                start: 0,
+                end: 40,
+                translation_group: 0,
+            }],
+        };
+        let segment = source_block.segments[0].clone();
+
+        let spans = map_styles_to_segmented_translation(
+            &source_block,
+            &[(
+                segment.clone(),
+                vec![
+                    TokenAlignment {
+                        src_begin: 12,
+                        src_end: 16,
+                        tgt_begin: 12,
+                        tgt_end: 21,
+                    },
+                    TokenAlignment {
+                        src_begin: 35,
+                        src_end: 39,
+                        tgt_begin: 35,
+                        tgt_end: 39,
+                    },
+                ],
+            )],
+            &[(segment, "thin dashed blue) and thick dashed blue)".into())],
+        );
+
+        assert_eq!(
+            spans,
+            vec![
+                StyleSpan {
+                    start: 12,
+                    end: 16,
+                    style: Some(blue_style.clone()),
+                },
+                StyleSpan {
+                    start: 35,
+                    end: 39,
+                    style: Some(blue_style),
+                },
+            ]
         );
     }
 }

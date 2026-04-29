@@ -33,9 +33,11 @@ const STEXT_FLAGS: TextPageFlags = TextPageFlags::from_bits_truncate(
 const LINE_TJ_VERTICAL_TOLERANCE_PT: f32 = 2.0;
 
 /// Horizontal slack (in PDF points) when matching a char to the latest Tj at
-/// or before its display-x. Allows for sub-point rounding without spilling
-/// into the next Tj's run of glyphs.
-const TJ_X_MATCH_TOLERANCE_PT: f32 = 0.5;
+/// or before its display-x. MuPDF reports glyph origins at the glyph ink edge,
+/// while PDF text-show origins are baseline advances; coloured words with a
+/// left side bearing can otherwise start a few characters late.
+const TJ_X_MATCH_TOLERANCE_PT: f32 = 2.0;
+const TJ_INTERVAL_MATCH_SLACK_EM: f32 = 0.45;
 
 pub fn extract_text(pdf_bytes: &[u8]) -> Result<Vec<PageTextFragments>, PdfError> {
     let document = Document::from_bytes(pdf_bytes, "application/pdf")?;
@@ -88,6 +90,10 @@ fn extract_page(
             }
 
             if chars.iter().all(|(c, _)| c.is_whitespace()) {
+                continue;
+            }
+            let line_text: String = chars.iter().map(|(c, _)| *c).collect();
+            if should_skip_pdf_line(&line_text, line_rect, dims) {
                 continue;
             }
 
@@ -151,54 +157,82 @@ fn split_line_by_style(
     // another — a 9pt heading sitting just above a 12pt body line was
     // pulling its bold Tjs into the body and producing spurious mid-word
     // bold splits.
-    let mut on_line: Vec<(f32, &TjSample)> = page_styles
+    let mut on_line: Vec<LineTjSample<'_>> = page_styles
         .samples
         .iter()
         .filter_map(|s| {
             let (dx, dy) = page_styles.to_display(s.origin);
+            let (end_dx, end_dy) = page_styles.to_display(s.end_origin);
             if dy >= line_top - LINE_TJ_VERTICAL_TOLERANCE_PT
                 && dy <= line_bottom + LINE_TJ_VERTICAL_TOLERANCE_PT
+                || end_dy >= line_top - LINE_TJ_VERTICAL_TOLERANCE_PT
+                    && end_dy <= line_bottom + LINE_TJ_VERTICAL_TOLERANCE_PT
             {
-                Some((dx, s))
+                Some(LineTjSample {
+                    start_x: dx.min(end_dx),
+                    end_x: dx.max(end_dx),
+                    slack: (s.font_size * s.xy_scale.0 * TJ_INTERVAL_MATCH_SLACK_EM)
+                        .max(TJ_X_MATCH_TOLERANCE_PT),
+                    sample: s,
+                })
             } else {
                 None
             }
         })
         .collect();
-    on_line.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    on_line.sort_by(|a, b| {
+        a.start_x
+            .partial_cmp(&b.start_x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if on_line.is_empty() {
         return None;
     }
 
-    // For each char, find the latest Tj whose display-x ≤ char's display-x.
-    // That Tj's flags become the char's style.
-    fn flags_at(on_line: &[(f32, &TjSample)], x: f32) -> FontStyleFlags {
+    // Prefer the Tj/TJ run interval containing this char. Near boundaries,
+    // choose the latest run whose start is within slack so colour resets after
+    // short styled words win over the previous run. Fall back to latest-before
+    // for producers where our advance estimate is too rough.
+    fn style_at(on_line: &[LineTjSample<'_>], x: f32) -> PdfCharStyle {
         let mut last: Option<&TjSample> = None;
-        for (sx, s) in on_line {
-            if *sx <= x + TJ_X_MATCH_TOLERANCE_PT {
-                last = Some(*s);
+        let mut interval_match: Option<&TjSample> = None;
+        for entry in on_line {
+            if entry.start_x <= x + entry.slack && x <= entry.end_x + entry.slack {
+                interval_match = Some(entry.sample);
+            }
+            if entry.start_x <= x + TJ_X_MATCH_TOLERANCE_PT {
+                last = Some(entry.sample);
             } else {
                 break;
             }
         }
-        last.unwrap_or(on_line[0].1).flags
+        let sample = interval_match.or(last).unwrap_or(on_line[0].sample);
+        PdfCharStyle {
+            flags: sample.flags,
+            fill_argb: rgb_to_argb(sample.fill_rgb),
+        }
     }
 
     let mut runs: Vec<LineRun> = Vec::new();
     let mut run_text = String::new();
     let mut run_start_x: Option<f32> = None;
     let mut run_end_x: f32 = line_rect.left as f32;
-    let mut run_flags: Option<FontStyleFlags> = None;
+    let mut run_style: Option<PdfCharStyle> = None;
 
     for (c, x) in chars {
-        let flags = flags_at(&on_line, *x);
-        if Some(flags) != run_flags && !run_text.is_empty() {
+        let style = style_at(&on_line, *x);
+        if Some(style) != run_style && !run_text.is_empty() {
+            let end_x = if run_text.chars().last().is_some_and(char::is_whitespace) {
+                run_end_x
+            } else {
+                *x
+            };
             runs.push(finish_run(
                 &run_text,
-                run_flags,
+                run_style,
                 run_start_x,
-                run_end_x,
+                end_x,
                 line_rect,
             ));
             run_text.clear();
@@ -208,15 +242,15 @@ fn split_line_by_style(
             run_start_x = Some(*x);
         }
         run_end_x = run_end_x.max(*x);
-        run_flags = Some(flags);
+        run_style = Some(style);
         run_text.push(*c);
     }
     if !run_text.is_empty() {
         runs.push(finish_run(
             &run_text,
-            run_flags,
+            run_style,
             run_start_x,
-            run_end_x,
+            line_rect.right as f32,
             line_rect,
         ));
     }
@@ -226,22 +260,28 @@ fn split_line_by_style(
     Some(runs)
 }
 
+struct LineTjSample<'a> {
+    start_x: f32,
+    end_x: f32,
+    slack: f32,
+    sample: &'a TjSample,
+}
+
 fn finish_run(
     text: &str,
-    flags: Option<FontStyleFlags>,
+    pdf_style: Option<PdfCharStyle>,
     start_x: Option<f32>,
     end_x: f32,
     line_rect: Rect,
 ) -> LineRun {
     // TextStyle has no `monospace` field — that gets re-derived from the
-    // font name on the write side. Bold/italic are what survive translation
-    // alignment.
-    let style = flags.map(|f| TextStyle {
-        text_color: None,
+    // font name on the write side.
+    let style = pdf_style.map(|s| TextStyle {
+        text_color: Some(s.fill_argb),
         bg_color: None,
         text_size: None,
-        bold: f.bold,
-        italic: f.italic,
+        bold: s.flags.bold,
+        italic: s.flags.italic,
         underline: false,
         strikethrough: false,
     });
@@ -256,6 +296,61 @@ fn finish_run(
         style,
         bbox,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PdfCharStyle {
+    flags: FontStyleFlags,
+    fill_argb: u32,
+}
+
+fn rgb_to_argb(rgb: (f32, f32, f32)) -> u32 {
+    let channel = |v: f32| -> u32 { (v.clamp(0.0, 1.0) * 255.0).round() as u32 };
+    0xFF00_0000 | (channel(rgb.0) << 16) | (channel(rgb.1) << 8) | channel(rgb.2)
+}
+
+fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let words = trimmed.split_whitespace().count();
+    let letters = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    let symbols = trimmed
+        .chars()
+        .filter(|c| {
+            matches!(
+                c,
+                '=' | '<'
+                    | '>'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '∑'
+                    | 'Σ'
+                    | 'σ'
+                    | '≤'
+                    | '≥'
+                    | '→'
+                    | '←'
+                    | '↔'
+            )
+        })
+        .count();
+    let underscores = trimmed.matches('_').count();
+    let centered = {
+        let center = (rect.left + rect.right) as f32 * 0.5;
+        (center - page.width_pts * 0.5).abs() < page.width_pts * 0.2
+    };
+
+    // Display equations/code signatures in papers should stay verbatim. They
+    // are usually centered, symbol-heavy, or underscore-heavy, and contain
+    // little ordinary prose.
+    (centered && symbols > 0 && words <= 8)
+        || (symbols >= 2 && letters < 24)
+        || (underscores >= 2 && words <= 8)
 }
 
 /// mupdf::Rect (top-left origin, points, f32) → our Rect (top-left origin, u32).

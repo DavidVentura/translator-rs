@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
+use crate::pdf_content::{UserRect, object_as_f32};
 use crate::pdf_font_embed::EmbeddedFont;
 use crate::pdf_write::{
     COURIER_BOLD, COURIER_BOLD_OBLIQUE, COURIER_OBLIQUE, COURIER_REGULAR, HELVETICA_BOLD,
@@ -188,6 +189,113 @@ pub(crate) fn prune_unused_fonts(
     Ok(())
 }
 
+/// Remove link annotations whose clickable rectangle belongs to text we
+/// surgically replaced. Without this, PDF viewers can keep drawing/storing
+/// stale link rectangles at the original source-text positions.
+pub(crate) fn prune_link_annotations(
+    doc: &mut Document,
+    page_id: ObjectId,
+    removal_rects: &[UserRect],
+) -> Result<(), PdfWriteError> {
+    if removal_rects.is_empty() {
+        return Ok(());
+    }
+
+    let annots = doc
+        .get_object(page_id)
+        .and_then(Object::as_dict)?
+        .get(b"Annots")
+        .ok()
+        .cloned();
+    let Some(annots) = annots else {
+        return Ok(());
+    };
+
+    match annots {
+        Object::Array(items) => {
+            let filtered = filter_annotations(doc, items, removal_rects);
+            let page = doc.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
+            if filtered.is_empty() {
+                page.remove(b"Annots");
+            } else {
+                page.set("Annots", Object::Array(filtered));
+            }
+        }
+        Object::Reference(annots_id) => {
+            let Ok(items) = doc.get_object(annots_id).and_then(Object::as_array) else {
+                return Ok(());
+            };
+            let filtered = filter_annotations(doc, items.clone(), removal_rects);
+            *doc.get_object_mut(annots_id)? = Object::Array(filtered);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn filter_annotations(
+    doc: &Document,
+    items: Vec<Object>,
+    removal_rects: &[UserRect],
+) -> Vec<Object> {
+    items
+        .into_iter()
+        .filter(|item| !should_prune_annotation(doc, item, removal_rects))
+        .collect()
+}
+
+fn should_prune_annotation(doc: &Document, item: &Object, removal_rects: &[UserRect]) -> bool {
+    let dict = match item {
+        Object::Dictionary(d) => d,
+        Object::Reference(id) => match doc.get_object(*id).and_then(Object::as_dict) {
+            Ok(d) => d,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    let is_link = dict
+        .get(b"Subtype")
+        .and_then(Object::as_name)
+        .is_ok_and(|name| name == b"Link");
+    if !is_link {
+        return false;
+    }
+    let Ok(rect_obj) = dict.get(b"Rect") else {
+        return false;
+    };
+    let Some(rect) = annotation_rect(doc, rect_obj) else {
+        return false;
+    };
+    removal_rects
+        .iter()
+        .any(|removal| rects_intersect(rect, *removal))
+}
+
+fn annotation_rect(doc: &Document, obj: &Object) -> Option<UserRect> {
+    let arr = match obj {
+        Object::Array(arr) => arr,
+        Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?,
+        _ => return None,
+    };
+    if arr.len() != 4 {
+        return None;
+    }
+    let x0 = object_as_f32(&arr[0])?;
+    let y0 = object_as_f32(&arr[1])?;
+    let x1 = object_as_f32(&arr[2])?;
+    let y1 = object_as_f32(&arr[3])?;
+    Some(UserRect {
+        x0: x0.min(x1),
+        y0: y0.min(y1),
+        x1: x0.max(x1),
+        y1: y0.max(y1),
+    })
+}
+
+fn rects_intersect(a: UserRect, b: UserRect) -> bool {
+    a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0
+}
+
 fn used_font_resource_names(
     doc: &Document,
     page_id: ObjectId,
@@ -242,6 +350,16 @@ pub(crate) fn append_content_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn annotation(subtype: &[u8], rect: [f32; 4]) -> Object {
+        let mut d = Dictionary::new();
+        d.set("Subtype", Object::Name(subtype.to_vec()));
+        d.set(
+            "Rect",
+            Object::Array(rect.into_iter().map(Object::Real).collect()),
+        );
+        Object::Dictionary(d)
+    }
 
     #[test]
     fn helvetica_font_dict_shape() {
@@ -298,5 +416,56 @@ mod tests {
             .as_dict()
             .unwrap();
         assert!(matches!(local.get(b"XObject"), Ok(Object::Dictionary(_))));
+    }
+
+    #[test]
+    fn prune_link_annotations_removes_intersecting_links_only() {
+        let mut doc = Document::with_version("1.5");
+        let page_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", Object::Name(b"Page".to_vec()));
+            d.set(
+                "Annots",
+                Object::Array(vec![
+                    annotation(b"Link", [10.0, 10.0, 30.0, 30.0]),
+                    annotation(b"Link", [80.0, 80.0, 90.0, 90.0]),
+                    annotation(b"Text", [10.0, 10.0, 30.0, 30.0]),
+                ]),
+            );
+            Object::Dictionary(d)
+        });
+
+        prune_link_annotations(
+            &mut doc,
+            page_id,
+            &[UserRect {
+                x0: 20.0,
+                y0: 20.0,
+                x1: 40.0,
+                y1: 40.0,
+            }],
+        )
+        .unwrap();
+
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        let annots = page.get(b"Annots").unwrap().as_array().unwrap();
+        assert_eq!(annots.len(), 2);
+        let kept_link = annots[0].as_dict().unwrap();
+        assert_eq!(
+            kept_link.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Link"
+        );
+        let kept_rect = annotation_rect(&doc, kept_link.get(b"Rect").unwrap()).unwrap();
+        assert_eq!(kept_rect.x0, 80.0);
+        assert_eq!(
+            annots[1]
+                .as_dict()
+                .unwrap()
+                .get(b"Subtype")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"Text"
+        );
     }
 }

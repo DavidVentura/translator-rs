@@ -26,7 +26,7 @@ use crate::pdf_overlay::{
 };
 use crate::pdf_resources::{
     append_content_stream, attach_embedded_fonts_to_page, ensure_fonts_in_page_resources,
-    prune_unused_fonts,
+    prune_link_annotations, prune_unused_fonts,
 };
 use crate::pdf_surgery::rewrite_page_content;
 use crate::pdf_translate::PageTranslationResult;
@@ -273,6 +273,7 @@ fn run_surgery<'a>(
             .map(|b| geom.user_rect_from_display(b.bounding_box))
             .collect();
         let (final_ctm, block_styles) = rewrite_page_content(doc, *page_id, &removal_rects, geom)?;
+        prune_link_annotations(doc, *page_id, &removal_rects)?;
         ensure_fonts_in_page_resources(doc, *page_id)?;
         modified_pages.insert(*page_id);
         works.push(PageWork {

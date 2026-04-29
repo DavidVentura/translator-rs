@@ -39,6 +39,8 @@ impl From<lopdf::Error> for StyleProbeError {
 pub struct TjSample {
     /// Glyph baseline-leading-edge in PDF user space.
     pub origin: (f32, f32),
+    /// Text cursor in PDF user space after this show operation advances.
+    pub end_origin: (f32, f32),
     /// Per-axis scale of the combined `text_matrix × CTM` at this Tj. Multiply
     /// by the `Tf` font size to get the user-space rendered size.
     pub xy_scale: (f32, f32),
@@ -46,6 +48,7 @@ pub struct TjSample {
     /// `font_size × xy_scale.1`.
     pub font_size: f32,
     pub(crate) flags: FontStyleFlags,
+    pub(crate) fill_rgb: (f32, f32, f32),
 }
 
 #[derive(Debug, Clone)]
@@ -125,9 +128,11 @@ fn probe_page(doc: &Document, page_id: ObjectId) -> Result<PageStyles, StyleProb
         let safe_y = if y_scale > 1e-6 { y_scale } else { 1.0 };
         samples.push(TjSample {
             origin: combined.transform_point(0.0, 0.0),
+            end_origin: state.current_text_origin(),
             xy_scale: (safe_x, safe_y),
             font_size: state.font_size(),
             flags,
+            fill_rgb: state.fill_rgb(),
         });
     }
 

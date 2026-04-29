@@ -226,12 +226,12 @@ fn emit_block(
             if seg.text.is_empty() {
                 continue;
             }
-            let (seg_metrics, seg_embed) = resources.for_flags(seg.flags);
+            let (seg_metrics, seg_embed) = resources.for_flags(seg.style.flags);
             let seg_resource_name: &[u8] = match seg_embed {
                 Some(e) => &e.resource_name,
                 None => BlockTypography::font_resource_for(FontStyleFlags {
-                    bold: seg.flags.bold,
-                    italic: seg.flags.italic,
+                    bold: seg.style.flags.bold,
+                    italic: seg.style.flags.italic,
                     monospace: resources.monospace,
                 }),
             };
@@ -243,6 +243,15 @@ fn emit_block(
                 ..style.geometry.text_orientation
             };
             let tm = combined.mul(*inv_ctm);
+            if let Some((r, g, b)) = seg.style.fill_rgb {
+                builder.set_fill_rgb(r, g, b);
+            } else {
+                builder.set_fill_rgb(
+                    style.typography.fill_rgb.0,
+                    style.typography.fill_rgb.1,
+                    style.typography.fill_rgb.2,
+                );
+            }
             builder.set_font(seg_resource_name, font_size);
             builder.set_text_matrix(tm);
             emit_tj_for_segment(builder, &seg.text, seg_metrics, seg_embed);
@@ -316,10 +325,16 @@ fn user_rect_visual_bounds(rect: UserRect, geom: PageGeometry) -> (f32, f32, f32
 }
 
 /// One run of consecutive characters from a wrapped line that share the
-/// same [`BoldItalic`] style flags.
+/// same font/color style.
 struct LineSegment {
     text: String,
+    style: SegmentStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SegmentStyle {
     flags: BoldItalic,
+    fill_rgb: Option<(f32, f32, f32)>,
 }
 
 /// Walk the line's words (located in `block_text` via `word_ranges`),
@@ -333,35 +348,49 @@ fn segments_for_line(
     style_spans: &[StyleSpan],
     default_flags: BoldItalic,
 ) -> Vec<LineSegment> {
-    let lookup = |byte: usize| -> BoldItalic {
+    let lookup = |byte: usize| -> SegmentStyle {
         for span in style_spans {
             if byte >= span.start as usize && byte < span.end as usize {
                 if let Some(s) = &span.style {
-                    return BoldItalic {
-                        bold: s.bold,
-                        italic: s.italic,
+                    return SegmentStyle {
+                        flags: BoldItalic {
+                            bold: s.bold,
+                            italic: s.italic,
+                        },
+                        fill_rgb: s.text_color.map(argb_to_rgb),
                     };
                 }
             }
         }
-        default_flags
+        SegmentStyle {
+            flags: default_flags,
+            fill_rgb: None,
+        }
     };
 
     // Per-word majority flag.
-    let mut word_flags: Vec<BoldItalic> = Vec::with_capacity(word_ranges.len());
+    let mut word_styles: Vec<SegmentStyle> = Vec::with_capacity(word_ranges.len());
     for (start, end) in word_ranges {
-        let mut counts: HashMap<BoldItalic, usize> = HashMap::new();
+        let mut counts: Vec<(SegmentStyle, usize)> = Vec::new();
         let mut byte = *start;
         for c in block_text[*start..*end].chars() {
-            *counts.entry(lookup(byte)).or_default() += 1;
+            let style = lookup(byte);
+            if let Some((_, count)) = counts.iter_mut().find(|(s, _)| *s == style) {
+                *count += 1;
+            } else {
+                counts.push((style, 1));
+            }
             byte += c.len_utf8();
         }
         let majority = counts
             .into_iter()
             .max_by_key(|(_, n)| *n)
-            .map(|(f, _)| f)
-            .unwrap_or(default_flags);
-        word_flags.push(majority);
+            .map(|(s, _)| s)
+            .unwrap_or(SegmentStyle {
+                flags: default_flags,
+                fill_rgb: None,
+            });
+        word_styles.push(majority);
     }
 
     // Group consecutive same-flag words into segments. Word-separator
@@ -369,8 +398,11 @@ fn segments_for_line(
     // segments (bold→regular transition) doesn't drop them.
     let mut segments: Vec<LineSegment> = Vec::new();
     let mut current = String::new();
-    let mut current_flags = default_flags;
-    for (i, ((start, end), flags)) in word_ranges.iter().zip(word_flags.iter()).enumerate() {
+    let mut current_style = SegmentStyle {
+        flags: default_flags,
+        fill_rgb: None,
+    };
+    for (i, ((start, end), word_style)) in word_ranges.iter().zip(word_styles.iter()).enumerate() {
         let word = &block_text[*start..*end];
         // Bergamot's SentencePiece detokenizer emits a space before
         // closing punctuation (`,`, `.`, `)`, etc.) — visually fine when
@@ -382,31 +414,39 @@ fn segments_for_line(
             .next()
             .is_some_and(|c| matches!(c, ',' | '.' | ')' | ']' | '}' | ':' | ';' | '?' | '!'));
         let separator = i > 0 && !hugs_previous;
-        let need_break = !current.is_empty() && *flags != current_flags;
+        let need_break = !current.is_empty() && *word_style != current_style;
         if need_break {
             if separator {
                 current.push(' ');
             }
             segments.push(LineSegment {
                 text: std::mem::take(&mut current),
-                flags: current_flags,
+                style: current_style,
             });
-            current_flags = *flags;
+            current_style = *word_style;
         } else if separator {
             current.push(' ');
         }
         if current.is_empty() {
-            current_flags = *flags;
+            current_style = *word_style;
         }
         current.push_str(word);
     }
     if !current.is_empty() {
         segments.push(LineSegment {
             text: current,
-            flags: current_flags,
+            style: current_style,
         });
     }
     segments
+}
+
+fn argb_to_rgb(argb: u32) -> (f32, f32, f32) {
+    (
+        ((argb >> 16) & 0xFF) as f32 / 255.0,
+        ((argb >> 8) & 0xFF) as f32 / 255.0,
+        (argb & 0xFF) as f32 / 255.0,
+    )
 }
 
 /// Locate each wrapped line's word byte ranges back inside `block_text`.
