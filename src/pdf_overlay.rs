@@ -338,10 +338,13 @@ struct SegmentStyle {
 }
 
 /// Walk the line's words (located in `block_text` via `word_ranges`),
-/// snap each word's style to its **majority** char flag (Bergamot's
-/// token alignment often spans whitespace, so going char-by-char produces
-/// off-by-one bold edges; snapping to whole words makes bold/italic
-/// word-aligned), then group consecutive same-flag words into segments.
+/// snap each alphanumeric run's style to its **majority** char flag
+/// (Bergamot's token alignment often spans whitespace, so going char-by-char
+/// produces off-by-one bold edges; snapping to whole words makes
+/// bold/italic word-aligned). Trailing/leading punctuation inside the same
+/// whitespace token (`Empleado).`) is split out into its own sub-word so
+/// it picks up the punctuation's actual per-byte style instead of inheriting
+/// the styled word's bold.
 fn segments_for_line(
     block_text: &str,
     word_ranges: &[(usize, usize)],
@@ -368,12 +371,41 @@ fn segments_for_line(
         }
     };
 
-    // Per-word majority flag.
-    let mut word_styles: Vec<SegmentStyle> = Vec::with_capacity(word_ranges.len());
-    for (start, end) in word_ranges {
+    // Sub-word: a (start, end, separates_words) range. Each sub-word is
+    // either fully alphanumeric or fully non-alphanumeric. `separates_words`
+    // is true for the FIRST sub-word of a whitespace-delimited word (i.e.
+    // the ones a real word-gap precedes); subsequent sub-words inside the
+    // same whitespace token never get a leading space.
+    let mut sub_words: Vec<(usize, usize, bool)> = Vec::new();
+    for (word_start, word_end) in word_ranges {
+        let mut chunk_start = *word_start;
+        let mut chunk_alpha: Option<bool> = None;
+        let mut byte = *word_start;
+        let mut first_chunk_in_word = true;
+        for c in block_text[*word_start..*word_end].chars() {
+            let alpha = c.is_alphanumeric();
+            if let Some(prev_alpha) = chunk_alpha
+                && alpha != prev_alpha
+            {
+                sub_words.push((chunk_start, byte, first_chunk_in_word));
+                first_chunk_in_word = false;
+                chunk_start = byte;
+            }
+            chunk_alpha = Some(alpha);
+            byte += c.len_utf8();
+        }
+        if chunk_alpha.is_some() {
+            sub_words.push((chunk_start, byte, first_chunk_in_word));
+        }
+    }
+
+    let style_for = |start: usize, end: usize, is_alpha: bool| -> SegmentStyle {
+        if !is_alpha {
+            return lookup(start);
+        }
         let mut counts: Vec<(SegmentStyle, usize)> = Vec::new();
-        let mut byte = *start;
-        for c in block_text[*start..*end].chars() {
+        let mut byte = start;
+        for c in block_text[start..end].chars() {
             let style = lookup(byte);
             if let Some((_, count)) = counts.iter_mut().find(|(s, _)| *s == style) {
                 *count += 1;
@@ -382,18 +414,17 @@ fn segments_for_line(
             }
             byte += c.len_utf8();
         }
-        let majority = counts
+        counts
             .into_iter()
             .max_by_key(|(_, n)| *n)
             .map(|(s, _)| s)
             .unwrap_or(SegmentStyle {
                 flags: default_flags,
                 fill_rgb: None,
-            });
-        word_styles.push(majority);
-    }
+            })
+    };
 
-    // Group consecutive same-flag words into segments. Word-separator
+    // Group consecutive same-flag sub-words into segments. Word-separator
     // spaces stay attached to the *previous* segment so that breaking
     // segments (bold→regular transition) doesn't drop them.
     let mut segments: Vec<LineSegment> = Vec::new();
@@ -402,19 +433,27 @@ fn segments_for_line(
         flags: default_flags,
         fill_rgb: None,
     };
-    for (i, ((start, end), word_style)) in word_ranges.iter().zip(word_styles.iter()).enumerate() {
-        let word = &block_text[*start..*end];
+    for (i, &(start, end, separates_words)) in sub_words.iter().enumerate() {
+        let chunk = &block_text[start..end];
+        let is_alpha = chunk
+            .chars()
+            .next()
+            .map(char::is_alphanumeric)
+            .unwrap_or(false);
+        let style = style_for(start, end, is_alpha);
         // Bergamot's SentencePiece detokenizer emits a space before
         // closing punctuation (`,`, `.`, `)`, etc.) — visually fine when
         // the surrounding text shares one font, but the bold transitions
         // we now add make the gap obvious. Suppress the separator before
-        // any token that starts with a closing-punctuation glyph.
-        let hugs_previous = word
+        // any token that starts with a closing-punctuation glyph. Sub-words
+        // that came from splitting *within* a whitespace token never get
+        // a separator either.
+        let hugs_previous = chunk
             .chars()
             .next()
             .is_some_and(|c| matches!(c, ',' | '.' | ')' | ']' | '}' | ':' | ';' | '?' | '!'));
-        let separator = i > 0 && !hugs_previous;
-        let need_break = !current.is_empty() && *word_style != current_style;
+        let separator = i > 0 && separates_words && !hugs_previous;
+        let need_break = !current.is_empty() && style != current_style;
         if need_break {
             if separator {
                 current.push(' ');
@@ -423,14 +462,14 @@ fn segments_for_line(
                 text: std::mem::take(&mut current),
                 style: current_style,
             });
-            current_style = *word_style;
+            current_style = style;
         } else if separator {
             current.push(' ');
         }
         if current.is_empty() {
-            current_style = *word_style;
+            current_style = style;
         }
-        current.push_str(word);
+        current.push_str(chunk);
     }
     if !current.is_empty() {
         segments.push(LineSegment {

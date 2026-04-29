@@ -1,15 +1,15 @@
-//! Extract text + bounding boxes from a PDF via mupdf's stext API, and
-//! enrich each line with intra-line style spans probed from the source PDF
-//! (bold / italic / monospace flags per character) so translation preserves
-//! styled words inside otherwise-regular paragraphs.
+//! Extract text + bounding boxes from a PDF via mupdf's stext API. mupdf
+//! reports per-character colour, bold flag and font on every emitted glyph,
+//! which is enough to split a line into runs of consecutive same-style
+//! characters in a single pass — no second content-stream parser needed.
+
+use std::collections::HashMap;
 
 use mupdf::text_page::TextBlockType;
-use mupdf::{Document, Page, TextPageFlags};
+use mupdf::{Document, Page, TextCharFlags, TextPageFlags};
 
 use crate::ocr::Rect;
 use crate::pdf::{PageDims, PdfError};
-use crate::pdf_content::FontStyleFlags;
-use crate::pdf_style_probe::{PageStyles, TjSample, probe_pages};
 use crate::styled::{StyledFragment, TextStyle};
 
 #[derive(Debug, Clone)]
@@ -26,41 +26,18 @@ const STEXT_FLAGS: TextPageFlags = TextPageFlags::from_bits_truncate(
         | TextPageFlags::ACCURATE_BBOXES.bits(),
 );
 
-/// Vertical slack (in PDF points) when associating Tj samples with a stext
-/// line. Wide enough to catch the baseline of an ascender-heavy line, narrow
-/// enough that adjacent lines (e.g. a 9pt heading just above a 12pt body)
-/// don't bleed their style into one another.
-const LINE_TJ_VERTICAL_TOLERANCE_PT: f32 = 2.0;
-
-/// Horizontal slack (in PDF points) when matching a char to the latest Tj at
-/// or before its display-x. MuPDF reports glyph origins at the glyph ink edge,
-/// while PDF text-show origins are baseline advances; coloured words with a
-/// left side bearing can otherwise start a few characters late.
-const TJ_X_MATCH_TOLERANCE_PT: f32 = 2.0;
-const TJ_INTERVAL_MATCH_SLACK_EM: f32 = 0.45;
-
 pub fn extract_text(pdf_bytes: &[u8]) -> Result<Vec<PageTextFragments>, PdfError> {
     let document = Document::from_bytes(pdf_bytes, "application/pdf")?;
     let page_count = document.page_count()?;
-
-    // Best-effort style probe: if lopdf can't parse the file we still emit
-    // unsplit fragments rather than failing the whole extraction.
-    let styles_per_page = probe_pages(pdf_bytes).ok();
-
     let mut pages = Vec::with_capacity(page_count as usize);
     for i in 0..page_count {
         let page = document.load_page(i)?;
-        let style_samples = styles_per_page.as_ref().and_then(|v| v.get(i as usize));
-        pages.push(extract_page(&page, i as usize, style_samples)?);
+        pages.push(extract_page(&page, i as usize)?);
     }
     Ok(pages)
 }
 
-fn extract_page(
-    page: &Page,
-    page_index: usize,
-    page_styles: Option<&PageStyles>,
-) -> Result<PageTextFragments, PdfError> {
+fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, PdfError> {
     let bounds = page.bounds()?;
     let dims = PageDims {
         width_pts: bounds.x1 - bounds.x0,
@@ -69,6 +46,10 @@ fn extract_page(
 
     let stext = page.to_text_page(STEXT_FLAGS)?;
     let mut fragments = Vec::new();
+    // Cache italic lookups per font name. fz_font_name is stable per font and
+    // calling fz_font_is_italic per char is wasteful when a paragraph reuses
+    // the same handful of fonts.
+    let mut italic_by_font: HashMap<String, bool> = HashMap::new();
 
     for (block_index, block) in stext
         .blocks()
@@ -77,45 +58,48 @@ fn extract_page(
     {
         let translation_group = block_index as u32;
         for line in block.lines() {
-            let line_bbox = line.bounds();
-            let line_rect = rect_from_mupdf(line_bbox);
+            let line_rect = rect_from_mupdf(line.bounds());
 
-            // Collect chars + their display-coord origins. Drop NBSPs and
-            // invisible chars to avoid polluting the visible text.
-            let mut chars: Vec<(char, f32)> = Vec::new(); // (char, display_x)
+            let mut typed_chars: Vec<TypedChar> = Vec::new();
             for ch in line.chars() {
-                if let Some(c) = ch.char() {
-                    chars.push((c, ch.origin().x));
-                }
+                let Some(c) = ch.char() else {
+                    continue;
+                };
+                let italic = ch
+                    .font()
+                    .map(|f| {
+                        *italic_by_font
+                            .entry(f.name().to_string())
+                            .or_insert_with(|| f.is_italic())
+                    })
+                    .unwrap_or(false);
+                typed_chars.push(TypedChar {
+                    c,
+                    x: ch.origin().x,
+                    style: PdfCharStyle {
+                        bold: ch.flags().contains(TextCharFlags::BOLD),
+                        italic,
+                        fill_argb: ch.argb(),
+                    },
+                });
             }
 
-            if chars.iter().all(|(c, _)| c.is_whitespace()) {
+            if typed_chars.iter().all(|tc| tc.c.is_whitespace()) {
                 continue;
             }
-            let line_text: String = chars.iter().map(|(c, _)| *c).collect();
+            let line_text: String = typed_chars.iter().map(|tc| tc.c).collect();
             if should_skip_pdf_line(&line_text, line_rect, dims) {
                 continue;
             }
 
-            // Split the line into runs of consecutive chars that share style
-            // flags. With no probe, the whole line is one run with style: None.
-            let runs = split_line_by_style(&chars, line_rect, page_styles).unwrap_or_else(|| {
-                vec![LineRun {
-                    text: chars.iter().map(|(c, _)| *c).collect(),
-                    style: None,
-                    bbox: line_rect,
-                }]
-            });
-
-            for run in runs {
-                let trimmed = run.text.trim();
-                if trimmed.is_empty() {
+            for run in split_line_by_style(&typed_chars, line_rect) {
+                if run.text.trim().is_empty() {
                     continue;
                 }
                 fragments.push(StyledFragment {
-                    text: trimmed.to_string(),
+                    text: run.text,
                     bounding_box: run.bbox,
-                    style: run.style,
+                    style: Some(run.style.into()),
                     layout_group: 0,
                     translation_group,
                     cluster_group: translation_group,
@@ -131,160 +115,100 @@ fn extract_page(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PdfCharStyle {
+    bold: bool,
+    italic: bool,
+    fill_argb: u32,
+}
+
+impl From<PdfCharStyle> for TextStyle {
+    fn from(s: PdfCharStyle) -> Self {
+        TextStyle {
+            text_color: Some(s.fill_argb),
+            bg_color: None,
+            text_size: None,
+            bold: s.bold,
+            italic: s.italic,
+            underline: false,
+            strikethrough: false,
+        }
+    }
+}
+
+struct TypedChar {
+    c: char,
+    x: f32,
+    style: PdfCharStyle,
+}
+
 #[derive(Debug)]
 struct LineRun {
     text: String,
-    style: Option<TextStyle>,
+    style: PdfCharStyle,
     bbox: Rect,
 }
 
-/// Split a line's chars into runs by style flag transitions, using the
-/// per-Tj samples from the lopdf probe. Returns `None` if no probe samples
-/// fall on this line (caller falls back to a single style-less run).
-fn split_line_by_style(
-    chars: &[(char, f32)],
-    line_rect: Rect,
-    page_styles: Option<&PageStyles>,
-) -> Option<Vec<LineRun>> {
-    let page_styles = page_styles?;
-    let line_top = line_rect.top as f32;
-    let line_bottom = line_rect.bottom as f32;
-
-    // Tjs whose display-converted origin lies inside this line's bbox (the
-    // baseline is near the bottom for plain text and not far above the top
-    // for ascender-heavy lines). Using `[line_top, line_bottom] ± 2pt`
-    // instead of distance-from-mid keeps adjacent lines from polluting one
-    // another — a 9pt heading sitting just above a 12pt body line was
-    // pulling its bold Tjs into the body and producing spurious mid-word
-    // bold splits.
-    let mut on_line: Vec<LineTjSample<'_>> = page_styles
-        .samples
-        .iter()
-        .filter_map(|s| {
-            let (dx, dy) = page_styles.to_display(s.origin);
-            let (end_dx, end_dy) = page_styles.to_display(s.end_origin);
-            if dy >= line_top - LINE_TJ_VERTICAL_TOLERANCE_PT
-                && dy <= line_bottom + LINE_TJ_VERTICAL_TOLERANCE_PT
-                || end_dy >= line_top - LINE_TJ_VERTICAL_TOLERANCE_PT
-                    && end_dy <= line_bottom + LINE_TJ_VERTICAL_TOLERANCE_PT
-            {
-                Some(LineTjSample {
-                    start_x: dx.min(end_dx),
-                    end_x: dx.max(end_dx),
-                    slack: (s.font_size * s.xy_scale.0 * TJ_INTERVAL_MATCH_SLACK_EM)
-                        .max(TJ_X_MATCH_TOLERANCE_PT),
-                    sample: s,
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-    on_line.sort_by(|a, b| {
-        a.start_x
-            .partial_cmp(&b.start_x)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    if on_line.is_empty() {
-        return None;
-    }
-
-    // Prefer the Tj/TJ run interval containing this char. Near boundaries,
-    // choose the latest run whose start is within slack so colour resets after
-    // short styled words win over the previous run. Fall back to latest-before
-    // for producers where our advance estimate is too rough.
-    fn style_at(on_line: &[LineTjSample<'_>], x: f32) -> PdfCharStyle {
-        let mut last: Option<&TjSample> = None;
-        let mut interval_match: Option<&TjSample> = None;
-        for entry in on_line {
-            if entry.start_x <= x + entry.slack && x <= entry.end_x + entry.slack {
-                interval_match = Some(entry.sample);
-            }
-            if entry.start_x <= x + TJ_X_MATCH_TOLERANCE_PT {
-                last = Some(entry.sample);
-            } else {
-                break;
-            }
-        }
-        let sample = interval_match.or(last).unwrap_or(on_line[0].sample);
-        PdfCharStyle {
-            flags: sample.flags,
-            fill_argb: rgb_to_argb(sample.fill_rgb),
-        }
-    }
-
+/// Group consecutive chars into runs of identical style. Whitespace is
+/// treated as style-neutral: it inherits whichever run it falls into and
+/// never triggers a transition. That way the trailing space of "bold word "
+/// stays inside the bold run instead of starting a new one — and downstream
+/// concatenation in `build_block` sees the space and joins fragments
+/// correctly.
+fn split_line_by_style(chars: &[TypedChar], line_rect: Rect) -> Vec<LineRun> {
     let mut runs: Vec<LineRun> = Vec::new();
     let mut run_text = String::new();
     let mut run_start_x: Option<f32> = None;
     let mut run_end_x: f32 = line_rect.left as f32;
     let mut run_style: Option<PdfCharStyle> = None;
 
-    for (c, x) in chars {
-        let style = style_at(&on_line, *x);
-        if Some(style) != run_style && !run_text.is_empty() {
-            let end_x = if run_text.chars().last().is_some_and(char::is_whitespace) {
-                run_end_x
-            } else {
-                *x
-            };
+    for tc in chars {
+        let is_ws = tc.c.is_whitespace();
+        let style_changed = !is_ws && run_style.is_some_and(|s| s != tc.style);
+        if style_changed && !run_text.is_empty() {
             runs.push(finish_run(
                 &run_text,
-                run_style,
+                run_style.expect("run_style set when run_text non-empty"),
                 run_start_x,
-                end_x,
+                tc.x,
                 line_rect,
             ));
             run_text.clear();
             run_start_x = None;
         }
         if run_start_x.is_none() {
-            run_start_x = Some(*x);
+            run_start_x = Some(tc.x);
         }
-        run_end_x = run_end_x.max(*x);
-        run_style = Some(style);
-        run_text.push(*c);
+        run_end_x = run_end_x.max(tc.x);
+        if !is_ws {
+            run_style = Some(tc.style);
+        }
+        run_text.push(tc.c);
     }
     if !run_text.is_empty() {
+        let style = run_style.unwrap_or(PdfCharStyle {
+            bold: false,
+            italic: false,
+            fill_argb: 0xFF00_0000,
+        });
         runs.push(finish_run(
             &run_text,
-            run_style,
+            style,
             run_start_x,
             line_rect.right as f32,
             line_rect,
         ));
     }
-
-    // If the whole line collapsed to one style, return a single run with
-    // that style — no point fragmenting a uniform line.
-    Some(runs)
-}
-
-struct LineTjSample<'a> {
-    start_x: f32,
-    end_x: f32,
-    slack: f32,
-    sample: &'a TjSample,
+    runs
 }
 
 fn finish_run(
     text: &str,
-    pdf_style: Option<PdfCharStyle>,
+    style: PdfCharStyle,
     start_x: Option<f32>,
     end_x: f32,
     line_rect: Rect,
 ) -> LineRun {
-    // TextStyle has no `monospace` field — that gets re-derived from the
-    // font name on the write side.
-    let style = pdf_style.map(|s| TextStyle {
-        text_color: Some(s.fill_argb),
-        bg_color: None,
-        text_size: None,
-        bold: s.flags.bold,
-        italic: s.flags.italic,
-        underline: false,
-        strikethrough: false,
-    });
     let bbox = Rect {
         left: start_x.unwrap_or(line_rect.left as f32) as u32,
         top: line_rect.top,
@@ -296,17 +220,6 @@ fn finish_run(
         style,
         bbox,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PdfCharStyle {
-    flags: FontStyleFlags,
-    fill_argb: u32,
-}
-
-fn rgb_to_argb(rgb: (f32, f32, f32)) -> u32 {
-    let channel = |v: f32| -> u32 { (v.clamp(0.0, 1.0) * 255.0).round() as u32 };
-    0xFF00_0000 | (channel(rgb.0) << 16) | (channel(rgb.1) << 8) | channel(rgb.2)
 }
 
 fn should_skip_pdf_line(text: &str, rect: Rect, page: PageDims) -> bool {

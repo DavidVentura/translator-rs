@@ -644,7 +644,7 @@ fn resolves_direct_translation_plan_from_installed_catalog() {
         .expect("direct plan should resolve");
 
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].cache_key, "enes");
+    assert_eq!(plan.steps[0].cache_key, "en-es");
     assert!(
         plan.steps[0]
             .config
@@ -747,8 +747,8 @@ fn resolves_pivot_translation_plan_from_installed_catalog() {
 
     assert_eq!(plan.steps.len(), 2);
     assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].cache_key, "esen");
-    assert_eq!(plan.steps[1].cache_key, "enfr");
+    assert_eq!(plan.steps[0].cache_key, "es-en");
+    assert_eq!(plan.steps[1].cache_key, "en-fr");
 }
 
 #[test]

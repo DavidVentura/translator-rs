@@ -563,44 +563,11 @@ fn style_spans_for_fragment(fragment: &StyledFragment, block_start: u32) -> Vec<
     let Some(style) = &fragment.style else {
         return Vec::new();
     };
-    if style
-        .normalized_text_color()
-        .is_some_and(is_non_default_color)
-    {
-        let end = first_text_token_end(&fragment.text).unwrap_or(fragment.text.len());
-        return (end > 0)
-            .then(|| StyleSpan {
-                start: block_start,
-                end: block_start + end as u32,
-                style: Some(style.clone()),
-            })
-            .into_iter()
-            .collect();
-    }
-
     vec![StyleSpan {
         start: block_start,
         end: block_start + fragment.text.len() as u32,
         style: Some(style.clone()),
     }]
-}
-
-fn is_non_default_color(argb: u32) -> bool {
-    (argb & 0x00FF_FFFF) != 0
-}
-
-fn first_text_token_end(text: &str) -> Option<usize> {
-    let mut saw_non_whitespace = false;
-    for (byte, ch) in text.char_indices() {
-        if ch.is_whitespace() {
-            if saw_non_whitespace {
-                return Some(byte);
-            }
-        } else {
-            saw_non_whitespace = true;
-        }
-    }
-    saw_non_whitespace.then_some(text.len())
 }
 
 fn is_section_heading_line(line: &[StyledFragment]) -> bool {
@@ -1216,22 +1183,6 @@ mod tests {
         assert_eq!(blocks[0].text, "thin dashed blue");
         assert_eq!(blocks[0].style_spans[0].start, 12);
         assert_eq!(blocks[0].style_spans[0].end, 16);
-    }
-
-    #[test]
-    fn drifted_color_fragment_only_styles_first_token() {
-        let fragments = vec![
-            fragment("thin dashed", 10, 10, 70, 22),
-            colored_fragment("blue) fo", 76, 10, 118, 22, 0xFF00_00FF),
-            fragment("r its own block", 118, 10, 190, 22),
-        ];
-
-        let blocks = cluster_fragments_into_blocks(&fragments);
-
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].text, "thin dashed blue) for its own block");
-        assert_eq!(blocks[0].style_spans[0].start, 12);
-        assert_eq!(blocks[0].style_spans[0].end, 17);
     }
 
     #[test]
