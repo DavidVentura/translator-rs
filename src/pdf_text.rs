@@ -220,27 +220,121 @@ fn classify_math_line(chars: &[TypedChar]) -> MathKind {
 
 fn compute_opaque_flags(pre_lines: &[PreLine]) -> Vec<bool> {
     let mut flags = vec![false; pre_lines.len()];
-    let mut i = 0;
-    while i < pre_lines.len() {
-        if matches!(pre_lines[i].math_kind, MathKind::Prose) {
-            i += 1;
-            continue;
+    if pre_lines.is_empty() {
+        return flags;
+    }
+    // Walk the lines one mupdf-block at a time. mupdf groups display
+    // equations into their own block(s), so block context is the right
+    // grain for "is this a formula or prose?" decisions.
+    let mut block_start = 0;
+    while block_start < pre_lines.len() {
+        let block_idx = pre_lines[block_start].block_index;
+        let mut block_end = block_start + 1;
+        while block_end < pre_lines.len() && pre_lines[block_end].block_index == block_idx {
+            block_end += 1;
         }
-        let start = i;
-        let mut has_strong = false;
-        while i < pre_lines.len() && !matches!(pre_lines[i].math_kind, MathKind::Prose) {
-            if matches!(pre_lines[i].math_kind, MathKind::Strong) {
-                has_strong = true;
-            }
-            i += 1;
-        }
-        if has_strong {
-            for j in start..i {
+        let block = &pre_lines[block_start..block_end];
+        if block_is_display_equation(block) {
+            // Whole-block override: a display equation may have lines that
+            // mix math with subscript words (CMR7 chars from `Θ_recovery`,
+            // `T_qc`) or with text-font labels (`GST`, `view`). Those lines
+            // fail the per-line math-majority test and would be classified
+            // Prose, but the block as a whole has no real prose words so we
+            // treat every line as opaque.
+            for j in block_start..block_end {
                 flags[j] = true;
+            }
+        } else {
+            // Per-line math-run analysis within a non-equation block.
+            // Marks Strong lines opaque, plus any Weak run touching at
+            // least one Strong line — that's how multi-line display math
+            // embedded in a prose block (the page-7 `Bk ← (bk, P(Bk−1))`
+            // sitting inside the same mupdf block as the surrounding
+            // paragraph) gets opaque while lone subscripts (a single `i`
+            // dropped between two prose lines) stays prose.
+            let mut i = block_start;
+            while i < block_end {
+                if matches!(pre_lines[i].math_kind, MathKind::Prose) {
+                    i += 1;
+                    continue;
+                }
+                let run_start = i;
+                let mut has_strong = false;
+                while i < block_end && !matches!(pre_lines[i].math_kind, MathKind::Prose) {
+                    if matches!(pre_lines[i].math_kind, MathKind::Strong) {
+                        has_strong = true;
+                    }
+                    i += 1;
+                }
+                if has_strong {
+                    for j in run_start..i {
+                        flags[j] = true;
+                    }
+                }
+            }
+        }
+        block_start = block_end;
+    }
+    flags
+}
+
+/// True when a mupdf block looks like a (multi-line) display equation —
+/// it contains math-class chars but no real prose. "Real prose" is
+/// approximated by alphabetic runs of ≥4 chars in body-size text fonts:
+/// subscript words (CMR7 `recovery`) don't count because they only ever
+/// appear inside math, and short body-font snippets (`GST`, `Lv`) don't
+/// either because they're math labels rather than prose.
+fn block_is_display_equation(lines: &[PreLine]) -> bool {
+    const REAL_WORD_LEN: usize = 4;
+    const MAX_WORDS_FOR_DISPLAY: usize = 4;
+    let mut math_chars = 0usize;
+    let mut real_words = 0usize;
+    for line in lines {
+        let mut run = 0usize;
+        for tc in &line.typed_chars {
+            if is_math_font(&tc.font_name) {
+                math_chars += 1;
+                run = 0;
+                continue;
+            }
+            if tc.c.is_alphabetic() && is_body_text_font(&tc.font_name) {
+                run += 1;
+                if run == REAL_WORD_LEN {
+                    real_words += 1;
+                    if real_words > MAX_WORDS_FOR_DISPLAY && math_chars > 0 {
+                        return false;
+                    }
+                }
+            } else {
+                run = 0;
             }
         }
     }
-    flags
+    math_chars > 0 && real_words <= MAX_WORDS_FOR_DISPLAY
+}
+
+/// Body-size text fonts are size ≥8pt. CMR7/CMTI7/etc. are subscript
+/// scripts — they appear inside math expressions and shouldn't count
+/// toward a block's "is this prose?" word total.
+fn is_body_text_font(name: &str) -> bool {
+    if !is_text_font(name) {
+        return false;
+    }
+    font_size_suffix(name).map(|n| n >= 8).unwrap_or(true)
+}
+
+fn font_size_suffix(name: &str) -> Option<u32> {
+    let stem = font_stem(name);
+    let trailing: String = stem
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let digits: String = trailing.chars().rev().collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
