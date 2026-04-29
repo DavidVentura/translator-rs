@@ -47,7 +47,7 @@ pub(crate) fn rewrite_page_content(
         operations: filtered,
     }
     .encode()?;
-    let block_styles = resolve_block_styles(doc, page_id, &raw_samples, geom);
+    let block_styles = resolve_block_styles(doc, page_id, &raw_samples, removal_rects, geom);
     doc.change_page_content(page_id, new_bytes)?;
     Ok((final_ctm, block_styles))
 }
@@ -113,11 +113,24 @@ fn resolve_block_styles(
     doc: &Document,
     page_id: ObjectId,
     raw: &[Vec<RawStyleSample>],
+    removal_rects: &[Vec<UserRect>],
     geom: PageGeometry,
 ) -> Vec<SampledBlockStyle> {
     let fonts = doc.get_page_fonts(page_id).ok();
     raw.iter()
-        .map(|samples| {
+        .enumerate()
+        .map(|(block_idx, samples)| {
+            // Visual leftmost edge in user space, lifted from the block's
+            // mupdf-derived bbox. We use this to override anchor.x — surgery's
+            // Tj-origin tracking advances by *text-matrix translation*, so for
+            // PDFs that emit text via `TJ` arrays with leading negative
+            // spacing (`[-3889 (Alg.) ...]`) the Tj origin sits at the
+            // gutter position (where the matrix was set), not where the
+            // glyphs actually land. mupdf's per-char x is the truth here.
+            let block_left_x = removal_rects
+                .get(block_idx)
+                .and_then(|rects| rects.iter().map(|r| r.x0).reduce(f32::min))
+                .filter(|x| x.is_finite());
             if samples.is_empty() {
                 return SampledBlockStyle::default();
             }
@@ -173,7 +186,11 @@ fn resolve_block_styles(
 
             // Anchor = the visually top-left baseline among the sampled Tjs.
             // We sort by visual y first (smallest visual_y = visually
-            // topmost line), then by visual x (leftmost on that line).
+            // topmost line), then by visual x (leftmost on that line). Then
+            // we override the x with the bbox left edge (mupdf's per-char x)
+            // — surgery's Tj-origin tracking can land further right than the
+            // first visible glyph when the producer uses `TJ` arrays with
+            // leading negative-spacing.
             let anchor = samples
                 .iter()
                 .min_by(|a, b| {
@@ -183,9 +200,12 @@ fn resolve_block_styles(
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal))
                 })
-                .map(|s| s.origin);
+                .map(|s| {
+                    let x = block_left_x.unwrap_or(s.origin.0);
+                    (x, s.origin.1)
+                });
 
-            let line_anchors = original_line_anchors(samples, geom);
+            let line_anchors = original_line_anchors(samples, geom, block_left_x);
             let original_line_count = line_anchors.len().max(1);
 
             // Pick the orientation of the first sample. Producers almost
@@ -217,7 +237,11 @@ fn resolve_block_styles(
         .collect()
 }
 
-fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<(f32, f32)> {
+fn original_line_anchors(
+    samples: &[RawStyleSample],
+    geom: PageGeometry,
+    override_x: Option<f32>,
+) -> Vec<(f32, f32)> {
     let baseline_threshold = distinct_baseline_threshold(samples);
     let mut positioned: Vec<(f32, f32, (f32, f32))> = samples
         .iter()
@@ -236,9 +260,13 @@ fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<
     let mut current_y: Option<f32> = None;
     let mut best_x = f32::INFINITY;
     let mut best_origin = (0.0, 0.0);
+    let push_anchor = |anchors: &mut Vec<(f32, f32)>, origin: (f32, f32)| match override_x {
+        Some(x) => anchors.push((x, origin.1)),
+        None => anchors.push(origin),
+    };
     for (vy, vx, origin) in positioned {
         if current_y.is_some_and(|y| (vy - y).abs() >= baseline_threshold) {
-            anchors.push(best_origin);
+            push_anchor(&mut anchors, best_origin);
             current_y = Some(vy);
             best_x = vx;
             best_origin = origin;
@@ -253,7 +281,7 @@ fn original_line_anchors(samples: &[RawStyleSample], geom: PageGeometry) -> Vec<
         }
     }
     if current_y.is_some() {
-        anchors.push(best_origin);
+        push_anchor(&mut anchors, best_origin);
     }
     anchors
 }
@@ -671,7 +699,7 @@ mod tests {
             },
         ];
 
-        let anchors = original_line_anchors(&samples, geom);
+        let anchors = original_line_anchors(&samples, geom, None);
         assert_eq!(anchors, vec![(72.0, 710.0), (72.0, 698.0)]);
     }
 }
