@@ -286,7 +286,8 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
                     .left
                     .max(fragment.bounding_box.left)
                     .saturating_sub(bb.right.min(fragment.bounding_box.right));
-                let same_line_nearby = horizontal_gap <= line_height.saturating_mul(3);
+                let same_line_nearby =
+                    should_merge_same_line(&block_groups[i], fragment, line_height, horizontal_gap);
 
                 if vertical_overlap > 0 && same_line_nearby {
                     same_line_match = Some(i);
@@ -294,6 +295,7 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
                 }
                 if vertical_gap <= block_gap_threshold
                     && horizontal_overlap > 0
+                    && should_merge_next_line(&block_groups[i], bb, fragment, line_height)
                     && next_line_match.is_none()
                 {
                     next_line_match = Some(i);
@@ -316,6 +318,80 @@ fn cluster_fragments_into_blocks(fragments: &[StyledFragment]) -> Vec<Translatab
         .into_iter()
         .flat_map(|group| build_blocks(&group))
         .collect()
+}
+
+fn same_line_gap_threshold(line_height: u32) -> u32 {
+    // A real word-space is normally well below one line-height. Larger gaps
+    // are commonly table label/value columns that merely share a baseline.
+    ((line_height as f32) * 0.8).ceil() as u32
+}
+
+fn same_line_prose_gap_threshold(line_height: u32) -> u32 {
+    line_height.saturating_mul(3)
+}
+
+fn should_merge_same_line(
+    existing: &[StyledFragment],
+    next: &StyledFragment,
+    line_height: u32,
+    horizontal_gap: u32,
+) -> bool {
+    if horizontal_gap <= same_line_gap_threshold(line_height) {
+        return true;
+    }
+    if horizontal_gap > same_line_prose_gap_threshold(line_height) {
+        return false;
+    }
+
+    let existing_text = joined_fragment_text(existing);
+    let next_text = next.text.trim();
+    looks_like_prose(&existing_text) || looks_like_enumerated_prose_start(&existing_text, next_text)
+}
+
+fn should_merge_next_line(
+    existing: &[StyledFragment],
+    existing_bounds: Rect,
+    next: &StyledFragment,
+    line_height: u32,
+) -> bool {
+    let existing_text = joined_fragment_text(existing);
+    let min_paragraph_width = line_height.saturating_mul(10).max(90);
+    let wide_enough = existing_bounds.width() >= min_paragraph_width
+        || next.bounding_box.width() >= min_paragraph_width;
+
+    wide_enough && looks_like_prose(&existing_text)
+}
+
+fn joined_fragment_text(fragments: &[StyledFragment]) -> String {
+    let mut text = String::new();
+    for fragment in fragments {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(fragment.text.trim());
+    }
+    text
+}
+
+fn looks_like_prose(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let words = trimmed.split_whitespace().count();
+    let letters = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    words >= 4 || letters >= 32 || trimmed.contains([',', '.', ';', ':'])
+}
+
+fn looks_like_enumerated_prose_start(existing: &str, next: &str) -> bool {
+    let marker = existing.trim();
+    let next = next.trim();
+    !next.is_empty()
+        && marker.len() <= 5
+        && marker
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ')' | '('))
+        && next.chars().any(|c| c.is_alphabetic())
 }
 
 fn is_standalone_list_marker(fragment: &StyledFragment) -> bool {
@@ -692,15 +768,31 @@ fn lower_quartile_height(fragments: &[StyledFragment]) -> u32 {
 mod tests {
     use super::{Rect, StyledFragment, TextStyle, cluster_fragments_into_blocks};
 
+    fn fragment(text: &str, left: u32, top: u32, right: u32, bottom: u32) -> StyledFragment {
+        StyledFragment {
+            text: text.into(),
+            bounding_box: Rect {
+                left,
+                top,
+                right,
+                bottom,
+            },
+            style: None,
+            layout_group: 0,
+            translation_group: 0,
+            cluster_group: 0,
+        }
+    }
+
     #[test]
     fn clusters_fragments_into_two_lines_one_block() {
         let fragments = vec![
             StyledFragment {
-                text: "Hello".into(),
+                text: "Hello world this is a wrapped paragraph".into(),
                 bounding_box: Rect {
                     left: 0,
                     top: 0,
-                    right: 40,
+                    right: 240,
                     bottom: 20,
                 },
                 style: Some(TextStyle {
@@ -717,11 +809,11 @@ mod tests {
                 cluster_group: 0,
             },
             StyledFragment {
-                text: "world".into(),
+                text: "with a styled middle run".into(),
                 bounding_box: Rect {
-                    left: 48,
+                    left: 248,
                     top: 0,
-                    right: 92,
+                    right: 390,
                     bottom: 20,
                 },
                 style: None,
@@ -730,11 +822,11 @@ mod tests {
                 cluster_group: 0,
             },
             StyledFragment {
-                text: "again".into(),
+                text: "again on the next line".into(),
                 bounding_box: Rect {
                     left: 0,
                     top: 28,
-                    right: 48,
+                    right: 160,
                     bottom: 48,
                 },
                 style: None,
@@ -746,6 +838,137 @@ mod tests {
 
         let blocks = cluster_fragments_into_blocks(&fragments);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].text, "Hello world\nagain");
+        assert_eq!(
+            blocks[0].text,
+            "Hello world this is a wrapped paragraph with a styled middle run\nagain on the next line"
+        );
+    }
+
+    #[test]
+    fn clusters_wrapped_prose_into_one_block() {
+        let fragments = vec![
+            fragment(
+                "This paragraph contains enough words to look like prose",
+                20,
+                100,
+                520,
+                112,
+            ),
+            fragment(
+                "and continues naturally on the next line.",
+                20,
+                115,
+                360,
+                127,
+            ),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text,
+            "This paragraph contains enough words to look like prose\nand continues naturally on the next line."
+        );
+    }
+
+    #[test]
+    fn does_not_cluster_aligned_record_rows() {
+        let fragments = vec![
+            fragment("Record 1001", 22, 100, 80, 112),
+            fragment("Record 1002", 22, 116, 80, 128),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "Record 1001");
+        assert_eq!(blocks[1].text, "Record 1002");
+    }
+
+    #[test]
+    fn does_not_cluster_same_line_table_value_gap() {
+        let fragments = vec![
+            fragment("Metric label", 20, 100, 124, 112),
+            fragment("42", 140, 100, 164, 112),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "Metric label");
+        assert_eq!(blocks[1].text, "42");
+    }
+
+    #[test]
+    fn still_clusters_same_line_word_gap() {
+        let fragments = vec![
+            fragment("part 1", 140, 100, 219, 112),
+            fragment("part 2", 222, 100, 245, 112),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "part 1 part 2");
+    }
+
+    #[test]
+    fn clusters_same_line_prose_with_wide_style_gap() {
+        let fragments = vec![
+            fragment("This prose line contains enough words", 72, 100, 280, 112),
+            fragment("term", 306, 100, 330, 112),
+            fragment("to continue after a styled gap.", 356, 100, 520, 112),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text,
+            "This prose line contains enough words term to continue after a styled gap."
+        );
+    }
+
+    #[test]
+    fn clusters_enumerated_marker_with_same_line_text() {
+        let fragments = vec![
+            fragment("1.", 72, 100, 82, 112),
+            fragment("A paragraph heading starts here", 108, 100, 280, 112),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "1. A paragraph heading starts here");
+    }
+
+    #[test]
+    fn prose_block_can_continue_with_short_next_line_fragment() {
+        let fragments = vec![
+            fragment(
+                "This paragraph is already wide enough to be prose",
+                72,
+                100,
+                420,
+                112,
+            ),
+            fragment("short", 72, 116, 105, 128),
+            fragment(
+                "continuation after a justified line break.",
+                130,
+                116,
+                360,
+                128,
+            ),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text,
+            "This paragraph is already wide enough to be prose\nshort continuation after a justified line break."
+        );
     }
 }

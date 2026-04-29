@@ -415,9 +415,9 @@ fn parse_cid_widths(w_array: &[Object], widths: &mut HashMap<u16, f32>) {
 
 /// Subset of state q/Q saves/restores. Per the PDF spec, text state (font
 /// size, char/word spacing, horizontal scaling, leading) belongs here too,
-/// but real producers — including the WOZ test PDF — emit `Tf` once before
-/// any q and expect that size to persist past Q. Keeping those fields flat
-/// on [`ContentState`] matches that de-facto behavior.
+/// but some real producers emit `Tf` once before any q and expect that size
+/// to persist past Q. Keeping those fields flat on [`ContentState`] matches
+/// that de-facto behavior.
 #[derive(Debug, Clone)]
 struct GraphicsState {
     ctm: Matrix,
