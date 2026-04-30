@@ -21,6 +21,19 @@ use crate::pdf_write::{BlockGeometry, BlockTypography, PdfWriteError, SampledBlo
 const DISTINCT_BASELINE_PT_FLOOR: f32 = 1.0;
 const DISTINCT_BASELINE_FONT_FRACTION: f32 = 0.55;
 
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedTextShow {
+    pub(crate) operation: Operation,
+    pub(crate) font_resource: Vec<u8>,
+    pub(crate) font_size: f32,
+    pub(crate) fill_rgb: (f32, f32, f32),
+    pub(crate) char_spacing: f32,
+    pub(crate) word_spacing: f32,
+    pub(crate) horizontal_scaling: f32,
+    pub(crate) combined: Matrix,
+    pub(crate) origin: (f32, f32),
+}
+
 /// Walk the page's decoded content stream, drop every text-show operator
 /// whose origin lies inside any of `removal_rects`, and write the result
 /// back. Non-text operators (paths, images, shading) are left untouched.
@@ -31,14 +44,16 @@ pub(crate) fn rewrite_page_content(
     doc: &mut Document,
     page_id: ObjectId,
     removal_rects: &[Vec<UserRect>],
+    capture_text: &[bool],
     geom: PageGeometry,
-) -> Result<(Matrix, Vec<SampledBlockStyle>), PdfWriteError> {
+) -> Result<(Matrix, Vec<SampledBlockStyle>, Vec<Vec<CapturedTextShow>>), PdfWriteError> {
     let content = doc.get_and_decode_page_content(page_id)?;
     let resources = ResourceContext::from_page(doc, page_id);
-    let (filtered, final_ctm, raw_samples) = filter_text_ops(
+    let (filtered, final_ctm, raw_samples, captured) = filter_text_ops(
         doc,
         content.operations,
         removal_rects,
+        capture_text,
         &resources,
         ContentState::new(),
         &mut HashSet::new(),
@@ -49,7 +64,7 @@ pub(crate) fn rewrite_page_content(
     .encode()?;
     let block_styles = resolve_block_styles(doc, page_id, &raw_samples, removal_rects, geom);
     doc.change_page_content(page_id, new_bytes)?;
-    Ok((final_ctm, block_styles))
+    Ok((final_ctm, block_styles, captured))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,7 +220,38 @@ fn resolve_block_styles(
                     (x, s.origin.1)
                 });
 
-            let line_anchors = original_line_anchors(samples, geom, block_left_x);
+            let line_anchors = original_line_anchors(samples, geom, None);
+            // Per-line x override from the block's source_rects: surgery's
+            // Tj-origin x can land further right than the first visible
+            // glyph (TJ arrays with leading negative spacing land at the
+            // gutter, not the glyph). The fix used to be a single global
+            // `block_left_x` override, but that conflated lines that
+            // genuinely start at different x positions — e.g. a multi-line
+            // prose block whose FIRST line continues an inline formula
+            // (starts at x=473) and whose later lines wrap to the left
+            // margin (x=88). Pushing every line to the global min would
+            // shove the "and we commit" continuation back to x=88 where it
+            // overlaps the formula it's supposed to follow.
+            let block_rects = removal_rects
+                .get(block_idx)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let line_anchors: Vec<(f32, f32)> = line_anchors
+                .into_iter()
+                .map(|(sample_x, y)| {
+                    let line_left_x = block_rects
+                        .iter()
+                        .filter(|r| y >= r.y0 - 1.0 && y <= r.y1 + 1.0)
+                        .map(|r| r.x0)
+                        .fold(f32::INFINITY, f32::min);
+                    let new_x = if line_left_x.is_finite() {
+                        line_left_x
+                    } else {
+                        sample_x
+                    };
+                    (new_x, y)
+                })
+                .collect();
             let original_line_count = line_anchors.len().max(1);
 
             // Pick the orientation of the first sample. Producers almost
@@ -358,12 +404,22 @@ fn filter_text_ops(
     doc: &mut Document,
     ops: Vec<Operation>,
     removal_rects: &[Vec<UserRect>],
+    capture_text: &[bool],
     resources: &ResourceContext,
     mut state: ContentState,
     xobject_stack: &mut HashSet<ObjectId>,
-) -> Result<(Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>), PdfWriteError> {
+) -> Result<
+    (
+        Vec<Operation>,
+        Matrix,
+        Vec<Vec<RawStyleSample>>,
+        Vec<Vec<CapturedTextShow>>,
+    ),
+    PdfWriteError,
+> {
     let mut out = Vec::with_capacity(ops.len());
     let mut samples: Vec<Vec<RawStyleSample>> = vec![Vec::new(); removal_rects.len()];
+    let mut captured: Vec<Vec<CapturedTextShow>> = vec![Vec::new(); removal_rects.len()];
 
     for op in ops {
         if !is_text_show_operator(&op.operator) {
@@ -374,7 +430,9 @@ fn filter_text_ops(
                     &state,
                     resources,
                     removal_rects,
+                    capture_text,
                     &mut samples,
+                    &mut captured,
                     xobject_stack,
                 )?;
             }
@@ -383,11 +441,33 @@ fn filter_text_ops(
             continue;
         }
         let snapshot = state.process_text_show(&op, &resources.font_advances);
-        let dropped_rect = removal_rects.iter().position(|rects| {
-            rects
-                .iter()
-                .any(|r| text_show_touches_source_rect(snapshot, *r))
-        });
+        // Pick the rect that BEST matches this Tj's origin, not just the
+        // first one that "touches" it. Adjacent fragments often have
+        // bboxes that overlap by a fraction of a point at glyph
+        // boundaries — a TeX big paren (CMEX10, e.g. x in [467, 472])
+        // sits flush against a following comma (x=471), and surgery's
+        // first-match-wins iteration would attribute the comma's Tj to
+        // the paren's block. Prefer the rect whose left edge is closest
+        // to (and not past) the Tj's own origin x — that's the rect the
+        // glyph actually belongs to.
+        let dropped_rect = removal_rects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rects)| {
+                rects
+                    .iter()
+                    .filter(|r| text_show_touches_source_rect(snapshot, **r))
+                    .map(|r| (i, *r))
+                    .next()
+            })
+            .min_by(|(_, a), (_, b)| {
+                let dist_a = (snapshot.origin.0 - a.x0).abs();
+                let dist_b = (snapshot.origin.0 - b.x0).abs();
+                dist_a
+                    .partial_cmp(&dist_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
         let Some(rect_index) = dropped_rect else {
             out.push(op);
             continue;
@@ -416,6 +496,21 @@ fn filter_text_ops(
                 f: 0.0,
             },
         });
+        if capture_text.get(rect_index).copied().unwrap_or(false)
+            && let Some(font_resource) = state.font_resource().clone()
+        {
+            captured[rect_index].push(CapturedTextShow {
+                operation: normalize_text_show_operation(&op),
+                font_resource,
+                font_size: state.font_size(),
+                fill_rgb: state.fill_rgb(),
+                char_spacing: state.char_spacing(),
+                word_spacing: state.word_spacing(),
+                horizontal_scaling: state.horizontal_scaling(),
+                combined,
+                origin: snapshot.origin,
+            });
+        }
         // Drop the glyphs but emit a cursor-advance-only TJ in their place
         // so subsequent text-show operators in the same BT/ET still draw at
         // the correct x. Without this, dropping a Tj `(hello) Tj` removes
@@ -440,7 +535,7 @@ fn filter_text_ops(
         }
     }
 
-    Ok((out, state.current_ctm(), samples))
+    Ok((out, state.current_ctm(), samples, captured))
 }
 
 fn rewrite_form_xobject(
@@ -449,7 +544,9 @@ fn rewrite_form_xobject(
     state: &ContentState,
     resources: &ResourceContext,
     removal_rects: &[Vec<UserRect>],
+    capture_text: &[bool],
     samples: &mut [Vec<RawStyleSample>],
+    captured: &mut [Vec<CapturedTextShow>],
     xobject_stack: &mut HashSet<ObjectId>,
 ) -> Result<(), PdfWriteError> {
     let Some(Object::Name(name)) = op.operands.first() else {
@@ -489,15 +586,19 @@ fn rewrite_form_xobject(
 
     let decoded = stream.decompressed_content()?;
     let content = Content::decode(&decoded)?;
-    let (filtered, _, nested_samples) = filter_text_ops(
+    let (filtered, _, nested_samples, nested_captured) = filter_text_ops(
         doc,
         content.operations,
         removal_rects,
+        capture_text,
         &form_resources,
         form_state,
         xobject_stack,
     )?;
     for (dst, src) in samples.iter_mut().zip(nested_samples) {
+        dst.extend(src);
+    }
+    for (dst, src) in captured.iter_mut().zip(nested_captured) {
         dst.extend(src);
     }
     stream.set_plain_content(
@@ -509,6 +610,29 @@ fn rewrite_form_xobject(
     *doc.get_object_mut(xobject_id)? = Object::Stream(stream);
     xobject_stack.remove(&xobject_id);
     Ok(())
+}
+
+fn normalize_text_show_operation(op: &Operation) -> Operation {
+    match op.operator.as_str() {
+        "Tj" | "TJ" => op.clone(),
+        "'" => {
+            let text = op
+                .operands
+                .last()
+                .cloned()
+                .unwrap_or(Object::String(Vec::new(), lopdf::StringFormat::Literal));
+            Operation::new("Tj", vec![text])
+        }
+        "\"" => {
+            let text = op
+                .operands
+                .get(2)
+                .cloned()
+                .unwrap_or(Object::String(Vec::new(), lopdf::StringFormat::Literal));
+            Operation::new("Tj", vec![text])
+        }
+        _ => op.clone(),
+    }
 }
 
 fn form_resource_context(doc: &Document, dict: &Dictionary) -> ResourceContext {
@@ -595,11 +719,39 @@ mod tests {
     fn run_filter(
         ops: Vec<Operation>,
         rects: &[Vec<UserRect>],
-    ) -> (Vec<Operation>, Matrix, Vec<Vec<RawStyleSample>>) {
+    ) -> (
+        Vec<Operation>,
+        Matrix,
+        Vec<Vec<RawStyleSample>>,
+        Vec<Vec<CapturedTextShow>>,
+    ) {
         filter_text_ops(
             &mut Document::with_version("1.5"),
             ops,
             rects,
+            &vec![false; rects.len()],
+            &ResourceContext::default(),
+            ContentState::new(),
+            &mut HashSet::new(),
+        )
+        .unwrap()
+    }
+
+    fn run_filter_with_capture(
+        ops: Vec<Operation>,
+        rects: &[Vec<UserRect>],
+        capture_text: &[bool],
+    ) -> (
+        Vec<Operation>,
+        Matrix,
+        Vec<Vec<RawStyleSample>>,
+        Vec<Vec<CapturedTextShow>>,
+    ) {
+        filter_text_ops(
+            &mut Document::with_version("1.5"),
+            ops,
+            rects,
+            capture_text,
             &ResourceContext::default(),
             ContentState::new(),
             &mut HashSet::new(),
@@ -635,7 +787,7 @@ mod tests {
             x1: 200.0,
             y1: 750.0,
         };
-        let (filtered, _, _) = run_filter(ops.clone(), &[vec![rect]]);
+        let (filtered, _, _, _) = run_filter(ops.clone(), &[vec![rect]]);
         // The Tj is replaced by a glyphless `[N] TJ` that preserves the
         // cursor advance for any subsequent text-show on the same line.
         assert!(filtered.iter().all(|o| o.operator != "Tj"));
@@ -663,6 +815,37 @@ mod tests {
     }
 
     #[test]
+    fn filter_captures_dropped_opaque_text_show() {
+        let ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Real(12.0)]),
+            Operation::new("Td", vec![Object::Real(100.0), Object::Real(700.0)]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(
+                    b"math".to_vec(),
+                    lopdf::StringFormat::Literal,
+                )],
+            ),
+            Operation::new("ET", vec![]),
+        ];
+        let rect = UserRect {
+            x0: 50.0,
+            y0: 650.0,
+            x1: 200.0,
+            y1: 750.0,
+        };
+
+        let (_, _, _, captured) = run_filter_with_capture(ops, &[vec![rect]], &[true]);
+
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 1);
+        assert_eq!(captured[0][0].font_resource, b"F1".to_vec());
+        assert_eq!(captured[0][0].font_size, 12.0);
+        assert_eq!(captured[0][0].operation.operator, "Tj");
+    }
+
+    #[test]
     fn filter_keeps_text_show_outside_rect() {
         let ops = vec![
             Operation::new("BT", vec![]),
@@ -681,7 +864,7 @@ mod tests {
             x1: 50.0,
             y1: 50.0,
         };
-        let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
+        let (filtered, _, _, _) = run_filter(ops, &[vec![rect]]);
         assert!(filtered.iter().any(|o| o.operator == "Tj"));
     }
 
@@ -707,7 +890,7 @@ mod tests {
             x1: 115.0,
             y1: 701.0,
         };
-        let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
+        let (filtered, _, _, _) = run_filter(ops, &[vec![rect]]);
         assert!(filtered.iter().all(|op| op.operator != "Tj"));
     }
 
@@ -736,7 +919,7 @@ mod tests {
             x1: 129.0,
             y1: 710.0,
         };
-        let (filtered, _, _) = run_filter(ops, &[vec![rect]]);
+        let (filtered, _, _, _) = run_filter(ops, &[vec![rect]]);
         assert_eq!(filtered.iter().filter(|op| op.operator == "Tj").count(), 1);
     }
 
@@ -745,6 +928,8 @@ mod tests {
         let geom = PageGeometry {
             user_w: 612.0,
             user_h: 792.0,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
             rotate: 0,
         };
         let samples = vec![

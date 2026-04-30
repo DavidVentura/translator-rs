@@ -7,6 +7,10 @@ use crate::session::TranslatorSession;
 use crate::settings::BackgroundMode;
 use crate::styled::TranslatedStyledBlock;
 
+pub enum PdfTranslateProgress {
+    TranslatingPage { current: usize, total: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct PageTranslationResult {
     pub page_index: usize,
@@ -23,6 +27,7 @@ pub struct PageTranslationResult {
 pub enum PdfTranslateError {
     Pdf(PdfError),
     Translator(TranslatorError),
+    Cancelled,
 }
 
 impl From<PdfError> for PdfTranslateError {
@@ -42,6 +47,7 @@ impl std::fmt::Display for PdfTranslateError {
         match self {
             Self::Pdf(err) => write!(f, "{err}"),
             Self::Translator(err) => write!(f, "translator: {err:?}"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -57,8 +63,28 @@ pub fn translate_pdf(
     target_code: &str,
     available_language_codes: &[LanguageCode],
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
+    translate_pdf_with_progress(
+        session,
+        pdf_bytes,
+        forced_source_code,
+        target_code,
+        available_language_codes,
+        |_| Ok(()),
+    )
+}
+
+pub fn translate_pdf_with_progress(
+    session: &TranslatorSession,
+    pdf_bytes: &[u8],
+    forced_source_code: Option<&str>,
+    target_code: &str,
+    available_language_codes: &[LanguageCode],
+    mut on_progress: impl FnMut(PdfTranslateProgress) -> Result<(), PdfTranslateError>,
+) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
     let extracted = extract_text(pdf_bytes)?;
     let mut results = Vec::with_capacity(extracted.len());
+    let total = extracted.len();
+    on_progress(PdfTranslateProgress::TranslatingPage { current: 0, total })?;
 
     for page in extracted {
         let translated = session.translate_structured_fragments(
@@ -77,6 +103,10 @@ pub fn translate_pdf(
             error: translated.error_message,
             target_language: target_code.to_string(),
         });
+        on_progress(PdfTranslateProgress::TranslatingPage {
+            current: results.len(),
+            total,
+        })?;
     }
 
     Ok(results)

@@ -122,9 +122,9 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
     // Third pass: drop non-opaque lines that look like display math under the
     // text-only heuristic (catch-all for non-TeX producers), then emit
     // fragments. `group_id` bumps on every mupdf-block boundary AND on every
-    // opaqueness transition so opaque math gets its own TranslatableBlock —
-    // surgery and overlay both leave opaque blocks alone, while the prose
-    // around them is translated and rendered normally.
+    // opaqueness transition so opaque math gets its own TranslatableBlock:
+    // the writer can preserve its original PDF text-show program, while the
+    // prose around it is translated and rendered normally.
     let mut fragments = Vec::new();
     let mut group_id: u32 = 0;
     let mut prev_block_index: Option<usize> = None;
@@ -180,8 +180,8 @@ enum MathKind {
     /// No math-class chars, or math is a minority alongside text-class
     /// chars. Treated like prose for opaqueness.
     Prose,
-    /// At least 3 chars and ≥70% math-class — a real display equation
-    /// fragment. Always opaque on its own.
+    /// At least 3 chars and a strict majority are math-class — a real
+    /// display equation fragment. Always opaque on its own.
     Strong,
     /// Math-class chars only (no text-class chars), but too few to be a
     /// Strong line on its own. Could be a one-char inline subscript that
@@ -198,6 +198,13 @@ fn classify_math_line(chars: &[TypedChar]) -> MathKind {
         if tc.c.is_whitespace() {
             continue;
         }
+        if is_extensible_math_replacement(tc) {
+            // MuPDF cannot map some TeX extensible delimiters (large
+            // parentheses/brackets from CMEX) to Unicode, so it reports
+            // U+FFFD. Redrawing that text can only reproduce the replacement
+            // character; keep the original PDF glyphs instead.
+            return MathKind::Strong;
+        }
         if is_math_font(&tc.font_name) {
             math += 1;
         } else if is_text_font(&tc.font_name) {
@@ -209,7 +216,16 @@ fn classify_math_line(chars: &[TypedChar]) -> MathKind {
         return MathKind::Prose;
     }
     let counted = math + text;
-    if counted >= 3 && math * 10 >= counted * 7 {
+    // Strong iff math chars make up at least half of the voting chars.
+    // The previous 70% threshold rejected fraction-numerator lines like
+    // `(τ_2 − τ_1)` where the digits/parens land in CMR (text) even
+    // though the line is unambiguously part of a display equation, and
+    // 50/50 lines like `−2 = Ω` (where `2`, `=` are CMR but `−`, `Ω`
+    // are math) — both showed up as Prose. A 50% floor catches those
+    // while still keeping ordinary prose (where `Lemma 21`-style
+    // references contribute one inline math char against many text
+    // ones) classified as Prose.
+    if counted >= 3 && math * 2 >= counted {
         return MathKind::Strong;
     }
     if text == 0 {
@@ -223,9 +239,19 @@ fn compute_opaque_flags(pre_lines: &[PreLine]) -> Vec<bool> {
     if pre_lines.is_empty() {
         return flags;
     }
-    // Walk the lines one mupdf-block at a time. mupdf groups display
-    // equations into their own block(s), so block context is the right
-    // grain for "is this a formula or prose?" decisions.
+    // Walk the lines one mupdf-block at a time and find each contiguous
+    // math run (consecutive Strong/Weak lines, broken by Prose). A run is
+    // marked opaque iff it contains at least one Strong line. That keeps
+    // a lone subscript line (a single CMMI `i` mupdf split out from
+    // surrounding prose) bound to its prose neighbours — but tags a real
+    // multi-line display equation (or an inline `Ω(τ_2-τ_1)/δ` whose
+    // numerator/denominator/big-paren chunks span several mupdf "lines"
+    // at slightly offset baselines) as one opaque unit. The per-block
+    // boundaries matter because group_id later flips on every mupdf-block
+    // and every opaqueness change, so a math run inside a prose paragraph
+    // ends up as its own TranslatableBlock with the prose runs around it
+    // becoming their own — and the writer's cursor-coordination logic
+    // chains them back together on the visual row.
     let mut block_start = 0;
     while block_start < pre_lines.len() {
         let block_idx = pre_lines[block_start].block_index;
@@ -233,108 +259,29 @@ fn compute_opaque_flags(pre_lines: &[PreLine]) -> Vec<bool> {
         while block_end < pre_lines.len() && pre_lines[block_end].block_index == block_idx {
             block_end += 1;
         }
-        let block = &pre_lines[block_start..block_end];
-        if block_is_display_equation(block) {
-            // Whole-block override: a display equation may have lines that
-            // mix math with subscript words (CMR7 chars from `Θ_recovery`,
-            // `T_qc`) or with text-font labels (`GST`, `view`). Those lines
-            // fail the per-line math-majority test and would be classified
-            // Prose, but the block as a whole has no real prose words so we
-            // treat every line as opaque.
-            for j in block_start..block_end {
-                flags[j] = true;
+        let mut i = block_start;
+        while i < block_end {
+            if matches!(pre_lines[i].math_kind, MathKind::Prose) {
+                i += 1;
+                continue;
             }
-        } else {
-            // Per-line math-run analysis within a non-equation block.
-            // Marks Strong lines opaque, plus any Weak run touching at
-            // least one Strong line — that's how multi-line display math
-            // embedded in a prose block (the page-7 `Bk ← (bk, P(Bk−1))`
-            // sitting inside the same mupdf block as the surrounding
-            // paragraph) gets opaque while lone subscripts (a single `i`
-            // dropped between two prose lines) stays prose.
-            let mut i = block_start;
-            while i < block_end {
-                if matches!(pre_lines[i].math_kind, MathKind::Prose) {
-                    i += 1;
-                    continue;
+            let run_start = i;
+            let mut has_strong = false;
+            while i < block_end && !matches!(pre_lines[i].math_kind, MathKind::Prose) {
+                if matches!(pre_lines[i].math_kind, MathKind::Strong) {
+                    has_strong = true;
                 }
-                let run_start = i;
-                let mut has_strong = false;
-                while i < block_end && !matches!(pre_lines[i].math_kind, MathKind::Prose) {
-                    if matches!(pre_lines[i].math_kind, MathKind::Strong) {
-                        has_strong = true;
-                    }
-                    i += 1;
-                }
-                if has_strong {
-                    for j in run_start..i {
-                        flags[j] = true;
-                    }
+                i += 1;
+            }
+            if has_strong {
+                for j in run_start..i {
+                    flags[j] = true;
                 }
             }
         }
         block_start = block_end;
     }
     flags
-}
-
-/// True when a mupdf block looks like a (multi-line) display equation —
-/// it contains math-class chars but no real prose. "Real prose" is
-/// approximated by alphabetic runs of ≥4 chars in body-size text fonts:
-/// subscript words (CMR7 `recovery`) don't count because they only ever
-/// appear inside math, and short body-font snippets (`GST`, `Lv`) don't
-/// either because they're math labels rather than prose.
-fn block_is_display_equation(lines: &[PreLine]) -> bool {
-    const REAL_WORD_LEN: usize = 4;
-    const MAX_WORDS_FOR_DISPLAY: usize = 4;
-    let mut math_chars = 0usize;
-    let mut real_words = 0usize;
-    for line in lines {
-        let mut run = 0usize;
-        for tc in &line.typed_chars {
-            if is_math_font(&tc.font_name) {
-                math_chars += 1;
-                run = 0;
-                continue;
-            }
-            if tc.c.is_alphabetic() && is_body_text_font(&tc.font_name) {
-                run += 1;
-                if run == REAL_WORD_LEN {
-                    real_words += 1;
-                    if real_words > MAX_WORDS_FOR_DISPLAY && math_chars > 0 {
-                        return false;
-                    }
-                }
-            } else {
-                run = 0;
-            }
-        }
-    }
-    math_chars > 0 && real_words <= MAX_WORDS_FOR_DISPLAY
-}
-
-/// Body-size text fonts are size ≥8pt. CMR7/CMTI7/etc. are subscript
-/// scripts — they appear inside math expressions and shouldn't count
-/// toward a block's "is this prose?" word total.
-fn is_body_text_font(name: &str) -> bool {
-    if !is_text_font(name) {
-        return false;
-    }
-    font_size_suffix(name).map(|n| n >= 8).unwrap_or(true)
-}
-
-fn font_size_suffix(name: &str) -> Option<u32> {
-    let stem = font_stem(name);
-    let trailing: String = stem
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let digits: String = trailing.chars().rev().collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +410,13 @@ fn is_math_font(name: &str) -> bool {
     .any(|prefix| stem.starts_with(prefix))
 }
 
+fn is_extensible_math_replacement(tc: &TypedChar) -> bool {
+    tc.c == '\u{FFFD}'
+        && font_stem(&tc.font_name)
+            .to_ascii_uppercase()
+            .starts_with("CMEX")
+}
+
 fn is_text_font(name: &str) -> bool {
     let stem = font_stem(name).to_ascii_uppercase();
     [
@@ -583,5 +537,107 @@ fn rect_from_mupdf(r: mupdf::Rect) -> Rect {
         top: r.y0.max(0.0).floor() as u32,
         right: r.x1.max(0.0).ceil() as u32,
         bottom: r.y1.max(0.0).ceil() as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tc(c: char, font_name: &str) -> TypedChar {
+        TypedChar {
+            c,
+            x: 0.0,
+            style: PdfCharStyle {
+                bold: false,
+                italic: false,
+                fill_argb: 0xFF00_0000,
+            },
+            font_name: font_name.to_string(),
+        }
+    }
+
+    fn prose_line(text: &str, top: u32, bottom: u32) -> PreLine {
+        PreLine {
+            block_index: 0,
+            typed_chars: text.chars().map(|c| tc(c, "NUYYMY+CMR10")).collect(),
+            line_rect: Rect {
+                left: 0,
+                top,
+                right: 100,
+                bottom,
+            },
+            math_kind: MathKind::Prose,
+        }
+    }
+
+    #[test]
+    fn cmex_replacement_glyph_makes_fraction_line_strong_math() {
+        let chars = [
+            tc('\u{FFFD}', "KJCFKR+CMEX10"),
+            tc('τ', "YOUTFK+CMMI7"),
+            tc('2', "XDHWRX+CMR5"),
+            tc('−', "AQGLSQ+CMSY7"),
+            tc('τ', "YOUTFK+CMMI7"),
+            tc('1', "XDHWRX+CMR5"),
+        ];
+
+        assert_eq!(classify_math_line(&chars), MathKind::Strong);
+    }
+
+    #[test]
+    fn cmex_fraction_keeps_only_formula_lines_opaque() {
+        let leading_prose = prose_line("alpha beta gamma delta epsilon", 10, 20);
+        let numerator = PreLine {
+            block_index: 0,
+            typed_chars: vec![
+                tc('\u{FFFD}', "KJCFKR+CMEX10"),
+                tc('τ', "YOUTFK+CMMI7"),
+                tc('2', "XDHWRX+CMR5"),
+            ],
+            line_rect: Rect {
+                left: 100,
+                top: 9,
+                right: 130,
+                bottom: 21,
+            },
+            math_kind: MathKind::Strong,
+        };
+        let denominator = PreLine {
+            block_index: 0,
+            typed_chars: vec![tc('δ', "YOUTFK+CMMI7")],
+            line_rect: Rect {
+                left: 110,
+                top: 16,
+                right: 120,
+                bottom: 21,
+            },
+            math_kind: MathKind::Weak,
+        };
+        let right_delimiter = PreLine {
+            block_index: 0,
+            typed_chars: vec![tc('\u{FFFD}', "KJCFKR+CMEX10")],
+            line_rect: Rect {
+                left: 130,
+                top: 9,
+                right: 140,
+                bottom: 21,
+            },
+            math_kind: MathKind::Strong,
+        };
+        let trailing_prose = prose_line("zeta eta theta iota kappa", 11, 19);
+        let next_row_prose = prose_line("lambda mu nu xi omicron", 30, 40);
+
+        assert_eq!(
+            compute_opaque_flags(&[
+                leading_prose,
+                numerator,
+                denominator,
+                right_delimiter,
+                trailing_prose,
+                next_row_prose
+            ]),
+            vec![false, true, true, true, false, false]
+        );
     }
 }

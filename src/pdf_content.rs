@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
-use lopdf::content::Operation;
+use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::ocr::Rect;
@@ -100,6 +100,12 @@ pub(crate) struct PageGeometry {
     pub user_w: f32,
     /// User-space height (independent of `/Rotate`; matches MediaBox y range).
     pub user_h: f32,
+    /// MediaBox lower-left x in user space. Most PDFs have 0; some (like
+    /// this Cockburn book) use a non-zero offset, e.g. `[-6.69, -12.89,
+    /// 504, 667.58]`.
+    pub user_x_min: f32,
+    /// MediaBox lower-left y in user space. Same caveat as `user_x_min`.
+    pub user_y_min: f32,
     /// `/Rotate` value, normalised to 0/90/180/270.
     pub rotate: i32,
 }
@@ -115,12 +121,14 @@ impl PageGeometry {
             .unwrap_or(0);
         let rotate = ((rotate % 360 + 360) % 360) as i32;
 
-        if let Some((user_w, user_h)) =
+        if let Some((user_x_min, user_y_min, user_w, user_h)) =
             inherited_object(doc, page_id, b"MediaBox").and_then(|o| media_box_dims(doc, &o))
         {
             return Self {
                 user_w,
                 user_h,
+                user_x_min,
+                user_y_min,
                 rotate,
             };
         }
@@ -135,19 +143,31 @@ impl PageGeometry {
         Self {
             user_w,
             user_h,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
             rotate,
         }
+    }
+
+    fn user_top(&self) -> f32 {
+        self.user_y_min + self.user_h
+    }
+
+    fn user_right(&self) -> f32 {
+        self.user_x_min + self.user_w
     }
 
     /// Convert a user-space point to display coords (top-left origin), matching
     /// MuPDF's stext line/char coordinates.
     pub(crate) fn to_display(&self, user: (f32, f32)) -> (f32, f32) {
+        let top = self.user_top();
+        let right = self.user_right();
         match self.rotate {
-            0 => (user.0, self.user_h - user.1),
-            90 => (user.1, user.0),
-            180 => (self.user_w - user.0, user.1),
-            270 => (self.user_h - user.1, self.user_w - user.0),
-            _ => (user.0, self.user_h - user.1),
+            0 => (user.0 - self.user_x_min, top - user.1),
+            90 => (user.1 - self.user_y_min, user.0 - self.user_x_min),
+            180 => (right - user.0, user.1 - self.user_y_min),
+            270 => (top - user.1, right - user.0),
+            _ => (user.0 - self.user_x_min, top - user.1),
         }
     }
 
@@ -160,17 +180,24 @@ impl PageGeometry {
             bbox.right as f32,
             bbox.bottom as f32,
         );
+        let top = self.user_top();
+        let right = self.user_right();
         let (x0, x1, y0, y1) = match self.rotate {
-            0 => (l, r, self.user_h - b, self.user_h - t),
-            90 => (t, b, l, r),
-            180 => (self.user_w - r, self.user_w - l, t, b),
-            270 => (
-                self.user_w - b,
-                self.user_w - t,
-                self.user_h - r,
-                self.user_h - l,
+            0 => (l + self.user_x_min, r + self.user_x_min, top - b, top - t),
+            90 => (
+                t + self.user_x_min,
+                b + self.user_x_min,
+                l + self.user_y_min,
+                r + self.user_y_min,
             ),
-            _ => (l, r, self.user_h - b, self.user_h - t),
+            180 => (
+                right - r,
+                right - l,
+                t + self.user_y_min,
+                b + self.user_y_min,
+            ),
+            270 => (right - b, right - t, top - r, top - l),
+            _ => (l + self.user_x_min, r + self.user_x_min, top - b, top - t),
         };
         UserRect {
             x0: x0.min(x1),
@@ -210,7 +237,7 @@ fn inherited_object(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Obj
     }
 }
 
-fn media_box_dims(doc: &Document, obj: &Object) -> Option<(f32, f32)> {
+fn media_box_dims(doc: &Document, obj: &Object) -> Option<(f32, f32, f32, f32)> {
     let arr = match obj {
         Object::Array(arr) => arr,
         Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?,
@@ -221,7 +248,11 @@ fn media_box_dims(doc: &Document, obj: &Object) -> Option<(f32, f32)> {
     }
     let nums: Option<Vec<f32>> = arr.iter().map(object_as_f32).collect();
     let nums = nums?;
-    Some((nums[2] - nums[0], nums[3] - nums[1]))
+    let lx = nums[0].min(nums[2]);
+    let ly = nums[1].min(nums[3]);
+    let rx = nums[0].max(nums[2]);
+    let ty = nums[1].max(nums[3]);
+    Some((lx, ly, rx - lx, ty - ly))
 }
 
 #[derive(Debug, Clone)]
@@ -673,6 +704,14 @@ impl ContentState {
         self.horizontal_scaling
     }
 
+    pub(crate) fn char_spacing(&self) -> f32 {
+        self.char_spacing
+    }
+
+    pub(crate) fn word_spacing(&self) -> f32 {
+        self.word_spacing
+    }
+
     pub(crate) fn fill_rgb(&self) -> (f32, f32, f32) {
         self.current.fill_rgb
     }
@@ -905,6 +944,31 @@ impl ContentStreamBuilder {
             "{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm",
             m.a, m.b, m.c, m.d, m.e, m.f
         );
+    }
+
+    pub(crate) fn set_char_spacing(&mut self, spacing: f32) {
+        let _ = writeln!(self.out, "{spacing:.4} Tc");
+    }
+
+    pub(crate) fn set_word_spacing(&mut self, spacing: f32) {
+        let _ = writeln!(self.out, "{spacing:.4} Tw");
+    }
+
+    pub(crate) fn set_horizontal_scaling(&mut self, scaling: f32) {
+        let _ = writeln!(self.out, "{:.4} Tz", scaling * 100.0);
+    }
+
+    pub(crate) fn push_operation(&mut self, op: &Operation) {
+        if let Ok(bytes) = (Content {
+            operations: vec![op.clone()],
+        })
+        .encode()
+        {
+            self.out.extend_from_slice(&bytes);
+            if !self.out.ends_with(b"\n") {
+                self.out.push(b'\n');
+            }
+        }
     }
 
     /// `<HHHH...>` Tj — draws hex-encoded glyph IDs (used with embedded

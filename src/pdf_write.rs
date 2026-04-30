@@ -28,7 +28,7 @@ use crate::pdf_resources::{
     append_content_stream, attach_embedded_fonts_to_page, ensure_fonts_in_page_resources,
     prune_link_annotations, prune_unused_fonts,
 };
-use crate::pdf_surgery::rewrite_page_content;
+use crate::pdf_surgery::{CapturedTextShow, rewrite_page_content};
 use crate::pdf_translate::PageTranslationResult;
 use crate::styled::TranslatedStyledBlock;
 
@@ -195,6 +195,7 @@ struct PageWork<'a> {
     translation: &'a PageTranslationResult,
     layout_rects: Vec<UserRect>,
     block_styles: Vec<SampledBlockStyle>,
+    captured_text: Vec<Vec<CapturedTextShow>>,
     final_ctm: Matrix,
     geom: PageGeometry,
 }
@@ -276,13 +277,6 @@ fn run_surgery<'a>(
             .blocks
             .iter()
             .map(|b| {
-                // Opaque blocks (display math) keep their original glyphs —
-                // surgery is told the block has no source rects, so the
-                // original Tjs survive untouched. The writer also skips
-                // overlay emission for these in `pdf_overlay::emit_block`.
-                if b.opaque {
-                    return Vec::new();
-                }
                 let source_rects = if b.source_rects.is_empty() {
                     std::slice::from_ref(&b.bounding_box)
                 } else {
@@ -294,7 +288,9 @@ fn run_surgery<'a>(
                     .collect()
             })
             .collect();
-        let (final_ctm, block_styles) = rewrite_page_content(doc, *page_id, &removal_rects, geom)?;
+        let capture_text: Vec<bool> = translation.blocks.iter().map(|b| b.opaque).collect();
+        let (final_ctm, block_styles, captured_text) =
+            rewrite_page_content(doc, *page_id, &removal_rects, &capture_text, geom)?;
         let flat_removal_rects = removal_rects.iter().flatten().copied().collect::<Vec<_>>();
         prune_link_annotations(doc, *page_id, &flat_removal_rects)?;
         ensure_fonts_in_page_resources(doc, *page_id)?;
@@ -304,6 +300,7 @@ fn run_surgery<'a>(
             translation,
             layout_rects,
             block_styles,
+            captured_text,
             final_ctm,
             geom,
         });
@@ -448,6 +445,7 @@ fn emit_pages(
             &work.layout_rects,
             &work.block_styles,
             &block_resources,
+            &work.captured_text,
             work.geom,
             work.final_ctm,
         );

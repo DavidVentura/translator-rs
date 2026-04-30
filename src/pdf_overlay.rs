@@ -12,6 +12,7 @@ use crate::pdf_content::{
     BoldItalic, ContentStreamBuilder, FontStyleFlags, Matrix, PageGeometry, UserRect,
 };
 use crate::pdf_font_embed::EmbeddedFont;
+use crate::pdf_surgery::CapturedTextShow;
 use crate::pdf_write::{BlockGeometry, BlockTypography, SampledBlockStyle};
 use crate::styled::{StyleSpan, TranslatedStyledBlock};
 
@@ -53,6 +54,10 @@ const OVERHANG_TOLERANCE: f32 = 1.05;
 /// text becomes unreadable so we accept overflow instead.
 const MIN_SHRINK_FRACTION: f32 = 0.7;
 
+/// Gap to reserve before an inline opaque formula when wrapping the prose
+/// line that precedes it.
+const INLINE_FORMULA_PAD_PT: f32 = 6.0;
+
 /// Per-block resolved fonts: one `(FontMetrics, EmbeddedFont)` entry per
 /// [`BoldItalic`] variant the block actually uses (its dominant style plus
 /// whatever appears in `style_spans`). Wrapping always uses the dominant
@@ -87,66 +92,179 @@ pub(crate) fn build_overlay_stream(
     user_rects: &[UserRect],
     block_styles: &[SampledBlockStyle],
     block_resources: &[BlockResources],
+    captured_text: &[Vec<CapturedTextShow>],
     geom: PageGeometry,
     final_ctm: Matrix,
 ) -> Vec<u8> {
     let mut builder = ContentStreamBuilder::new();
     builder.save_state();
     let inv_ctm = final_ctm.inverse().unwrap_or_else(Matrix::identity);
-    for (i, (block, user_rect)) in blocks.iter().zip(user_rects.iter()).enumerate() {
-        // Opaque blocks (display math) keep their original glyphs — surgery
-        // didn't erase them and we don't draw an overlay over them either.
+    // Cursor coordination across adjacent blocks. After each block we
+    // record where its last visual line ended in user space; the next
+    // block, if its first visual line is on the same row, picks up from
+    // there. That's how a `<text><formula><text>` row stays coherent
+    // after translation: the formula slides over to follow the actual
+    // prose endpoint, the following prose slides further, and a
+    // multi-line prose's later wraps fall back to their own anchors at
+    // the left margin.
+    let mut prev_line_end: Option<(f32, f32)> = None;
+    let mut i = 0usize;
+    while i < blocks.len() && i < user_rects.len() {
+        let block = &blocks[i];
+        let user_rect = user_rects[i];
+        let style = block_styles.get(i).cloned().unwrap_or_default();
+        let first_line_y = first_line_user_y(&style, user_rect);
+        let inherit_x = prev_line_end.and_then(|(px, py)| {
+            ((first_line_y - py).abs() <= 4.0).then_some(px + INLINE_FORMULA_PAD_PT)
+        });
+
         if block.opaque {
+            let captured = captured_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let _ = inherit_x; // formulas stay anchored — see emit_captured_text_block
+            prev_line_end =
+                emit_captured_text_block(&mut builder, captured, user_rect, &style, &inv_ctm);
+            i += 1;
             continue;
         }
-        let style = block_styles.get(i).cloned().unwrap_or_default();
+
         let Some(resources) = block_resources.get(i) else {
+            prev_line_end = None;
+            i += 1;
             continue;
         };
-        emit_block(
+        // The prose's last visual line might be on the same row as a
+        // following opaque formula. Find the leftmost opaque block on
+        // that row so the wrap doesn't run past it (formulas stay at
+        // original x, so the prose has to leave them room).
+        let last_line_obstacle =
+            following_inline_obstacle_x(i, blocks, user_rects, &block_styles, geom);
+        prev_line_end = emit_block(
             &mut builder,
             block,
-            *user_rect,
+            user_rect,
             &style,
             resources,
+            inherit_x,
+            last_line_obstacle,
             geom,
             &inv_ctm,
         );
+        i += 1;
     }
     builder.restore_state();
     builder.finish()
+}
+
+fn following_inline_obstacles(
+    index: usize,
+    blocks: &[TranslatedStyledBlock],
+    user_rects: &[UserRect],
+    geom: PageGeometry,
+) -> Vec<UserRect> {
+    let Some(current) = user_rects.get(index).copied() else {
+        return Vec::new();
+    };
+    let (_, current_top, _, current_bottom) = user_rect_visual_bounds(current, geom);
+    if current_bottom - current_top > 45.0 {
+        return Vec::new();
+    }
+    let mut obstacles = Vec::new();
+    for next in (index + 1)..blocks.len().min(user_rects.len()) {
+        let rect = user_rects[next];
+        let (left, top, _, bottom) = user_rect_visual_bounds(rect, geom);
+        if top > current_bottom + 2.0 {
+            break;
+        }
+        if bottom < current_top - 2.0 {
+            continue;
+        }
+        if left <= user_rect_visual_bounds(current, geom).0 {
+            continue;
+        }
+        obstacles.push(rect);
+        if blocks[next].opaque {
+            continue;
+        }
+        if !blocks[next].opaque {
+            break;
+        }
+    }
+    obstacles
+}
+
+fn following_inline_obstacle_x(
+    index: usize,
+    blocks: &[TranslatedStyledBlock],
+    user_rects: &[UserRect],
+    _block_styles: &[SampledBlockStyle],
+    geom: PageGeometry,
+) -> Option<f32> {
+    following_inline_obstacles(index, blocks, user_rects, geom)
+        .into_iter()
+        .map(|rect| user_rect_visual_bounds(rect, geom).0)
+        .reduce(f32::min)
+}
+
+/// First-line baseline y in user space. Falls back to the block bbox if
+/// no anchor was sampled.
+fn first_line_user_y(style: &SampledBlockStyle, user_rect: UserRect) -> f32 {
+    if let Some((_, y)) = style.geometry.line_anchors.first() {
+        return *y;
+    }
+    if let Some((_, y)) = style.geometry.anchor {
+        return y;
+    }
+    user_rect.y1
 }
 
 /// Emit one translated block. Positioning happens in PDF user space (which
 /// matches what `UserRect` carries), then we inverse-transform through the
 /// page's still-active CTM into the producer's local coordinate system so
 /// the appended `cm`-less stream draws at the right visual spot.
+///
+/// `first_line_x_override` lets the caller force the first wrapped line
+/// to start at a specific x — used when this block is continuing an
+/// inline row that opened with a previous opaque formula. Subsequent
+/// lines fall back to their own anchors (typically the left margin).
+///
+/// Returns the user-space `(x, y)` where the last wrapped line ended, so
+/// the caller can chain a following block onto the same visual row.
 fn emit_block(
     builder: &mut ContentStreamBuilder,
     block: &TranslatedStyledBlock,
     user_rect: UserRect,
     style: &SampledBlockStyle,
     resources: &BlockResources,
+    first_line_x_override: Option<f32>,
+    last_line_obstacle_x: Option<f32>,
     geom: PageGeometry,
     inv_ctm: &Matrix,
-) {
+) -> Option<(f32, f32)> {
     let text = block.text.trim();
     if text.is_empty() {
-        return;
+        return None;
     }
     let user_w = user_rect.x1 - user_rect.x0;
     let user_h = user_rect.y1 - user_rect.y0;
     if user_w <= 0.0 || user_h <= 0.0 {
-        return;
+        return None;
     }
 
     let (vis_w, vis_h) = match geom.rotate {
         90 | 270 => (user_h, user_w),
         _ => (user_w, user_h),
     };
-    let line_widths = line_available_widths(&style.geometry, user_rect, geom, vis_w);
+    let line_widths = line_available_widths(
+        &style.geometry,
+        user_rect,
+        first_line_x_override,
+        last_line_obstacle_x,
+        geom,
+        vis_w,
+    );
 
     let dominant_metrics = resources.dominant_metrics();
+    let target_line_count = style.geometry.original_line_count;
     let (font_size, lines) = match style.typography.font_size {
         Some(size) if size.is_finite() && size > 0.0 => fit_with_sampled_size(
             text,
@@ -154,7 +272,7 @@ fn emit_block(
             vis_h,
             size,
             dominant_metrics,
-            style.geometry.original_line_count,
+            target_line_count,
         ),
         _ => {
             let initial = (vis_h * (1.0 - TEXT_BASELINE_PAD)).max(MIN_FIT_FONT_SIZE_PT);
@@ -202,8 +320,12 @@ fn emit_block(
     // can intersect with `block.style_spans` and produce styled segments.
     let line_word_ranges = line_byte_ranges(&block.text, &lines);
 
+    let advance_dx = style.geometry.text_orientation.a;
+    let advance_dy = style.geometry.text_orientation.b;
+    let mut last_line_end: Option<(f32, f32)> = None;
+
     for (i, _line) in lines.iter().enumerate() {
-        let (line_x, line_y) = line_origin(
+        let (mut line_x, line_y) = line_origin(
             &style.geometry,
             i,
             first_baseline_x,
@@ -212,12 +334,11 @@ fn emit_block(
             line_dx,
             line_dy,
         );
-
-        // Per-segment "advance right" vector in user space: row 1 of the
-        // sampled orientation matrix. For pure translation that's (1, 0); for
-        // 90° rotated producers it's (0, 1); etc.
-        let advance_dx = style.geometry.text_orientation.a;
-        let advance_dy = style.geometry.text_orientation.b;
+        if i == 0
+            && let Some(override_x) = first_line_x_override
+        {
+            line_x = override_x;
+        }
 
         let segments = segments_for_line(
             &block.text,
@@ -263,8 +384,56 @@ fn emit_block(
 
             cumulative += seg_metrics.measure(&seg.text, font_size);
         }
+        last_line_end = Some((
+            line_x + cumulative * advance_dx,
+            line_y + cumulative * advance_dy,
+        ));
     }
     builder.end_text();
+    last_line_end
+}
+
+/// Re-emit a captured run of original Tjs (a preserved formula) at
+/// the original positions. We deliberately keep formulas anchored where
+/// they were in the source PDF: a TeX fraction renders its bar with a
+/// PDF path operator (`m`, `l`, `S`) rather than a Tj, and surgery only
+/// captures text-show ops. If we shifted the captured Tjs, the
+/// numerator/denominator glyphs would slide one way and the fraction
+/// bar would stay behind, gutting the formula. Returns the user-space
+/// `(x, y)` of the formula's right edge so the caller can place the
+/// next inline block (the prose continuing on the same visual row)
+/// flush against it.
+fn emit_captured_text_block(
+    builder: &mut ContentStreamBuilder,
+    captured: &[CapturedTextShow],
+    user_rect: UserRect,
+    style: &SampledBlockStyle,
+    inv_ctm: &Matrix,
+) -> Option<(f32, f32)> {
+    if captured.is_empty() {
+        return None;
+    }
+
+    for show in captured {
+        let tm = show.combined.mul(*inv_ctm);
+        builder.set_fill_rgb(show.fill_rgb.0, show.fill_rgb.1, show.fill_rgb.2);
+        builder.begin_text();
+        builder.set_char_spacing(show.char_spacing);
+        builder.set_word_spacing(show.word_spacing);
+        builder.set_horizontal_scaling(show.horizontal_scaling);
+        builder.set_font(&show.font_resource, show.font_size);
+        builder.set_text_matrix(tm);
+        builder.push_operation(&show.operation);
+        builder.end_text();
+    }
+
+    let anchor_y = style
+        .geometry
+        .anchor
+        .map(|(_, y)| y)
+        .or_else(|| captured.first().map(|s| s.origin.1))
+        .unwrap_or(user_rect.y1);
+    Some((user_rect.x1, anchor_y))
 }
 
 fn line_origin(
@@ -290,6 +459,8 @@ fn line_origin(
 fn line_available_widths(
     geometry: &BlockGeometry,
     user_rect: UserRect,
+    first_line_x_override: Option<f32>,
+    last_line_obstacle_x: Option<f32>,
     geom: PageGeometry,
     fallback: f32,
 ) -> Vec<f32> {
@@ -298,12 +469,31 @@ fn line_available_widths(
     }
 
     let visual_right = user_rect_visual_bounds(user_rect, geom).2;
+    let last_index = geometry.line_anchors.len().saturating_sub(1);
     geometry
         .line_anchors
         .iter()
-        .map(|origin| {
-            let (vx, _) = geom.to_display(*origin);
-            (visual_right - vx).max(fallback * 0.25).min(fallback)
+        .enumerate()
+        .map(|(index, origin)| {
+            let (vx, _vy) = geom.to_display(*origin);
+            let effective_left = if index == 0
+                && let Some(override_x) = first_line_x_override
+            {
+                geom.to_display((override_x, origin.1)).0
+            } else {
+                vx
+            };
+            let effective_right = if index == last_index
+                && let Some(obstacle_user_x) = last_line_obstacle_x
+            {
+                let (ox, _) = geom.to_display((obstacle_user_x, origin.1));
+                ox.min(visual_right)
+            } else {
+                visual_right
+            };
+            (effective_right - effective_left)
+                .max(fallback * 0.25)
+                .min(fallback)
         })
         .collect()
 }
