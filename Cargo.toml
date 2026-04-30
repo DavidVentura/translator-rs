@@ -41,7 +41,8 @@ icu = { version = "2.1", optional = true }
 mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false }
 lopdf = { version = "0.40", optional = true, default-features = false }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
-subsetter = { version = "0.2", optional = true }
+subsetter = { version = "0.2", optional = true, default-features = false }
+
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
