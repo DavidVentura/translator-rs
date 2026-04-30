@@ -16,6 +16,11 @@ use crate::session::TranslatorSession;
 use crate::{TokenAlignment, TranslationWithAlignment};
 
 const ODT_MIMETYPE: &str = "application/vnd.oasis.opendocument.text";
+const ODT_TRANSLATION_BATCH_SIZE: usize = 8;
+
+pub enum OdtTranslateProgress {
+    TranslatingBlock { current: usize, total: usize },
+}
 
 #[derive(Debug)]
 pub enum OdtTranslateError {
@@ -24,6 +29,7 @@ pub enum OdtTranslateError {
     Io(String),
     Utf8(String),
     Translation(String),
+    Cancelled,
 }
 
 impl fmt::Display for OdtTranslateError {
@@ -34,6 +40,7 @@ impl fmt::Display for OdtTranslateError {
             | Self::Io(message)
             | Self::Utf8(message)
             | Self::Translation(message) => message.fmt(f),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -155,18 +162,44 @@ pub fn translate_odt(
     target_code: &str,
     available_language_codes: &[LanguageCode],
 ) -> Result<Vec<u8>, OdtTranslateError> {
+    translate_odt_with_progress(
+        session,
+        odt_bytes,
+        forced_source_code,
+        target_code,
+        available_language_codes,
+        |_| Ok(()),
+    )
+}
+
+pub fn translate_odt_with_progress(
+    session: &TranslatorSession,
+    odt_bytes: &[u8],
+    forced_source_code: Option<&str>,
+    target_code: &str,
+    available_language_codes: &[LanguageCode],
+    on_progress: impl FnMut(OdtTranslateProgress) -> Result<(), OdtTranslateError>,
+) -> Result<Vec<u8>, OdtTranslateError> {
     let mut translator = SessionOdtTranslator::new(
         session,
         forced_source_code,
         target_code,
         available_language_codes,
     );
-    translate_odt_with_translator(odt_bytes, &mut translator)
+    translate_odt_with_translator_and_progress(odt_bytes, &mut translator, on_progress)
 }
 
 pub fn translate_odt_with_translator(
     odt_bytes: &[u8],
     translator: &mut dyn OdtTextTranslator,
+) -> Result<Vec<u8>, OdtTranslateError> {
+    translate_odt_with_translator_and_progress(odt_bytes, translator, |_| Ok(()))
+}
+
+pub fn translate_odt_with_translator_and_progress(
+    odt_bytes: &[u8],
+    translator: &mut dyn OdtTextTranslator,
+    mut on_progress: impl FnMut(OdtTranslateProgress) -> Result<(), OdtTranslateError>,
 ) -> Result<Vec<u8>, OdtTranslateError> {
     let mut archive = ZipArchive::new(Cursor::new(odt_bytes))?;
     let mut entries = Vec::with_capacity(archive.len());
@@ -206,10 +239,32 @@ pub fn translate_odt_with_translator(
         }
     }
 
+    let total_blocks = entries
+        .iter()
+        .filter(|entry| is_translatable_xml_entry(&entry.name) && !entry.is_dir)
+        .map(|entry| {
+            String::from_utf8(entry.data.clone())
+                .map(|xml| count_translatable_text_blocks(&xml))
+                .unwrap_or(0)
+        })
+        .sum();
+    let mut translated_blocks = 0usize;
+    on_progress(OdtTranslateProgress::TranslatingBlock {
+        current: translated_blocks,
+        total: total_blocks,
+    })?;
+
     for entry in &mut entries {
         if is_translatable_xml_entry(&entry.name) && !entry.is_dir {
             let xml = String::from_utf8(entry.data.clone())?;
-            entry.data = rewrite_odt_xml(&xml, translator)?.into_bytes();
+            entry.data = rewrite_odt_xml_with_progress(
+                &xml,
+                translator,
+                total_blocks,
+                &mut translated_blocks,
+                &mut on_progress,
+            )?
+            .into_bytes();
             entry.compression = CompressionMethod::Deflated;
         }
     }
@@ -279,9 +334,28 @@ struct OdtTextBlock {
     style_spans: Vec<OdtStyleSpan>,
 }
 
+#[cfg(test)]
 fn rewrite_odt_xml(
     xml: &str,
     translator: &mut dyn OdtTextTranslator,
+) -> Result<String, OdtTranslateError> {
+    let total_blocks = count_translatable_text_blocks(xml);
+    let mut translated_blocks = 0usize;
+    rewrite_odt_xml_with_progress(
+        xml,
+        translator,
+        total_blocks,
+        &mut translated_blocks,
+        &mut |_| Ok(()),
+    )
+}
+
+fn rewrite_odt_xml_with_progress(
+    xml: &str,
+    translator: &mut dyn OdtTextTranslator,
+    total_blocks: usize,
+    translated_blocks: &mut usize,
+    on_progress: &mut dyn FnMut(OdtTranslateProgress) -> Result<(), OdtTranslateError>,
 ) -> Result<String, OdtTranslateError> {
     let tokens = tokenize_xml(xml);
     let mut replacements = Vec::<BlockReplacement>::new();
@@ -322,7 +396,15 @@ fn rewrite_odt_xml(
         return Ok(xml.to_string());
     }
 
-    let translations = translator.translate_texts_with_alignment(&texts)?;
+    let mut translations = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(ODT_TRANSLATION_BATCH_SIZE) {
+        translations.extend(translator.translate_texts_with_alignment(chunk)?);
+        *translated_blocks += chunk.len();
+        on_progress(OdtTranslateProgress::TranslatingBlock {
+            current: *translated_blocks,
+            total: total_blocks,
+        })?;
+    }
     let mut output = String::with_capacity(xml.len());
     let mut replacement_index = 0usize;
     let mut token_index = 0usize;
@@ -354,6 +436,38 @@ fn rewrite_odt_xml(
     }
 
     Ok(output)
+}
+
+fn count_translatable_text_blocks(xml: &str) -> usize {
+    let tokens = tokenize_xml(xml);
+    let mut count = 0usize;
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if let XmlTokenKind::Start {
+            name, self_closing, ..
+        } = &token.kind
+        {
+            if is_translatable_block(name) && !self_closing {
+                let Some(end_index) = find_matching_end(&tokens, index) else {
+                    index += 1;
+                    continue;
+                };
+                let inner_tokens = &tokens[index + 1..end_index];
+                if let Some(block) = collect_text_block(inner_tokens)
+                    && !block.text.trim().is_empty()
+                {
+                    count += 1;
+                }
+                index = end_index + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    count
 }
 
 #[derive(Debug)]
@@ -558,10 +672,11 @@ fn project_style_spans(
 }
 
 fn emit_translated_inline_xml(text: &str, style_spans: &[OdtStyleSpan]) -> String {
+    let style_spans = normalize_odt_style_spans_for_output(text, style_spans);
     let mut output = String::new();
     let mut cursor = 0usize;
 
-    for span in style_spans {
+    for span in &style_spans {
         let start = (span.start as usize).min(text.len());
         let end = (span.end as usize).min(text.len());
         if start < cursor
@@ -586,6 +701,52 @@ fn emit_translated_inline_xml(text: &str, style_spans: &[OdtStyleSpan]) -> Strin
 
     output.push_str(&escape_xml_text(&text[cursor..]));
     output
+}
+
+fn normalize_odt_style_spans_for_output(text: &str, spans: &[OdtStyleSpan]) -> Vec<OdtStyleSpan> {
+    let mut normalized = Vec::<OdtStyleSpan>::new();
+    let text_len = text.len() as u32;
+
+    for mut span in merge_odt_style_spans(spans.to_vec()) {
+        span.start = span.start.min(text_len);
+        span.end = span.end.min(text_len);
+        if span.start >= span.end
+            || !text.is_char_boundary(span.start as usize)
+            || !text.is_char_boundary(span.end as usize)
+        {
+            continue;
+        }
+
+        if let Some(last) = normalized.last_mut() {
+            if is_whitespace_range(text, last.end as usize, span.start as usize) {
+                last.end = span.start;
+            }
+            if last.style == span.style && span.start <= last.end {
+                last.end = last.end.max(span.end);
+                continue;
+            }
+        } else if is_whitespace_range(text, 0, span.start as usize) {
+            span.start = 0;
+        }
+
+        normalized.push(span);
+    }
+
+    if let Some(last) = normalized.last_mut() {
+        if is_whitespace_range(text, last.end as usize, text.len()) {
+            last.end = text_len;
+        }
+    }
+
+    merge_odt_style_spans(normalized)
+}
+
+fn is_whitespace_range(text: &str, start: usize, end: usize) -> bool {
+    start <= end
+        && end <= text.len()
+        && text.is_char_boundary(start)
+        && text.is_char_boundary(end)
+        && text[start..end].chars().all(char::is_whitespace)
 }
 
 fn merge_odt_style_spans(mut spans: Vec<OdtStyleSpan>) -> Vec<OdtStyleSpan> {
@@ -967,6 +1128,78 @@ mod tests {
             rewritten,
             r#"<office:text><text:p>X&amp;Y</text:p></office:text>"#
         );
+    }
+
+    #[test]
+    fn emits_same_style_words_as_single_span() {
+        let style = OdtTextStyle {
+            style_name: Some("T1".to_string()),
+        };
+        let spans = vec![
+            OdtStyleSpan {
+                start: 0,
+                end: 2,
+                style: style.clone(),
+            },
+            OdtStyleSpan {
+                start: 3,
+                end: 8,
+                style: style.clone(),
+            },
+            OdtStyleSpan {
+                start: 9,
+                end: 11,
+                style: style.clone(),
+            },
+            OdtStyleSpan {
+                start: 12,
+                end: 19,
+                style,
+            },
+        ];
+
+        let emitted = emit_translated_inline_xml("El panel de control", &spans);
+
+        assert_eq!(
+            emitted,
+            r#"<text:span text:style-name="T1">El panel de control</text:span>"#
+        );
+        assert!(!emitted.contains("</text:span> <text:span"));
+    }
+
+    #[test]
+    fn emits_style_boundary_space_inside_previous_span() {
+        let style_1 = OdtTextStyle {
+            style_name: Some("T1".to_string()),
+        };
+        let style_2 = OdtTextStyle {
+            style_name: Some("T2".to_string()),
+        };
+        let spans = vec![
+            OdtStyleSpan {
+                start: 0,
+                end: 3,
+                style: style_1,
+            },
+            OdtStyleSpan {
+                start: 4,
+                end: 7,
+                style: style_2.clone(),
+            },
+            OdtStyleSpan {
+                start: 8,
+                end: 12,
+                style: style_2,
+            },
+        ];
+
+        let emitted = emit_translated_inline_xml("uno dos tres", &spans);
+
+        assert_eq!(
+            emitted,
+            r#"<text:span text:style-name="T1">uno </text:span><text:span text:style-name="T2">dos tres</text:span>"#
+        );
+        assert!(!emitted.contains("</text:span> <text:span"));
     }
 
     #[test]
