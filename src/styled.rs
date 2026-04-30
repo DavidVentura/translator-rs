@@ -49,11 +49,11 @@ pub struct StyledFragment {
     pub layout_group: u32,
     pub translation_group: u32,
     pub cluster_group: u32,
-    /// Treat this fragment as a black box: don't translate, don't re-render,
-    /// don't erase the original glyphs. Used for display-math lines (LaTeX
-    /// formulas) where mupdf's per-char font analysis says the line is
-    /// drawn predominantly in CMSY/CMMI/CMEX. The original glyphs survive
-    /// in their original PDF font and position.
+    /// Treat this fragment as a black box: don't translate it into prose and
+    /// don't redraw it with fallback fonts. Used for display-math lines
+    /// (LaTeX formulas) where mupdf's per-char font analysis says the line
+    /// is drawn predominantly in CMSY/CMMI/CMEX. The PDF writer preserves
+    /// the original glyph program for these fragments.
     #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub opaque: bool,
 }
@@ -82,7 +82,7 @@ struct TranslatableBlock {
     segments: Vec<TranslationSegment>,
     /// True iff every fragment in this block was tagged opaque. Set on
     /// extraction for display-math blocks; carried through translation
-    /// untouched so the writer can leave the original glyphs intact.
+    /// untouched so the writer can preserve the original glyph program.
     opaque: bool,
 }
 
@@ -95,9 +95,9 @@ pub struct TranslatedStyledBlock {
     pub style_spans: Vec<StyleSpan>,
     pub background_argb: u32,
     pub foreground_argb: u32,
-    /// Display-math (or otherwise pass-through) block. The writer leaves
-    /// the original PDF glyphs alone — no overlay, no surgery rect — so
-    /// the original CMSY/CMMI/etc. typesetting survives verbatim.
+    /// Display-math (or otherwise pass-through) block. The writer preserves
+    /// the original CMSY/CMMI/etc. text-show program instead of translating
+    /// and redrawing the block with fallback fonts.
     #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub opaque: bool,
 }

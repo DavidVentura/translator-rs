@@ -584,7 +584,7 @@ fn rewrite_form_xobject(
         .unwrap_or_else(Matrix::identity);
     let form_state = ContentState::with_ctm(form_matrix.mul(state.current_ctm()));
 
-    let decoded = stream.decompressed_content()?;
+    let decoded = stream.get_plain_content()?;
     let content = Content::decode(&decoded)?;
     let (filtered, _, nested_samples, nested_captured) = filter_text_ops(
         doc,

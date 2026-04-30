@@ -25,6 +25,7 @@ odt = ["dep:zip"]
 
 [dependencies]
 bergamot-sys = { git = "https://github.com/DavidVentura/bergamot-sys" }
+# bergamot-sys = { path = "../bergamot-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -36,7 +37,8 @@ mucab = { git = "https://github.com/DavidVentura/mucab", optional = true }
 piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization"] }
 icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
 icu = { version = "2.1", optional = true }
-mupdf = { path = "../mupdf-rs", optional = true, default-features = false }
+# mupdf = { path = "../mupdf-rs", optional = true, default-features = false }
+mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false }
 lopdf = { version = "0.40", optional = true, default-features = false }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
 subsetter = { version = "0.2", optional = true }

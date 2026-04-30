@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "bergamot-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/bergamot-sys#8545adcd1e657f42e1a602b5ed092d4da849cd8e"
+source = "git+https://github.com/DavidVentura/bergamot-sys#b589ea841090752dabf6cbf3cfa8b3a584e4503f"
 dependencies = [
  "cmake",
 ]
@@ -1443,6 +1443,7 @@ dependencies = [
 [[package]]
 name = "mupdf"
 version = "0.6.0"
+source = "git+https://github.com/DavidVentura/mupdf-rs#ab0c0b12b2909b7f874da0d44f05ea1d99a0c7f8"
 dependencies = [
  "bitflags 2.11.1",
  "mupdf-sys",
@@ -1454,6 +1455,7 @@ dependencies = [
 [[package]]
 name = "mupdf-sys"
 version = "0.6.0"
+source = "git+https://github.com/DavidVentura/mupdf-rs#ab0c0b12b2909b7f874da0d44f05ea1d99a0c7f8"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
