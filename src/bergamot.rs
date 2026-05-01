@@ -1,34 +1,55 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 
-use bergamot_sys::{
-    BlockingService, TokenAlignment as BergamotTokenAlignment, TranslationModel as BergamotModel,
-    TranslationWithAlignment as BergamotTranslationWithAlignment,
+use slimt_sys::{
+    BlockingService, TokenAlignment as SlimtTokenAlignment, TranslationModel as SlimtModel,
+    TranslationWithAlignment as SlimtTranslationWithAlignment,
 };
 
 use crate::translate::{TokenAlignment, TranslationMode, TranslationWithAlignment};
 
 const DEFAULT_CACHE_SIZE: usize = 8192;
+const DEFAULT_WORKERS: usize = 4;
+
+/// Filesystem locations for a single translation direction's model assets.
+///
+/// Slimt expects one vocabulary file; bergamot models in our catalog ship a
+/// single shared vocabulary, so callers pass the same path for source and
+/// target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPaths {
+    pub model: PathBuf,
+    pub vocabulary: PathBuf,
+    pub shortlist: PathBuf,
+}
 
 pub struct BergamotEngine {
     service: BlockingService,
-    models: HashMap<String, BergamotModel>,
+    models: HashMap<String, SlimtModel>,
 }
 
 impl BergamotEngine {
     pub fn new() -> Self {
+        let workers = std::env::var("TRANSLATOR_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_WORKERS);
         Self {
-            service: BlockingService::new(DEFAULT_CACHE_SIZE),
+            service: BlockingService::with_workers(workers, DEFAULT_CACHE_SIZE),
             models: HashMap::new(),
         }
     }
 
-    pub fn load_model_into_cache(&mut self, config: &str, key: &str) -> Result<(), String> {
+    pub fn load_model_into_cache(&mut self, paths: &ModelPaths, key: &str) -> Result<(), String> {
         if self.models.contains_key(key) {
             return Ok(());
         }
 
-        let model = catch_bergamot_panic(|| BergamotModel::from_config(config))?;
+        let model = catch_slimt_panic(|| {
+            SlimtModel::new(&paths.model, &paths.vocabulary, &paths.shortlist, None)
+        })?;
         self.models.insert(key.to_string(), model);
         Ok(())
     }
@@ -53,7 +74,7 @@ impl BergamotEngine {
         let model = self.model(key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
         let html = matches!(mode, TranslationMode::Html);
-        catch_bergamot_panic(|| Ok(self.service.translate(model, &refs, html)))
+        catch_slimt_panic(|| Ok(self.service.translate(model, &refs, html)))
     }
 
     pub fn translate_multiple_with_alignment(
@@ -63,7 +84,7 @@ impl BergamotEngine {
     ) -> Result<Vec<TranslationWithAlignment>, String> {
         let model = self.model(key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-        catch_bergamot_panic(|| {
+        catch_slimt_panic(|| {
             Ok(self
                 .service
                 .translate_with_alignment(model, &refs)
@@ -84,7 +105,7 @@ impl BergamotEngine {
         let second_model = self.model(second_key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
         let html = matches!(mode, TranslationMode::Html);
-        catch_bergamot_panic(|| Ok(self.service.pivot(first_model, second_model, &refs, html)))
+        catch_slimt_panic(|| Ok(self.service.pivot(first_model, second_model, &refs, html)))
     }
 
     pub fn pivot_multiple_with_alignment(
@@ -96,7 +117,7 @@ impl BergamotEngine {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-        catch_bergamot_panic(|| {
+        catch_slimt_panic(|| {
             Ok(self
                 .service
                 .pivot_with_alignment(first_model, second_model, &refs)
@@ -110,7 +131,7 @@ impl BergamotEngine {
         self.models.clear();
     }
 
-    fn model(&self, key: &str) -> Result<&BergamotModel, String> {
+    fn model(&self, key: &str) -> Result<&SlimtModel, String> {
         self.models
             .get(key)
             .ok_or_else(|| format!("Model not loaded for key: {key}"))
@@ -123,7 +144,7 @@ impl Default for BergamotEngine {
     }
 }
 
-fn map_alignment_result(result: BergamotTranslationWithAlignment) -> TranslationWithAlignment {
+fn map_alignment_result(result: SlimtTranslationWithAlignment) -> TranslationWithAlignment {
     TranslationWithAlignment {
         source_text: result.source,
         translated_text: result.target,
@@ -131,7 +152,7 @@ fn map_alignment_result(result: BergamotTranslationWithAlignment) -> Translation
     }
 }
 
-fn map_alignment(alignment: BergamotTokenAlignment) -> TokenAlignment {
+fn map_alignment(alignment: SlimtTokenAlignment) -> TokenAlignment {
     TokenAlignment {
         src_begin: alignment.src_begin as u64,
         src_end: alignment.src_end as u64,
@@ -140,7 +161,7 @@ fn map_alignment(alignment: BergamotTokenAlignment) -> TokenAlignment {
     }
 }
 
-fn catch_bergamot_panic<T, F>(f: F) -> Result<T, String>
+fn catch_slimt_panic<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String>,
 {
@@ -153,6 +174,6 @@ fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     } else if let Some(message) = payload.downcast_ref::<String>() {
         message.clone()
     } else {
-        "Bergamot panicked".to_string()
+        "slimt panicked".to_string()
     }
 }

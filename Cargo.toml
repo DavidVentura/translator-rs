@@ -24,8 +24,7 @@ pdf = ["dep:mupdf", "dep:lopdf", "dep:ttf-parser", "dep:subsetter"]
 odt = ["dep:zip"]
 
 [dependencies]
-bergamot-sys = { git = "https://github.com/DavidVentura/bergamot-sys" }
-# bergamot-sys = { path = "../bergamot-sys" }
+slimt-sys = { path = "../slimt-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

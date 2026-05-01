@@ -126,14 +126,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bergamot-sys"
-version = "0.1.0"
-source = "git+https://github.com/DavidVentura/bergamot-sys#b589ea841090752dabf6cbf3cfa8b3a584e4503f"
-dependencies = [
- "cmake",
-]
-
-[[package]]
 name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2046,6 +2038,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
 
 [[package]]
+name = "slimt-sys"
+version = "0.1.0"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2329,7 +2328,6 @@ name = "translator"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
- "bergamot-sys",
  "cld2",
  "icu",
  "icu_experimental",
@@ -2341,6 +2339,7 @@ dependencies = [
  "regex 1.12.3",
  "serde",
  "serde_json",
+ "slimt-sys",
  "subsetter",
  "tarkka",
  "tesseract",

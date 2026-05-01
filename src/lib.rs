@@ -64,5 +64,5 @@ pub use settings::BackgroundMode;
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
 };
-pub use translate::{TokenAlignment, TranslationWithAlignment};
+pub use translate::{TokenAlignment, TranslationMode, TranslationWithAlignment};
 pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};

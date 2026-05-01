@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::api::{LanguageCode, TranslatorError};
-use crate::bergamot::BergamotEngine;
+use crate::bergamot::{BergamotEngine, ModelPaths};
 use crate::catalog::CatalogSnapshot;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use crate::styled::{
@@ -225,7 +225,7 @@ pub(crate) struct TranslationStep {
     pub from_code: String,
     pub to_code: String,
     pub cache_key: String,
-    pub config: String,
+    pub paths: ModelPaths,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -233,34 +233,18 @@ pub(crate) struct TranslationPlan {
     pub steps: Vec<TranslationStep>,
 }
 
-fn absolute_install_path(base_dir: &str, install_path: &str) -> String {
-    Path::new(base_dir)
-        .join(install_path)
-        .to_string_lossy()
-        .into_owned()
+fn absolute_install_path(base_dir: &str, install_path: &str) -> PathBuf {
+    Path::new(base_dir).join(install_path)
 }
 
-fn build_bergamot_config(base_dir: &str, step: &crate::language::LanguageDirection) -> String {
-    let model_path = absolute_install_path(base_dir, &step.model.path);
-    let src_vocab_path = absolute_install_path(base_dir, &step.src_vocab.path);
-    let tgt_vocab_path = absolute_install_path(base_dir, &step.tgt_vocab.path);
-
-    format!(
-        "models:\n  - {model_path}\n\
-vocabs:\n  - {src_vocab_path}\n  - {tgt_vocab_path}\n\
-beam-size: 1\n\
-normalize: 1.0\n\
-word-penalty: 0\n\
-max-length-break: 128\n\
-mini-batch-words: 1024\n\
-max-length-factor: 2.0\n\
-skip-cost: true\n\
-cpu-threads: 1\n\
-quiet: true\n\
-quiet-translation: true\n\
-gemm-precision: int8shiftAlphaAll\n\
-alignment: soft\n"
-    )
+fn build_model_paths(base_dir: &str, step: &crate::language::LanguageDirection) -> ModelPaths {
+    ModelPaths {
+        model: absolute_install_path(base_dir, &step.model.path),
+        // bergamot models in our catalog ship one shared vocab; src and tgt
+        // resolve to the same file. Slimt only needs the single vocabulary.
+        vocabulary: absolute_install_path(base_dir, &step.src_vocab.path),
+        shortlist: absolute_install_path(base_dir, &step.lex.path),
+    }
 }
 
 fn cache_key(from_code: &str, to_code: &str) -> String {
@@ -289,7 +273,7 @@ pub(crate) fn resolve_translation_plan_in_snapshot(
             from_code: from.to_string(),
             to_code: to.to_string(),
             cache_key: cache_key(from, to),
-            config: build_bergamot_config(&snapshot.base_dir, &direction),
+            paths: build_model_paths(&snapshot.base_dir, &direction),
         })
     };
 
@@ -335,7 +319,7 @@ pub(crate) fn execute_translation_plan_with_alignment(
 
 fn ensure_plan_loaded(engine: &mut BergamotEngine, plan: &TranslationPlan) -> Result<(), String> {
     for step in &plan.steps {
-        engine.load_model_into_cache(&step.config, &step.cache_key)?;
+        engine.load_model_into_cache(&step.paths, &step.cache_key)?;
     }
     Ok(())
 }

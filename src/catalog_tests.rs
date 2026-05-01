@@ -645,20 +645,14 @@ fn resolves_direct_translation_plan_from_installed_catalog() {
 
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].cache_key, "en-es");
-    assert!(
-        plan.steps[0]
-            .config
-            .contains("/data/user/0/dev.davidv.translator/files/bin/model.enes.bin")
+    let paths = &plan.steps[0].paths;
+    assert_eq!(
+        paths.model.to_str().unwrap(),
+        "/data/user/0/dev.davidv.translator/files/bin/model.enes.bin"
     );
-    assert!(
-        plan.steps[0]
-            .config
-            .contains("/data/user/0/dev.davidv.translator/files/bin/vocab.aa.spm")
-    );
-    assert!(
-        plan.steps[0]
-            .config
-            .contains("/data/user/0/dev.davidv.translator/files/bin/vocab.zz.spm")
+    assert_eq!(
+        paths.vocabulary.to_str().unwrap(),
+        "/data/user/0/dev.davidv.translator/files/bin/vocab.aa.spm"
     );
 }
 
