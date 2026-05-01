@@ -237,6 +237,25 @@ impl TranslatorSession {
         )
     }
 
+    pub fn translate_structured_fragments_batch(
+        &self,
+        pages: &[&[StyledFragment]],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[LanguageCode],
+        background_mode: BackgroundMode,
+    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap).translate_structured_fragments_batch(
+            pages,
+            forced_source_code.map(LanguageCode::from).as_ref(),
+            &LanguageCode::from(target_code),
+            available_language_codes,
+            background_mode,
+        )
+    }
+
     #[cfg(feature = "odt")]
     pub(crate) fn translate_texts_with_alignment(
         &self,

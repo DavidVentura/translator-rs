@@ -7,9 +7,7 @@ use crate::api::LanguageCode;
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 use crate::language_detect::detect_language_robust_code;
-use crate::translate::{
-    TranslationMode, execute_translation_plan, resolve_translation_plan_in_snapshot,
-};
+use crate::translate::{execute_translation_plan, resolve_translation_plan_in_snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -196,8 +194,7 @@ pub(crate) fn translate_mixed_texts_in_snapshot(
         ) else {
             continue;
         };
-        let batch_results =
-            execute_translation_plan(engine, &plan, &batch.texts, TranslationMode::PlainText)?;
+        let batch_results = execute_translation_plan(engine, &plan, &batch.texts)?;
         translations.extend(batch.texts.into_iter().zip(batch_results).map(
             |(source_text, translated_text)| TextTranslation {
                 source_text,

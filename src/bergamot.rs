@@ -7,21 +7,27 @@ use slimt_sys::{
     TranslationWithAlignment as SlimtTranslationWithAlignment,
 };
 
-use crate::translate::{TokenAlignment, TranslationMode, TranslationWithAlignment};
+use crate::translate::{TokenAlignment, TranslationWithAlignment};
 
 const DEFAULT_CACHE_SIZE: usize = 8192;
 const DEFAULT_WORKERS: usize = 4;
 
 /// Filesystem locations for a single translation direction's model assets.
 ///
-/// Slimt expects one vocabulary file; bergamot models in our catalog ship a
-/// single shared vocabulary, so callers pass the same path for source and
-/// target.
+/// Most bergamot models in our catalog ship a single shared vocabulary
+/// (`vocab.*.spm`). Mozilla's CJK pairs (`en-zh`, `en-ja`, `en-ko`,
+/// `en-zh_hant`, `zh_hant-en`) instead ship a `srcvocab.*.spm` +
+/// `trgvocab.*.spm` pair and have separate `encoder_Wemb` / `decoder_Wemb`
+/// tensors in the model file. For those, set `vocabulary` to the source vocab
+/// and `target_vocabulary` to the target vocab; slimt routes them to the
+/// right embedding tables. For shared-vocab models leave
+/// `target_vocabulary = None` and slimt reuses `vocabulary` for both sides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPaths {
     pub model: PathBuf,
     pub vocabulary: PathBuf,
     pub shortlist: PathBuf,
+    pub target_vocabulary: Option<PathBuf>,
 }
 
 pub struct BergamotEngine {
@@ -48,7 +54,14 @@ impl BergamotEngine {
         }
 
         let model = catch_slimt_panic(|| {
-            SlimtModel::new(&paths.model, &paths.vocabulary, &paths.shortlist, None)
+            SlimtModel::with_arch_and_target_vocab(
+                &paths.model,
+                &paths.vocabulary,
+                &paths.shortlist,
+                None,
+                slimt_sys::ModelArch::default(),
+                paths.target_vocabulary.as_deref(),
+            )
         })?;
         self.models.insert(key.to_string(), model);
         Ok(())
@@ -65,16 +78,10 @@ impl BergamotEngine {
             .retain(|key, _| !key.starts_with(&needle_from) && !key.ends_with(&needle_to));
     }
 
-    pub fn translate_multiple(
-        &self,
-        inputs: &[String],
-        key: &str,
-        mode: TranslationMode,
-    ) -> Result<Vec<String>, String> {
+    pub fn translate_multiple(&self, inputs: &[String], key: &str) -> Result<Vec<String>, String> {
         let model = self.model(key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-        let html = matches!(mode, TranslationMode::Html);
-        catch_slimt_panic(|| Ok(self.service.translate(model, &refs, html)))
+        catch_slimt_panic(|| Ok(self.service.translate(model, &refs)))
     }
 
     pub fn translate_multiple_with_alignment(
@@ -99,13 +106,11 @@ impl BergamotEngine {
         first_key: &str,
         second_key: &str,
         inputs: &[String],
-        mode: TranslationMode,
     ) -> Result<Vec<String>, String> {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
         let refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-        let html = matches!(mode, TranslationMode::Html);
-        catch_slimt_panic(|| Ok(self.service.pivot(first_model, second_model, &refs, html)))
+        catch_slimt_panic(|| Ok(self.service.pivot(first_model, second_model, &refs)))
     }
 
     pub fn pivot_multiple_with_alignment(

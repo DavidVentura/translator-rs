@@ -1,5 +1,5 @@
-use icu::locale::Locale;
 use icu_experimental::transliterate::Transliterator;
+use icu_locale_core::Locale;
 
 use crate::api::{LanguageCode, ScriptCode};
 

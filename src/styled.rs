@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::api::LanguageCode;
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
@@ -5,7 +7,9 @@ use crate::language_detect::detect_language_robust_code;
 use crate::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use crate::routing::NothingReason;
 use crate::settings::BackgroundMode;
-use crate::translate::{TokenAlignment, Translator};
+use crate::translate::{
+    TokenAlignment, execute_translation_plan_with_alignment, resolve_translation_plan_in_snapshot,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -128,51 +132,260 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
     screenshot: Option<&OverlayScreenshot>,
     background_mode: BackgroundMode,
 ) -> Result<StructuredTranslationResult, String> {
-    let blocks = cluster_fragments_into_blocks(fragments);
-    if blocks.is_empty() {
+    let available_codes = available_language_codes
+        .iter()
+        .map(|code| LanguageCode::from(code.as_str()))
+        .collect::<Vec<_>>();
+    let prepared = classify_page(fragments, forced_source_code, target_code, &available_codes);
+
+    let (blocks, source_code) = match prepared {
+        PageState::Empty(reason) => {
+            return Ok(StructuredTranslationResult {
+                blocks: Vec::new(),
+                nothing_reason: Some(reason),
+                error_message: None,
+            });
+        }
+        PageState::Identity(blocks) => {
+            return Ok(StructuredTranslationResult {
+                blocks: identity_translated_blocks(&blocks, screenshot, background_mode)?,
+                nothing_reason: None,
+                error_message: None,
+            });
+        }
+        PageState::Translate {
+            blocks,
+            source_code,
+        } => (blocks, source_code),
+    };
+
+    let segments = collect_block_segments(&blocks);
+    let texts = segments
+        .iter()
+        .map(|seg| seg.text.clone())
+        .collect::<Vec<_>>();
+
+    let target_code_lc = LanguageCode::from(target_code);
+    let Some(plan) = resolve_translation_plan_in_snapshot(
+        snapshot,
+        source_code.as_str(),
+        target_code_lc.as_str(),
+    ) else {
         return Ok(StructuredTranslationResult {
             blocks: Vec::new(),
-            nothing_reason: Some(NothingReason::NoTranslatableText),
-            error_message: None,
+            nothing_reason: None,
+            error_message: Some(format!(
+                "Language pair {} -> {} not installed",
+                source_code.as_str(),
+                target_code_lc.as_str()
+            )),
         });
+    };
+    let translations = execute_translation_plan_with_alignment(engine, &plan, &texts)?;
+
+    let block_translations = segments
+        .into_iter()
+        .zip(translations)
+        .map(|(seg, t)| BlockSegmentTranslation {
+            block_index: seg.block_index,
+            segment: seg.segment,
+            translated_text: t.translated_text,
+            alignments: t.alignments,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(StructuredTranslationResult {
+        blocks: assemble_translated_blocks(
+            &blocks,
+            &block_translations,
+            screenshot,
+            background_mode,
+        )?,
+        nothing_reason: None,
+        error_message: None,
+    })
+}
+
+/// Translate many pages worth of structured fragments in one go: every page's
+/// segments are bundled into a single bergamot call (per source language), so
+/// slimt's worker pool stays saturated even when individual pages are short.
+///
+/// Pages with mismatched outcomes (no translatable text, undetectable source,
+/// missing model pair, source==target) are still reported per-page, the same
+/// way the single-page entry does.
+pub(crate) fn translate_structured_fragments_batch_in_snapshot(
+    engine: &mut BergamotEngine,
+    snapshot: &CatalogSnapshot,
+    pages: &[&[StyledFragment]],
+    forced_source_code: Option<&str>,
+    target_code: &str,
+    available_language_codes: &[String],
+    background_mode: BackgroundMode,
+) -> Result<Vec<StructuredTranslationResult>, String> {
+    let available_codes = available_language_codes
+        .iter()
+        .map(|code| LanguageCode::from(code.as_str()))
+        .collect::<Vec<_>>();
+
+    let states = pages
+        .iter()
+        .map(|fragments| {
+            classify_page(fragments, forced_source_code, target_code, &available_codes)
+        })
+        .collect::<Vec<_>>();
+
+    // Bundle every translate-pending page's segments into per-source-language
+    // batches. One bergamot call per source code regardless of how many pages
+    // it spans — that's where the worker pool gets fed.
+    struct PageSegmentRef {
+        page_index: usize,
+        block_index: usize,
+        segment: TranslationSegment,
+    }
+    let mut texts_by_source: HashMap<String, Vec<String>> = HashMap::new();
+    let mut refs_by_source: HashMap<String, Vec<PageSegmentRef>> = HashMap::new();
+
+    for (page_index, state) in states.iter().enumerate() {
+        let PageState::Translate {
+            blocks,
+            source_code,
+        } = state
+        else {
+            continue;
+        };
+        let key = source_code.as_str().to_string();
+        let texts = texts_by_source.entry(key.clone()).or_default();
+        let refs = refs_by_source.entry(key).or_default();
+        for seg in collect_block_segments(blocks) {
+            texts.push(seg.text);
+            refs.push(PageSegmentRef {
+                page_index,
+                block_index: seg.block_index,
+                segment: seg.segment,
+            });
+        }
     }
 
+    let mut translations_by_page: HashMap<usize, Vec<BlockSegmentTranslation>> = HashMap::new();
+    let mut missing_pair_pages: HashSet<usize> = HashSet::new();
+
+    for (source_code_str, texts) in texts_by_source {
+        let refs = refs_by_source.remove(&source_code_str).unwrap_or_default();
+        let Some(plan) =
+            resolve_translation_plan_in_snapshot(snapshot, &source_code_str, target_code)
+        else {
+            for r in &refs {
+                missing_pair_pages.insert(r.page_index);
+            }
+            continue;
+        };
+        let translated = execute_translation_plan_with_alignment(engine, &plan, &texts)?;
+        for (r, t) in refs.into_iter().zip(translated) {
+            translations_by_page
+                .entry(r.page_index)
+                .or_default()
+                .push(BlockSegmentTranslation {
+                    block_index: r.block_index,
+                    segment: r.segment,
+                    translated_text: t.translated_text,
+                    alignments: t.alignments,
+                });
+        }
+    }
+
+    states
+        .into_iter()
+        .enumerate()
+        .map(|(page_index, state)| match state {
+            PageState::Empty(reason) => Ok(StructuredTranslationResult {
+                blocks: Vec::new(),
+                nothing_reason: Some(reason),
+                error_message: None,
+            }),
+            PageState::Identity(blocks) => Ok(StructuredTranslationResult {
+                blocks: identity_translated_blocks(&blocks, None, background_mode)?,
+                nothing_reason: None,
+                error_message: None,
+            }),
+            PageState::Translate {
+                blocks,
+                source_code,
+            } => {
+                if missing_pair_pages.contains(&page_index) {
+                    return Ok(StructuredTranslationResult {
+                        blocks: Vec::new(),
+                        nothing_reason: None,
+                        error_message: Some(format!(
+                            "Language pair {} -> {} not installed",
+                            source_code.as_str(),
+                            target_code,
+                        )),
+                    });
+                }
+                let page_translations =
+                    translations_by_page.remove(&page_index).unwrap_or_default();
+                Ok(StructuredTranslationResult {
+                    blocks: assemble_translated_blocks(
+                        &blocks,
+                        &page_translations,
+                        None,
+                        background_mode,
+                    )?,
+                    nothing_reason: None,
+                    error_message: None,
+                })
+            }
+        })
+        .collect()
+}
+
+enum PageState {
+    Empty(NothingReason),
+    Identity(Vec<TranslatableBlock>),
+    Translate {
+        blocks: Vec<TranslatableBlock>,
+        source_code: LanguageCode,
+    },
+}
+
+fn classify_page(
+    fragments: &[StyledFragment],
+    forced_source_code: Option<&str>,
+    target_code: &str,
+    available_codes: &[LanguageCode],
+) -> PageState {
+    let blocks = cluster_fragments_into_blocks(fragments);
+    if blocks.is_empty() {
+        return PageState::Empty(NothingReason::NoTranslatableText);
+    }
     let combined_text = blocks
         .iter()
         .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let available_language_codes = available_language_codes
-        .iter()
-        .map(|code| LanguageCode::from(code.as_str()))
-        .collect::<Vec<_>>();
     let Some(source_code) = forced_source_code
         .map(LanguageCode::from)
-        .or_else(|| detect_language_robust_code(&combined_text, None, &available_language_codes))
+        .or_else(|| detect_language_robust_code(&combined_text, None, available_codes))
     else {
-        return Ok(StructuredTranslationResult {
-            blocks: Vec::new(),
-            nothing_reason: Some(NothingReason::CouldNotDetect),
-            error_message: None,
-        });
+        return PageState::Empty(NothingReason::CouldNotDetect);
     };
-
     if source_code.as_str() == target_code {
-        return Ok(StructuredTranslationResult {
-            blocks: identity_translated_blocks(&blocks, screenshot, background_mode)?,
-            nothing_reason: None,
-            error_message: None,
-        });
+        return PageState::Identity(blocks);
     }
-
-    #[derive(Clone)]
-    struct SegmentRef {
-        block_index: usize,
-        segment: TranslationSegment,
+    PageState::Translate {
+        blocks,
+        source_code,
     }
+}
 
-    let mut all_segment_texts = Vec::new();
-    let mut segment_refs = Vec::new();
+struct CollectedSegment {
+    block_index: usize,
+    segment: TranslationSegment,
+    text: String,
+}
+
+fn collect_block_segments(blocks: &[TranslatableBlock]) -> Vec<CollectedSegment> {
+    let mut out = Vec::new();
     for (block_index, block) in blocks.iter().enumerate() {
         // Opaque blocks (display math) bypass bergamot — their text is the
         // original, and we want it preserved exactly. They still carry
@@ -188,44 +401,43 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
             // inside a paragraph would translate line-per-line and lose
             // cross-line context. Flatten to spaces — '\n' and ' ' are both
             // 1 byte, so alignment offsets remain valid for style mapping.
-            all_segment_texts.push(block.text[start..end].replace('\n', " "));
-            segment_refs.push(SegmentRef {
+            out.push(CollectedSegment {
                 block_index,
                 segment: segment.clone(),
+                text: block.text[start..end].replace('\n', " "),
             });
         }
     }
+    out
+}
 
-    let target_code = LanguageCode::from(target_code);
-    let Some(translations) = Translator::new(engine, snapshot)
-        .translate_texts_with_alignment(&source_code, &target_code, &all_segment_texts)
-        .map_err(|err| err.message)?
-    else {
-        return Ok(StructuredTranslationResult {
-            blocks: Vec::new(),
-            nothing_reason: None,
-            error_message: Some(format!(
-                "Language pair {} -> {} not installed",
-                source_code.as_str(),
-                target_code.as_str()
-            )),
-        });
-    };
+struct BlockSegmentTranslation {
+    block_index: usize,
+    segment: TranslationSegment,
+    translated_text: String,
+    alignments: Vec<TokenAlignment>,
+}
 
-    let translated_blocks = blocks
+fn assemble_translated_blocks(
+    blocks: &[TranslatableBlock],
+    translations: &[BlockSegmentTranslation],
+    screenshot: Option<&OverlayScreenshot>,
+    background_mode: BackgroundMode,
+) -> Result<Vec<TranslatedStyledBlock>, String> {
+    blocks
         .iter()
         .enumerate()
         .map(|(block_index, source_block)| {
+            let colors = resolve_block_colors(
+                screenshot,
+                source_block.bounds,
+                source_block
+                    .style_spans
+                    .first()
+                    .and_then(|span| span.style.as_ref()),
+                background_mode,
+            )?;
             if source_block.opaque {
-                let colors = resolve_block_colors(
-                    screenshot,
-                    source_block.bounds,
-                    source_block
-                        .style_spans
-                        .first()
-                        .and_then(|span| span.style.as_ref()),
-                    background_mode,
-                )?;
                 return Ok(TranslatedStyledBlock {
                     text: source_block.text.clone(),
                     bounding_box: source_block.bounds,
@@ -236,24 +448,17 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
                     opaque: true,
                 });
             }
-            let block_segment_results = translations
-                .iter()
-                .zip(segment_refs.iter())
-                .filter(|(_, segment_ref)| segment_ref.block_index == block_index)
-                .collect::<Vec<_>>();
-
             let mut translated_text = String::new();
             let mut segment_alignments = Vec::new();
             let mut translated_segments = Vec::new();
 
-            for (translation, segment_ref) in block_segment_results {
-                translated_segments.push((
-                    segment_ref.segment.clone(),
-                    translation.translated_text.clone(),
-                ));
-                segment_alignments
-                    .push((segment_ref.segment.clone(), translation.alignments.clone()));
-                translated_text.push_str(&translation.translated_text);
+            for entry in translations
+                .iter()
+                .filter(|entry| entry.block_index == block_index)
+            {
+                translated_segments.push((entry.segment.clone(), entry.translated_text.clone()));
+                segment_alignments.push((entry.segment.clone(), entry.alignments.clone()));
+                translated_text.push_str(&entry.translated_text);
             }
 
             let style_spans = map_styles_to_segmented_translation(
@@ -261,15 +466,6 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
                 &segment_alignments,
                 &translated_segments,
             );
-            let colors = resolve_block_colors(
-                screenshot,
-                source_block.bounds,
-                source_block
-                    .style_spans
-                    .first()
-                    .and_then(|span| span.style.as_ref()),
-                background_mode,
-            )?;
 
             Ok(TranslatedStyledBlock {
                 text: translated_text,
@@ -278,16 +474,10 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
                 style_spans,
                 background_argb: colors.background_argb,
                 foreground_argb: colors.foreground_argb,
-                opaque: source_block.opaque,
+                opaque: false,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    Ok(StructuredTranslationResult {
-        blocks: translated_blocks,
-        nothing_reason: None,
-        error_message: None,
-    })
+        .collect()
 }
 
 fn identity_translated_blocks(

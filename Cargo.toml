@@ -14,14 +14,16 @@ path = "src/bin/bucket_samples.rs"
 required-features = ["tts"]
 
 [features]
+default = []
 uniffi = ["dep:uniffi"]
 dictionary = ["dep:tarkka"]
 mucab = ["dep:mucab"]
 tesseract = ["dep:tesseract"]
 tts = ["dep:piper-rs"]
-transliterate = ["dep:icu", "dep:icu_experimental"]
+transliterate = ["dep:icu_locale_core", "dep:icu_experimental"]
 pdf = ["dep:mupdf", "dep:lopdf", "dep:ttf-parser", "dep:subsetter"]
 odt = ["dep:zip"]
+html = ["dep:html5ever", "dep:markup5ever_rcdom"]
 
 [dependencies]
 slimt-sys = { path = "../slimt-sys" }
@@ -35,7 +37,7 @@ tesseract = { git = "https://github.com/DavidVentura/tesseract-rs", optional = t
 mucab = { git = "https://github.com/DavidVentura/mucab", optional = true }
 piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization"] }
 icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
-icu = { version = "2.1", optional = true }
+icu_locale_core = { version = "2.2", optional = true }
 # mupdf = { path = "../mupdf-rs", optional = true, default-features = false }
 mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false }
 lopdf = { version = "0.40", optional = true, default-features = false }
@@ -43,6 +45,8 @@ ttf-parser = { version = "0.25", optional = true, default-features = false, feat
 subsetter = { version = "0.2", optional = true, default-features = false }
 
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
+html5ever = { version = "0.38", optional = true }
+markup5ever_rcdom = { version = "0.38", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

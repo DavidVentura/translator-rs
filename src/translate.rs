@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::{BergamotEngine, ModelPaths};
 use crate::catalog::CatalogSnapshot;
+#[cfg(feature = "html")]
+use crate::html_translate;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use crate::styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment,
-    translate_structured_fragments_in_snapshot,
+    translate_structured_fragments_batch_in_snapshot, translate_structured_fragments_in_snapshot,
 };
 
 pub struct Translator<'a> {
@@ -97,8 +99,7 @@ impl<'a> Translator<'a> {
                 to_code.as_str()
             ))
         })?;
-        execute_translation_plan(self.engine, &plan, texts, TranslationMode::PlainText)
-            .map_err(TranslatorError::translation)
+        execute_translation_plan(self.engine, &plan, texts).map_err(TranslatorError::translation)
     }
 
     pub fn translate_html_fragments(
@@ -125,8 +126,7 @@ impl<'a> Translator<'a> {
                 to_code.as_str()
             ))
         })?;
-        execute_translation_plan(self.engine, &plan, fragments, TranslationMode::Html)
-            .map_err(TranslatorError::translation)
+        translate_html_via_dom(self.engine, &plan, fragments).map_err(TranslatorError::translation)
     }
 
     pub fn translate_mixed_texts(
@@ -177,6 +177,31 @@ impl<'a> Translator<'a> {
         .map_err(TranslatorError::translation)
     }
 
+    pub fn translate_structured_fragments_batch(
+        &mut self,
+        pages: &[&[StyledFragment]],
+        forced_source_code: Option<&LanguageCode>,
+        target_code: &LanguageCode,
+        available_language_codes: &[LanguageCode],
+        background_mode: crate::BackgroundMode,
+    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
+        let available_language_codes = available_language_codes
+            .iter()
+            .map(|code| code.as_str().to_string())
+            .collect::<Vec<_>>();
+        translate_structured_fragments_batch_in_snapshot(
+            self.engine,
+            self.snapshot,
+            pages,
+            forced_source_code.map(LanguageCode::as_str),
+            target_code.as_str(),
+            &available_language_codes,
+            background_mode,
+        )
+        .map_err(TranslatorError::translation)
+    }
+
+    #[cfg(feature = "odt")]
     pub(crate) fn translate_texts_with_alignment(
         &mut self,
         from_code: &LanguageCode,
@@ -194,13 +219,6 @@ impl<'a> Translator<'a> {
             .map(Some)
             .map_err(TranslatorError::translation)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum TranslationMode {
-    PlainText,
-    Html,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,12 +256,19 @@ fn absolute_install_path(base_dir: &str, install_path: &str) -> PathBuf {
 }
 
 fn build_model_paths(base_dir: &str, step: &crate::language::LanguageDirection) -> ModelPaths {
+    let src_vocab = absolute_install_path(base_dir, &step.src_vocab.path);
+    let tgt_vocab = absolute_install_path(base_dir, &step.tgt_vocab.path);
+    // Most catalog packs ship a single shared `vocab.*.spm` and the catalog
+    // points both src_vocab and tgt_vocab at the same file. Mozilla's CJK
+    // pairs (en-zh / en-ja / en-ko / en-zh_hant / zh_hant-en) ship distinct
+    // `srcvocab.*.spm` + `trgvocab.*.spm`; pass the second one as
+    // `target_vocabulary` only when it really differs from the source.
+    let target_vocabulary = (src_vocab != tgt_vocab).then(|| tgt_vocab);
     ModelPaths {
         model: absolute_install_path(base_dir, &step.model.path),
-        // bergamot models in our catalog ship one shared vocab; src and tgt
-        // resolve to the same file. Slimt only needs the single vocabulary.
-        vocabulary: absolute_install_path(base_dir, &step.src_vocab.path),
+        vocabulary: src_vocab,
         shortlist: absolute_install_path(base_dir, &step.lex.path),
+        target_vocabulary,
     }
 }
 
@@ -292,12 +317,11 @@ pub(crate) fn execute_translation_plan(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     texts: &[String],
-    mode: TranslationMode,
 ) -> Result<Vec<String>, String> {
     ensure_plan_loaded(engine, plan)?;
     match plan.steps.as_slice() {
-        [step] => engine.translate_multiple(texts, &step.cache_key, mode),
-        [first, second] => engine.pivot_multiple(&first.cache_key, &second.cache_key, texts, mode),
+        [step] => engine.translate_multiple(texts, &step.cache_key),
+        [first, second] => engine.pivot_multiple(&first.cache_key, &second.cache_key, texts),
         _ => Ok(Vec::new()),
     }
 }
@@ -315,6 +339,31 @@ pub(crate) fn execute_translation_plan_with_alignment(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// HTML translation runs entirely Rust-side: html5ever parses each fragment,
+/// scope-grouped text leaves are flattened to plain strings, slimt translates
+/// them with token alignments, and we splice the translated content back into
+/// the same DOM nodes (no structural changes — `<p>` stays `<p>`, attributes
+/// pass through verbatim). This replaces slimt's old C++ HTML mode.
+#[cfg(feature = "html")]
+pub(crate) fn translate_html_via_dom(
+    engine: &mut BergamotEngine,
+    plan: &TranslationPlan,
+    fragments: &[String],
+) -> Result<Vec<String>, String> {
+    html_translate::translate_html_with(fragments, |scope_texts| {
+        execute_translation_plan_with_alignment(engine, plan, scope_texts)
+    })
+}
+
+#[cfg(not(feature = "html"))]
+pub(crate) fn translate_html_via_dom(
+    _engine: &mut BergamotEngine,
+    _plan: &TranslationPlan,
+    _fragments: &[String],
+) -> Result<Vec<String>, String> {
+    Err("HTML translation requires the `html` feature".to_string())
 }
 
 fn ensure_plan_loaded(engine: &mut BergamotEngine, plan: &TranslationPlan) -> Result<(), String> {

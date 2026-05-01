@@ -8,6 +8,8 @@ pub mod catalog;
 pub mod font_metrics;
 #[cfg(feature = "pdf")]
 pub mod font_provider;
+#[cfg(feature = "html")]
+pub mod html_translate;
 pub mod language;
 pub mod language_detect;
 #[cfg(feature = "mucab")]
@@ -64,5 +66,5 @@ pub use settings::BackgroundMode;
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
 };
-pub use translate::{TokenAlignment, TranslationMode, TranslationWithAlignment};
+pub use translate::{TokenAlignment, TranslationWithAlignment};
 pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};
