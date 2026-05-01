@@ -26,7 +26,7 @@ odt = ["dep:zip"]
 html = ["dep:html5ever", "dep:markup5ever_rcdom"]
 
 [dependencies]
-slimt-sys = { path = "../slimt-sys" }
+slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
