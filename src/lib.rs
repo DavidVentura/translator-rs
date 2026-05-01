@@ -38,6 +38,7 @@ pub mod pdf_translate;
 #[cfg(feature = "pdf")]
 pub mod pdf_write;
 mod routing;
+mod sentence_split;
 pub mod session;
 pub mod settings;
 #[cfg(feature = "tts")]
