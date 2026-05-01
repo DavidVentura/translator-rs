@@ -507,7 +507,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#942c591f9b98c668397a25f3d7b767684f9b1023"
+source = "git+https://github.com/DavidVentura/piper-rs#2c0a6266e42b0aa4cc65362a7361a2e1dbe03a18"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -515,7 +515,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#942c591f9b98c668397a25f3d7b767684f9b1023"
+source = "git+https://github.com/DavidVentura/piper-rs#2c0a6266e42b0aa4cc65362a7361a2e1dbe03a18"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "leptonica-sys"
 version = "0.4.9"
-source = "git+https://github.com/DavidVentura/leptonica-sys#818ad27ec2aee42776a985b283c9405b65033080"
+source = "git+https://github.com/DavidVentura/leptonica-sys#dc8c4339ba075aa41b913a358432bfdaf64155f3"
 dependencies = [
  "bindgen 0.64.0",
  "cmake",
@@ -1562,7 +1562,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#942c591f9b98c668397a25f3d7b767684f9b1023"
+source = "git+https://github.com/DavidVentura/piper-rs#2c0a6266e42b0aa4cc65362a7361a2e1dbe03a18"
 dependencies = [
  "espeak-rs",
  "mucab",
@@ -2182,7 +2182,7 @@ dependencies = [
 [[package]]
 name = "tesseract-sys"
 version = "0.6.3"
-source = "git+https://github.com/DavidVentura/tesseract-sys#03b92c6cc4d2ad0d9295cc6ad64c5f9afbc30967"
+source = "git+https://github.com/DavidVentura/tesseract-sys#94e38ebd5b3c61c735f882e70670a988ea3f4b58"
 dependencies = [
  "bindgen 0.64.0",
  "cc",
