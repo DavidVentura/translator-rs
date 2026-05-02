@@ -13,6 +13,11 @@ name = "bucket_samples"
 path = "src/bin/bucket_samples.rs"
 required-features = ["tts"]
 
+[[bin]]
+name = "bloat_probe"
+path = "src/bin/bloat_probe.rs"
+required-features = ["odt", "tts", "dictionary", "tesseract", "transliterate", "pdf"]
+
 [features]
 default = []
 uniffi = ["dep:uniffi"]
