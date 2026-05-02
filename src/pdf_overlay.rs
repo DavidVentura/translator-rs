@@ -755,8 +755,10 @@ fn fit_with_sampled_size(
     let min_size = (sampled * MIN_SHRINK_FRACTION).max(MIN_FIT_FONT_SIZE_PT);
 
     if original_lines <= 1 {
-        // Originally one line. Don't introduce wraps — keep one line and
-        // shrink the font if it'd overflow the bbox by more than tolerance.
+        // Originally one line. Prefer keeping one line and shrink the font if
+        // it'd overflow the bbox by more than tolerance. If it still overflows
+        // at the readability floor, wrap unbreakable text by character rather
+        // than letting CJK/URLs run across the page.
         let vis_w = line_width_at(line_widths, 0);
         let width_at_sampled = metrics.measure(text, sampled);
         let allowed = vis_w * OVERHANG_TOLERANCE;
@@ -765,7 +767,14 @@ fn fit_with_sampled_size(
         } else {
             (sampled * vis_w / width_at_sampled).max(min_size)
         };
-        (final_size, vec![text.to_string()])
+        if metrics.measure(text, final_size) <= allowed {
+            (final_size, vec![text.to_string()])
+        } else {
+            (
+                final_size,
+                wrap_lines_to_widths(text, line_widths, final_size, metrics),
+            )
+        }
     } else {
         // Originally multi-line. Wrap at the sampled size, and if the
         // wrap produces more lines than the original used, shrink and
@@ -826,11 +835,13 @@ fn wrap_lines_to_widths(
                 format!("{current} {word}")
             };
             let max_width = line_width_at(line_widths, lines.len());
-            if metrics.measure(&candidate, font_size) <= max_width || current.is_empty() {
+            if metrics.measure(&candidate, font_size) <= max_width {
                 current = candidate;
+            } else if current.is_empty() {
+                current = push_wrapped_word(word, line_widths, font_size, metrics, &mut lines);
             } else {
                 lines.push(current);
-                current = word.to_string();
+                current = push_wrapped_word(word, line_widths, font_size, metrics, &mut lines);
             }
         }
         if !current.is_empty() {
@@ -841,6 +852,31 @@ fn wrap_lines_to_widths(
         lines.push(String::new());
     }
     lines
+}
+
+fn push_wrapped_word(
+    word: &str,
+    line_widths: &[f32],
+    font_size: f32,
+    metrics: &FontMetrics,
+    lines: &mut Vec<String>,
+) -> String {
+    let max_width = line_width_at(line_widths, lines.len());
+    if metrics.measure(word, font_size) <= max_width || word.chars().count() <= 1 {
+        return word.to_string();
+    }
+
+    let mut current = String::new();
+    for ch in word.chars() {
+        let mut candidate = current.clone();
+        candidate.push(ch);
+        let max_width = line_width_at(line_widths, lines.len());
+        if !current.is_empty() && metrics.measure(&candidate, font_size) > max_width {
+            lines.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    current
 }
 
 fn line_width_at(line_widths: &[f32], index: usize) -> f32 {
@@ -901,6 +937,28 @@ mod tests {
                 assert!(w <= 60.0, "line too wide: {line:?} width {w}");
             }
         }
+    }
+
+    #[test]
+    fn wraps_unspaced_cjk_text_into_multiple_lines() {
+        let text = "这是一个没有空格的中文句子";
+        let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+        let lines = wrap_lines_to_widths(text, &[30.0], 10.0, &metrics);
+        assert!(lines.len() > 1);
+        assert_eq!(lines.join(""), text);
+        for line in &lines {
+            let w = metrics.measure(line, 10.0);
+            assert!(w <= 30.0, "line too wide: {line:?} width {w}");
+        }
+    }
+
+    #[test]
+    fn wraps_unspaced_cjk_single_line_when_shrink_floor_still_overflows() {
+        let text = "这是一个没有空格的中文句子";
+        let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+        let (_size, lines) = fit_with_sampled_size(text, &[30.0], 20.0, 10.0, &metrics, 1);
+        assert!(lines.len() > 1);
+        assert_eq!(lines.join(""), text);
     }
 
     #[test]
