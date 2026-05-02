@@ -191,6 +191,8 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
             segment: seg.segment,
             translated_text: t.translated_text,
             alignments: t.alignments,
+            source_offset: seg.source_offset,
+            output_prefix: seg.output_prefix,
         })
         .collect::<Vec<_>>();
 
@@ -241,6 +243,8 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
         page_index: usize,
         block_index: usize,
         segment: TranslationSegment,
+        source_offset: u32,
+        output_prefix: String,
     }
     let mut texts_by_source: HashMap<String, Vec<String>> = HashMap::new();
     let mut refs_by_source: HashMap<String, Vec<PageSegmentRef>> = HashMap::new();
@@ -262,6 +266,8 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
                 page_index,
                 block_index: seg.block_index,
                 segment: seg.segment,
+                source_offset: seg.source_offset,
+                output_prefix: seg.output_prefix,
             });
         }
     }
@@ -289,6 +295,8 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
                     segment: r.segment,
                     translated_text: t.translated_text,
                     alignments: t.alignments,
+                    source_offset: r.source_offset,
+                    output_prefix: r.output_prefix,
                 });
         }
     }
@@ -382,6 +390,8 @@ struct CollectedSegment {
     block_index: usize,
     segment: TranslationSegment,
     text: String,
+    source_offset: u32,
+    output_prefix: String,
 }
 
 fn collect_block_segments(blocks: &[TranslatableBlock]) -> Vec<CollectedSegment> {
@@ -397,6 +407,9 @@ fn collect_block_segments(blocks: &[TranslatableBlock]) -> Vec<CollectedSegment>
         for segment in &block.segments {
             let start = segment.start as usize;
             let end = segment.end as usize;
+            let raw_text = &block.text[start..end];
+            let (output_prefix, source_offset, translatable_text) =
+                split_protected_leading_list_marker(raw_text);
             // Marian treats '\n' as a hard sentence break, so soft line wraps
             // inside a paragraph would translate line-per-line and lose
             // cross-line context. Flatten to spaces — '\n' and ' ' are both
@@ -404,7 +417,9 @@ fn collect_block_segments(blocks: &[TranslatableBlock]) -> Vec<CollectedSegment>
             out.push(CollectedSegment {
                 block_index,
                 segment: segment.clone(),
-                text: block.text[start..end].replace('\n', " "),
+                text: translatable_text.replace('\n', " "),
+                source_offset,
+                output_prefix,
             });
         }
     }
@@ -416,6 +431,8 @@ struct BlockSegmentTranslation {
     segment: TranslationSegment,
     translated_text: String,
     alignments: Vec<TokenAlignment>,
+    source_offset: u32,
+    output_prefix: String,
 }
 
 fn assemble_translated_blocks(
@@ -456,9 +473,15 @@ fn assemble_translated_blocks(
                 .iter()
                 .filter(|entry| entry.block_index == block_index)
             {
-                translated_segments.push((entry.segment.clone(), entry.translated_text.clone()));
-                segment_alignments.push((entry.segment.clone(), entry.alignments.clone()));
-                translated_text.push_str(&entry.translated_text);
+                let full_translation = format!("{}{}", entry.output_prefix, entry.translated_text);
+                let adjusted_alignments = adjust_alignments_for_protected_prefix(
+                    &entry.alignments,
+                    entry.source_offset,
+                    entry.output_prefix.len() as u64,
+                );
+                translated_segments.push((entry.segment.clone(), full_translation.clone()));
+                segment_alignments.push((entry.segment.clone(), adjusted_alignments));
+                translated_text.push_str(&full_translation);
             }
 
             let style_spans = map_styles_to_segmented_translation(
@@ -476,6 +499,53 @@ fn assemble_translated_blocks(
                 foreground_argb: colors.foreground_argb,
                 opaque: false,
             })
+        })
+        .collect()
+}
+
+fn split_protected_leading_list_marker(text: &str) -> (String, u32, &str) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let marker_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == marker_start || i >= bytes.len() {
+        return (String::new(), 0, text);
+    }
+    if !matches!(bytes[i], b'.' | b')') {
+        return (String::new(), 0, text);
+    }
+    i += 1;
+    let marker_end = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == marker_end {
+        return (String::new(), 0, text);
+    }
+
+    let mut prefix = text[..marker_end].trim().to_string();
+    prefix.push(' ');
+    (prefix, i as u32, &text[i..])
+}
+
+fn adjust_alignments_for_protected_prefix(
+    alignments: &[TokenAlignment],
+    source_offset: u32,
+    target_offset: u64,
+) -> Vec<TokenAlignment> {
+    let source_offset = source_offset as u64;
+    alignments
+        .iter()
+        .map(|alignment| TokenAlignment {
+            src_begin: alignment.src_begin + source_offset,
+            src_end: alignment.src_end + source_offset,
+            tgt_begin: alignment.tgt_begin + target_offset,
+            tgt_end: alignment.tgt_end + target_offset,
         })
         .collect()
 }
@@ -912,7 +982,11 @@ fn cluster_into_lines(fragments: &[StyledFragment]) -> Vec<Vec<StyledFragment>> 
     line_indices.sort_by_key(|index| line_tops[*index]);
     line_indices
         .into_iter()
-        .map(|index| lines[index].clone())
+        .map(|index| {
+            let mut line = lines[index].clone();
+            line.sort_by_key(|fragment| fragment.bounding_box.left);
+            line
+        })
         .collect()
 }
 
@@ -1395,6 +1469,48 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].text, "1. A paragraph heading starts here");
+    }
+
+    #[test]
+    fn leading_ordered_list_marker_is_protected_from_translation() {
+        let (prefix, offset, text) = split_protected_leading_list_marker("1. Finalize report.");
+
+        assert_eq!(prefix, "1. ");
+        assert_eq!(offset, 3);
+        assert_eq!(text, "Finalize report.");
+    }
+
+    #[test]
+    fn assemble_reattaches_protected_list_marker_before_translation() {
+        let text = "1. Finalize report.";
+        let source_block = TranslatableBlock {
+            text: text.into(),
+            bounds: Rect::default(),
+            source_rects: Vec::new(),
+            style_spans: Vec::new(),
+            segments: vec![TranslationSegment {
+                start: 0,
+                end: text.len() as u32,
+                translation_group: 0,
+            }],
+            opaque: false,
+        };
+        let translated = assemble_translated_blocks(
+            std::slice::from_ref(&source_block),
+            &[BlockSegmentTranslation {
+                block_index: 0,
+                segment: source_block.segments[0].clone(),
+                translated_text: "Finalizar el informe.".into(),
+                alignments: Vec::new(),
+                source_offset: 3,
+                output_prefix: "1. ".into(),
+            }],
+            None,
+            BackgroundMode::BlackOnWhite,
+        )
+        .expect("assemble");
+
+        assert_eq!(translated[0].text, "1. Finalizar el informe.");
     }
 
     #[test]
