@@ -483,7 +483,7 @@ fn line_available_widths(
         return vec![fallback.max(1.0)];
     }
 
-    let visual_right = user_rect_visual_bounds(user_rect, geom).2;
+    let (visual_left, _, visual_right, _) = user_rect_visual_bounds(user_rect, geom);
     let last_index = geometry.line_anchors.len().saturating_sub(1);
     geometry
         .line_anchors
@@ -491,7 +491,9 @@ fn line_available_widths(
         .enumerate()
         .map(|(index, origin)| {
             let (vx, _vy) = geom.to_display(*origin);
-            let effective_left = if index == 0
+            let effective_left = if matches!(geom.rotate, 90 | 270) {
+                visual_left
+            } else if index == 0
                 && let Some(override_x) = first_line_x_override
             {
                 geom.to_display((override_x, origin.1)).0
@@ -782,14 +784,7 @@ fn fit_with_sampled_size(
         } else {
             (sampled * vis_w / width_at_sampled).max(min_size)
         };
-        if metrics.measure(text, final_size) <= allowed || text.split_whitespace().count() > 1 {
-            (final_size, vec![text.to_string()])
-        } else {
-            (
-                final_size,
-                wrap_lines_to_widths(text, line_widths, final_size, metrics),
-            )
-        }
+        (final_size, vec![text.to_string()])
     } else {
         // Originally multi-line. Wrap at the sampled size, and if the
         // wrap produces more lines than the original used, shrink and
@@ -968,12 +963,11 @@ mod tests {
     }
 
     #[test]
-    fn wraps_unspaced_cjk_single_line_when_shrink_floor_still_overflows() {
+    fn preserves_unspaced_single_line_when_shrink_floor_still_overflows() {
         let text = "这是一个没有空格的中文句子";
         let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
         let (_size, lines) = fit_with_sampled_size(text, &[30.0], 20.0, 10.0, &metrics, 1);
-        assert!(lines.len() > 1);
-        assert_eq!(lines.join(""), text);
+        assert_eq!(lines, vec![text]);
     }
 
     #[test]
@@ -982,6 +976,31 @@ mod tests {
         let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
         let (_size, lines) = fit_with_sampled_size(text, &[20.0], 12.0, 10.0, &metrics, 1);
         assert_eq!(lines, vec![text]);
+    }
+
+    #[test]
+    fn rotated_line_width_uses_visual_bbox_left_edge() {
+        let geom = PageGeometry {
+            user_w: 595.0,
+            user_h: 842.0,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
+            rotate: 90,
+        };
+        let user_rect = geom.user_rect_from_display(crate::ocr::Rect {
+            left: 20,
+            top: 121,
+            right: 53,
+            bottom: 132,
+        });
+        let geometry = BlockGeometry {
+            line_anchors: vec![(126.0, 52.0)],
+            ..BlockGeometry::default()
+        };
+
+        let widths = line_available_widths(&geometry, user_rect, None, None, geom, 33.0);
+
+        assert_eq!(widths, vec![33.0]);
     }
 
     #[test]
