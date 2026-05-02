@@ -18,6 +18,8 @@ bucket="${PDF_VISUAL_BUCKET_DIR:-$repo_root/smoke-bucket}"
 out_root="${PDF_VISUAL_OUT_DIR:-$repo_root/smoke-out/visual}"
 dpi="${PDF_VISUAL_DPI:-144}"
 max_pages="${PDF_VISUAL_MAX_PAGES:-6}"
+page_from="${PDF_VISUAL_PAGE_FROM:-1}"
+page_to="${PDF_VISUAL_PAGE_TO:-}"
 target_lang="${PDF_VISUAL_TARGET_LANG:-en}"
 source_lang="${PDF_VISUAL_SOURCE_LANG:-en}"
 
@@ -53,8 +55,20 @@ prepare_input_pdf() {
   local dir="$2"
   local pages="$3"
   local selected="$pdf"
+  local first="$page_from"
+  local last="$page_to"
 
-  if [ "$max_pages" -gt 0 ] && [ "$pages" -gt "$max_pages" ]; then
+  if [ -n "$last" ]; then
+    if [ "$first" -lt 1 ] || [ "$last" -lt "$first" ] || [ "$last" -gt "$pages" ]; then
+      echo "invalid PDF_VISUAL_PAGE_FROM/PDF_VISUAL_PAGE_TO for $pdf: $first-$last of $pages" >&2
+      exit 1
+    fi
+    selected="$dir/input-p$first-$last.pdf"
+    mkdir -p "$dir/pages"
+    pdfseparate -f "$first" -l "$last" "$pdf" "$dir/pages/page-%03d.pdf" >"$dir/pdfseparate.log" 2>&1
+    # shellcheck disable=SC2046
+    pdfunite $(find "$dir/pages" -name 'page-*.pdf' | sort) "$selected" >"$dir/pdfunite.log" 2>&1
+  elif [ "$max_pages" -gt 0 ] && [ "$pages" -gt "$max_pages" ]; then
     selected="$dir/input-p1-$max_pages.pdf"
     mkdir -p "$dir/pages"
     pdfseparate -f 1 -l "$max_pages" "$pdf" "$dir/pages/page-%03d.pdf" >"$dir/pdfseparate.log" 2>&1
