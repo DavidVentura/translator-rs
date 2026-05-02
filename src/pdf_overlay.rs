@@ -281,6 +281,7 @@ fn emit_block(
     );
 
     let dominant_metrics = resources.dominant_metrics();
+    let source_line_boxes = source_rect_line_boxes(&block.source_rects);
     let target_line_count = style
         .geometry
         .original_line_count
@@ -345,7 +346,7 @@ fn emit_block(
     let mut last_line_end: Option<(f32, f32)> = None;
 
     for (i, _line) in lines.iter().enumerate() {
-        let (mut line_x, line_y) = line_origin(
+        let (mut line_x, mut line_y) = line_origin(
             &style.geometry,
             i,
             first_baseline_x,
@@ -354,6 +355,13 @@ fn emit_block(
             line_dx,
             line_dy,
         );
+        if let Some(line_box) = source_line_boxes.get(i)
+            && uses_visual_top_origin(&style.geometry)
+        {
+            let (vx, _) = geom.to_display((line_x, line_y));
+            let desired_visual_y = source_line_baseline_y(*line_box, font_size);
+            (line_x, line_y) = display_to_user((vx, desired_visual_y), geom);
+        }
         if i == 0
             && let Some(override_x) = first_line_x_override
         {
@@ -368,6 +376,7 @@ fn emit_block(
         );
 
         let mut cumulative = 0.0_f32;
+        let sampled_font_size = style.typography.font_size.unwrap_or(font_size).max(0.1);
         for seg in segments {
             if seg.text.is_empty() {
                 continue;
@@ -381,11 +390,23 @@ fn emit_block(
                     monospace: resources.monospace,
                 }),
             };
+            let seg_font_size = seg
+                .style
+                .text_size
+                .filter(|size| size.is_finite() && *size > 0.0)
+                .map(|size| font_size * (size / sampled_font_size))
+                .unwrap_or(font_size);
+            let baseline_shift = seg
+                .style
+                .baseline_shift
+                .filter(|shift| shift.is_finite())
+                .map(|shift| shift * (font_size / sampled_font_size))
+                .unwrap_or(0.0);
             let seg_x = line_x + cumulative * advance_dx;
             let seg_y = line_y + cumulative * advance_dy;
             let combined = Matrix {
-                e: seg_x,
-                f: seg_y,
+                e: seg_x + baseline_shift * line_dx,
+                f: seg_y + baseline_shift * line_dy,
                 ..style.geometry.text_orientation
             };
             let tm = combined.mul(*inv_ctm);
@@ -398,11 +419,11 @@ fn emit_block(
                     style.typography.fill_rgb.2,
                 );
             }
-            builder.set_font(seg_resource_name, font_size);
+            builder.set_font(seg_resource_name, seg_font_size);
             builder.set_text_matrix(tm);
             emit_tj_for_segment(builder, &seg.text, seg_metrics, seg_embed);
 
-            cumulative += seg_metrics.measure(&seg.text, font_size);
+            cumulative += seg_metrics.measure(&seg.text, seg_font_size);
         }
         last_line_end = Some((
             line_x + cumulative * advance_dx,
@@ -545,8 +566,10 @@ fn line_available_widths(
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisualLineBox {
     left: f32,
+    top: f32,
     center_y: f32,
     right: f32,
+    bottom: f32,
     height: f32,
 }
 
@@ -556,8 +579,10 @@ fn source_rect_line_boxes(rects: &[Rect]) -> Vec<VisualLineBox> {
         .filter(|r| r.height() > 0 && r.width() > 0)
         .map(|r| VisualLineBox {
             left: r.left as f32,
+            top: r.top as f32,
             center_y: (r.top + r.bottom) as f32 * 0.5,
             right: r.right as f32,
+            bottom: r.bottom as f32,
             height: r.height() as f32,
         })
         .collect();
@@ -572,7 +597,9 @@ fn source_rect_line_boxes(rects: &[Rect]) -> Vec<VisualLineBox> {
             let threshold = (line.height.max(b.height) * 0.6).max(2.0);
             if (b.center_y - line.center_y).abs() <= threshold {
                 line.left = line.left.min(b.left);
+                line.top = line.top.min(b.top);
                 line.right = line.right.max(b.right);
+                line.bottom = line.bottom.max(b.bottom);
                 line.center_y = (line.center_y + b.center_y) * 0.5;
                 line.height = line.height.max(b.height);
                 continue;
@@ -581,6 +608,28 @@ fn source_rect_line_boxes(rects: &[Rect]) -> Vec<VisualLineBox> {
         lines.push(b);
     }
     lines
+}
+
+fn uses_visual_top_origin(geometry: &BlockGeometry) -> bool {
+    geometry.text_orientation.d < -0.5
+        || (geometry.text_orientation.b > 0.5 && geometry.text_orientation.c < -0.5)
+}
+
+fn source_line_baseline_y(line_box: VisualLineBox, font_size: f32) -> f32 {
+    let descent = (font_size * 0.2).max(1.0);
+    (line_box.bottom - descent).max(line_box.top)
+}
+
+fn display_to_user(display: (f32, f32), geom: PageGeometry) -> (f32, f32) {
+    let top = geom.user_y_min + geom.user_h;
+    let right = geom.user_x_min + geom.user_w;
+    match geom.rotate {
+        0 => (display.0 + geom.user_x_min, top - display.1),
+        90 => (display.1 + geom.user_x_min, display.0 + geom.user_y_min),
+        180 => (right - display.0, display.1 + geom.user_y_min),
+        270 => (right - display.1, top - display.0),
+        _ => (display.0 + geom.user_x_min, top - display.1),
+    }
 }
 
 fn user_rect_visual_bounds(rect: UserRect, geom: PageGeometry) -> (f32, f32, f32, f32) {
@@ -615,6 +664,14 @@ struct LineSegment {
 struct SegmentStyle {
     flags: BoldItalic,
     fill_rgb: Option<(f32, f32, f32)>,
+    text_size: Option<f32>,
+    baseline_shift: Option<f32>,
+}
+
+impl SegmentStyle {
+    fn is_script(self) -> bool {
+        self.text_size.is_some() || self.baseline_shift.is_some()
+    }
 }
 
 /// Walk the line's words (located in `block_text` via `word_ranges`),
@@ -641,6 +698,8 @@ fn segments_for_line(
                             italic: s.italic,
                         },
                         fill_rgb: s.text_color.map(argb_to_rgb),
+                        text_size: s.text_size,
+                        baseline_shift: s.baseline_shift,
                     };
                 }
             }
@@ -648,6 +707,8 @@ fn segments_for_line(
         SegmentStyle {
             flags: default_flags,
             fill_rgb: None,
+            text_size: None,
+            baseline_shift: None,
         }
     };
 
@@ -659,22 +720,24 @@ fn segments_for_line(
     let mut sub_words: Vec<(usize, usize, bool)> = Vec::new();
     for (word_start, word_end) in word_ranges {
         let mut chunk_start = *word_start;
-        let mut chunk_alpha: Option<bool> = None;
+        let mut chunk_key: Option<(bool, bool)> = None;
         let mut byte = *word_start;
         let mut first_chunk_in_word = true;
         for c in block_text[*word_start..*word_end].chars() {
             let alpha = c.is_alphanumeric();
-            if let Some(prev_alpha) = chunk_alpha
-                && alpha != prev_alpha
+            let style = lookup(byte);
+            let key = (alpha, style.is_script());
+            if let Some(prev_key) = chunk_key
+                && key != prev_key
             {
                 sub_words.push((chunk_start, byte, first_chunk_in_word));
                 first_chunk_in_word = false;
                 chunk_start = byte;
             }
-            chunk_alpha = Some(alpha);
+            chunk_key = Some(key);
             byte += c.len_utf8();
         }
-        if chunk_alpha.is_some() {
+        if chunk_key.is_some() {
             sub_words.push((chunk_start, byte, first_chunk_in_word));
         }
     }
@@ -682,6 +745,10 @@ fn segments_for_line(
     let style_for = |start: usize, end: usize, is_alpha: bool| -> SegmentStyle {
         if !is_alpha {
             return lookup(start);
+        }
+        let first_style = lookup(start);
+        if first_style.is_script() {
+            return first_style;
         }
         let mut counts: Vec<(SegmentStyle, usize)> = Vec::new();
         let mut byte = start;
@@ -701,6 +768,8 @@ fn segments_for_line(
             .unwrap_or(SegmentStyle {
                 flags: default_flags,
                 fill_rgb: None,
+                text_size: None,
+                baseline_shift: None,
             })
     };
 
@@ -712,6 +781,8 @@ fn segments_for_line(
     let mut current_style = SegmentStyle {
         flags: default_flags,
         fill_rgb: None,
+        text_size: None,
+        baseline_shift: None,
     };
     for (i, &(start, end, separates_words)) in sub_words.iter().enumerate() {
         let chunk = &block_text[start..end];
@@ -1110,6 +1181,39 @@ mod tests {
             line_available_widths(&geometry, &source_rects, user_rect, None, None, geom, 300.0);
 
         assert_eq!(widths, vec![300.0, 180.0]);
+    }
+
+    #[test]
+    fn detects_rotated_visual_top_origin() {
+        let geometry = BlockGeometry {
+            text_orientation: Matrix {
+                a: 0.0,
+                b: 1.0,
+                c: -1.0,
+                d: 0.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            ..BlockGeometry::default()
+        };
+
+        assert!(uses_visual_top_origin(&geometry));
+    }
+
+    #[test]
+    fn display_to_user_round_trips_rotated_point() {
+        let geom = PageGeometry {
+            user_w: 595.0,
+            user_h: 842.0,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
+            rotate: 90,
+        };
+        let display = (22.0, 216.0);
+
+        let user = display_to_user(display, geom);
+
+        assert_eq!(geom.to_display(user), display);
     }
 
     #[test]

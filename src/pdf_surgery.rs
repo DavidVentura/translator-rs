@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
+use crate::Rect;
 use crate::pdf_content::{
     ContentState, FontAdvanceMap, FontStyleFlags, Matrix, PageGeometry, UserRect, font_flags,
     is_text_show_operator, matrix_from_operands,
@@ -44,6 +45,7 @@ pub(crate) fn rewrite_page_content(
     doc: &mut Document,
     page_id: ObjectId,
     removal_rects: &[Vec<UserRect>],
+    display_removal_rects: &[Vec<Rect>],
     capture_text: &[bool],
     geom: PageGeometry,
 ) -> Result<(Matrix, Vec<SampledBlockStyle>, Vec<Vec<CapturedTextShow>>), PdfWriteError> {
@@ -53,8 +55,10 @@ pub(crate) fn rewrite_page_content(
         doc,
         content.operations,
         removal_rects,
+        display_removal_rects,
         capture_text,
         &resources,
+        geom,
         ContentState::new(),
         &mut HashSet::new(),
     )?;
@@ -404,8 +408,10 @@ fn filter_text_ops(
     doc: &mut Document,
     ops: Vec<Operation>,
     removal_rects: &[Vec<UserRect>],
+    display_removal_rects: &[Vec<Rect>],
     capture_text: &[bool],
     resources: &ResourceContext,
+    geom: PageGeometry,
     mut state: ContentState,
     xobject_stack: &mut HashSet<ObjectId>,
 ) -> Result<
@@ -430,7 +436,9 @@ fn filter_text_ops(
                     &state,
                     resources,
                     removal_rects,
+                    display_removal_rects,
                     capture_text,
+                    geom,
                     &mut samples,
                     &mut captured,
                     xobject_stack,
@@ -453,16 +461,18 @@ fn filter_text_ops(
         let dropped_rect = removal_rects
             .iter()
             .enumerate()
-            .filter_map(|(i, rects)| {
-                rects
+            .filter_map(|(i, _rects)| {
+                display_removal_rects
+                    .get(i)?
                     .iter()
-                    .filter(|r| text_show_touches_source_rect(snapshot, **r))
+                    .filter(|r| text_show_touches_display_rect(snapshot, **r, geom))
                     .map(|r| (i, *r))
                     .next()
             })
             .min_by(|(_, a), (_, b)| {
-                let dist_a = (snapshot.origin.0 - a.x0).abs();
-                let dist_b = (snapshot.origin.0 - b.x0).abs();
+                let (sx, _) = geom.to_display(snapshot.origin);
+                let dist_a = (sx - a.left as f32).abs();
+                let dist_b = (sx - b.left as f32).abs();
                 dist_a
                     .partial_cmp(&dist_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -544,7 +554,9 @@ fn rewrite_form_xobject(
     state: &ContentState,
     resources: &ResourceContext,
     removal_rects: &[Vec<UserRect>],
+    display_removal_rects: &[Vec<Rect>],
     capture_text: &[bool],
+    geom: PageGeometry,
     samples: &mut [Vec<RawStyleSample>],
     captured: &mut [Vec<CapturedTextShow>],
     xobject_stack: &mut HashSet<ObjectId>,
@@ -590,8 +602,10 @@ fn rewrite_form_xobject(
         doc,
         content.operations,
         removal_rects,
+        display_removal_rects,
         capture_text,
         &form_resources,
+        geom,
         form_state,
         xobject_stack,
     )?;
@@ -646,30 +660,45 @@ fn form_resource_context(doc: &Document, dict: &Dictionary) -> ResourceContext {
     }
 }
 
-fn text_show_touches_source_rect(
+fn text_show_touches_display_rect(
     snapshot: crate::pdf_content::ShowSnapshot,
-    rect: UserRect,
+    rect: Rect,
+    geom: PageGeometry,
 ) -> bool {
-    if rect.contains(snapshot.origin.0, snapshot.origin.1) {
+    let (ox, oy) = geom.to_display(snapshot.origin);
+    if display_rect_contains(rect, ox, oy) {
         return true;
     }
     if snapshot.advance.abs() <= f32::EPSILON {
         return false;
     }
-    let start = snapshot.combined.transform_point(0.0, 0.0);
-    let end = snapshot.combined.transform_point(snapshot.advance, 0.0);
-    segment_intersects_rect(start, end, rect)
+    let start = geom.to_display(snapshot.combined.transform_point(0.0, 0.0));
+    let end = geom.to_display(snapshot.combined.transform_point(snapshot.advance, 0.0));
+    segment_intersects_display_rect(start, end, rect)
 }
 
-fn segment_intersects_rect(start: (f32, f32), end: (f32, f32), rect: UserRect) -> bool {
-    if rect.contains(start.0, start.1) || rect.contains(end.0, end.1) {
+fn display_rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.left as f32
+        && x <= rect.right as f32
+        && y >= rect.top as f32
+        && y <= rect.bottom as f32
+}
+
+fn segment_intersects_display_rect(start: (f32, f32), end: (f32, f32), rect: Rect) -> bool {
+    if display_rect_contains(rect, start.0, start.1) || display_rect_contains(rect, end.0, end.1) {
         return true;
     }
+    let (l, t, r, b) = (
+        rect.left as f32,
+        rect.top as f32,
+        rect.right as f32,
+        rect.bottom as f32,
+    );
     let edges = [
-        ((rect.x0, rect.y0), (rect.x1, rect.y0)),
-        ((rect.x1, rect.y0), (rect.x1, rect.y1)),
-        ((rect.x1, rect.y1), (rect.x0, rect.y1)),
-        ((rect.x0, rect.y1), (rect.x0, rect.y0)),
+        ((l, t), (r, t)),
+        ((r, t), (r, b)),
+        ((r, b), (l, b)),
+        ((l, b), (l, t)),
     ];
     edges
         .iter()
@@ -725,12 +754,16 @@ mod tests {
         Vec<Vec<RawStyleSample>>,
         Vec<Vec<CapturedTextShow>>,
     ) {
+        let geom = test_geom();
+        let display_rects = display_rects_for(rects, geom);
         filter_text_ops(
             &mut Document::with_version("1.5"),
             ops,
             rects,
+            &display_rects,
             &vec![false; rects.len()],
             &ResourceContext::default(),
+            geom,
             ContentState::new(),
             &mut HashSet::new(),
         )
@@ -747,16 +780,51 @@ mod tests {
         Vec<Vec<RawStyleSample>>,
         Vec<Vec<CapturedTextShow>>,
     ) {
+        let geom = test_geom();
+        let display_rects = display_rects_for(rects, geom);
         filter_text_ops(
             &mut Document::with_version("1.5"),
             ops,
             rects,
+            &display_rects,
             capture_text,
             &ResourceContext::default(),
+            geom,
             ContentState::new(),
             &mut HashSet::new(),
         )
         .unwrap()
+    }
+
+    fn test_geom() -> PageGeometry {
+        PageGeometry {
+            user_w: 1000.0,
+            user_h: 1000.0,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
+            rotate: 0,
+        }
+    }
+
+    fn display_rects_for(rects: &[Vec<UserRect>], geom: PageGeometry) -> Vec<Vec<Rect>> {
+        rects
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|r| {
+                        let (x0, y0) = geom.to_display((r.x0, r.y1));
+                        let (x1, y1) = geom.to_display((r.x1, r.y0));
+                        Rect {
+                            left: x0.min(x1).floor() as u32,
+                            top: y0.min(y1).floor() as u32,
+                            right: x0.max(x1).ceil() as u32,
+                            bottom: y0.max(y1).ceil() as u32,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -766,6 +834,30 @@ mod tests {
         let r = t.mul(i);
         assert!((r.e - 10.0).abs() < 1e-5);
         assert!((r.f - 20.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn display_rect_matching_honors_page_rotation() {
+        let geom = PageGeometry {
+            user_w: 595.0,
+            user_h: 842.0,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
+            rotate: 90,
+        };
+        let snapshot = crate::pdf_content::ShowSnapshot {
+            origin: (216.0, 22.0),
+            combined: Matrix::translate(216.0, 22.0),
+            advance: 0.0,
+        };
+        let rect = Rect {
+            left: 22,
+            top: 216,
+            right: 86,
+            bottom: 226,
+        };
+
+        assert!(text_show_touches_display_rect(snapshot, rect, geom));
     }
 
     #[test]

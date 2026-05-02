@@ -89,10 +89,15 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                 typed_chars.push(TypedChar {
                     c,
                     x: ch.origin().x,
+                    y: ch.origin().y,
+                    bbox: rect_from_quad(ch.quad()),
+                    font_size: ch.size(),
                     style: PdfCharStyle {
                         bold: ch.flags().contains(TextCharFlags::BOLD),
                         italic,
                         fill_argb: ch.argb(),
+                        text_size: None,
+                        baseline_shift: None,
                     },
                     font_name,
                 });
@@ -284,11 +289,13 @@ fn compute_opaque_flags(pre_lines: &[PreLine]) -> Vec<bool> {
     flags
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PdfCharStyle {
     bold: bool,
     italic: bool,
     fill_argb: u32,
+    text_size: Option<f32>,
+    baseline_shift: Option<f32>,
 }
 
 impl From<PdfCharStyle> for TextStyle {
@@ -296,7 +303,8 @@ impl From<PdfCharStyle> for TextStyle {
         TextStyle {
             text_color: Some(s.fill_argb),
             bg_color: None,
-            text_size: None,
+            text_size: s.text_size,
+            baseline_shift: s.baseline_shift,
             bold: s.bold,
             italic: s.italic,
             underline: false,
@@ -308,6 +316,9 @@ impl From<PdfCharStyle> for TextStyle {
 struct TypedChar {
     c: char,
     x: f32,
+    y: f32,
+    bbox: Rect,
+    font_size: f32,
     style: PdfCharStyle,
     /// mupdf-reported font name. We look at this to decide whether the line
     /// is display math (drawn in a math-class font like CMSY/CMMI) versus
@@ -334,10 +345,13 @@ fn split_line_by_style(chars: &[TypedChar], line_rect: Rect) -> Vec<LineRun> {
     let mut run_start_x: Option<f32> = None;
     let mut run_end_x: f32 = line_rect.left as f32;
     let mut run_style: Option<PdfCharStyle> = None;
+    let script_context = ScriptContext::for_line(chars);
 
     for tc in chars {
         let is_ws = tc.c.is_whitespace();
-        let style_changed = !is_ws && run_style.is_some_and(|s| s != tc.style);
+        let script = script_context.kind_for(tc);
+        let effective_style = script_context.style_for(tc, script);
+        let style_changed = !is_ws && run_style.is_some_and(|s| s != effective_style);
         if style_changed && !run_text.is_empty() {
             runs.push(finish_run(
                 &run_text,
@@ -354,7 +368,7 @@ fn split_line_by_style(chars: &[TypedChar], line_rect: Rect) -> Vec<LineRun> {
         }
         run_end_x = run_end_x.max(tc.x);
         if !is_ws {
-            run_style = Some(tc.style);
+            run_style = Some(effective_style);
         }
         run_text.push(tc.c);
     }
@@ -363,6 +377,8 @@ fn split_line_by_style(chars: &[TypedChar], line_rect: Rect) -> Vec<LineRun> {
             bold: false,
             italic: false,
             fill_argb: 0xFF00_0000,
+            text_size: None,
+            baseline_shift: None,
         });
         runs.push(finish_run(
             &run_text,
@@ -373,6 +389,85 @@ fn split_line_by_style(chars: &[TypedChar], line_rect: Rect) -> Vec<LineRun> {
         ));
     }
     runs
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptKind {
+    Normal,
+    Subscript,
+    Superscript,
+}
+
+struct ScriptContext {
+    main_size: f32,
+    main_top: f32,
+    main_bottom: f32,
+    main_baseline: f32,
+}
+
+impl ScriptContext {
+    fn for_line(chars: &[TypedChar]) -> Self {
+        let main_size = chars
+            .iter()
+            .filter(|tc| !tc.c.is_whitespace())
+            .map(|tc| tc.font_size)
+            .fold(0.0, f32::max);
+        let mut main_tops = Vec::new();
+        let mut main_bottoms = Vec::new();
+        let mut main_baselines = Vec::new();
+        for tc in chars {
+            if tc.c.is_whitespace() || tc.font_size < main_size * 0.95 {
+                continue;
+            }
+            main_tops.push(tc.bbox.top);
+            main_bottoms.push(tc.bbox.bottom);
+            main_baselines.push(tc.y);
+        }
+        main_tops.sort_unstable();
+        main_bottoms.sort_unstable();
+        main_baselines.sort_by(|a, b| a.total_cmp(b));
+        let main_top = main_tops
+            .get(main_tops.len() / 2)
+            .copied()
+            .unwrap_or_default() as f32;
+        let main_bottom = main_bottoms
+            .get(main_bottoms.len() / 2)
+            .copied()
+            .unwrap_or_default() as f32;
+        let main_baseline = main_baselines
+            .get(main_baselines.len() / 2)
+            .copied()
+            .unwrap_or_default();
+        Self {
+            main_size,
+            main_top,
+            main_bottom,
+            main_baseline,
+        }
+    }
+
+    fn kind_for(&self, tc: &TypedChar) -> ScriptKind {
+        if self.main_size <= 0.0 || tc.font_size > self.main_size * 0.82 {
+            return ScriptKind::Normal;
+        }
+        let shift_threshold = (self.main_size * 0.18).max(1.0);
+        if tc.bbox.top as f32 > self.main_top + shift_threshold {
+            return ScriptKind::Subscript;
+        }
+        if (tc.bbox.bottom as f32) < self.main_bottom - shift_threshold {
+            return ScriptKind::Superscript;
+        }
+        ScriptKind::Normal
+    }
+
+    fn style_for(&self, tc: &TypedChar, script: ScriptKind) -> PdfCharStyle {
+        let mut style = tc.style;
+        if script != ScriptKind::Normal {
+            style.text_size = Some(tc.font_size);
+            style.baseline_shift = Some(tc.y - self.main_baseline);
+        }
+        style
+    }
 }
 
 fn finish_run(
@@ -540,6 +635,21 @@ fn rect_from_mupdf(r: mupdf::Rect) -> Rect {
     }
 }
 
+fn rect_from_quad(q: mupdf::Quad) -> Rect {
+    let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
+    let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
+    let left = xs.iter().copied().fold(f32::INFINITY, f32::min);
+    let right = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let top = ys.iter().copied().fold(f32::INFINITY, f32::min);
+    let bottom = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    Rect {
+        left: left.max(0.0).floor() as u32,
+        top: top.max(0.0).floor() as u32,
+        right: right.max(0.0).ceil() as u32,
+        bottom: bottom.max(0.0).ceil() as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,12 +658,45 @@ mod tests {
         TypedChar {
             c,
             x: 0.0,
+            y: if font_name.contains('7') { 21.5 } else { 20.0 },
+            bbox: Rect {
+                left: 0,
+                top: 10,
+                right: 10,
+                bottom: 20,
+            },
+            font_size: if font_name.contains('7') { 7.0 } else { 10.0 },
             style: PdfCharStyle {
                 bold: false,
                 italic: false,
                 fill_argb: 0xFF00_0000,
+                text_size: None,
+                baseline_shift: None,
             },
             font_name: font_name.to_string(),
+        }
+    }
+
+    fn tc_at(c: char, x: f32, top: u32, right: u32, bottom: u32, size: f32) -> TypedChar {
+        TypedChar {
+            c,
+            x,
+            y: bottom as f32,
+            bbox: Rect {
+                left: x as u32,
+                top,
+                right,
+                bottom,
+            },
+            font_size: size,
+            style: PdfCharStyle {
+                bold: false,
+                italic: false,
+                fill_argb: 0xFF00_0000,
+                text_size: None,
+                baseline_shift: None,
+            },
+            font_name: "GENERIC".into(),
         }
     }
 
@@ -639,5 +782,81 @@ mod tests {
             ]),
             vec![false, true, true, true, false, false]
         );
+    }
+
+    #[test]
+    fn lowered_small_glyph_gets_subscript_style() {
+        let chars = vec![
+            tc_at('L', 10.0, 100, 17, 110, 10.0),
+            tc_at('v', 17.0, 104, 22, 112, 7.0),
+        ];
+
+        let runs = split_line_by_style(
+            &chars,
+            Rect {
+                left: 10,
+                top: 100,
+                right: 22,
+                bottom: 112,
+            },
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "L");
+        assert_eq!(runs[0].style.text_size, None);
+        assert_eq!(runs[0].style.baseline_shift, None);
+        assert_eq!(runs[1].text, "v");
+        assert_eq!(runs[1].style.text_size, Some(7.0));
+        assert_eq!(runs[1].style.baseline_shift, Some(2.0));
+    }
+
+    #[test]
+    fn shifted_operator_stays_inside_subscript_group() {
+        let chars = vec![
+            tc_at('L', 10.0, 100, 17, 110, 10.0),
+            tc_at('v', 17.0, 104, 22, 112, 7.0),
+            tc_at('+', 22.0, 104, 27, 112, 7.0),
+            tc_at('1', 27.0, 104, 32, 112, 7.0),
+        ];
+
+        let runs = split_line_by_style(
+            &chars,
+            Rect {
+                left: 10,
+                top: 100,
+                right: 32,
+                bottom: 112,
+            },
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "L");
+        assert_eq!(runs[1].text, "v+1");
+        assert_eq!(runs[1].style.text_size, Some(7.0));
+        assert_eq!(runs[1].style.baseline_shift, Some(2.0));
+    }
+
+    #[test]
+    fn raised_small_glyph_gets_superscript_style() {
+        let chars = vec![
+            tc_at('x', 10.0, 100, 17, 110, 10.0),
+            tc_at('2', 17.0, 96, 22, 104, 7.0),
+        ];
+
+        let runs = split_line_by_style(
+            &chars,
+            Rect {
+                left: 10,
+                top: 96,
+                right: 22,
+                bottom: 110,
+            },
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "x");
+        assert_eq!(runs[1].text, "2");
+        assert_eq!(runs[1].style.text_size, Some(7.0));
+        assert_eq!(runs[1].style.baseline_shift, Some(-6.0));
     }
 }

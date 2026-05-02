@@ -216,12 +216,6 @@ pub(crate) struct UserRect {
     pub y1: f32,
 }
 
-impl UserRect {
-    pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
-    }
-}
-
 fn inherited_object(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Object> {
     let mut current_id = page_id;
     let mut seen = HashSet::new();

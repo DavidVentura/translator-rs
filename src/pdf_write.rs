@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use lopdf::{Document, ObjectId};
 
+use crate::Rect;
 use crate::pdf::PdfError;
 use crate::pdf_content::{BoldItalic, FontStyleFlags, Matrix, PageGeometry, UserRect};
 use crate::pdf_overlay::{
@@ -288,9 +289,26 @@ fn run_surgery<'a>(
                     .collect()
             })
             .collect();
+        let display_removal_rects: Vec<Vec<Rect>> = translation
+            .blocks
+            .iter()
+            .map(|b| {
+                if b.source_rects.is_empty() {
+                    vec![b.bounding_box]
+                } else {
+                    b.source_rects.clone()
+                }
+            })
+            .collect();
         let capture_text: Vec<bool> = translation.blocks.iter().map(|b| b.opaque).collect();
-        let (final_ctm, block_styles, captured_text) =
-            rewrite_page_content(doc, *page_id, &removal_rects, &capture_text, geom)?;
+        let (final_ctm, block_styles, captured_text) = rewrite_page_content(
+            doc,
+            *page_id,
+            &removal_rects,
+            &display_removal_rects,
+            &capture_text,
+            geom,
+        )?;
         let flat_removal_rects = removal_rects.iter().flatten().copied().collect::<Vec<_>>();
         prune_link_annotations(doc, *page_id, &flat_removal_rects)?;
         ensure_fonts_in_page_resources(doc, *page_id)?;

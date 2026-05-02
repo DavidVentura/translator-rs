@@ -17,6 +17,8 @@ pub struct TextStyle {
     pub text_color: Option<u32>,
     pub bg_color: Option<u32>,
     pub text_size: Option<f32>,
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    pub baseline_shift: Option<f32>,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -761,7 +763,7 @@ fn is_standalone_list_marker(fragment: &StyledFragment) -> bool {
     let text = fragment.text.trim();
     !text.is_empty()
         && text.chars().all(|c| matches!(c, '●' | '•' | '▪' | '◦'))
-        && fragment.bounding_box.width() <= 2
+        && fragment.bounding_box.width() <= 16
 }
 
 fn build_blocks(fragments: &[StyledFragment]) -> Vec<TranslatableBlock> {
@@ -1077,6 +1079,11 @@ fn expand_style_spans_to_word_boundaries(spans: Vec<StyleSpan>, text: &str) -> V
     spans
         .into_iter()
         .map(|mut span| {
+            if span.style.as_ref().is_some_and(is_script_style) {
+                span.start = span.start.min(text.len() as u32);
+                span.end = span.end.min(text.len() as u32);
+                return span;
+            }
             let (start, end) =
                 expand_byte_range_to_first_word(text, span.start as usize, span.end as usize);
             span.start = start as u32;
@@ -1085,6 +1092,10 @@ fn expand_style_spans_to_word_boundaries(spans: Vec<StyleSpan>, text: &str) -> V
         })
         .filter(|span| span.start < span.end)
         .collect()
+}
+
+fn is_script_style(style: &TextStyle) -> bool {
+    style.text_size.is_some() || style.baseline_shift.is_some()
 }
 
 fn expand_byte_range_to_first_word(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -1285,6 +1296,7 @@ mod tests {
             text_color: Some(color),
             bg_color: None,
             text_size: None,
+            baseline_shift: None,
             bold: false,
             italic: false,
             underline: false,
@@ -1308,6 +1320,7 @@ mod tests {
                     text_color: None,
                     bg_color: None,
                     text_size: None,
+                    baseline_shift: None,
                     bold: false,
                     italic: false,
                     underline: false,
@@ -1563,6 +1576,24 @@ mod tests {
     }
 
     #[test]
+    fn standalone_bullet_glyph_is_not_translated_inline() {
+        let fragments = vec![
+            fragment("Job Description:", 72, 100, 170, 112),
+            fragment("●", 90, 118, 97, 124),
+            fragment("Maintain infrastructure", 108, 116, 260, 128),
+            fragment("●", 90, 142, 97, 148),
+            fragment("Improve security", 108, 140, 230, 152),
+        ];
+
+        let blocks = cluster_fragments_into_blocks(&fragments);
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].text, "Job Description:");
+        assert_eq!(blocks[1].text, "Maintain infrastructure");
+        assert_eq!(blocks[2].text, "Improve security");
+    }
+
+    #[test]
     fn adjacent_style_split_inside_word_does_not_insert_space() {
         let fragments = vec![
             fragment("blu", 10, 10, 28, 22),
@@ -1599,6 +1630,7 @@ mod tests {
             text_color: Some(0xFF00_00FF),
             bg_color: None,
             text_size: None,
+            baseline_shift: None,
             bold: false,
             italic: false,
             underline: false,
@@ -1652,6 +1684,7 @@ mod tests {
             text_color: Some(0xFF00_00FF),
             bg_color: None,
             text_size: None,
+            baseline_shift: None,
             bold: false,
             italic: false,
             underline: false,
