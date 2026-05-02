@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::Rect;
 use crate::font_metrics::FontMetrics;
 use crate::pdf_content::{
     BoldItalic, ContentStreamBuilder, FontStyleFlags, Matrix, PageGeometry, UserRect,
@@ -271,6 +272,7 @@ fn emit_block(
     };
     let line_widths = line_available_widths(
         &style.geometry,
+        &block.source_rects,
         user_rect,
         first_line_x_override,
         last_line_obstacle_x,
@@ -279,7 +281,10 @@ fn emit_block(
     );
 
     let dominant_metrics = resources.dominant_metrics();
-    let target_line_count = style.geometry.original_line_count;
+    let target_line_count = style
+        .geometry
+        .original_line_count
+        .max(source_rect_line_count(&block.source_rects));
     let (font_size, lines) = match style.typography.font_size {
         Some(size) if size.is_finite() && size > 0.0 => fit_with_sampled_size(
             text,
@@ -408,6 +413,10 @@ fn emit_block(
     last_line_end
 }
 
+fn source_rect_line_count(rects: &[Rect]) -> usize {
+    source_rect_line_boxes(rects).len()
+}
+
 /// Re-emit a captured run of original Tjs (a preserved formula) at
 /// the original positions. We deliberately keep formulas anchored where
 /// they were in the source PDF: a TeX fraction renders its bar with a
@@ -473,19 +482,29 @@ fn line_origin(
 
 fn line_available_widths(
     geometry: &BlockGeometry,
+    source_rects: &[Rect],
     user_rect: UserRect,
     first_line_x_override: Option<f32>,
     last_line_obstacle_x: Option<f32>,
     geom: PageGeometry,
     fallback: f32,
 ) -> Vec<f32> {
+    let source_widths: Vec<f32> = source_rect_line_boxes(source_rects)
+        .into_iter()
+        .map(|line| (line.right - line.left).max(1.0))
+        .collect();
+
     if geometry.line_anchors.is_empty() {
-        return vec![fallback.max(1.0)];
+        return if source_widths.is_empty() {
+            vec![fallback.max(1.0)]
+        } else {
+            source_widths
+        };
     }
 
     let (visual_left, _, visual_right, _) = user_rect_visual_bounds(user_rect, geom);
     let last_index = geometry.line_anchors.len().saturating_sub(1);
-    geometry
+    let mut widths: Vec<f32> = geometry
         .line_anchors
         .iter()
         .enumerate()
@@ -512,7 +531,56 @@ fn line_available_widths(
                 .max(fallback * 0.25)
                 .min(fallback)
         })
-        .collect()
+        .collect();
+
+    if source_widths.len() > widths.len() {
+        widths.extend(source_widths.iter().skip(widths.len()).copied());
+    }
+    for (width, source_width) in widths.iter_mut().zip(source_widths) {
+        *width = width.min(source_width.max(1.0));
+    }
+    widths
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VisualLineBox {
+    left: f32,
+    center_y: f32,
+    right: f32,
+    height: f32,
+}
+
+fn source_rect_line_boxes(rects: &[Rect]) -> Vec<VisualLineBox> {
+    let mut boxes: Vec<VisualLineBox> = rects
+        .iter()
+        .filter(|r| r.height() > 0 && r.width() > 0)
+        .map(|r| VisualLineBox {
+            left: r.left as f32,
+            center_y: (r.top + r.bottom) as f32 * 0.5,
+            right: r.right as f32,
+            height: r.height() as f32,
+        })
+        .collect();
+    if boxes.is_empty() {
+        return boxes;
+    }
+
+    boxes.sort_by(|a, b| a.center_y.total_cmp(&b.center_y));
+    let mut lines: Vec<VisualLineBox> = Vec::new();
+    for b in boxes {
+        if let Some(line) = lines.last_mut() {
+            let threshold = (line.height.max(b.height) * 0.6).max(2.0);
+            if (b.center_y - line.center_y).abs() <= threshold {
+                line.left = line.left.min(b.left);
+                line.right = line.right.max(b.right);
+                line.center_y = (line.center_y + b.center_y) * 0.5;
+                line.height = line.height.max(b.height);
+                continue;
+            }
+        }
+        lines.push(b);
+    }
+    lines
 }
 
 fn user_rect_visual_bounds(rect: UserRect, geom: PageGeometry) -> (f32, f32, f32, f32) {
@@ -979,6 +1047,72 @@ mod tests {
     }
 
     #[test]
+    fn counts_source_rect_visual_lines() {
+        let rects = vec![
+            Rect {
+                left: 20,
+                top: 509,
+                right: 797,
+                bottom: 520,
+            },
+            Rect {
+                left: 20,
+                top: 521,
+                right: 808,
+                bottom: 533,
+            },
+            Rect {
+                left: 20,
+                top: 534,
+                right: 794,
+                bottom: 546,
+            },
+        ];
+
+        assert_eq!(source_rect_line_count(&rects), 3);
+    }
+
+    #[test]
+    fn line_widths_follow_source_rect_line_boxes() {
+        let geom = PageGeometry {
+            user_w: 842.0,
+            user_h: 595.0,
+            user_x_min: 0.0,
+            user_y_min: 0.0,
+            rotate: 0,
+        };
+        let user_rect = geom.user_rect_from_display(Rect {
+            left: 20,
+            top: 100,
+            right: 320,
+            bottom: 136,
+        });
+        let source_rects = vec![
+            Rect {
+                left: 20,
+                top: 100,
+                right: 320,
+                bottom: 112,
+            },
+            Rect {
+                left: 40,
+                top: 124,
+                right: 220,
+                bottom: 136,
+            },
+        ];
+        let geometry = BlockGeometry {
+            line_anchors: vec![(20.0, 490.0)],
+            ..BlockGeometry::default()
+        };
+
+        let widths =
+            line_available_widths(&geometry, &source_rects, user_rect, None, None, geom, 300.0);
+
+        assert_eq!(widths, vec![300.0, 180.0]);
+    }
+
+    #[test]
     fn rotated_line_width_uses_visual_bbox_left_edge() {
         let geom = PageGeometry {
             user_w: 595.0,
@@ -998,7 +1132,7 @@ mod tests {
             ..BlockGeometry::default()
         };
 
-        let widths = line_available_widths(&geometry, user_rect, None, None, geom, 33.0);
+        let widths = line_available_widths(&geometry, &[], user_rect, None, None, geom, 33.0);
 
         assert_eq!(widths, vec![33.0]);
     }
