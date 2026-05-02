@@ -782,7 +782,7 @@ fn fit_with_sampled_size(
         } else {
             (sampled * vis_w / width_at_sampled).max(min_size)
         };
-        if metrics.measure(text, final_size) <= allowed {
+        if metrics.measure(text, final_size) <= allowed || text.split_whitespace().count() > 1 {
             (final_size, vec![text.to_string()])
         } else {
             (
@@ -974,6 +974,14 @@ mod tests {
         let (_size, lines) = fit_with_sampled_size(text, &[30.0], 20.0, 10.0, &metrics, 1);
         assert!(lines.len() > 1);
         assert_eq!(lines.join(""), text);
+    }
+
+    #[test]
+    fn preserves_spaced_single_line_when_shrink_floor_still_overflows() {
+        let text = "Lead in prose";
+        let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+        let (_size, lines) = fit_with_sampled_size(text, &[20.0], 12.0, 10.0, &metrics, 1);
+        assert_eq!(lines, vec![text]);
     }
 
     #[test]
