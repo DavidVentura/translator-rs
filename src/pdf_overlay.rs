@@ -108,27 +108,28 @@ pub(crate) fn build_overlay_stream(
     // multi-line prose's later wraps fall back to their own anchors at
     // the left margin.
     let mut prev_line_end: Option<(f32, f32)> = None;
+    let mut prev_block_was_opaque = false;
     let mut i = 0usize;
     while i < blocks.len() && i < user_rects.len() {
         let block = &blocks[i];
         let user_rect = user_rects[i];
         let style = block_styles.get(i).cloned().unwrap_or_default();
         let first_line_y = first_line_user_y(&style, user_rect);
-        let inherit_x = prev_line_end.and_then(|(px, py)| {
-            ((first_line_y - py).abs() <= 4.0).then_some(px + INLINE_FORMULA_PAD_PT)
-        });
+        let inherit_x = inline_x_override(prev_line_end, prev_block_was_opaque, first_line_y);
 
         if block.opaque {
             let captured = captured_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let _ = inherit_x; // formulas stay anchored — see emit_captured_text_block
             prev_line_end =
                 emit_captured_text_block(&mut builder, captured, user_rect, &style, &inv_ctm);
+            prev_block_was_opaque = true;
             i += 1;
             continue;
         }
 
         let Some(resources) = block_resources.get(i) else {
             prev_line_end = None;
+            prev_block_was_opaque = false;
             i += 1;
             continue;
         };
@@ -149,10 +150,24 @@ pub(crate) fn build_overlay_stream(
             geom,
             &inv_ctm,
         );
+        prev_block_was_opaque = false;
         i += 1;
     }
     builder.restore_state();
     builder.finish()
+}
+
+fn inline_x_override(
+    prev_line_end: Option<(f32, f32)>,
+    prev_block_was_opaque: bool,
+    first_line_y: f32,
+) -> Option<f32> {
+    if !prev_block_was_opaque {
+        return None;
+    }
+    prev_line_end.and_then(|(px, py)| {
+        ((first_line_y - py).abs() <= 4.0).then_some(px + INLINE_FORMULA_PAD_PT)
+    })
 }
 
 fn following_inline_obstacles(
@@ -967,5 +982,23 @@ mod tests {
         let lines =
             wrap_lines_to_widths("alpha beta\ngamma delta", &[200.0, 200.0], 10.0, &metrics);
         assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
+    }
+
+    #[test]
+    fn same_row_plain_text_blocks_do_not_inherit_x() {
+        assert_eq!(inline_x_override(Some((120.0, 300.0)), false, 300.0), None);
+    }
+
+    #[test]
+    fn prose_after_opaque_inline_block_inherits_x() {
+        assert_eq!(
+            inline_x_override(Some((120.0, 300.0)), true, 302.0),
+            Some(126.0)
+        );
+    }
+
+    #[test]
+    fn prose_after_opaque_block_on_different_row_keeps_anchor() {
+        assert_eq!(inline_x_override(Some((120.0, 300.0)), true, 308.5), None);
     }
 }

@@ -194,11 +194,25 @@ fn smoke_translate_and_write_pdf() {
 
     assert!(total_blocks > 0, "no blocks were translated");
 
-    // Hard-coded host font path for the integration test. Real consumer apps
+    // Hard-coded host font paths for the integration test. Real consumer apps
     // (Android, native Linux) implement [`FontProvider`] via their own
     // platform shim; this test stub stands in for that.
+    let noto_cjk_dir = PathBuf::from("/usr/share/fonts/opentype/noto");
     let dejavu_dir = PathBuf::from("/usr/share/fonts/truetype/dejavu");
-    let dejavu = |req: &FontRequest| -> Option<FontHandle> {
+    let host_fonts = |req: &FontRequest| -> Option<FontHandle> {
+        if req.language == "zh" {
+            let leaf = if req.bold {
+                "NotoSansCJK-Bold.ttc"
+            } else {
+                "NotoSansCJK-Regular.ttc"
+            };
+            let path = noto_cjk_dir.join(leaf);
+            if path.is_file() {
+                let ttc_index = if req.monospace { 7 } else { 2 };
+                return Some(FontHandle::new(path, ttc_index));
+            }
+        }
+
         if !dejavu_dir.is_dir() {
             return None;
         }
@@ -216,7 +230,7 @@ fn smoke_translate_and_write_pdf() {
     };
     // `dyn FontProvider` accepts the closure via the blanket impl in
     // `crate::font_provider`.
-    let provider: &dyn FontProvider = &dejavu;
+    let provider: &dyn FontProvider = &host_fonts;
     let _ = NoFontProvider;
     let out_pdf =
         write_translated_pdf(&pdf_bytes, &translations, provider).expect("write_translated_pdf");
