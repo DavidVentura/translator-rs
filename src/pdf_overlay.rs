@@ -86,14 +86,6 @@ impl BlockResources {
             .expect("at least the dominant variant exists");
         (&entry.0, entry.1.as_ref())
     }
-
-    pub(crate) fn should_use_standard14_for_segment(&self, flags: BoldItalic, text: &str) -> bool {
-        if !is_ascii_text(text) {
-            return false;
-        }
-        let (metrics, embed) = self.for_flags(flags);
-        embed.is_some() && !metrics.covers_text(text)
-    }
 }
 
 pub(crate) fn build_overlay_stream(
@@ -394,22 +386,7 @@ fn emit_block(
             if seg.text.is_empty() {
                 continue;
             }
-            let use_standard14 =
-                resources.should_use_standard14_for_segment(seg.style.flags, &seg.text);
             let (target_metrics, target_embed) = resources.for_flags(seg.style.flags);
-            let (seg_metrics, seg_embed) = if use_standard14 {
-                (&latin_fallback_metrics, None)
-            } else {
-                (target_metrics, target_embed)
-            };
-            let seg_resource_name: &[u8] = match seg_embed {
-                Some(e) => &e.resource_name,
-                None => BlockTypography::font_resource_for(FontStyleFlags {
-                    bold: seg.style.flags.bold,
-                    italic: seg.style.flags.italic,
-                    monospace: resources.monospace,
-                }),
-            };
             let seg_font_size = seg
                 .style
                 .text_size
@@ -422,28 +399,44 @@ fn emit_block(
                 .filter(|shift| shift.is_finite())
                 .map(|shift| shift * (font_size / sampled_font_size))
                 .unwrap_or(0.0);
-            let seg_x = line_x + cumulative * advance_dx;
-            let seg_y = line_y + cumulative * advance_dy;
-            let combined = Matrix {
-                e: seg_x + baseline_shift * line_dx,
-                f: seg_y + baseline_shift * line_dy,
-                ..style.geometry.text_orientation
-            };
-            let tm = combined.mul(*inv_ctm);
-            if let Some((r, g, b)) = seg.style.fill_rgb {
-                builder.set_fill_rgb(r, g, b);
-            } else {
-                builder.set_fill_rgb(
-                    style.typography.fill_rgb.0,
-                    style.typography.fill_rgb.1,
-                    style.typography.fill_rgb.2,
-                );
-            }
-            builder.set_font(seg_resource_name, seg_font_size);
-            builder.set_text_matrix(tm);
-            emit_tj_for_segment(builder, &seg.text, seg_metrics, seg_embed);
 
-            cumulative += seg_metrics.measure(&seg.text, seg_font_size);
+            for run in segment_font_runs(&seg.text, target_metrics, target_embed) {
+                let (run_metrics, run_embed) = if run.use_standard14 {
+                    (&latin_fallback_metrics, None)
+                } else {
+                    (target_metrics, target_embed)
+                };
+                let run_resource_name: &[u8] = match run_embed {
+                    Some(e) => &e.resource_name,
+                    None => BlockTypography::font_resource_for(FontStyleFlags {
+                        bold: seg.style.flags.bold,
+                        italic: seg.style.flags.italic,
+                        monospace: resources.monospace,
+                    }),
+                };
+                let run_x = line_x + cumulative * advance_dx;
+                let run_y = line_y + cumulative * advance_dy;
+                let combined = Matrix {
+                    e: run_x + baseline_shift * line_dx,
+                    f: run_y + baseline_shift * line_dy,
+                    ..style.geometry.text_orientation
+                };
+                let tm = combined.mul(*inv_ctm);
+                if let Some((r, g, b)) = seg.style.fill_rgb {
+                    builder.set_fill_rgb(r, g, b);
+                } else {
+                    builder.set_fill_rgb(
+                        style.typography.fill_rgb.0,
+                        style.typography.fill_rgb.1,
+                        style.typography.fill_rgb.2,
+                    );
+                }
+                builder.set_font(run_resource_name, seg_font_size);
+                builder.set_text_matrix(tm);
+                emit_tj_for_segment(builder, run.text, run_metrics, run_embed);
+
+                cumulative += run_metrics.measure(run.text, seg_font_size);
+            }
         }
         last_line_end = Some((
             line_x + cumulative * advance_dx,
@@ -895,8 +888,44 @@ fn line_byte_ranges(block_text: &str, lines: &[String]) -> Vec<Vec<(usize, usize
     all
 }
 
-fn is_ascii_text(text: &str) -> bool {
-    !text.is_empty() && text.chars().all(|c| c.is_ascii())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentFontRun<'a> {
+    text: &'a str,
+    use_standard14: bool,
+}
+
+fn segment_font_runs<'a>(
+    text: &'a str,
+    target_metrics: &FontMetrics,
+    target_embed: Option<&EmbeddedFont>,
+) -> Vec<SegmentFontRun<'a>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    let mut run_start = 0usize;
+    let mut run_kind: Option<bool> = None;
+    for (byte, c) in text.char_indices() {
+        let use_standard14 =
+            target_embed.is_some() && c.is_ascii() && !target_metrics.covers_char(c);
+        if let Some(previous) = run_kind
+            && previous != use_standard14
+        {
+            runs.push(SegmentFontRun {
+                text: &text[run_start..byte],
+                use_standard14: previous,
+            });
+            run_start = byte;
+        }
+        run_kind = Some(use_standard14);
+    }
+    if let Some(use_standard14) = run_kind {
+        runs.push(SegmentFontRun {
+            text: &text[run_start..],
+            use_standard14,
+        });
+    }
+    runs
 }
 
 fn emit_tj_for_segment(
@@ -1141,44 +1170,53 @@ mod tests {
 
     #[test]
     fn ascii_segment_uses_standard14_when_target_font_lacks_latin() {
-        let mut by_flags = HashMap::new();
-        by_flags.insert(
-            BoldItalic {
-                bold: false,
-                italic: false,
-            },
-            (
-                fake_real_metrics(&['আ']),
-                Some(EmbeddedFont {
-                    resource_name: b"Tr0".to_vec(),
-                    type0_id: (1, 0),
-                    gid_remap: HashMap::new(),
-                }),
-            ),
-        );
-        let resources = BlockResources {
-            by_flags,
-            default_flags: BoldItalic {
-                bold: false,
-                italic: false,
-            },
-            monospace: false,
+        let metrics = fake_real_metrics(&['আ']);
+        let embed = EmbeddedFont {
+            resource_name: b"Tr0".to_vec(),
+            type0_id: (1, 0),
+            gid_remap: HashMap::new(),
         };
 
-        assert!(resources.should_use_standard14_for_segment(
-            BoldItalic {
-                bold: false,
-                italic: false,
-            },
-            "https://sample-files.com"
-        ));
-        assert!(!resources.should_use_standard14_for_segment(
-            BoldItalic {
-                bold: false,
-                italic: false,
-            },
-            "বাংলা"
-        ));
+        assert_eq!(
+            segment_font_runs("https://sample-files.com", &metrics, Some(&embed)),
+            vec![SegmentFontRun {
+                text: "https://sample-files.com",
+                use_standard14: true,
+            }]
+        );
+        assert_eq!(
+            segment_font_runs("আ", &metrics, Some(&embed)),
+            vec![SegmentFontRun {
+                text: "আ",
+                use_standard14: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn mixed_segment_splits_unsupported_ascii_to_standard14() {
+        let metrics = fake_real_metrics(&['আ', 'ম', 'ি']);
+        let embed = EmbeddedFont {
+            resource_name: b"Tr0".to_vec(),
+            type0_id: (1, 0),
+            gid_remap: HashMap::new(),
+        };
+
+        let runs = segment_font_runs("আমি 123 OK", &metrics, Some(&embed));
+
+        assert_eq!(
+            runs,
+            vec![
+                SegmentFontRun {
+                    text: "আমি",
+                    use_standard14: false,
+                },
+                SegmentFontRun {
+                    text: " 123 OK",
+                    use_standard14: true,
+                },
+            ]
+        );
     }
 
     #[test]

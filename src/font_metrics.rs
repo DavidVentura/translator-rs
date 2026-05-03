@@ -185,9 +185,13 @@ impl FontMetrics {
     }
 
     pub fn covers_text(&self, text: &str) -> bool {
+        text.chars().all(|c| self.covers_char(c))
+    }
+
+    pub fn covers_char(&self, c: char) -> bool {
         match self {
-            Self::Real { glyphs, .. } => text.chars().all(|c| glyphs.contains_key(&c)),
-            Self::Approx { .. } => text.chars().all(is_winansi_char),
+            Self::Real { glyphs, .. } => glyphs.contains_key(&c),
+            Self::Approx { .. } => is_winansi_char(c),
         }
     }
 
