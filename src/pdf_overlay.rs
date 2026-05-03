@@ -86,6 +86,14 @@ impl BlockResources {
             .expect("at least the dominant variant exists");
         (&entry.0, entry.1.as_ref())
     }
+
+    pub(crate) fn should_use_standard14_for_segment(&self, flags: BoldItalic, text: &str) -> bool {
+        if !is_ascii_text(text) {
+            return false;
+        }
+        let (metrics, embed) = self.for_flags(flags);
+        embed.is_some() && !metrics.covers_text(text)
+    }
 }
 
 pub(crate) fn build_overlay_stream(
@@ -377,11 +385,23 @@ fn emit_block(
 
         let mut cumulative = 0.0_f32;
         let sampled_font_size = style.typography.font_size.unwrap_or(font_size).max(0.1);
+        let latin_fallback_metrics = if resources.monospace {
+            FontMetrics::approx(COURIER_AVG_ADVANCE)
+        } else {
+            FontMetrics::approx(HELVETICA_AVG_ADVANCE)
+        };
         for seg in segments {
             if seg.text.is_empty() {
                 continue;
             }
-            let (seg_metrics, seg_embed) = resources.for_flags(seg.style.flags);
+            let use_standard14 =
+                resources.should_use_standard14_for_segment(seg.style.flags, &seg.text);
+            let (target_metrics, target_embed) = resources.for_flags(seg.style.flags);
+            let (seg_metrics, seg_embed) = if use_standard14 {
+                (&latin_fallback_metrics, None)
+            } else {
+                (target_metrics, target_embed)
+            };
             let seg_resource_name: &[u8] = match seg_embed {
                 Some(e) => &e.resource_name,
                 None => BlockTypography::font_resource_for(FontStyleFlags {
@@ -875,6 +895,10 @@ fn line_byte_ranges(block_text: &str, lines: &[String]) -> Vec<Vec<(usize, usize
     all
 }
 
+fn is_ascii_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii())
+}
+
 fn emit_tj_for_segment(
     builder: &mut ContentStreamBuilder,
     text: &str,
@@ -1040,6 +1064,9 @@ fn line_width_at(line_widths: &[f32], index: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::font_metrics::{FontDescriptorInfo, FontFileKind, GlyphInfo};
 
     /// Body bytes between `(` and `) Tj\n` from a single show_winansi call.
     fn encode_helper(text: &str) -> Vec<u8> {
@@ -1072,6 +1099,86 @@ mod tests {
     #[test]
     fn replaces_unmappable_codepoints() {
         assert_eq!(encode_helper("日本"), b"??");
+    }
+
+    fn fake_real_metrics(chars: &[char]) -> FontMetrics {
+        let glyphs = chars
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| {
+                (
+                    *ch,
+                    GlyphInfo {
+                        gid: (i + 1) as u16,
+                        advance: 500,
+                    },
+                )
+            })
+            .collect();
+        FontMetrics::Real {
+            units_per_em: 1000,
+            glyphs,
+            fallback: GlyphInfo {
+                gid: 0,
+                advance: 500,
+            },
+            bytes: Arc::new(Vec::new()),
+            ttc_index: 0,
+            descriptor: FontDescriptorInfo {
+                postscript_name: "Fake".into(),
+                italic: false,
+                bold: false,
+                monospace: false,
+                italic_angle: 0.0,
+                ascent: 800,
+                descent: -200,
+                cap_height: 700,
+                bbox: (0, -200, 1000, 800),
+                kind: FontFileKind::TrueType,
+            },
+        }
+    }
+
+    #[test]
+    fn ascii_segment_uses_standard14_when_target_font_lacks_latin() {
+        let mut by_flags = HashMap::new();
+        by_flags.insert(
+            BoldItalic {
+                bold: false,
+                italic: false,
+            },
+            (
+                fake_real_metrics(&['আ']),
+                Some(EmbeddedFont {
+                    resource_name: b"Tr0".to_vec(),
+                    type0_id: (1, 0),
+                    gid_remap: HashMap::new(),
+                }),
+            ),
+        );
+        let resources = BlockResources {
+            by_flags,
+            default_flags: BoldItalic {
+                bold: false,
+                italic: false,
+            },
+            monospace: false,
+        };
+
+        assert!(resources.should_use_standard14_for_segment(
+            BoldItalic {
+                bold: false,
+                italic: false,
+            },
+            "https://sample-files.com"
+        ));
+        assert!(!resources.should_use_standard14_for_segment(
+            BoldItalic {
+                bold: false,
+                italic: false,
+            },
+            "বাংলা"
+        ));
     }
 
     #[test]

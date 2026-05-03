@@ -198,6 +198,7 @@ fn smoke_translate_and_write_pdf() {
     // (Android, native Linux) implement [`FontProvider`] via their own
     // platform shim; this test stub stands in for that.
     let noto_cjk_dir = PathBuf::from("/usr/share/fonts/opentype/noto");
+    let noto_truetype_dir = PathBuf::from("/usr/share/fonts/truetype/noto");
     let dejavu_dir = PathBuf::from("/usr/share/fonts/truetype/dejavu");
     let host_fonts = |req: &FontRequest| -> Option<FontHandle> {
         if req.language == "zh" {
@@ -210,6 +211,17 @@ fn smoke_translate_and_write_pdf() {
             if path.is_file() {
                 let ttc_index = if req.monospace { 7 } else { 2 };
                 return Some(FontHandle::new(path, ttc_index));
+            }
+        }
+        if req.language == "bn" && !req.monospace {
+            let leaf = if req.bold {
+                "NotoSansBengali-Bold.ttf"
+            } else {
+                "NotoSansBengali-Regular.ttf"
+            };
+            let path = noto_truetype_dir.join(leaf);
+            if path.is_file() {
+                return Some(FontHandle::from(path));
             }
         }
 

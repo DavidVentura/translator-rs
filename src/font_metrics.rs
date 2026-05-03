@@ -184,6 +184,13 @@ impl FontMetrics {
         }
     }
 
+    pub fn covers_text(&self, text: &str) -> bool {
+        match self {
+            Self::Real { glyphs, .. } => text.chars().all(|c| glyphs.contains_key(&c)),
+            Self::Approx { .. } => text.chars().all(is_winansi_char),
+        }
+    }
+
     pub fn units_per_em(&self) -> Option<u16> {
         match self {
             Self::Real { units_per_em, .. } => Some(*units_per_em),
@@ -213,6 +220,10 @@ impl FontMetrics {
             }
         }
     }
+}
+
+fn is_winansi_char(c: char) -> bool {
+    c.is_ascii()
 }
 
 fn build_descriptor(face: &ttf_parser::Face<'_>, raw: &[u8]) -> FontDescriptorInfo {
