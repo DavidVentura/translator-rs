@@ -27,6 +27,7 @@ pub struct PageTranslationResult {
 pub enum PdfTranslateError {
     Pdf(PdfError),
     Translator(TranslatorError),
+    NoTextFound,
     Cancelled,
 }
 
@@ -47,6 +48,7 @@ impl std::fmt::Display for PdfTranslateError {
         match self {
             Self::Pdf(err) => write!(f, "{err}"),
             Self::Translator(err) => write!(f, "translator: {err:?}"),
+            Self::NoTextFound => write!(f, "no extractable text found in PDF"),
             Self::Cancelled => write!(f, "cancelled"),
         }
     }
@@ -90,6 +92,10 @@ pub fn translate_pdf_with_progress(
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
     let extracted = extract_text(pdf_bytes)?;
     let total = extracted.len();
+    if extracted.iter().all(|page| page.fragments.is_empty()) {
+        return Err(PdfTranslateError::NoTextFound);
+    }
+
     let mut results = Vec::with_capacity(total);
     on_progress(PdfTranslateProgress::TranslatingPage { current: 0, total })?;
 
