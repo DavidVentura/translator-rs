@@ -43,8 +43,6 @@ mucab = { git = "https://github.com/DavidVentura/mucab", optional = true }
 piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization"] }
 icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
 icu_locale_core = { version = "2.2", optional = true }
-# mupdf = { path = "../mupdf-rs", optional = true, default-features = false }
-mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false }
 lopdf = { version = "0.40", optional = true, default-features = false }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
 subsetter = { version = "0.2", optional = true, default-features = false }
@@ -56,6 +54,12 @@ markup5ever_rcdom = { version = "0.38", optional = true }
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ab_glyph = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false, features = [] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false, features = ["system-fonts"] }
 
 [[test]]
 name = "overpaint_visual"
@@ -74,3 +78,6 @@ required-features = ["odt"]
 
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }
+
+# [patch."https://github.com/DavidVentura/mupdf-rs"]
+# piper-rs = { path = "../mupdf-rs" }

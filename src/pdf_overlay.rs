@@ -368,12 +368,16 @@ fn emit_block(
             line_x = override_x;
         }
 
-        let segments = segments_for_line(
-            &block.text,
-            &line_word_ranges[i],
-            &block.style_spans,
-            resources.default_flags,
-        );
+        let segments = if resources.monospace {
+            literal_line_segments(&lines[i], resources.default_flags)
+        } else {
+            segments_for_line(
+                &block.text,
+                &line_word_ranges[i],
+                &block.style_spans,
+                resources.default_flags,
+            )
+        };
 
         let mut cumulative = 0.0_f32;
         let sampled_font_size = style.typography.font_size.unwrap_or(font_size).max(0.1);
@@ -844,6 +848,21 @@ fn segments_for_line(
     segments
 }
 
+fn literal_line_segments(line: &str, default_flags: BoldItalic) -> Vec<LineSegment> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    vec![LineSegment {
+        text: line.to_string(),
+        style: SegmentStyle {
+            flags: default_flags,
+            fill_rgb: None,
+            text_size: None,
+            baseline_shift: None,
+        },
+    }]
+}
+
 fn argb_to_rgb(argb: u32) -> (f32, f32, f32) {
     (
         ((argb >> 16) & 0xFF) as f32 / 255.0,
@@ -1260,6 +1279,20 @@ mod tests {
         let metrics = FontMetrics::approx(HELVETICA_AVG_ADVANCE);
         let (_size, lines) = fit_with_sampled_size(text, &[20.0], 12.0, 10.0, &metrics, 1);
         assert_eq!(lines, vec![text]);
+    }
+
+    #[test]
+    fn literal_line_segments_preserve_monospace_spacing() {
+        let segments = literal_line_segments(
+            "VIA  <1184,1080>       8:36 ICE143",
+            BoldItalic {
+                bold: false,
+                italic: false,
+            },
+        );
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "VIA  <1184,1080>       8:36 ICE143");
     }
 
     #[test]

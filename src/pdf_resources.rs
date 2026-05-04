@@ -44,22 +44,10 @@ pub(crate) fn ensure_fonts_in_page_resources(
         new_refs.push((resource_name, id));
     }
 
-    let resources_id = ensure_inline_resources(doc, page_id)?;
-    let resources = doc
-        .get_object_mut(resources_id)
+    let font_dict_id = ensure_page_font_dict(doc, page_id)?;
+    let font_dict = doc
+        .get_object_mut(font_dict_id)
         .and_then(Object::as_dict_mut)?;
-
-    let font_dict = match resources.get_mut(b"Font") {
-        Ok(Object::Dictionary(d)) => d,
-        _ => {
-            resources.set("Font", Object::Dictionary(Dictionary::new()));
-            resources
-                .get_mut(b"Font")
-                .expect("just inserted")
-                .as_dict_mut()
-                .expect("just inserted as dict")
-        }
-    };
     for (resource_name, id) in new_refs {
         font_dict.set(resource_name, Object::Reference(id));
     }
@@ -81,37 +69,62 @@ pub(crate) fn attach_embedded_fonts_to_page(
     if unique.is_empty() {
         return Ok(());
     }
-    let resources_id = ensure_inline_resources(doc, page_id)?;
-    let resources = doc
-        .get_object_mut(resources_id)
+    let font_dict_id = ensure_page_font_dict(doc, page_id)?;
+    let font_dict = doc
+        .get_object_mut(font_dict_id)
         .and_then(Object::as_dict_mut)?;
-    let font_dict = match resources.get_mut(b"Font") {
-        Ok(Object::Dictionary(d)) => d,
-        _ => {
-            resources.set("Font", Object::Dictionary(Dictionary::new()));
-            resources
-                .get_mut(b"Font")
-                .expect("just inserted")
-                .as_dict_mut()
-                .expect("just inserted as dict")
-        }
-    };
     for (name, id) in unique {
         font_dict.set(name, Object::Reference(id));
     }
     Ok(())
 }
 
+fn ensure_page_font_dict(doc: &mut Document, page_id: ObjectId) -> Result<ObjectId, PdfWriteError> {
+    let resources_id = ensure_inline_resources(doc, page_id)?;
+    let existing_font = {
+        let resources = doc.get_object(resources_id).and_then(Object::as_dict)?;
+        resources.get(b"Font").ok().cloned()
+    };
+
+    let font_dict_id = match existing_font {
+        Some(Object::Reference(id)) => {
+            let dict = doc
+                .get_object(id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_else(|_| Dictionary::new());
+            let id = doc.add_object(Object::Dictionary(dict));
+            let resources = doc
+                .get_object_mut(resources_id)
+                .and_then(Object::as_dict_mut)?;
+            resources.set("Font", Object::Reference(id));
+            id
+        }
+        Some(Object::Dictionary(dict)) => {
+            let id = doc.add_object(Object::Dictionary(dict));
+            let resources = doc
+                .get_object_mut(resources_id)
+                .and_then(Object::as_dict_mut)?;
+            resources.set("Font", Object::Reference(id));
+            id
+        }
+        _ => {
+            let id = doc.add_object(Object::Dictionary(Dictionary::new()));
+            let resources = doc
+                .get_object_mut(resources_id)
+                .and_then(Object::as_dict_mut)?;
+            resources.set("Font", Object::Reference(id));
+            id
+        }
+    };
+
+    Ok(font_dict_id)
+}
+
 pub(crate) fn ensure_inline_resources(
     doc: &mut Document,
     page_id: ObjectId,
 ) -> Result<ObjectId, PdfWriteError> {
-    if let Ok(page) = doc.get_object(page_id).and_then(Object::as_dict) {
-        if let Ok(Object::Reference(id)) = page.get(b"Resources") {
-            return Ok(*id);
-        }
-    }
-
     let inline_resources = effective_page_resources(doc, page_id)?;
 
     let new_id = doc.add_object(Object::Dictionary(inline_resources));
@@ -160,26 +173,20 @@ pub(crate) fn prune_unused_fonts(
 ) -> Result<(), PdfWriteError> {
     for page_id in modified_pages.iter().copied() {
         let used = used_font_resource_names(doc, page_id)?;
-        let resources_id = ensure_inline_resources(doc, page_id)?;
-        let resources = doc
-            .get_object_mut(resources_id)
-            .and_then(Object::as_dict_mut)?;
-        let to_remove: Vec<Vec<u8>> = match resources.get(b"Font") {
-            Ok(Object::Dictionary(d)) => d
-                .iter()
-                .filter_map(|(k, _)| {
-                    (installed.contains(k) && !used.contains(k)).then(|| k.clone())
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
+        let font_dict_id = ensure_page_font_dict(doc, page_id)?;
+        let font_dict = doc.get_object(font_dict_id).and_then(Object::as_dict)?;
+        let to_remove: Vec<Vec<u8>> = font_dict
+            .iter()
+            .filter_map(|(k, _)| (installed.contains(k) && !used.contains(k)).then(|| k.clone()))
+            .collect();
         if to_remove.is_empty() {
             continue;
         }
-        if let Ok(Object::Dictionary(font_dict)) = resources.get_mut(b"Font") {
-            for k in &to_remove {
-                font_dict.remove(k);
-            }
+        let font_dict = doc
+            .get_object_mut(font_dict_id)
+            .and_then(Object::as_dict_mut)?;
+        for k in &to_remove {
+            font_dict.remove(k);
         }
     }
     // Now that no /Resources/Font entry references them, the font dicts and
@@ -375,7 +382,8 @@ mod tests {
         let resources_ref = page.get(b"Resources").unwrap();
         let resources_id = resources_ref.as_reference().unwrap();
         let resources = doc.get_object(resources_id).unwrap().as_dict().unwrap();
-        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        let fonts_id = resources.get(b"Font").unwrap().as_reference().unwrap();
+        let fonts = doc.get_object(fonts_id).unwrap().as_dict().unwrap();
         let helv_ref = fonts.get(HELVETICA_REGULAR).unwrap();
         let helv_id = helv_ref.as_reference().unwrap();
         let helv = doc.get_object(helv_id).unwrap().as_dict().unwrap();
@@ -383,6 +391,48 @@ mod tests {
             helv.get(b"BaseFont").unwrap().as_name().unwrap(),
             b"Helvetica"
         );
+    }
+
+    #[test]
+    fn ensure_fonts_preserves_existing_referenced_font_dict() {
+        let mut doc = Document::with_version("1.5");
+        let original_font_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", Object::Name(b"Font".to_vec()));
+            d.set("Subtype", Object::Name(b"Type1".to_vec()));
+            d.set("BaseFont", Object::Name(b"Courier".to_vec()));
+            Object::Dictionary(d)
+        });
+        let font_dict_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("F1", Object::Reference(original_font_id));
+            Object::Dictionary(d)
+        });
+        let resources_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Font", Object::Reference(font_dict_id));
+            Object::Dictionary(d)
+        });
+        let page_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", Object::Name(b"Page".to_vec()));
+            d.set("Resources", Object::Reference(resources_id));
+            Object::Dictionary(d)
+        });
+
+        ensure_fonts_in_page_resources(&mut doc, page_id).unwrap();
+
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        let resources_id = page.get(b"Resources").unwrap().as_reference().unwrap();
+        let resources = doc.get_object(resources_id).unwrap().as_dict().unwrap();
+        let fonts_id = resources.get(b"Font").unwrap().as_reference().unwrap();
+        assert_ne!(fonts_id, font_dict_id);
+        let fonts = doc.get_object(fonts_id).unwrap().as_dict().unwrap();
+        assert_eq!(
+            fonts.get(b"F1").unwrap().as_reference().unwrap(),
+            original_font_id
+        );
+        assert!(fonts.get(HELVETICA_REGULAR).is_ok());
     }
 
     #[test]
