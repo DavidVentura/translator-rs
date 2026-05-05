@@ -27,6 +27,8 @@ pub mod pdf;
 mod pdf_content;
 #[cfg(feature = "pdf")]
 pub mod pdf_font_embed;
+#[cfg(feature = "pdf-image-translate")]
+pub mod pdf_image_translate;
 #[cfg(feature = "pdf")]
 mod pdf_overlay;
 #[cfg(feature = "pdf")]

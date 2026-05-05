@@ -58,6 +58,11 @@ impl std::error::Error for PdfTranslateError {}
 
 /// Extract every page's text via mupdf, run each through the existing
 /// structured-translation path, and return per-page translated blocks.
+///
+/// To also translate raster image XObjects embedded in the PDF, run
+/// [`crate::pdf_image_translate::translate_pdf_images_in_place`] on the
+/// input bytes first and pass the result here — image translation lives
+/// in the `pdf-image-translate` feature, not here.
 pub fn translate_pdf(
     session: &TranslatorSession,
     pdf_bytes: &[u8],

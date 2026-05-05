@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
@@ -35,9 +37,50 @@ impl Default for OcrCache {
     }
 }
 
+/// Pool of [`OcrCache`] instances, one [`Mutex`] per slot, so concurrent
+/// callers can run Tesseract in parallel. Single-language workloads keep
+/// each slot's tessdata loaded on first use; the cost is roughly N copies
+/// of the language model in RAM (50–80 MB each for `eng`).
+pub struct OcrPool {
+    workers: Vec<Mutex<OcrCache>>,
+    /// Round-robin pointer used as a tiebreaker when every worker is busy
+    /// — distributes the blocking-wait load instead of always queueing
+    /// behind worker[0].
+    next: AtomicUsize,
+}
+
+impl OcrPool {
+    pub fn new(n_workers: usize) -> Self {
+        let n = n_workers.max(1);
+        Self {
+            workers: (0..n).map(|_| Mutex::new(OcrCache::new())).collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Lease an idle worker. Walks `try_lock` over every slot first
+    /// (lock-free fast path); if all are busy, blocks on a round-robin
+    /// pick so concurrent callers don't all queue behind the same slot.
+    pub fn lease(&self) -> MutexGuard<'_, OcrCache> {
+        for w in &self.workers {
+            if let Ok(g) = w.try_lock() {
+                return g;
+            }
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        self.workers[idx].lock().expect("ocr cache poisoned")
+    }
+}
+
+impl Default for OcrPool {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
 pub(crate) fn translate_image_rgba_in_snapshot(
-    engine: &mut BergamotEngine,
-    ocr_cache: &mut OcrCache,
+    engine: &Mutex<BergamotEngine>,
+    ocr_pool: &OcrPool,
     snapshot: &CatalogSnapshot,
     rgba_bytes: &[u8],
     width: u32,
@@ -63,40 +106,55 @@ pub(crate) fn translate_image_rgba_in_snapshot(
     let join_without_spaces = source_code.as_str() == "ja";
     let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomLeftToRight;
 
-    let blocks = with_ocr_engine(
-        ocr_cache,
-        snapshot,
-        source_code.as_str(),
-        reading_order,
-        |ocr| {
-            ocr.set_page_seg_mode(page_seg_mode);
-            ocr.set_frame(
-                rgba_bytes,
-                i_width,
-                i_height,
-                bytes_per_pixel,
-                bytes_per_line,
-            )
-            .map_err(|err| format!("failed to set OCR frame: {err}"))?;
-            let words = ocr
-                .get_word_boxes()
-                .map_err(|err| format!("failed to read OCR words: {err}"))?;
-            let detected_words = words
-                .into_iter()
-                .map(map_tesseract_word)
-                .collect::<Vec<_>>();
-            Ok(build_text_blocks(
-                &detected_words,
-                min_confidence,
-                join_without_spaces,
-                relax_single_char_confidence,
-            ))
-        },
-    )
-    .map_err(TranslatorError::ocr)?;
+    // OCR phase: leases an idle pool worker, runs to completion, releases.
+    // Holding the bergamot engine lock here would serialize parallel callers.
+    let blocks = {
+        let mut cache_guard = ocr_pool.lease();
+        with_ocr_engine(
+            &mut cache_guard,
+            snapshot,
+            source_code.as_str(),
+            reading_order,
+            |ocr| {
+                ocr.set_page_seg_mode(page_seg_mode);
+                ocr.set_frame(
+                    rgba_bytes,
+                    i_width,
+                    i_height,
+                    bytes_per_pixel,
+                    bytes_per_line,
+                )
+                .map_err(|err| format!("failed to set OCR frame: {err}"))?;
+                let words = ocr
+                    .get_word_boxes()
+                    .map_err(|err| format!("failed to read OCR words: {err}"))?;
+                let detected_words = words
+                    .into_iter()
+                    .map(map_tesseract_word)
+                    .collect::<Vec<_>>();
+                Ok(build_text_blocks(
+                    &detected_words,
+                    min_confidence,
+                    join_without_spaces,
+                    relax_single_char_confidence,
+                ))
+            },
+        )
+        .map_err(TranslatorError::ocr)?
+    };
 
-    let translated_blocks =
-        translate_block_texts(engine, snapshot, source_code, target_code, &blocks)?;
+    // Translation phase: bergamot engine is single-instance + Mutex-protected.
+    // Slimt internally pools workers, so contention is fine.
+    let translated_blocks = {
+        let mut engine_guard = engine.lock().expect("bergamot engine lock poisoned");
+        translate_block_texts(
+            &mut engine_guard,
+            snapshot,
+            source_code,
+            target_code,
+            &blocks,
+        )?
+    };
 
     prepare_overlay_image(
         rgba_bytes,

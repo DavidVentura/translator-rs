@@ -37,6 +37,13 @@ image-render = [
     "dep:unicode-linebreak",
     "dep:zeno",
 ]
+pdf-image-translate = [
+    "pdf",
+    "image-render",
+    "tesseract",
+    "dep:image",
+    "dep:flate2",
+]
 
 [dependencies]
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
@@ -59,6 +66,9 @@ unicode-bidi = { version = "0.3", optional = true, default-features = false, fea
 unicode-script = { version = "0.5", optional = true, default-features = false }
 unicode-linebreak = { version = "0.1", optional = true }
 zeno = { version = "0.3", optional = true, default-features = false, features = ["std", "eval"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
+log = "0.4"
 
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 html5ever = { version = "0.38", optional = true }
@@ -67,6 +77,7 @@ markup5ever_rcdom = { version = "0.38", optional = true }
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ab_glyph = "0.2"
+env_logger = "0.11"
 
 [target.'cfg(target_os = "android")'.dependencies]
 mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false, features = [] }
@@ -83,6 +94,11 @@ required-features = ["tesseract", "image-render"]
 name = "pdf_smoke"
 path = "tests/pdf_smoke.rs"
 required-features = ["pdf"]
+
+[[test]]
+name = "pdf_image_smoke"
+path = "tests/pdf_image_smoke.rs"
+required-features = ["pdf-image-translate"]
 
 [[test]]
 name = "odt_smoke"

@@ -26,7 +26,7 @@ use crate::tarkka::{
 #[cfg(feature = "tesseract")]
 use crate::ocr::{PreparedImageOverlay, ReadingOrder};
 #[cfg(feature = "tesseract")]
-use crate::ocr_runtime::{OcrCache, translate_image_rgba_in_snapshot};
+use crate::ocr_runtime::{OcrPool, translate_image_rgba_in_snapshot};
 
 #[cfg(feature = "tts")]
 use crate::api::VoiceName;
@@ -55,8 +55,14 @@ pub struct TranslatorSession {
     #[cfg(feature = "dictionary")]
     dictionaries: Mutex<DictionaryCache>,
     #[cfg(feature = "tesseract")]
-    ocr: Mutex<OcrCache>,
+    ocr: OcrPool,
 }
+
+/// Tesseract OCR worker pool size. A small fixed value: more workers
+/// would multiply per-language tessdata RAM cost without much speedup,
+/// since OCR scales sub-linearly past 4 cores on phone-class hardware.
+#[cfg(feature = "tesseract")]
+const OCR_POOL_SIZE: usize = 4;
 
 impl TranslatorSession {
     pub fn from_snapshot(snapshot: CatalogSnapshot) -> Self {
@@ -67,7 +73,7 @@ impl TranslatorSession {
             #[cfg(feature = "dictionary")]
             dictionaries: Mutex::new(DictionaryCache::new()),
             #[cfg(feature = "tesseract")]
-            ocr: Mutex::new(OcrCache::new()),
+            ocr: OcrPool::new(OCR_POOL_SIZE),
         }
     }
 
@@ -282,11 +288,9 @@ impl TranslatorSession {
         background_mode: BackgroundMode,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
-        let mut engine = self.engine().lock().expect("engine lock poisoned");
-        let mut ocr = self.ocr.lock().expect("ocr cache poisoned");
         translate_image_rgba_in_snapshot(
-            &mut engine,
-            &mut ocr,
+            self.engine(),
+            &self.ocr,
             &snap,
             rgba_bytes,
             width,
