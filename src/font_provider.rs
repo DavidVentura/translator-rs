@@ -1,25 +1,30 @@
-//! Font lookup interface for PDF output.
+//! Font lookup interface for PDF and image output.
 //!
 //! The translator crate is platform-agnostic: it does not know about
 //! `/system/fonts`, `fonts.xml`, `AFontMatcher`, fontconfig, CoreText, etc.
 //! Consumer applications (Android, native Linux, …) own that knowledge and
 //! expose it through this trait.
 //!
-//! The PDF writer asks for a font when it has decided what to render and what
-//! style is needed. The provider returns a filesystem path to a TrueType /
-//! OpenType file that covers the requested language + style; the writer reads
-//! it for glyph metrics (real wrap widths) and embeds a subset in the output.
+//! Both the PDF writer and the image renderer ask for a font when they have
+//! decided what to render and what style is needed. The provider returns a
+//! preference-ordered chain of TrueType / OpenType files that should cover
+//! the requested script + style; the writer picks the first one whose cmap
+//! covers the codepoint(s) at hand.
 
 use std::path::PathBuf;
 
+use crate::script::Script;
+
 /// What the writer is asking for.
 ///
-/// `language` is the BCP-47 tag of the *translated* text (e.g. `"en"`,
-/// `"ja"`, `"zh-Hans"`, `"ar"`). Most fonts that cover a language already
-/// include the Latin block, so a single font per block is enough — we don't
-/// build per-codepoint fallback chains here.
+/// `script` is the primary key — providers walk their per-script font tables
+/// (matches Android's `fonts.xml`, fontconfig's `:lang`/`:charset`, etc.).
+/// `language` is a BCP-47 hint, useful mainly for Han disambiguation
+/// (`zh-Hans` vs `ja` vs `ko` produce visibly different glyphs from the
+/// same Unicode codepoints).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FontRequest {
+    pub script: Script,
     pub language: String,
     pub bold: bool,
     pub italic: bool,
@@ -29,7 +34,7 @@ pub struct FontRequest {
 /// Path + sub-font index. For `.ttf` / `.otf` set `ttc_index = 0`; for
 /// `.ttc` collections (e.g. `NotoSansCJK-Regular.ttc`) the platform's font
 /// API tells you which index inside the collection covers the requested
-/// language (Android's `AFont_getCollectionIndex()`, fontconfig's `index`
+/// script (Android's `AFont_getCollectionIndex()`, fontconfig's `index`
 /// property, the `index="N"` attribute in `fonts.xml`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FontHandle {
@@ -53,32 +58,36 @@ impl<P: Into<PathBuf>> From<P> for FontHandle {
     }
 }
 
-/// Resolves a [`FontRequest`] to a font file on disk.
+/// Resolves a [`FontRequest`] to a preference-ordered chain of fonts on disk.
 ///
-/// Returning `None` means "no preference / unsupported"; the writer falls
-/// back to the PDF Standard-14 path (Helvetica / Courier), which only works
-/// for Latin-1 / WinAnsi.
+/// The first entry is the primary choice (covers the requested script);
+/// subsequent entries are fallbacks the renderer walks when it encounters
+/// codepoints the primary doesn't cover (e.g. Latin text embedded inside a
+/// Bengali run). An empty `Vec` means "no preference / unsupported"; the PDF
+/// writer falls back to the Standard-14 path (Helvetica / Courier), and the
+/// image renderer falls back to a tofu glyph.
 pub trait FontProvider {
-    fn locate(&self, request: &FontRequest) -> Option<FontHandle>;
+    fn locate(&self, request: &FontRequest) -> Vec<FontHandle>;
 }
 
 /// Blanket impl so callers can pass a closure when a one-liner suffices,
-/// e.g. integration tests: `&|_req| Some(FontHandle::from("/usr/share/.../X.ttf"))`.
+/// e.g. integration tests:
+/// `&|_req| vec![FontHandle::from("/usr/share/.../X.ttf")]`.
 impl<F> FontProvider for F
 where
-    F: Fn(&FontRequest) -> Option<FontHandle>,
+    F: Fn(&FontRequest) -> Vec<FontHandle>,
 {
-    fn locate(&self, request: &FontRequest) -> Option<FontHandle> {
+    fn locate(&self, request: &FontRequest) -> Vec<FontHandle> {
         self(request)
     }
 }
 
-/// Always returns `None`. Use when font discovery isn't wired up yet — the
-/// writer keeps its current Standard-14 behavior.
+/// Always returns an empty chain. Use when font discovery isn't wired up
+/// yet — the writer keeps its current Standard-14 behavior.
 pub struct NoFontProvider;
 
 impl FontProvider for NoFontProvider {
-    fn locate(&self, _request: &FontRequest) -> Option<FontHandle> {
-        None
+    fn locate(&self, _request: &FontRequest) -> Vec<FontHandle> {
+        Vec::new()
     }
 }

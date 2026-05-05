@@ -200,8 +200,9 @@ fn smoke_translate_and_write_pdf() {
     let noto_cjk_dir = PathBuf::from("/usr/share/fonts/opentype/noto");
     let noto_truetype_dir = PathBuf::from("/usr/share/fonts/truetype/noto");
     let dejavu_dir = PathBuf::from("/usr/share/fonts/truetype/dejavu");
-    let host_fonts = |req: &FontRequest| -> Option<FontHandle> {
-        if req.language == "zh" {
+    let host_fonts = |req: &FontRequest| -> Vec<FontHandle> {
+        let mut chain: Vec<FontHandle> = Vec::new();
+        if req.language == "zh" || req.script == translator::script::Script::Han {
             let leaf = if req.bold {
                 "NotoSansCJK-Bold.ttc"
             } else {
@@ -210,10 +211,12 @@ fn smoke_translate_and_write_pdf() {
             let path = noto_cjk_dir.join(leaf);
             if path.is_file() {
                 let ttc_index = if req.monospace { 7 } else { 2 };
-                return Some(FontHandle::new(path, ttc_index));
+                chain.push(FontHandle::new(path, ttc_index));
             }
         }
-        if req.language == "bn" && !req.monospace {
+        if (req.language == "bn" || req.script == translator::script::Script::Bengali)
+            && !req.monospace
+        {
             let leaf = if req.bold {
                 "NotoSansBengali-Bold.ttf"
             } else {
@@ -221,24 +224,24 @@ fn smoke_translate_and_write_pdf() {
             };
             let path = noto_truetype_dir.join(leaf);
             if path.is_file() {
-                return Some(FontHandle::from(path));
+                chain.push(FontHandle::from(path));
             }
         }
 
-        if !dejavu_dir.is_dir() {
-            return None;
+        if dejavu_dir.is_dir() {
+            let leaf = match (req.monospace, req.bold, req.italic) {
+                (true, true, true) => "DejaVuSansMono-BoldOblique.ttf",
+                (true, true, false) => "DejaVuSansMono-Bold.ttf",
+                (true, false, true) => "DejaVuSansMono-Oblique.ttf",
+                (true, false, false) => "DejaVuSansMono.ttf",
+                (false, true, true) => "DejaVuSans-BoldOblique.ttf",
+                (false, true, false) => "DejaVuSans-Bold.ttf",
+                (false, false, true) => "DejaVuSans-Oblique.ttf",
+                (false, false, false) => "DejaVuSans.ttf",
+            };
+            chain.push(FontHandle::from(dejavu_dir.join(leaf)));
         }
-        let leaf = match (req.monospace, req.bold, req.italic) {
-            (true, true, true) => "DejaVuSansMono-BoldOblique.ttf",
-            (true, true, false) => "DejaVuSansMono-Bold.ttf",
-            (true, false, true) => "DejaVuSansMono-Oblique.ttf",
-            (true, false, false) => "DejaVuSansMono.ttf",
-            (false, true, true) => "DejaVuSans-BoldOblique.ttf",
-            (false, true, false) => "DejaVuSans-Bold.ttf",
-            (false, false, true) => "DejaVuSans-Oblique.ttf",
-            (false, false, false) => "DejaVuSans.ttf",
-        };
-        Some(FontHandle::from(dejavu_dir.join(leaf)))
+        chain
     };
     // `dyn FontProvider` accepts the closure via the blanket impl in
     // `crate::font_provider`.

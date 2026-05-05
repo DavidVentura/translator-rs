@@ -29,6 +29,14 @@ transliterate = ["dep:icu_locale_core", "dep:icu_experimental"]
 pdf = ["dep:mupdf", "dep:lopdf", "dep:ttf-parser", "dep:subsetter"]
 odt = ["dep:zip"]
 html = ["dep:html5ever", "dep:markup5ever_rcdom"]
+image-render = [
+    "dep:ttf-parser",
+    "dep:rustybuzz",
+    "dep:unicode-bidi",
+    "dep:unicode-script",
+    "dep:unicode-linebreak",
+    "dep:zeno",
+]
 
 [dependencies]
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
@@ -46,6 +54,11 @@ icu_locale_core = { version = "2.2", optional = true }
 lopdf = { version = "0.40", optional = true, default-features = false }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
 subsetter = { version = "0.2", optional = true, default-features = false }
+rustybuzz = { version = "0.20", optional = true, default-features = false, features = ["std"] }
+unicode-bidi = { version = "0.3", optional = true, default-features = false, features = ["std", "hardcoded-data"] }
+unicode-script = { version = "0.5", optional = true, default-features = false }
+unicode-linebreak = { version = "0.1", optional = true }
+zeno = { version = "0.3", optional = true, default-features = false, features = ["std", "eval"] }
 
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 html5ever = { version = "0.38", optional = true }
@@ -64,7 +77,7 @@ mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, def
 [[test]]
 name = "overpaint_visual"
 path = "tests/overpaint_visual.rs"
-required-features = ["tesseract"]
+required-features = ["tesseract", "image-render"]
 
 [[test]]
 name = "pdf_smoke"

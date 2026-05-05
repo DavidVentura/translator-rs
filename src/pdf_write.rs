@@ -340,15 +340,17 @@ fn build_font_plan(
     // Pass 2: union of texts per (req, handle).
     let mut union_text: HashMap<FontKey, String> = HashMap::new();
     for work in works {
+        let script = crate::script::Script::from_bcp47(&work.translation.target_language);
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
             for variant in block_variants(block, style) {
                 let req = FontRequest {
+                    script,
                     language: work.translation.target_language.clone(),
                     bold: variant.bold,
                     italic: variant.italic,
                     monospace: style.typography.flags.monospace,
                 };
-                if let Some(handle) = fonts.locate(&req) {
+                if let Some(handle) = fonts.locate(&req).into_iter().next() {
                     union_text
                         .entry((req, handle))
                         .or_default()
@@ -412,6 +414,7 @@ fn emit_pages(
     for work in works {
         let mut block_resources: Vec<BlockResources> =
             Vec::with_capacity(work.translation.blocks.len());
+        let script = crate::script::Script::from_bcp47(&work.translation.target_language);
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
             let mut by_flags: HashMap<
                 BoldItalic,
@@ -422,12 +425,17 @@ fn emit_pages(
             > = HashMap::new();
             for variant in block_variants(block, style) {
                 let req = FontRequest {
+                    script,
                     language: work.translation.target_language.clone(),
                     bold: variant.bold,
                     italic: variant.italic,
                     monospace: style.typography.flags.monospace,
                 };
-                let key = fonts.locate(&req).map(|handle| (req, handle));
+                let key = fonts
+                    .locate(&req)
+                    .into_iter()
+                    .next()
+                    .map(|handle| (req, handle));
                 let metrics_for_seg = key
                     .as_ref()
                     .and_then(|k| plan.metrics.get(k).cloned())

@@ -4,12 +4,14 @@ uniffi::setup_scaffolding!();
 pub mod api;
 pub mod bergamot;
 pub mod catalog;
-#[cfg(feature = "pdf")]
+#[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_metrics;
-#[cfg(feature = "pdf")]
+#[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_provider;
 #[cfg(feature = "html")]
 pub mod html_translate;
+#[cfg(feature = "image-render")]
+pub mod image_render;
 pub mod language;
 pub mod language_detect;
 #[cfg(feature = "mucab")]
@@ -38,6 +40,8 @@ pub mod pdf_translate;
 #[cfg(feature = "pdf")]
 pub mod pdf_write;
 mod routing;
+#[cfg(any(feature = "pdf", feature = "image-render"))]
+pub mod script;
 mod sentence_split;
 pub mod session;
 pub mod settings;
@@ -48,6 +52,8 @@ mod styled;
 pub mod tarkka;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
+#[cfg(feature = "image-render")]
+pub mod text_runs;
 mod translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;

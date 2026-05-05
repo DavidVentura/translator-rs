@@ -1,25 +1,30 @@
-//! Visual integration test: overpaint the text regions of `data/kindle.jpg`
-//! and re-render the OCR-extracted source text back into each line using the
-//! library's detected foreground color. Output lands at
-//! `target/overpaint_visual/kindle.overpaint.png` so the background/foreground
-//! detection can be eyeballed on a real photograph.
+//! Visual integration test: drive the library's image renderer end-to-end on
+//! a real photograph. The pipeline is:
+//!   image -> tesseract OCR -> build text blocks -> prepare overlay (erase
+//!   text regions) -> render translated text back via translator::image_render.
 //!
-//! Only runs with `--features tesseract` (and requires system tessdata +
-//! DejaVuSans installed).
+//! Output lands at `target/overpaint_visual/<input>.overpaint.png`.
+//!
+//! Requires `--features tesseract,image-render` and a host font directory at
+//! `/usr/share/fonts/truetype/dejavu`.
 
 use std::path::PathBuf;
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use image::{ImageReader, RgbaImage};
 
+use translator::font_provider::{FontHandle, FontProvider, FontRequest};
+use translator::image_render::{RenderOptions, render_overlay};
 use translator::ocr::{
     DetectedWord, ReadingOrder, Rect, TextBlock, build_text_blocks, prepare_overlay_image,
 };
+use translator::script::Script;
 use translator::settings::BackgroundMode;
 use translator::tesseract::TesseractWrapper;
 
 const TESSDATA: &str = "/usr/share/tesseract-ocr/5/tessdata";
-const FONT_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+const DEJAVU_DIR: &str = "/usr/share/fonts/truetype/dejavu";
+const NOTO_TT_DIR: &str = "/usr/share/fonts/truetype/noto";
+const NOTO_OTF_DIR: &str = "/usr/share/fonts/opentype/noto";
 const OUTPUT_DIR: &str = "target/overpaint_visual";
 
 #[test]
@@ -67,24 +72,12 @@ fn run_case(input: &str, output_file: &str) {
     )
     .expect("prepare_overlay_image");
 
-    let mut out_bgra = prepared.rgba_bytes.clone();
-
-    let font_bytes = std::fs::read(FONT_PATH).expect("read DejaVuSans.ttf");
-    let font = FontVec::try_from_vec(font_bytes).expect("parse font");
-
-    for block in &prepared.blocks {
-        for line in &block.lines {
-            draw_line(
-                &mut out_bgra,
-                width,
-                height,
-                &line.text,
-                line.bounding_box,
-                line.foreground_argb,
-                &font,
-            );
-        }
-    }
+    let provider = HostFonts::default();
+    let opts = RenderOptions {
+        language: "en".to_string(),
+        ..RenderOptions::default()
+    };
+    let mut out_bgra = render_overlay(&prepared, &provider, &opts).expect("render_overlay");
 
     swap_r_b(&mut out_bgra);
     let output_image = RgbaImage::from_raw(width, height, out_bgra).expect("rebuild rgba image");
@@ -127,52 +120,70 @@ fn to_ocr_word(word: translator::tesseract::DetectedWord) -> DetectedWord {
     }
 }
 
-fn draw_line(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    text: &str,
-    rect: Rect,
-    fg_argb: u32,
-    font: &FontVec,
-) {
-    let rect_height = rect.bottom.saturating_sub(rect.top).max(1) as f32;
-    let rect_width = rect.right.saturating_sub(rect.left).max(1) as f32;
-    let mut scale_px = rect_height;
-    let text_width_at = |s: f32| -> f32 {
-        let sf = font.as_scaled(PxScale::from(s));
-        text.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum()
-    };
-    let width_at_height = text_width_at(scale_px);
-    if width_at_height > rect_width {
-        scale_px *= rect_width / width_at_height;
-    }
-    let scale = PxScale::from(scale_px);
-    let scaled = font.as_scaled(scale);
-    let baseline = rect.top as f32 + scaled.ascent();
-    let fg_bytes = fg_argb.to_ne_bytes();
-    let mut cursor = rect.left as f32;
+#[derive(Default)]
+struct HostFonts;
 
-    for ch in text.chars() {
-        let glyph_id = font.glyph_id(ch);
-        let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(cursor, baseline));
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            outlined.draw(|gx, gy, coverage| {
-                let px = bounds.min.x as i32 + gx as i32;
-                let py = bounds.min.y as i32 + gy as i32;
-                if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
-                    return;
+impl FontProvider for HostFonts {
+    fn locate(&self, req: &FontRequest) -> Vec<FontHandle> {
+        let mut chain: Vec<FontHandle> = Vec::new();
+
+        // Script-specific primary fonts where DejaVu doesn't cover.
+        match req.script {
+            Script::Devanagari => {
+                let p = PathBuf::from(NOTO_TT_DIR).join(if req.bold {
+                    "NotoSansDevanagari-Bold.ttf"
+                } else {
+                    "NotoSansDevanagari-Regular.ttf"
+                });
+                if p.is_file() {
+                    chain.push(FontHandle::from(p));
                 }
-                let idx = ((py as usize) * (width as usize) + px as usize) * 4;
-                let a = coverage.clamp(0.0, 1.0);
-                let inv = 1.0 - a;
-                for c in 0..3 {
-                    let blended = fg_bytes[c] as f32 * a + buf[idx + c] as f32 * inv;
-                    buf[idx + c] = blended.round().clamp(0.0, 255.0) as u8;
+            }
+            Script::Bengali => {
+                let p = PathBuf::from(NOTO_TT_DIR).join(if req.bold {
+                    "NotoSansBengali-Bold.ttf"
+                } else {
+                    "NotoSansBengali-Regular.ttf"
+                });
+                if p.is_file() {
+                    chain.push(FontHandle::from(p));
                 }
-            });
+            }
+            Script::Han | Script::Hiragana | Script::Katakana | Script::Hangul => {
+                let p = PathBuf::from(NOTO_OTF_DIR).join(if req.bold {
+                    "NotoSansCJK-Bold.ttc"
+                } else {
+                    "NotoSansCJK-Regular.ttc"
+                });
+                if p.is_file() {
+                    let ttc_index = match req.script {
+                        Script::Han => 2,
+                        Script::Hiragana | Script::Katakana => 0,
+                        Script::Hangul => 1,
+                        _ => 0,
+                    };
+                    chain.push(FontHandle::new(p, ttc_index));
+                }
+            }
+            _ => {}
         }
-        cursor += scaled.h_advance(glyph_id);
+
+        // DejaVu as primary for Latin/Cyrillic/Greek and as a Latin fallback
+        // for everything else.
+        let dejavu_dir = PathBuf::from(DEJAVU_DIR);
+        if dejavu_dir.is_dir() {
+            let leaf = match (req.monospace, req.bold, req.italic) {
+                (true, true, true) => "DejaVuSansMono-BoldOblique.ttf",
+                (true, true, false) => "DejaVuSansMono-Bold.ttf",
+                (true, false, true) => "DejaVuSansMono-Oblique.ttf",
+                (true, false, false) => "DejaVuSansMono.ttf",
+                (false, true, true) => "DejaVuSans-BoldOblique.ttf",
+                (false, true, false) => "DejaVuSans-Bold.ttf",
+                (false, false, true) => "DejaVuSans-Oblique.ttf",
+                (false, false, false) => "DejaVuSans.ttf",
+            };
+            chain.push(FontHandle::from(dejavu_dir.join(leaf)));
+        }
+        chain
     }
 }
