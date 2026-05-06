@@ -37,6 +37,8 @@ mod pdf_resources;
 mod pdf_surgery;
 #[cfg(feature = "pdf")]
 pub mod pdf_text;
+#[cfg(feature = "pdf-image-translate")]
+mod pdf_text_overlay;
 #[cfg(feature = "pdf")]
 pub mod pdf_translate;
 #[cfg(feature = "pdf")]

@@ -45,10 +45,19 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
     };
 
     let stext = page.to_text_page(STEXT_FLAGS)?;
-    // Cache italic lookups per font name. fz_font_name is stable per font and
-    // calling fz_font_is_italic per char is wasteful when a paragraph reuses
-    // the same handful of fonts.
+    // Cache italic + bold lookups per font name. fz_font_name is stable
+    // per font and calling fz_font_is_italic / fz_font_is_bold per char
+    // is wasteful when a paragraph reuses the same handful of fonts.
+    //
+    // Bold detection has to go through `Font::is_bold` rather than the
+    // per-char `TextCharFlags::BOLD` flag: mupdf reserves that flag for
+    // *synthetic* bold (drawn via double-stroke), so a producer that
+    // names its bold font `Times-Bold` (or carries a `Bold`
+    // FontDescriptor flag) but emits real glyphs leaves the per-char
+    // flag at 0. mupdf's own HTML output uses the same `fz_font_is_bold`
+    // path; without it our headings round-trip as regular weight.
     let mut italic_by_font: HashMap<String, bool> = HashMap::new();
+    let mut bold_by_font: HashMap<String, bool> = HashMap::new();
 
     // First pass: collect every non-empty line, with an upfront math-class
     // classification per line. We cannot finalise the `opaque` flag yet —
@@ -86,6 +95,14 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                             .or_insert_with(|| f.is_italic())
                     })
                     .unwrap_or(false);
+                let font_bold = font
+                    .as_ref()
+                    .map(|f| {
+                        *bold_by_font
+                            .entry(font_name.clone())
+                            .or_insert_with(|| f.is_bold())
+                    })
+                    .unwrap_or(false);
                 typed_chars.push(TypedChar {
                     c,
                     x: ch.origin().x,
@@ -93,7 +110,7 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
                     bbox: rect_from_quad(ch.quad()),
                     font_size: ch.size(),
                     style: PdfCharStyle {
-                        bold: ch.flags().contains(TextCharFlags::BOLD),
+                        bold: font_bold || ch.flags().contains(TextCharFlags::BOLD),
                         italic,
                         fill_argb: ch.argb(),
                         text_size: None,
@@ -122,7 +139,20 @@ fn extract_page(page: &Page, page_index: usize) -> Result<PageTextFragments, Pdf
     // tied to the surrounding prose, while still tagging the multi-line
     // display equation on page 7 (`Bk ←` + big-paren `(` + `bk, P(Bk−1)`
     // + big-paren `)` + trailing `,`) as a single opaque run.
-    let opaque_flags = compute_opaque_flags(&pre_lines);
+    let mut opaque_flags = compute_opaque_flags(&pre_lines);
+    // Lines whose Unicode mapping is entirely U+FFFD (replacement char,
+    // i.e. mupdf couldn't decode the glyph back to a codepoint) get
+    // marked opaque so the writer preserves the original text-show
+    // program. Bullet glyphs from FM-style PDFs land here: their font
+    // emits a glyph code with no /ToUnicode entry, so mupdf returns
+    // U+FFFD, bergamot strips it on translation, and the bullet
+    // disappears. With opaque=true the writer reuses the captured
+    // glyph program at the original position.
+    for (i, pre) in pre_lines.iter().enumerate() {
+        if !pre.typed_chars.is_empty() && pre.typed_chars.iter().all(|tc| tc.c == '\u{fffd}') {
+            opaque_flags[i] = true;
+        }
+    }
 
     // Third pass: drop non-opaque lines that look like display math under the
     // text-only heuristic (catch-all for non-TeX producers), then emit

@@ -709,10 +709,18 @@ fn segments_for_line(
         for span in style_spans {
             if byte >= span.start as usize && byte < span.end as usize {
                 if let Some(s) = &span.style {
+                    // OR-merge with the block's default flags so a span
+                    // that lost its bold/italic during extraction (mupdf
+                    // substitutes embedded fonts with host fonts whose
+                    // `is_bold` returns false even when the original
+                    // BaseFont was e.g. `Times-Bold`) still inherits the
+                    // surgery-sampled block-level weight. Spans that do
+                    // mark bold/italic explicitly stay bold/italic; they
+                    // can't go *less* bold than the block signal.
                     return SegmentStyle {
                         flags: BoldItalic {
-                            bold: s.bold,
-                            italic: s.italic,
+                            bold: s.bold || default_flags.bold,
+                            italic: s.italic || default_flags.italic,
                         },
                         fill_rgb: s.text_color.map(argb_to_rgb),
                         text_size: s.text_size,

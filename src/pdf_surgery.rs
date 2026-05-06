@@ -154,16 +154,22 @@ fn resolve_block_styles(
                 return SampledBlockStyle::default();
             }
 
-            // Dominant font resource = mode of font_resource values.
-            let mut font_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+            // Dominant font resource = the resource that paints the
+            // most *visible bytes*. Counting Tj samples instead would
+            // let a four-Tj heading (PDF producers split short headings
+            // across several Tjs to apply per-glyph kerning) outweigh a
+            // 200-character single-Tj body paragraph, flipping the
+            // block's typography to bold even though the body is what
+            // dominates visually.
+            let mut font_weights: HashMap<Vec<u8>, usize> = HashMap::new();
             for sample in samples {
                 if let Some(name) = &sample.font_resource {
-                    *font_counts.entry(name.clone()).or_default() += 1;
+                    *font_weights.entry(name.clone()).or_default() += sample.text_length.max(1);
                 }
             }
-            let dominant_font = font_counts
+            let dominant_font = font_weights
                 .into_iter()
-                .max_by_key(|(_, count)| *count)
+                .max_by_key(|(_, weight)| *weight)
                 .map(|(name, _)| name);
 
             // Mean fill color across samples.
@@ -387,6 +393,12 @@ struct RawStyleSample {
     font_resource: Option<Vec<u8>>,
     fill_rgb: (f32, f32, f32),
     font_size: f32,
+    /// Number of bytes shown by this Tj/TJ. Used to weight
+    /// dominant-font detection by visible text length, so a paragraph
+    /// emitted as one wide Tj doesn't get out-voted by a heading
+    /// emitted as four short Tjs (PDFs frequently split a heading
+    /// across several Tjs to apply per-glyph kerning).
+    text_length: usize,
     /// User-space origin of the Tj — i.e. the baseline-leading-edge of the
     /// original text, after CTM has been applied.
     origin: (f32, f32),
@@ -496,6 +508,7 @@ fn filter_text_ops(
             font_resource: state.font_resource().clone(),
             fill_rgb: state.fill_rgb(),
             font_size: state.font_size() * safe_x,
+            text_length: text_show_byte_len(&op),
             origin: snapshot.origin,
             text_orientation: Matrix {
                 a: combined.a / safe_x,
@@ -624,6 +637,48 @@ fn rewrite_form_xobject(
     *doc.get_object_mut(xobject_id)? = Object::Stream(stream);
     xobject_stack.remove(&xobject_id);
     Ok(())
+}
+
+/// Sum of bytes shown by a text-show op. Used to weight typography
+/// votes by how much text each Tj actually paints — short
+/// kerning-split Tjs ("LEADERSHI" + "P") shouldn't out-vote a single
+/// body-paragraph Tj just because they appear more times.
+fn text_show_byte_len(op: &Operation) -> usize {
+    match op.operator.as_str() {
+        "Tj" | "'" => op
+            .operands
+            .last()
+            .and_then(|o| match o {
+                Object::String(bytes, _) => Some(bytes.len()),
+                _ => None,
+            })
+            .unwrap_or(0),
+        "\"" => op
+            .operands
+            .get(2)
+            .and_then(|o| match o {
+                Object::String(bytes, _) => Some(bytes.len()),
+                _ => None,
+            })
+            .unwrap_or(0),
+        "TJ" => op
+            .operands
+            .first()
+            .and_then(|o| match o {
+                Object::Array(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Object::String(bytes, _) => Some(bytes.len()),
+                            _ => None,
+                        })
+                        .sum(),
+                ),
+                _ => None,
+            })
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn normalize_text_show_operation(op: &Operation) -> Operation {
@@ -1029,6 +1084,7 @@ mod tests {
                 font_resource: None,
                 fill_rgb: (0.0, 0.0, 0.0),
                 font_size: 10.0,
+                text_length: 0,
                 origin: (282.0, 714.0),
                 text_orientation: Matrix::identity(),
             },
@@ -1036,6 +1092,7 @@ mod tests {
                 font_resource: None,
                 fill_rgb: (0.0, 0.0, 0.0),
                 font_size: 10.0,
+                text_length: 0,
                 origin: (72.0, 710.0),
                 text_orientation: Matrix::identity(),
             },
@@ -1043,6 +1100,7 @@ mod tests {
                 font_resource: None,
                 fill_rgb: (0.0, 0.0, 0.0),
                 font_size: 10.0,
+                text_length: 0,
                 origin: (72.0, 698.0),
                 text_orientation: Matrix::identity(),
             },

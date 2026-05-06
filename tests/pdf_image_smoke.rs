@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use translator::font_provider::{FontHandle, FontProvider, FontRequest};
 use translator::pdf_image_translate::{
-    translate_pdf_images_in_place, translate_pdf_pages_as_raster_in_place,
+    log_page_inventory, pages_without_extractable_text, translate_pdf_images_in_place,
+    translate_pdf_pages_as_raster_in_place,
 };
 use translator::script::Script;
 use translator::{FsPackInstallChecker, TranslatorSession};
@@ -60,32 +61,45 @@ fn translates_images_in_pdf() {
     let pdf_bytes = fs::read(&pdf_path).expect("read PDF_IMAGE_TEST_FILE");
     let original_len = pdf_bytes.len();
 
-    let provider = HostFonts::default();
+    let provider = HostFonts;
+    log_page_inventory(&pdf_bytes);
+    let overlay_pages = pages_without_extractable_text(&pdf_bytes);
+    eprintln!(
+        "[pdf_image_smoke] {} page(s) flagged for overlay (no extractable text)",
+        overlay_pages.len()
+    );
+    let no_cancel = || false;
     // Pass 1: image-XObject translation.
-    let after_xobjects = translate_pdf_images_in_place(
+    let xobject_output = translate_pdf_images_in_place(
         &pdf_bytes,
         &session,
         &source_lang,
         &target_lang,
         &provider,
-        || false,
+        &overlay_pages,
+        &no_cancel,
         |c, t| eprintln!("[pdf_image_smoke] xobject {c}/{t}"),
     )
     .expect("translate_pdf_images_in_place");
     eprintln!(
         "[pdf_image_smoke] after XObject pass: {} bytes (input {original_len})",
-        after_xobjects.len()
+        xobject_output.bytes.len()
     );
 
-    // Pass 2: rasterize-and-replace pages with no extractable text.
-    let no_op = || false;
+    // Pages already translated through XObjects shouldn't be
+    // re-processed by page-raster overlay.
+    let raster_pages: std::collections::HashSet<usize> = overlay_pages
+        .difference(&xobject_output.translated_pages)
+        .copied()
+        .collect();
     let after_pages = translate_pdf_pages_as_raster_in_place(
-        &after_xobjects,
+        &xobject_output.bytes,
         &session,
         &source_lang,
         &target_lang,
         &provider,
-        &no_op,
+        &raster_pages,
+        &no_cancel,
         |c, t| eprintln!("[pdf_image_smoke] page {c}/{t}"),
     )
     .expect("translate_pdf_pages_as_raster_in_place");
@@ -94,7 +108,7 @@ fn translates_images_in_pdf() {
         after_pages.len()
     );
 
-    let any_change = after_xobjects != pdf_bytes || after_pages != after_xobjects;
+    let any_change = xobject_output.bytes != pdf_bytes || after_pages != xobject_output.bytes;
     assert!(
         any_change,
         "neither pass modified the PDF — nothing was translated"

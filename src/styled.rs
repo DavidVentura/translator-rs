@@ -952,10 +952,21 @@ fn cluster_into_lines(fragments: &[StyledFragment]) -> Vec<Vec<StyledFragment>> 
     let mut lines: Vec<Vec<StyledFragment>> = Vec::new();
     let mut line_tops: Vec<u32> = Vec::new();
     let mut line_bottoms: Vec<u32> = Vec::new();
+    let mut line_groups: Vec<u32> = Vec::new();
 
     for fragment in fragments {
         let mut best_line = None;
         for i in 0..lines.len() {
+            // Multi-column pages have fragments at the same y from
+            // different columns; clustering them together would make
+            // the resulting block span both columns and the wrap
+            // engine would use page width instead of column width.
+            // Each mupdf block (column) carries a distinct
+            // translation_group; gating clustering on that keeps
+            // columns separate.
+            if line_groups[i] != fragment.translation_group {
+                continue;
+            }
             let center_delta = fragment
                 .bounding_box
                 .center_y()
@@ -963,7 +974,17 @@ fn cluster_into_lines(fragments: &[StyledFragment]) -> Vec<Vec<StyledFragment>> 
             let vertical_overlap = line_bottoms[i]
                 .min(fragment.bounding_box.bottom)
                 .saturating_sub(line_tops[i].max(fragment.bounding_box.top));
-            if vertical_overlap > 0 || center_delta <= line_threshold {
+            // Require a *substantial* vertical overlap (not just 1–2px
+            // of ascender/descender bleed) before collapsing two
+            // fragments onto the same visual line. Tight-leaded body
+            // text (e.g. FM 22-100 page 7's heading + body packed at
+            // ~12pt leading on 13pt glyphs) has consecutive lines whose
+            // ink boxes touch by 1–2px; counting any overlap as
+            // same-line collapses every line of a column into one
+            // super-line, scrambling its reading order. The center-y
+            // delta check still handles legitimate baseline-matched
+            // fragments — there overlap is closer to full line height.
+            if vertical_overlap > line_threshold || center_delta <= line_threshold {
                 best_line = Some(i);
                 break;
             }
@@ -977,6 +998,7 @@ fn cluster_into_lines(fragments: &[StyledFragment]) -> Vec<Vec<StyledFragment>> 
             lines.push(vec![fragment.clone()]);
             line_tops.push(fragment.bounding_box.top);
             line_bottoms.push(fragment.bounding_box.bottom);
+            line_groups.push(fragment.translation_group);
         }
     }
 

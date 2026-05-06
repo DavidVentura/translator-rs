@@ -269,10 +269,17 @@ fn run_surgery<'a>(
             continue;
         }
         let geom = PageGeometry::read(doc, *page_id, Some(translation.page));
-        let layout_rects: Vec<UserRect> = translation
-            .blocks
+        // Tighten each block's right edge so it doesn't extend into a
+        // sibling block's column. mupdf's per-block ink bbox can creep
+        // a few points into the gap between columns; with longer
+        // translated text those few points become real visual overlap
+        // (Dutch is ~30% wider than English on average). Source rects
+        // for removal stay at their original positions; only the
+        // layout rect used for wrap-width is shrunk.
+        let layout_bboxes = clamp_block_bounds_to_columns(&translation.blocks);
+        let layout_rects: Vec<UserRect> = layout_bboxes
             .iter()
-            .map(|b| geom.user_rect_from_display(b.bounding_box))
+            .map(|bb| geom.user_rect_from_display(*bb))
             .collect();
         let removal_rects: Vec<Vec<UserRect>> = translation
             .blocks
@@ -325,6 +332,64 @@ fn run_surgery<'a>(
     }
 
     Ok((works, modified_pages))
+}
+
+/// For each block, return its bounding box clipped so the right edge
+/// doesn't intrude into any sibling block whose vertical extent
+/// overlaps. Two-column pages routinely have left-column blocks whose
+/// ink bbox reaches a few points into the gap between columns
+/// (mupdf includes glyph slants/extents); the english source fits
+/// because lines don't actually fill that bbox, but a translated line
+/// in a wider language does. By clamping at write time we keep
+/// translated text from spilling past the column gap.
+///
+/// `source_rects` are left untouched so removal of original Tjs still
+/// covers every glyph.
+fn clamp_block_bounds_to_columns(blocks: &[TranslatedStyledBlock]) -> Vec<crate::Rect> {
+    /// Extra breathing room (display-space points) we shave off the
+    /// clipped right edge so columns don't merely touch.
+    const COLUMN_MARGIN: u32 = 2;
+    let mut out: Vec<crate::Rect> = blocks.iter().map(|b| b.bounding_box).collect();
+    for i in 0..blocks.len() {
+        let me = blocks[i].bounding_box;
+        let mut new_right = me.right;
+        for j in 0..blocks.len() {
+            if i == j {
+                continue;
+            }
+            let other = blocks[j].bounding_box;
+            // Only clip against blocks that sit at the same vertical
+            // stripe (could share a row with us) AND start strictly
+            // to our right.
+            let y_overlap = me
+                .bottom
+                .min(other.bottom)
+                .saturating_sub(me.top.max(other.top));
+            if y_overlap == 0 {
+                continue;
+            }
+            if other.left <= me.left {
+                continue;
+            }
+            // The other block must also extend past our right edge
+            // for this to be a sibling-column conflict. A bullet item
+            // indented inside our paragraph (e.g. block at x=301..542
+            // sitting under a paragraph at x=291..543) starts to our
+            // right but lives entirely inside our column; clipping
+            // our right edge to its left would crush our paragraph
+            // down to the bullet's indent gap.
+            if other.right <= me.right {
+                continue;
+            }
+            if other.left < new_right {
+                new_right = other.left;
+            }
+        }
+        if new_right < me.right {
+            out[i].right = new_right.saturating_sub(COLUMN_MARGIN).max(me.left + 1);
+        }
+    }
+    out
 }
 
 /// Passes 2-4: walk every block, build the document-wide union of texts per

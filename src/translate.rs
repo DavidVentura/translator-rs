@@ -332,13 +332,28 @@ pub(crate) fn execute_translation_plan_with_alignment(
     texts: &[String],
 ) -> Result<Vec<TranslationWithAlignment>, String> {
     ensure_plan_loaded(engine, plan)?;
-    match plan.steps.as_slice() {
+    if log::log_enabled!(log::Level::Trace) {
+        for (i, t) in texts.iter().enumerate() {
+            log::trace!("[bergamot in {i}/{}] {:?}", texts.len(), t);
+        }
+    }
+    let result = match plan.steps.as_slice() {
         [step] => engine.translate_multiple_with_alignment(texts, &step.cache_key),
         [first, second] => {
             engine.pivot_multiple_with_alignment(&first.cache_key, &second.cache_key, texts)
         }
         _ => Ok(Vec::new()),
+    }?;
+    if log::log_enabled!(log::Level::Trace) {
+        for (i, t) in result.iter().enumerate() {
+            log::trace!(
+                "[bergamot out {i}/{}] {:?}",
+                result.len(),
+                t.translated_text
+            );
+        }
     }
+    Ok(result)
 }
 
 /// HTML translation runs entirely Rust-side: html5ever parses each fragment,
