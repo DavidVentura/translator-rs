@@ -66,8 +66,9 @@ pub mod tts;
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{
     CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker,
-    LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, TtsVoicePickerRegion,
-    installed_tts_voice_picker_regions, language_rows_in_snapshot, parse_and_validate_catalog,
+    InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, TtsSpeakerEntry,
+    TtsVoicePickerRegion, installed_tts_voice_picker_regions, language_rows_in_snapshot,
+    parse_and_validate_catalog,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{OverlayColors, PreparedImageOverlay, ReadingOrder, Rect, sample_overlay_colors};

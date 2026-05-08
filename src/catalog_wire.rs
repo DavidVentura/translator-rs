@@ -128,6 +128,8 @@ enum AssetPackWire {
         num_speakers: Option<i32>,
         #[serde(rename = "defaultSpeakerId")]
         default_speaker_id: Option<i32>,
+        #[serde(rename = "sampleUrl", default)]
+        sample_url: Option<String>,
         #[serde(flatten)]
         common: PackCommonWire,
     },
@@ -238,6 +240,7 @@ impl AssetPackWire {
                 quality,
                 num_speakers,
                 default_speaker_id,
+                sample_url,
                 common,
             } => PackRecord {
                 id,
@@ -252,6 +255,7 @@ impl AssetPackWire {
                     quality: normalized(quality),
                     num_speakers,
                     default_speaker_id,
+                    sample_url: normalized(sample_url),
                 }),
             },
             AssetPackWire::Dictionary {

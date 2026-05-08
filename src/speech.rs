@@ -314,7 +314,15 @@ fn resolve_speech_assets(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Option<ResolvedSpeechAssets> {
-    let files = resolve_tts_voice_files(snapshot, language_code)?;
+    resolve_speech_assets_for_pack(snapshot, language_code, None)
+}
+
+fn resolve_speech_assets_for_pack(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+    pack_id: Option<&str>,
+) -> Option<ResolvedSpeechAssets> {
+    let files = crate::catalog::resolve_tts_voice_files_for_pack(snapshot, language_code, pack_id)?;
     let support_data_root = support_data_root(snapshot, &files);
     let model_path = absolute_install_path(snapshot, &files.model_install_path);
     if !Path::new(&model_path).exists() {
@@ -376,8 +384,9 @@ pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
     text: &str,
+    pack_id: Option<&str>,
 ) -> Result<Vec<SpeechChunk>, TranslatorError> {
-    let assets = resolve_speech_assets(snapshot, language_code)
+    let assets = resolve_speech_assets_for_pack(snapshot, language_code, pack_id)
         .ok_or_else(|| missing_tts_asset(language_code))?;
     plan_speech_chunks_for_text(
         cache,
@@ -399,8 +408,9 @@ pub(crate) fn synthesize_pcm_in_snapshot(
     speech_speed: f32,
     voice_name: Option<&VoiceName>,
     is_phonemes: bool,
+    pack_id: Option<&str>,
 ) -> Result<PcmAudio, TranslatorError> {
-    let assets = resolve_speech_assets(snapshot, language_code)
+    let assets = resolve_speech_assets_for_pack(snapshot, language_code, pack_id)
         .ok_or_else(|| missing_tts_asset(language_code))?;
     synthesize_pcm(
         cache,

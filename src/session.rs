@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
 use crate::catalog::{
-    CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
-    LanguageOverview, PackInstallChecker, build_catalog_snapshot, build_language_overview,
-    language_rows_in_snapshot, parse_and_validate_catalog, plan_delete_dictionary,
-    plan_delete_language, plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts,
+    CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, InstalledTtsPack,
+    LanguageAvailabilityRow, LanguageOverview, PackInstallChecker, build_catalog_snapshot,
+    build_language_overview, installed_tts_voices_for_language, language_rows_in_snapshot,
+    parse_and_validate_catalog, plan_delete_dictionary, plan_delete_language,
+    plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts, plan_delete_tts_pack,
     plan_dictionary_download, plan_language_download, plan_support_download_by_kind,
     plan_tts_download, select_best_catalog,
 };
@@ -376,6 +377,13 @@ impl TranslatorSession {
         plan_delete_superseded_tts(&snap, &code, selected_pack_id)
     }
 
+    pub fn prepare_delete_tts_pack(&self, pack_id: &str) -> DeletePlan {
+        let snap = self.snapshot();
+        #[cfg(feature = "tts")]
+        self.clear_speech_cache();
+        plan_delete_tts_pack(&snap, pack_id)
+    }
+
     #[cfg(feature = "tts")]
     fn clear_speech_cache(&self) {
         self.speech.lock().expect("speech cache poisoned").clear();
@@ -429,6 +437,12 @@ impl TranslatorSession {
     }
 
     #[cfg(feature = "tts")]
+    pub fn installed_tts_voices(&self, language_code: &str) -> Vec<InstalledTtsPack> {
+        let snap = self.snapshot();
+        installed_tts_voices_for_language(&snap, &LanguageCode::from(language_code))
+    }
+
+    #[cfg(feature = "tts")]
     pub fn warm_tts_model(&self, language_code: &str) -> Result<(), TranslatorError> {
         let snap = self.snapshot();
         let mut cache = self.speech.lock().expect("speech cache poisoned");
@@ -440,6 +454,7 @@ impl TranslatorSession {
         &self,
         language_code: &str,
         text: &str,
+        pack_id: Option<&str>,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
         let snap = self.snapshot();
         let mut cache = self.speech.lock().expect("speech cache poisoned");
@@ -448,6 +463,7 @@ impl TranslatorSession {
             &mut cache,
             &LanguageCode::from(language_code),
             text,
+            pack_id,
         )
     }
 
@@ -459,6 +475,7 @@ impl TranslatorSession {
         speech_speed: f32,
         voice_name: Option<&str>,
         is_phonemes: bool,
+        pack_id: Option<&str>,
     ) -> Result<PcmAudio, TranslatorError> {
         let snap = self.snapshot();
         let mut cache = self.speech.lock().expect("speech cache poisoned");
@@ -470,6 +487,7 @@ impl TranslatorSession {
             speech_speed,
             voice_name.map(VoiceName::from).as_ref(),
             is_phonemes,
+            pack_id,
         )
     }
 

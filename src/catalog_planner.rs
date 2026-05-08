@@ -4,8 +4,9 @@ use crate::api::LanguageCode;
 use crate::language::Language;
 
 use super::model::{
-    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, LangAvailability, LanguageCatalog,
-    PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsVoicePackInfo, TtsVoicePickerRegion,
+    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, InstalledTtsPack, LangAvailability,
+    LanguageCatalog, PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry,
+    TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,11 +435,22 @@ pub fn resolve_tts_voice_files(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Option<ResolvedTtsVoiceFiles> {
-    let voice_pack_id = snapshot
-        .catalog
-        .tts_pack_ids_for_language(language_code)
-        .into_iter()
-        .find(|pack_id| pack_installed_in_snapshot(snapshot, pack_id))?;
+    resolve_tts_voice_files_for_pack(snapshot, language_code, None)
+}
+
+pub fn resolve_tts_voice_files_for_pack(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+    pack_id: Option<&str>,
+) -> Option<ResolvedTtsVoiceFiles> {
+    let voice_pack_id = match pack_id {
+        Some(requested) if pack_installed_in_snapshot(snapshot, requested) => requested.to_string(),
+        _ => snapshot
+            .catalog
+            .tts_pack_ids_for_language(language_code)
+            .into_iter()
+            .find(|pack_id| pack_installed_in_snapshot(snapshot, pack_id))?,
+    };
     let voice_pack = snapshot.catalog.pack(&voice_pack_id)?;
     let PackKind::Tts(tts) = &voice_pack.kind else {
         return None;
@@ -527,6 +539,44 @@ pub fn plan_dictionary_download(
         total_size: tasks.iter().map(|task| task.size_bytes).sum(),
         tasks,
     })
+}
+
+pub fn installed_tts_voices_for_language(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Vec<InstalledTtsPack> {
+    snapshot
+        .catalog
+        .tts_pack_ids_for_language(language_code)
+        .into_iter()
+        .filter(|pack_id| pack_installed_in_snapshot(snapshot, pack_id))
+        .filter_map(|pack_id| {
+            let pack = snapshot.catalog.pack(&pack_id)?;
+            let PackKind::Tts(tts) = &pack.kind else {
+                return None;
+            };
+            let display_name = tts.voice.clone().unwrap_or_else(|| pack.id.clone());
+            let num_speakers = tts.num_speakers.unwrap_or(1).max(1);
+            let voices = if num_speakers <= 1 {
+                vec![TtsSpeakerEntry {
+                    name: display_name.clone(),
+                    speaker_id: tts.default_speaker_id.unwrap_or(0),
+                }]
+            } else {
+                (0..num_speakers)
+                    .map(|index| TtsSpeakerEntry {
+                        name: format!("speaker_{index}"),
+                        speaker_id: index,
+                    })
+                    .collect()
+            };
+            Some(InstalledTtsPack {
+                pack_id,
+                display_name,
+                voices,
+            })
+        })
+        .collect()
 }
 
 pub fn installed_tts_voice_picker_regions(
@@ -756,6 +806,28 @@ pub fn plan_delete_support_by_kind(snapshot: &CatalogSnapshot, support_kind: &st
         .into_iter()
         .collect::<HashSet<_>>();
     delete_plan_for_pack_ids(&snapshot.catalog, pack_ids.iter().map(String::as_str))
+}
+
+pub fn plan_delete_tts_pack(snapshot: &CatalogSnapshot, pack_id: &str) -> DeletePlan {
+    if !pack_installed_in_snapshot(snapshot, pack_id) {
+        return DeletePlan::default();
+    }
+    let keep_root_packs = snapshot
+        .catalog
+        .languages
+        .keys()
+        .flat_map(|code| {
+            snapshot
+                .catalog
+                .tts_pack_ids_for_language(&LanguageCode::from(code.as_str()))
+        })
+        .filter(|other| other != pack_id && pack_installed_in_snapshot(snapshot, other))
+        .collect::<HashSet<_>>();
+    let delete_pack_ids = delete_pack_ids(&snapshot.catalog, [pack_id], keep_root_packs);
+    delete_plan_for_pack_ids(
+        &snapshot.catalog,
+        delete_pack_ids.iter().map(String::as_str),
+    )
 }
 
 pub fn plan_delete_superseded_tts(

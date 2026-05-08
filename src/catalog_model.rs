@@ -98,6 +98,7 @@ pub struct TtsPack {
     pub quality: Option<String>,
     pub num_speakers: Option<i32>,
     pub default_speaker_id: Option<i32>,
+    pub sample_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,22 @@ pub struct TtsVoicePackInfo {
     pub display_name: String,
     pub quality: Option<String>,
     pub size_bytes: u64,
+    pub sample_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TtsSpeakerEntry {
+    pub name: String,
+    pub speaker_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct InstalledTtsPack {
+    pub pack_id: String,
+    pub display_name: String,
+    pub voices: Vec<TtsSpeakerEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +423,7 @@ impl LanguageCatalog {
             display_name: tts.voice.clone().unwrap_or_else(|| pack.id.clone()),
             quality: tts.quality.clone(),
             size_bytes: self.pack_size_bytes(pack_id),
+            sample_url: tts.sample_url.clone(),
         })
     }
 

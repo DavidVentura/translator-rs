@@ -149,6 +149,7 @@ fn tts_pack(
             quality: None,
             num_speakers: None,
             default_speaker_id: Some(default_speaker_id),
+            sample_url: None,
         }),
         files,
         vec![],
