@@ -1,17 +1,14 @@
 set -eu
-find samples -name '*.wav' -print0 | while IFS="" read -r -d '' f; do
+find samples -name '*.wav' -print0 | xargs -0 -P "$(nproc)" -I{} bash -c '
+  f="$1"
   rel="${f#samples/}"
-  out="samples_ogg/${rel%.wav}.ogg"
+  out="samples_ogg/${rel%.wav}.opus"
   mkdir -p "$(dirname "$out")"
   if [ -f "$out" ]; then
-    # echo "skipping $f -> $out"
-    continue
+    exit 0
   fi
   echo "converting $f -> $out"
-  (
-    ffmpeg -nostdin -nostats -loglevel error -hide_banner -i "$f" -c:a libopus -b:a 48k -vbr on -compression_level 10 "$out"
-  ) &
-  sleep 0.1
-done
-
-wait
+  ffmpeg -nostdin -nostats -loglevel error -hide_banner -i "$f" \
+    -ac 1 -c:a libopus -b:a 24k -vbr on -application voip -compression_level 10 \
+    "$out"
+' _ {}

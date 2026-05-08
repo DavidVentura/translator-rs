@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--samples-root",
         default="samples_ogg",
-        help="Root directory containing generated .ogg samples. Default: samples_ogg",
+        help="Root directory containing generated .opus samples. Default: samples_ogg",
     )
     parser.add_argument(
         "--output",
@@ -88,8 +88,8 @@ def legacy_normalize_sample_name(value: str) -> str:
 def resolve_audio(samples_root: Path, language: str, voice: str, quality: str | None) -> Path | None:
     quality = quality or "default"
     candidates = [
-        samples_root / language / f"{normalize_sample_name(voice)}_{normalize_sample_name(quality)}.ogg",
-        samples_root / language / f"{legacy_normalize_sample_name(voice)}_{legacy_normalize_sample_name(quality)}.ogg",
+        samples_root / language / f"{normalize_sample_name(voice)}_{normalize_sample_name(quality)}.opus",
+        samples_root / language / f"{legacy_normalize_sample_name(voice)}_{legacy_normalize_sample_name(quality)}.opus",
     ]
     return next((p for p in candidates if p.exists()), None)
 
