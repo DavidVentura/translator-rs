@@ -54,6 +54,8 @@ struct LanguageTtsWire {
     default_region: Option<String>,
     #[serde(default)]
     regions: HashMap<String, LanguageTtsRegionWire>,
+    #[serde(default)]
+    sample_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -313,6 +315,7 @@ fn compile_tts_config(value: Option<LanguageTtsWire>) -> Option<LanguageTtsV2> {
     Some(LanguageTtsV2 {
         default_region: value.default_region.filter(|value| !value.is_empty()),
         regions,
+        sample_text: value.sample_text.filter(|value| !value.is_empty()),
     })
 }
 

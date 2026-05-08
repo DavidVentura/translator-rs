@@ -21,6 +21,7 @@ pub struct LanguageTtsRegionV2 {
 pub struct LanguageTtsV2 {
     pub default_region: Option<String>,
     pub regions: Vec<(String, LanguageTtsRegionV2)>,
+    pub sample_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -320,6 +321,10 @@ impl LanguageCatalog {
             return Vec::new();
         };
         tts_pack_ids_from_config(tts)
+    }
+
+    pub fn tts_sample_text(&self, language_code: &LanguageCode) -> Option<String> {
+        self.tts(language_code)?.sample_text.clone()
     }
 
     pub fn ordered_tts_regions_for_language(
