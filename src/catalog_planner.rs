@@ -5,7 +5,7 @@ use crate::language::Language;
 
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, LangAvailability, LanguageCatalog,
-    PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsVoicePackInfo,
+    PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,6 +527,33 @@ pub fn plan_dictionary_download(
         total_size: tasks.iter().map(|task| task.size_bytes).sum(),
         tasks,
     })
+}
+
+pub fn installed_tts_voice_picker_regions(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Vec<TtsVoicePickerRegion> {
+    snapshot
+        .catalog
+        .tts_voice_picker_regions(language_code)
+        .into_iter()
+        .filter_map(|region| {
+            let installed_voices: Vec<_> = region
+                .voices
+                .into_iter()
+                .filter(|pack_info| pack_installed_in_snapshot(snapshot, &pack_info.pack_id))
+                .collect();
+            if installed_voices.is_empty() {
+                None
+            } else {
+                Some(TtsVoicePickerRegion {
+                    code: region.code,
+                    display_name: region.display_name,
+                    voices: installed_voices,
+                })
+            }
+        })
+        .collect()
 }
 
 pub fn plan_tts_download(
