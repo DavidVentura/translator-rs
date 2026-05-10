@@ -369,32 +369,138 @@ fn map_script(s: Script) -> rustybuzz::Script {
 // ---------------------------------------------------------------------------
 // Per-run pick from the FontProvider chain
 
+/// A contiguous byte range within a run's source text, marked as either
+/// "primary font covered it" or ".notdef — needs the next font in the chain".
+#[derive(Debug)]
+struct FallbackSegment {
+    /// Absolute byte offset in the full `text`.
+    byte_start: usize,
+    /// Absolute byte offset in the full `text` (exclusive).
+    byte_end: usize,
+    has_real_glyph: bool,
+}
+
+/// Group `glyphs` by cluster, mark each cluster as covered or .notdef, and
+/// emit byte segments in source order. Adjacent clusters with the same state
+/// are merged. Cluster fields are offsets relative to the rustybuzz input
+/// (i.e. relative to `run_start`); we rebase to absolute offsets in `text`.
+fn compute_fallback_segments(
+    glyphs: &[ShapedGlyph],
+    run_start: usize,
+    run_end: usize,
+) -> Vec<FallbackSegment> {
+    use std::collections::BTreeMap;
+    if glyphs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cluster_all_notdef: BTreeMap<u32, bool> = BTreeMap::new();
+    for g in glyphs {
+        let entry = cluster_all_notdef.entry(g.cluster).or_insert(true);
+        if g.gid != 0 {
+            *entry = false;
+        }
+    }
+
+    let clusters: Vec<(u32, bool)> = cluster_all_notdef.into_iter().collect();
+    let run_len = run_end - run_start;
+
+    let mut out: Vec<FallbackSegment> = Vec::with_capacity(clusters.len());
+    for (i, (cluster_local_start, all_notdef)) in clusters.iter().enumerate() {
+        let cluster_local_end = clusters
+            .get(i + 1)
+            .map(|(c, _)| *c as usize)
+            .unwrap_or(run_len);
+        let byte_start = run_start + *cluster_local_start as usize;
+        let byte_end = run_start + cluster_local_end;
+        let has_real_glyph = !*all_notdef;
+
+        if let Some(last) = out.last_mut()
+            && last.has_real_glyph == has_real_glyph
+            && last.byte_end == byte_start
+        {
+            last.byte_end = byte_end;
+            continue;
+        }
+        out.push(FallbackSegment {
+            byte_start,
+            byte_end,
+            has_real_glyph,
+        });
+    }
+
+    out
+}
+
+/// Shape `run` against `chain` with per-cluster fallback: if the primary
+/// font produces .notdef glyphs for some clusters, those clusters' source
+/// bytes are re-shaped against `chain[1..]` and stitched into the output.
+///
+/// Returns shaped pieces in **visual order** (LTR = source order, RTL = source
+/// order reversed). Multiple pieces may share fonts; the caller treats them
+/// as a flat sequence to draw with the cursor advancing.
 fn pick_handle_and_shape(
     text: &str,
     run: &DirRun,
     chain: &[FontHandle],
     cache: &mut FontCache,
-) -> Option<ShapedRun> {
+) -> Vec<ShapedRun> {
     if chain.is_empty() {
-        return None;
+        return Vec::new();
     }
-    // Try each font in order; first one that produces zero .notdef glyphs
-    // for this run is the winner. If none manage it, return whichever the
-    // first font produced (best effort, tofu where needed).
-    let mut first: Option<ShapedRun> = None;
-    for handle in chain {
-        let Some(shaped) = shape_run(text, run, handle, cache) else {
-            continue;
+
+    let primary = match shape_run(text, run, &chain[0], cache) {
+        Some(s) => s,
+        None => return pick_handle_and_shape(text, run, &chain[1..], cache),
+    };
+
+    let has_notdef = primary.glyphs.iter().any(|g| g.gid == 0);
+    if !has_notdef || chain.len() == 1 {
+        return vec![primary];
+    }
+
+    let segments = compute_fallback_segments(&primary.glyphs, run.start, run.end);
+    if segments.is_empty() {
+        return vec![primary];
+    }
+
+    let mut out: Vec<ShapedRun> = Vec::with_capacity(segments.len());
+    for seg in &segments {
+        let sub_run = DirRun {
+            start: seg.byte_start,
+            end: seg.byte_end,
+            script: run.script,
+            rtl: run.rtl,
+            visual_index: run.visual_index,
         };
-        let any_notdef = shaped.glyphs.iter().any(|g| g.gid == 0);
-        if !any_notdef {
-            return Some(shaped);
-        }
-        if first.is_none() {
-            first = Some(shaped);
+        if seg.has_real_glyph {
+            // Primary font handles this segment; re-shape it in isolation.
+            // Cross-segment contextual shaping isn't lost because the
+            // segment boundary lies at clusters the primary font already
+            // failed on, which by definition broke any shaping context.
+            if let Some(s) = shape_run(text, &sub_run, &chain[0], cache) {
+                out.push(s);
+            }
+        } else {
+            let fallback = pick_handle_and_shape(text, &sub_run, &chain[1..], cache);
+            if !fallback.is_empty() {
+                out.extend(fallback);
+            } else if let Some(s) = shape_run(text, &sub_run, &chain[0], cache) {
+                // No fallback usable — keep tofu from the primary font.
+                out.push(s);
+            }
         }
     }
-    first
+
+    if out.is_empty() {
+        return vec![primary];
+    }
+
+    if run.rtl {
+        out.reverse();
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +528,8 @@ fn shape_line(
     let mut shaped: Vec<(usize, ShapedRun)> = Vec::new();
     for run in &runs {
         let chain = chain_lookup(run.script, cache);
-        if let Some(s) = pick_handle_and_shape(text, run, &chain, cache) {
-            shaped.push((run.visual_index, s));
+        for piece in pick_handle_and_shape(text, run, &chain, cache) {
+            shaped.push((run.visual_index, piece));
         }
     }
     shaped.sort_by_key(|(vi, _)| *vi);
