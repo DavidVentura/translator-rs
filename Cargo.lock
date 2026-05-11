@@ -2640,6 +2640,7 @@ dependencies = [
  "markup5ever_rcdom",
  "mucab",
  "mupdf",
+ "ort",
  "piper-rs",
  "regex 1.12.3",
  "rustybuzz",

@@ -24,6 +24,8 @@ use crate::tarkka::{
     lookup_dictionary_in_snapshot,
 };
 
+#[cfg(feature = "doc-align")]
+use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
 #[cfg(feature = "tesseract")]
 use crate::ocr::{PreparedImageOverlay, ReadingOrder};
 #[cfg(feature = "tesseract")]
@@ -57,6 +59,20 @@ pub struct TranslatorSession {
     dictionaries: Mutex<DictionaryCache>,
     #[cfg(feature = "tesseract")]
     ocr: OcrPool,
+    #[cfg(feature = "doc-align")]
+    doc_align: Mutex<DocAlignCache>,
+}
+
+#[cfg(feature = "doc-align")]
+struct DocAlignCache {
+    state: Option<(String, Arc<DocAligner>)>,
+}
+
+#[cfg(feature = "doc-align")]
+impl DocAlignCache {
+    fn new() -> Self {
+        Self { state: None }
+    }
 }
 
 /// Tesseract OCR worker pool size. A small fixed value: more workers
@@ -75,6 +91,8 @@ impl TranslatorSession {
             dictionaries: Mutex::new(DictionaryCache::new()),
             #[cfg(feature = "tesseract")]
             ocr: OcrPool::new(OCR_POOL_SIZE),
+            #[cfg(feature = "doc-align")]
+            doc_align: Mutex::new(DocAlignCache::new()),
         }
     }
 
@@ -520,6 +538,66 @@ impl TranslatorSession {
             let _ = (text, language_code);
             None
         }
+    }
+
+    #[cfg(feature = "doc-align")]
+    fn doc_aligner(&self) -> Result<Arc<DocAligner>, TranslatorError> {
+        let snap = self.snapshot();
+        let files = snap.catalog.support_files_by_kind("doc_detect");
+        let file = files.first().ok_or_else(|| {
+            TranslatorError::new(
+                crate::api::TranslatorErrorKind::MissingAsset,
+                "no doc_detect support pack in catalog",
+            )
+        })?;
+        let abs_path = std::path::Path::new(&snap.base_dir).join(&file.install_path);
+        let abs_str = abs_path.to_string_lossy().into_owned();
+        if !abs_path.exists() {
+            return Err(TranslatorError::new(
+                crate::api::TranslatorErrorKind::MissingAsset,
+                format!("doc-align model not installed at {}", abs_str),
+            ));
+        }
+        let mut cache = self.doc_align.lock().expect("doc-align cache poisoned");
+        if let Some((ref path, ref aligner)) = cache.state {
+            if path == &abs_str {
+                return Ok(Arc::clone(aligner));
+            }
+        }
+        let aligner = Arc::new(DocAligner::load(&abs_path, 2)?);
+        cache.state = Some((abs_str, Arc::clone(&aligner)));
+        Ok(aligner)
+    }
+
+    #[cfg(feature = "doc-align")]
+    pub fn detect_document_quad(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Option<DocumentDetection>, TranslatorError> {
+        self.doc_aligner()?.detect(rgba, width, height)
+    }
+
+    #[cfg(feature = "doc-align")]
+    pub fn warp_document_rgba(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        quad: &DocumentQuad,
+        out_width: Option<u32>,
+        out_height: Option<u32>,
+    ) -> Result<WarpedImageRgba, TranslatorError> {
+        let (default_w, default_h) = crate::doc_align::suggested_output_dims(quad);
+        let out_w = out_width.unwrap_or(default_w);
+        let out_h = out_height.unwrap_or(default_h);
+        crate::doc_align::warp(rgba, width, height, quad, out_w, out_h)
+    }
+
+    #[cfg(feature = "doc-align")]
+    pub fn suggested_warp_dims(&self, quad: &DocumentQuad) -> (u32, u32) {
+        crate::doc_align::suggested_output_dims(quad)
     }
 }
 

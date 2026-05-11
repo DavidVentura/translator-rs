@@ -381,18 +381,17 @@ where
 
     for (code, info) in &catalog.languages {
         let language = info.language.clone();
-        let ocr_pack_id = info
+        let any_ocr_installed = info
             .resources
             .ocr_packs
             .iter()
-            .find(|(engine, _)| engine == "tesseract")
-            .map(|(_, pack_id)| pack_id.as_str());
+            .any(|(_, pack_id)| resolver.is_installed(pack_id));
         let dictionary_pack_id = catalog.dictionary_pack_id_for_language(code);
         let availability = if language.is_english() {
             LangAvailability {
                 has_from_english: true,
                 has_to_english: true,
-                ocr_files: ocr_pack_id.is_some_and(|pack_id| resolver.is_installed(pack_id)),
+                ocr_files: any_ocr_installed,
                 dictionary_files: dictionary_pack_id
                     .as_deref()
                     .is_some_and(|pack_id| resolver.is_installed(pack_id)),
@@ -413,7 +412,7 @@ where
                 has_to_english: to_pack_id
                     .as_deref()
                     .is_some_and(|pack_id| resolver.is_installed(pack_id)),
-                ocr_files: ocr_pack_id.is_some_and(|pack_id| resolver.is_installed(pack_id)),
+                ocr_files: any_ocr_installed,
                 dictionary_files: dictionary_pack_id
                     .as_deref()
                     .is_some_and(|pack_id| resolver.is_installed(pack_id)),

@@ -91,6 +91,7 @@ fn ocr_pack(id: &str, language: &str, file: AssetFileV2) -> PackRecord {
         id,
         PackKind::Ocr(OcrPack {
             language: language.to_string(),
+            engine: "tesseract".to_string(),
         }),
         vec![file],
         vec![],
@@ -173,6 +174,7 @@ fn language_info(
                 .map(ToString::to_string)
                 .collect(),
             ocr_packs: vec![("tesseract".to_string(), ocr_pack_id.to_string())],
+            preferred_ocr_engine: "tesseract".to_string(),
             dictionary_pack_id: dictionary_pack_id.map(ToString::to_string),
             support_root_packs: support_root_packs
                 .into_iter()
@@ -181,6 +183,7 @@ fn language_info(
         },
         tts: Some(LanguageTtsV2 {
             default_region: default_region.map(ToString::to_string),
+            sample_text: None,
             regions: tts_regions
                 .into_iter()
                 .map(|(code, display_name, voices)| {
@@ -598,7 +601,7 @@ fn parses_bundled_catalog_asset() {
         .parent()
         .and_then(|parent| parent.parent())
         .map(|parent| {
-            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index.json")
+            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v3.json")
         })
         .expect("repo layout should have a parent");
     let Ok(json) = std::fs::read_to_string(asset_path) else {
@@ -616,8 +619,8 @@ fn parses_bundled_catalog_asset() {
 
 #[test]
 fn selects_best_catalog_using_headers_only() {
-    let bundled = r#"{"formatVersion":2,"generatedAt":1}"#;
-    let disk = r#"{"formatVersion":2,"generatedAt":2}"#;
+    let bundled = r#"{"formatVersion":3,"generatedAt":1}"#;
+    let disk = r#"{"formatVersion":3,"generatedAt":2}"#;
 
     let selected = crate::catalog::select_best_catalog(bundled, Some(disk))
         .expect("header-only catalogs should still compare");

@@ -4,6 +4,8 @@ uniffi::setup_scaffolding!();
 pub mod api;
 pub mod bergamot;
 pub mod catalog;
+#[cfg(feature = "doc-align")]
+pub mod doc_align;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
@@ -12,6 +14,8 @@ pub mod font_provider;
 pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub mod image_render;
+#[cfg(feature = "doc-align")]
+mod inference;
 pub mod language;
 pub mod language_detect;
 #[cfg(feature = "mucab")]

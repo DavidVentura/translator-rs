@@ -28,6 +28,7 @@ pub struct LanguageTtsV2 {
 pub(crate) struct LanguageResources {
     pub translation_root_packs: Vec<String>,
     pub ocr_packs: Vec<(String, String)>,
+    pub preferred_ocr_engine: String,
     pub dictionary_pack_id: Option<String>,
     pub support_root_packs: Vec<String>,
 }
@@ -86,6 +87,7 @@ pub struct TranslationPack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrPack {
     pub language: String,
+    pub engine: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +603,34 @@ impl LanguageCatalog {
             .into_iter()
             .map(|file| file.size_bytes)
             .sum()
+    }
+
+    pub fn ocr_engines_for_language(&self, language_code: &LanguageCode) -> Vec<(String, String)> {
+        self.languages
+            .get(language_code.as_str())
+            .map(|info| info.resources.ocr_packs.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn preferred_ocr_engine_for_language(&self, language_code: &LanguageCode) -> String {
+        self.languages
+            .get(language_code.as_str())
+            .map(|info| info.resources.preferred_ocr_engine.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn ocr_pack_id_for_engine(
+        &self,
+        language_code: &LanguageCode,
+        engine: &str,
+    ) -> Option<String> {
+        self.languages
+            .get(language_code.as_str())?
+            .resources
+            .ocr_packs
+            .iter()
+            .find(|(pack_engine, _)| pack_engine == engine)
+            .map(|(_, pack_id)| pack_id.clone())
     }
 
     pub(crate) fn unique_files_in_dependency_closure<'a, I>(

@@ -29,11 +29,14 @@ struct LanguageMetaWire {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LanguageAssetsWire {
     #[serde(default)]
     translate: Vec<String>,
     #[serde(default)]
     ocr: HashMap<String, String>,
+    #[serde(default)]
+    preferred_ocr_engine: String,
     dictionary: Option<String>,
     #[serde(default)]
     support: Vec<String>,
@@ -113,6 +116,7 @@ enum AssetPackWire {
     #[serde(rename = "ocr")]
     Ocr {
         language: String,
+        engine: String,
         #[serde(flatten)]
         common: PackCommonWire,
     },
@@ -154,6 +158,8 @@ enum AssetPackWire {
         #[serde(flatten)]
         common: PackCommonWire,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -217,19 +223,23 @@ fn normalized(value: Option<String>) -> Option<String> {
 }
 
 impl AssetPackWire {
-    fn into_record(self, id: String) -> PackRecord {
-        match self {
+    fn into_record(self, id: String) -> Option<PackRecord> {
+        Some(match self {
             AssetPackWire::Translation { from, to, common } => PackRecord {
                 id,
                 files: common.files.into_iter().map(Into::into).collect(),
                 depends_on: common.depends_on,
                 kind: PackKind::Translation(TranslationPack { from, to }),
             },
-            AssetPackWire::Ocr { language, common } => PackRecord {
+            AssetPackWire::Ocr {
+                language,
+                engine,
+                common,
+            } => PackRecord {
                 id,
                 files: common.files.into_iter().map(Into::into).collect(),
                 depends_on: common.depends_on,
-                kind: PackKind::Ocr(OcrPack { language }),
+                kind: PackKind::Ocr(OcrPack { language, engine }),
             },
             AssetPackWire::Tts {
                 language,
@@ -292,7 +302,8 @@ impl AssetPackWire {
                     metadata: metadata.map(Into::into),
                 }),
             },
-        }
+            AssetPackWire::Unknown => return None,
+        })
     }
 }
 
@@ -333,6 +344,7 @@ fn compile_language_info(
     let resources = LanguageResources {
         translation_root_packs: entry.assets.translate,
         ocr_packs,
+        preferred_ocr_engine: entry.assets.preferred_ocr_engine,
         dictionary_pack_id: entry.assets.dictionary.filter(|value| !value.is_empty()),
         support_root_packs: entry.assets.support,
     };
@@ -382,10 +394,7 @@ pub fn parse_language_catalog(json: &str) -> Result<LanguageCatalog, String> {
     let packs = wire
         .packs
         .into_iter()
-        .map(|(id, pack)| {
-            let record = pack.into_record(id.clone());
-            (id, record)
-        })
+        .filter_map(|(id, pack)| pack.into_record(id.clone()).map(|record| (id, record)))
         .collect::<HashMap<_, _>>();
 
     let mut languages = HashMap::new();
@@ -462,7 +471,7 @@ pub fn parse_language_catalog(json: &str) -> Result<LanguageCatalog, String> {
 
 pub fn parse_and_validate_catalog(json: &str) -> Result<LanguageCatalog, String> {
     let catalog = parse_language_catalog(json)?;
-    if catalog.format_version != 2 {
+    if catalog.format_version < 3 {
         return Err(format!(
             "Unsupported catalog formatVersion={}",
             catalog.format_version
@@ -478,7 +487,7 @@ pub fn select_best_catalog<'a>(
     let parse_header = |json: &str| -> Result<CatalogHeaderWire, String> {
         let header =
             serde_json::from_str::<CatalogHeaderWire>(json).map_err(|error| error.to_string())?;
-        if header.format_version != 2 {
+        if header.format_version < 3 {
             return Err(format!(
                 "Unsupported catalog formatVersion={}",
                 header.format_version
