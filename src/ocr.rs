@@ -319,20 +319,26 @@ impl TextBlock {
 /// the paragraph's running median tight-height, so the same values work across font sizes.
 #[derive(Debug, Clone, Copy)]
 pub struct ParagraphGroupingOptions {
-    /// Max permitted relative height jitter between a new line and the paragraph's running
-    /// median tight-height, once the paragraph has 2+ lines (the size has been "confirmed" by
-    /// at least one accepted body→body match). `0.25` accepts lines within ±25% of the running
-    /// paragraph height.
+    /// Max permitted relative tight-height jitter between a new line and the paragraph's
+    /// running median tight-height. Sized to cover normal body-text variation: the DB mask is
+    /// tight to the inked glyphs and skips ascenders/descenders, so an all-caps acronym like
+    /// `TMJ` or an ascender-heavy line like `"At first I thought"` can be 20–40% taller than
+    /// an adjacent lowercase-only line in the same paragraph. We accept up to ~40% so those
+    /// false-breaks go away; real headings remain a clear step above (typically 70%+ taller
+    /// than body) and continue to break correctly.
     pub height_tolerance: f32,
-    /// Tighter height tolerance used when the paragraph still has only its opening line. Until
-    /// we have a second body-shaped line, the "paragraph" might actually be a heading or a
-    /// caption — and a slightly-shorter body line beneath a heading is still a paragraph
-    /// break, not a join. Once the second line is accepted the size is "confirmed" and we
-    /// switch to the looser `height_tolerance`.
-    pub opening_height_tolerance: f32,
-    /// Max vertical gap (top-of-new-line minus bottom-of-prev-line) in median-tight-height
-    /// units before we call it a paragraph break. ~1.8 leaves room for generous leading
-    /// without merging across blank lines.
+    /// Maximum gap_ratio for the FIRST intra-paragraph join (i.e. line 1 → line 2 of a
+    /// freshly opened paragraph), before any leading baseline has been established. Sized to
+    /// admit loose-leading blog/article body text (gap_ratio ≈ 2–3) but stay below typical
+    /// blank-line inter-paragraph gaps (≥ 3.3 in observed real-world docs).
+    pub initial_max_gap_ratio: f32,
+    /// Max permitted deviation from the paragraph's running leading baseline for subsequent
+    /// joins, in median-tight-height units. Once line 1 → line 2 succeeds, that gap becomes
+    /// the paragraph's "leading"; later lines must stay within `baseline + leading_jitter`,
+    /// catching a blank-line break as soon as the gap inflates above the running rhythm.
+    pub leading_jitter: f32,
+    /// Hard ceiling on gap_ratio regardless of leading baseline — a sanity stop for documents
+    /// where the EMA baseline could drift upward through a sequence of accepted joins.
     pub max_gap_ratio: f32,
     /// Max negative gap (overlap) in median-tight-height units. Allows a sliver of overlap so
     /// rasterisation jitter or `sort_lines_reading_order` bucket aliasing doesn't split
@@ -348,17 +354,33 @@ pub struct ParagraphGroupingOptions {
     /// shifts to follow them — that's how an indented first line plus flush body gets glued
     /// into one paragraph.
     pub max_first_line_indent: f32,
+    /// "List-item start" gate. When the next line starts with an uppercase letter or a digit
+    /// AND the inter-line gap (in median-tight-height units) exceeds this value, treat the new
+    /// line as a fresh item and break. Catches menus / lists where each row starts with a
+    /// capital (or a price digit) and is set with looser leading than body text. Body
+    /// paragraphs with tight leading (typical gap_ratio ≤ 0.7) pass under the gate even when a
+    /// sentence happens to begin at a line head; only sentences split off in body text with
+    /// generous leading, which is acceptable — each sentence still translates correctly.
+    pub list_item_break_gap_ratio: f32,
+    /// Word-count ceiling for the list-item gate. Body prose lines that happen to start with a
+    /// capitalised pronoun or article ("I", "The", "After") are 5+ words long; menu/list items
+    /// are typically 1–4 words. Lines exceeding this count are not treated as list-item starts
+    /// even when the other conditions are met.
+    pub max_list_item_word_count: usize,
 }
 
 impl Default for ParagraphGroupingOptions {
     fn default() -> Self {
         Self {
-            height_tolerance: 0.25,
-            opening_height_tolerance: 0.15,
-            max_gap_ratio: 1.8,
+            height_tolerance: 0.40,
+            initial_max_gap_ratio: 3.5,
+            leading_jitter: 0.5,
+            max_gap_ratio: 4.0,
             max_overlap_ratio: 0.5,
             edge_alignment_tolerance: 0.6,
             max_first_line_indent: 4.0,
+            list_item_break_gap_ratio: 0.8,
+            max_list_item_word_count: 4,
         }
     }
 }
@@ -369,6 +391,25 @@ impl Default for ParagraphGroupingOptions {
 /// stays within one column while a multi-column page's column gap (typically ≥ 8 × x-height)
 /// triggers a new column.
 const COLUMN_TOLERANCE_HEIGHTS: f32 = 4.0;
+
+/// Half-window for clustering detections into the same visual row. Two detections whose
+/// tight-box centres are within this many tight-heights of each other are treated as the same
+/// row by `merge_same_row_detections`.
+const SAME_ROW_CY_HEIGHTS: f32 = 0.5;
+
+/// Maximum horizontal gap (in tight-height units) between two consecutive same-row detections
+/// before the pre-merge pass refuses to combine them. Tuned to reconnect typical wide-kerning
+/// word spacing (≤ 5 × x-height) plus a small safety margin, while staying below the gutter
+/// of a real two-column layout where line tops happen to align (typical column gap ≥ 8–10 ×
+/// x-height between text-end on the left and text-start on the right). When rows are
+/// vertically *offset* across columns — the much more common multi-column case — the cy-based
+/// row clustering already keeps them apart and this gate doesn't even run.
+const SAME_ROW_MAX_GAP_HEIGHTS: f32 = 6.0;
+
+/// Max relative tight-height difference for two same-row detections to count as the same font
+/// run. Stops two stacked-but-different-size lines (e.g. a heading sitting half on the row of
+/// a small body line above) from being collapsed together.
+const SAME_ROW_HEIGHT_TOLERANCE: f32 = 0.35;
 
 /// PPOCR's `sort_lines_reading_order` interleaves columns by binning on `top`, which means a
 /// two-column page comes in as A0, B0, A1, B1, … — breaking the gap and alignment heuristics
@@ -452,6 +493,153 @@ struct ParaState {
     /// Running estimate of the paragraph's tight-height. Updated as a simple EMA so the gate
     /// drifts with the paragraph but isn't pinned to the first line.
     median_h: f32,
+    /// Paragraph-local leading baseline (intra-paragraph gap_ratio). `None` until the first
+    /// join records a gap; afterwards an EMA over accepted-join gaps. Used as the centre of
+    /// the gap-acceptance band so a paragraph's running line rhythm sets its own threshold,
+    /// independent of document-wide leading.
+    leading_gap_ratio: Option<f32>,
+}
+
+fn tight_right(line: &TextLine) -> f32 {
+    line.tight_box.cx + line.tight_box.width * 0.5
+}
+
+/// Reconnect detections that PaddleOCR split into per-word boxes within a single visual row.
+/// DB-based detectors sometimes break a line on wide inter-word kerning (typical for pixel /
+/// retro fonts), which fragments a single sentence into many "lines" — each with the same
+/// `top` but a different `left`. The grouper's column-ID stage then puts each fragment in its
+/// own column, and paragraph merging never gets a chance to run.
+///
+/// The merge keys on the glyph-tight box: detections cluster into a row when their `cy`
+/// values are within `SAME_ROW_CY_HEIGHTS` of each other (so a row tolerance shrinks/grows
+/// with font size), and within a row consecutive boxes are joined when their horizontal gap is
+/// at most `SAME_ROW_MAX_GAP_HEIGHTS × tight_h` and their heights agree within
+/// `SAME_ROW_HEIGHT_TOLERANCE`. The gap ceiling deliberately sits above typical wide-kerning
+/// gaps but well below typical menu name-vs-price column gaps, so this pass restores rows
+/// without collapsing 2-column tabular layouts.
+///
+/// Output rows are returned in input order (the caller hasn't yet sorted by reading order);
+/// row order is established later by `reorder_lines_for_grouping`.
+fn merge_same_row_detections(lines: Vec<TextLine>) -> Vec<TextLine> {
+    if lines.len() < 2 {
+        return lines;
+    }
+
+    let mut heights: Vec<f32> = lines.iter().map(|l| l.tight_box.height.max(1.0)).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_h = heights[heights.len() / 2].max(1.0);
+    let row_window = SAME_ROW_CY_HEIGHTS * median_h;
+
+    // Assign row IDs by clustering on cy. Sort indices by cy, grow the ID whenever the cy
+    // delta exceeds the row window. This is the same shape as `assign_column_ids` — it works
+    // for the same reason (cluster-by-gap, not modular bucket).
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by(|&a, &b| {
+        lines[a]
+            .tight_box
+            .cy
+            .partial_cmp(&lines[b].tight_box.cy)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut row_ids = vec![0usize; lines.len()];
+    let mut current_row = 0usize;
+    let mut prev_cy: Option<f32> = None;
+    for &i in &order {
+        let cy = lines[i].tight_box.cy;
+        if let Some(p) = prev_cy
+            && (cy - p).abs() > row_window
+        {
+            current_row += 1;
+        }
+        row_ids[i] = current_row;
+        prev_cy = Some(cy);
+    }
+
+    // Bucket lines by row.
+    let row_count = current_row + 1;
+    let mut rows: Vec<Vec<TextLine>> = (0..row_count).map(|_| Vec::new()).collect();
+    for (line, &rid) in lines.into_iter().zip(row_ids.iter()) {
+        rows[rid].push(line);
+    }
+
+    // Per row, sort by tight-left and merge adjacent boxes whose horizontal gap is small
+    // enough to plausibly be intra-line word spacing.
+    let mut out: Vec<TextLine> = Vec::new();
+    for mut row in rows {
+        row.sort_by(|a, b| {
+            tight_left(a)
+                .partial_cmp(&tight_left(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut accumulator: Option<TextLine> = None;
+        for line in row {
+            let Some(prev) = accumulator.as_ref() else {
+                accumulator = Some(line);
+                continue;
+            };
+            let prev_h = prev.tight_box.height.max(1.0);
+            let unit = prev_h.max(line.tight_box.height).max(1.0);
+            let big = prev_h.max(line.tight_box.height);
+            let small = prev_h.min(line.tight_box.height).max(1.0);
+            let height_ok = (big / small - 1.0) <= SAME_ROW_HEIGHT_TOLERANCE;
+            let gap = tight_left(&line) - tight_right(prev);
+            let gap_ok = gap <= SAME_ROW_MAX_GAP_HEIGHTS * unit;
+            if height_ok && gap_ok {
+                let merged = merge_two_lines(prev.clone(), line);
+                accumulator = Some(merged);
+            } else {
+                out.push(accumulator.take().expect("had a value"));
+                accumulator = Some(line);
+            }
+        }
+        if let Some(line) = accumulator.take() {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Combine two same-row TextLines into one. AABB and tight-box are unioned; angle is reset to
+/// axis-aligned (the merged span is by construction left-to-right); text is concatenated with
+/// a space, except when both adjacent characters are CJK (in which case nothing).
+fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
+    let mut bb = a.bounding_box;
+    bb.union(b.bounding_box);
+    let separator = match (a.text.chars().last(), b.text.chars().next()) {
+        (Some(p), Some(n)) if is_cjk_char(p) && is_cjk_char(n) => "",
+        _ => " ",
+    };
+    let a_left = tight_left(&a);
+    let a_right = tight_right(&a);
+    let b_left = tight_left(&b);
+    let b_right = tight_right(&b);
+    let mut text = a.text;
+    text.push_str(separator);
+    text.push_str(&b.text);
+    let new_left = a_left.min(b_left);
+    let new_right = a_right.max(b_right);
+    let new_cx = (new_left + new_right) * 0.5;
+    let new_width = (new_right - new_left).max(1.0);
+    let new_cy = (a.tight_box.cy + b.tight_box.cy) * 0.5;
+    let new_height = a.tight_box.height.max(b.tight_box.height);
+    let tight_box = OrientedRect {
+        cx: new_cx,
+        cy: new_cy,
+        width: new_width,
+        height: new_height,
+        angle_radians: 0.0,
+    };
+
+    let mut word_rects = a.word_rects;
+    word_rects.extend(b.word_rects);
+
+    TextLine {
+        text,
+        bounding_box: bb,
+        oriented_box: OrientedRect::axis_aligned(bb),
+        tight_box,
+        word_rects,
+    }
 }
 
 /// Group already-line-detected text into paragraphs.
@@ -482,6 +670,15 @@ pub fn group_lines_into_paragraphs(
     opts: ParagraphGroupingOptions,
 ) -> Vec<TextBlock> {
     let input_count = lines.len();
+    let lines = merge_same_row_detections(lines);
+    let post_merge_count = lines.len();
+    if post_merge_count != input_count {
+        log::info!(
+            "ppocr same-row pre-merge: {} → {} lines",
+            input_count,
+            post_merge_count,
+        );
+    }
     let lines = reorder_lines_for_grouping(lines);
     let mut paragraphs: Vec<TextBlock> = Vec::new();
     let mut current: Option<ParaState> = None;
@@ -504,21 +701,19 @@ pub fn group_lines_into_paragraphs(
                 let big_h = h.max(state.median_h);
                 let small_h = h.min(state.median_h).max(1.0);
                 let height_ratio_excess = big_h / small_h - 1.0;
-                // Use the tighter "opening" tolerance until the paragraph's height has been
-                // confirmed by at least one accepted line. After that, real per-line OCR
-                // jitter can be a touch larger than the heading/body gap we want to catch,
-                // so we relax to `height_tolerance`.
-                let active_height_tolerance = if state.lines.len() == 1 {
-                    opts.opening_height_tolerance
-                } else {
-                    opts.height_tolerance
-                };
-                let height_ok = height_ratio_excess <= active_height_tolerance;
+                let height_ok = height_ratio_excess <= opts.height_tolerance;
 
                 let gap = top - last_bottom;
                 let gap_ratio = gap / unit;
-                let gap_ok = gap >= -opts.max_overlap_ratio * unit
-                    && gap.max(0.0) <= opts.max_gap_ratio * unit;
+                // Dynamic upper bound: until we've seen any intra-paragraph gap we use
+                // `initial_max_gap_ratio` (generous, has to admit loose blog/article body);
+                // afterwards we stay within `leading_jitter` of the running leading baseline,
+                // capped at `max_gap_ratio` as a global sanity ceiling.
+                let gap_upper = match state.leading_gap_ratio {
+                    Some(baseline) => (baseline + opts.leading_jitter).min(opts.max_gap_ratio),
+                    None => opts.initial_max_gap_ratio.min(opts.max_gap_ratio),
+                };
+                let gap_ok = gap_ratio >= -opts.max_overlap_ratio && gap_ratio <= gap_upper;
 
                 let delta = left - state.column_left;
                 let abs_delta = delta.abs();
@@ -526,15 +721,31 @@ pub fn group_lines_into_paragraphs(
                 let indent_shift = delta < 0.0 && (-delta) <= opts.max_first_line_indent * unit;
                 let align_ok = aligned || indent_shift;
 
-                if height_ok && gap_ok && align_ok {
+                // List-item check: a new short line that starts with an uppercase letter or
+                // digit, separated from the previous line by more than
+                // `list_item_break_gap_ratio`, is treated as a fresh list/menu item.
+                //   * Sub-details like "-espresso and filter" start with punctuation and slip
+                //     past the first-character gate so they stay glued to the parent item.
+                //   * Prose body lines that happen to begin with a capitalised pronoun or
+                //     article ("I", "The", "After ...") are filtered out by the word-count
+                //     ceiling — menu items are 1–4 words, prose lines 5+.
+                let word_count = line.text.split_whitespace().count();
+                let list_item_start = starts_with_break_signal(&line.text)
+                    && word_count <= opts.max_list_item_word_count
+                    && gap_ratio > opts.list_item_break_gap_ratio;
+
+                if height_ok && gap_ok && align_ok && !list_item_start {
                     JoinDecision::Join
                 } else {
                     JoinDecision::Break {
                         height_excess: height_ratio_excess,
-                        height_limit: active_height_tolerance,
+                        height_limit: opts.height_tolerance,
                         gap_ratio,
+                        gap_upper,
+                        leading_baseline: state.leading_gap_ratio,
                         delta,
                         unit,
+                        list_item_start,
                     }
                 }
             }
@@ -545,10 +756,17 @@ pub fn group_lines_into_paragraphs(
                 let state = current
                     .as_mut()
                     .expect("join implies a current paragraph exists");
+                let unit = state.median_h.max(1.0);
+                let accepted_gap_ratio =
+                    (tight_top(&line) - tight_bottom(state.lines.last().unwrap())) / unit;
                 state.column_left = state.column_left.min(left);
                 // EMA towards each new line's tight-height. Reacts to drift over a few lines
                 // without letting a single outlier dominate.
                 state.median_h = state.median_h * 0.7 + h * 0.3;
+                state.leading_gap_ratio = Some(match state.leading_gap_ratio {
+                    Some(prev) => prev * 0.7 + accepted_gap_ratio * 0.3,
+                    None => accepted_gap_ratio,
+                });
                 state.lines.push(line);
             }
             JoinDecision::OpenFirst | JoinDecision::Break { .. } => {
@@ -556,15 +774,19 @@ pub fn group_lines_into_paragraphs(
                     height_excess,
                     height_limit,
                     gap_ratio,
+                    gap_upper,
+                    leading_baseline,
                     delta,
                     unit,
+                    list_item_start,
                 } = decision
                 {
                     log::debug!(
                         "ppocr group break: \"{}\" h={:.1} top={:.1} left={:.1} \
                          vs prev unit={:.1} → height_excess={:.2} (limit {:.2}) \
-                         gap_ratio={:.2} (overlap {:.2}, gap {:.2}) \
-                         delta_left={:.1} (align {:.1}, indent {:.1})",
+                         gap_ratio={:.2} (overlap {:.2}, upper {:.2}, baseline {:?}, \
+                         list-item {:.2}) delta_left={:.1} (align {:.1}, indent {:.1}) \
+                         list_item={}",
                         truncate_for_log(&line.text),
                         h,
                         top,
@@ -574,10 +796,13 @@ pub fn group_lines_into_paragraphs(
                         height_limit,
                         gap_ratio,
                         -opts.max_overlap_ratio,
-                        opts.max_gap_ratio,
+                        gap_upper,
+                        leading_baseline.map(|b| (b * 100.0).round() / 100.0),
+                        opts.list_item_break_gap_ratio,
                         delta,
                         opts.edge_alignment_tolerance * unit,
                         opts.max_first_line_indent * unit,
+                        list_item_start,
                     );
                 }
                 if let Some(state) = current.take() {
@@ -587,6 +812,7 @@ pub fn group_lines_into_paragraphs(
                     lines: vec![line],
                     column_left: left,
                     median_h: h,
+                    leading_gap_ratio: None,
                 });
             }
         }
@@ -612,9 +838,28 @@ enum JoinDecision {
         height_excess: f32,
         height_limit: f32,
         gap_ratio: f32,
+        gap_upper: f32,
+        leading_baseline: Option<f32>,
         delta: f32,
         unit: f32,
+        list_item_start: bool,
     },
+}
+
+/// Does this line *open* what looks like a fresh list / menu item? A leading uppercase letter
+/// or digit qualifies; lines starting with punctuation (e.g. "-espresso and filter") do not,
+/// so sub-details still join their parent item under the gate.
+fn starts_with_break_signal(text: &str) -> bool {
+    let Some(first) = text.trim_start().chars().next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return true;
+    }
+    if !first.is_alphabetic() {
+        return false;
+    }
+    first.is_uppercase()
 }
 
 fn truncate_for_log(text: &str) -> String {
@@ -1911,11 +2156,13 @@ mod tests {
     fn grouping_breaks_at_column_change() {
         // Reading-order sort interleaves two columns, alternating: A0, B0, A1, B1.
         // The grouper should split them by left-edge mismatch / large overlap.
+        // Column gap is sized at ~20 × tight_h to stay above the same-row pre-merge gate
+        // (real two-column page gutters comfortably exceed that).
         let lines = vec![
             line("col A line 1", 20, 10, 180, 24, 10.0),
-            line("col B line 1", 220, 10, 380, 24, 10.0),
+            line("col B line 1", 400, 10, 560, 24, 10.0),
             line("col A line 2", 20, 28, 180, 42, 10.0),
-            line("col B line 2", 220, 28, 380, 42, 10.0),
+            line("col B line 2", 400, 28, 560, 42, 10.0),
         ];
         let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
         assert_eq!(blocks.len(), 2);
@@ -1940,19 +2187,240 @@ mod tests {
     }
 
     #[test]
-    fn grouping_separates_heading_from_body_when_size_is_only_modestly_larger() {
-        // Mirrors the Stadsdorp poster case: a heading whose tight-height is ~22% over the
-        // body. The pre-`opening_height_tolerance` version (0.25) merged this pair; the new
-        // 0.15 opening gate must split them.
+    fn grouping_separates_heading_only_when_size_difference_is_clearly_larger_than_body_jitter() {
+        // The DB mask is content-tracking, so consecutive body lines can differ in tight_h by
+        // 20–40% just from cap/acronym/ascender mix. We deliberately accept that range so
+        // those don't false-break, which means a *modestly* larger heading (≤ 40% over body)
+        // gets glued to its body. Real headings tend to be 70%+ taller and still separate.
+        // First scenario: heading h=14 vs body h=11 → excess 0.27 → merges with body.
+        let merged = group_lines_into_paragraphs(
+            vec![
+                line("Modest heading", 20, 10, 200, 24, 14.0),
+                line("body line one", 20, 28, 200, 42, 11.0),
+                line("body line two", 20, 46, 200, 60, 11.0),
+            ],
+            ParagraphGroupingOptions::default(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].lines.len(), 3);
+
+        // Second scenario: heading h=20 vs body h=11 → excess 0.82 → still breaks.
+        let split = group_lines_into_paragraphs(
+            vec![
+                line("Real heading", 20, 10, 200, 34, 20.0),
+                line("body line one", 20, 38, 200, 56, 11.0),
+                line("body line two", 20, 60, 200, 78, 11.0),
+            ],
+            ParagraphGroupingOptions::default(),
+        );
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].lines.len(), 1);
+        assert_eq!(split[0].lines[0].text, "Real heading");
+        assert_eq!(split[1].lines.len(), 2);
+    }
+
+    #[test]
+    fn grouping_merges_body_paragraph_with_acronym_height_jitter() {
+        // The TMJ case from the zackoverflow blog: three body lines in one paragraph whose
+        // tight_h's vary because of mid-line acronyms (TMJ) and cap-heavy openings ("At
+        // first I"). Old 0.15 opening tolerance fired on excess 0.19 and 0.26; the new 0.40
+        // single tolerance lets them all stay together.
         let lines = vec![
-            line("Section heading", 20, 10, 200, 34, 24.4),
-            line("body line one", 20, 38, 200, 56, 20.0),
-            line("body line two", 20, 60, 200, 78, 20.0),
+            line(
+                "I used to get random headaches while writing code. At first I",
+                36,
+                558,
+                540,
+                570,
+                11.5,
+            ),
+            line(
+                "thought it was sleep, or hydration, or TMJ pain from clenching my",
+                36,
+                595,
+                540,
+                609,
+                13.7,
+            ),
+            line(
+                "jaw. It turned out to be eye strain.",
+                36,
+                633,
+                280,
+                644,
+                10.9,
+            ),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn grouping_does_not_treat_long_prose_lines_starting_with_capital_as_list_items() {
+        // Two body paragraphs in the same blog page. Each paragraph's first line happens to
+        // start with a capitalised pronoun/article ("There", "I"). Without the word-count
+        // gate the list-item rule fires on any gap > 0.8, splitting *every* such line off.
+        // The word-count ceiling (≤ 4) excludes these 10+ word prose lines, so they stay in
+        // their own paragraphs joined by the gap-baseline logic.
+        let lines = vec![
+            line(
+                "There are strategies like the 20/20/20 rule to avoid eye-strain, but",
+                36,
+                692,
+                540,
+                704,
+                11.1,
+            ),
+            line(
+                "I never could actually stick to it. It's very flow breaking to stare off",
+                36,
+                729,
+                540,
+                740,
+                11.0,
+            ),
+            line(
+                "into the distance every 20 minutes while working.",
+                36,
+                765,
+                380,
+                777,
+                11.6,
+            ),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn grouping_splits_menu_items_starting_with_capitals() {
+        // Coffee-menu shape: each item starts with a capital and sits with looser leading than
+        // body text (gap ≈ 1.2 × tight_h). The list-item-start gate should split each into its
+        // own paragraph. A sub-detail starting with punctuation (`-espresso and filter`) stays
+        // glued to its parent.
+        let lines = vec![
+            line("Espresso", 20, 10, 80, 22, 10.0),
+            line("Americano", 20, 34, 100, 46, 10.0),
+            line("Iced Black", 20, 58, 105, 70, 10.0),
+            line("Double Parked", 20, 82, 120, 94, 10.0),
+            line("-espresso and filter", 20, 106, 150, 118, 10.0),
+            line("Off The Hook +75c", 20, 134, 140, 146, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        let texts: Vec<Vec<&str>> = blocks
+            .iter()
+            .map(|b| b.lines.iter().map(|l| l.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                vec!["Espresso"],
+                vec!["Americano"],
+                vec!["Iced Black"],
+                vec!["Double Parked", "-espresso and filter"],
+                vec!["Off The Hook +75c"],
+            ]
+        );
+    }
+
+    #[test]
+    fn grouping_merges_per_word_detections_from_a_pixel_font_row() {
+        // PaddleOCR's DB detector splits wide-kerning pixel fonts into per-word boxes. All
+        // five "words" share a row (top ≈ 748); pre-merge should restore them into a single
+        // line, and the grouper should then return one paragraph with one line of text.
+        let lines = vec![
+            line("How", 169, 748, 220, 758, 9.5),
+            line("did", 226, 747, 275, 757, 9.5),
+            line("other", 282, 748, 360, 758, 9.5),
+            line("people", 366, 749, 455, 759, 9.5),
+            line("do?", 463, 748, 510, 758, 9.5),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 1);
+        assert_eq!(blocks[0].lines[0].text, "How did other people do?");
+    }
+
+    #[test]
+    fn grouping_does_not_merge_menu_columns_into_one_row() {
+        // Item name on the left and price on the right at the same vertical position. Real
+        // menus place these in distinct columns with a generous gutter (here ~14 × tight_h),
+        // and pre-merge must leave them as two separate rows so column grouping can keep them
+        // apart.
+        let lines = vec![
+            line("Espresso", 130, 200, 200, 212, 10.0),
+            line("3.00", 360, 200, 410, 212, 10.0),
         ];
         let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].lines.len(), 1);
-        assert_eq!(blocks[0].lines[0].text, "Section heading");
+        assert_eq!(blocks[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn grouping_keeps_body_lines_starting_uppercase_after_sentence_at_line_head_when_leading_is_tight()
+     {
+        // A justified body paragraph where a new sentence happens to begin at a line head.
+        // Tight leading (gap_ratio ≈ 0.4) puts the join under `list_item_break_gap_ratio`, so
+        // the paragraph stays whole even though line 3 starts uppercase.
+        let lines = vec![
+            line("first sentence ends here.", 20, 10, 240, 24, 10.0),
+            line("Second sentence begins on this", 20, 28, 240, 42, 10.0),
+            line("line and wraps to here.", 20, 46, 220, 60, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn grouping_merges_loose_leading_blog_body() {
+        // Mirrors the zackoverflow.dev blog body in the bug report: each line is fully
+        // detected (one box per visual row), heights vary 9–12 from regular vs cap-heavy
+        // content, line tops are ~36–38 px apart with tight_h ≈ 10 (gap_ratio ≈ 2.5). Before
+        // the adaptive gate this exceeded the fixed `max_gap_ratio = 1.8` and every line
+        // ended up its own paragraph. Three intra-paragraph lines plus a fourth across a
+        // bigger gap should now collapse to two paragraphs.
+        let lines = vec![
+            line(
+                "low-refresh B/W screen that's easier to look at seems to reduce",
+                35,
+                82,
+                540,
+                92,
+                9.3,
+            ),
+            line(
+                "visual noise / stimulation and help me read text more intently and",
+                35,
+                117,
+                540,
+                128,
+                10.3,
+            ),
+            line("with less distractions.", 37, 153, 200, 164, 10.4),
+            line(
+                "I also just find the screen more comfortable to look at, which",
+                36,
+                213,
+                540,
+                225,
+                11.7,
+            ),
+            line(
+                "seems to result in me getting more hours of productivity.",
+                36,
+                251,
+                540,
+                262,
+                11.0,
+            ),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lines.len(), 3);
         assert_eq!(blocks[1].lines.len(), 2);
     }
 

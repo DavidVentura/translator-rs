@@ -14,7 +14,17 @@ use crate::mnn_inference::MnnSession;
 
 const REC_TARGET_HEIGHT: u32 = 48;
 const REC_MIN_SCORE: f32 = 0.3;
-const REC_PUNCT_MIN_SCORE: f32 = 0.1;
+/// Per-character CTC score gate for punctuation glyphs. Kept lower than `REC_MIN_SCORE`
+/// because real punctuation is small and ambiguous (period vs comma vs apostrophe), so its
+/// max-prob legitimately runs lower than letter glyphs. 0.3 still rejects the single rogue
+/// glyphs that texture/JPEG-ringing artifacts produce on non-text regions.
+const REC_PUNCT_MIN_SCORE: f32 = 0.3;
+/// Line-level confidence gate — analogous to PaddleOCR upstream's `drop_score = 0.5`. Lines
+/// whose mean accepted-character CTC score is below this threshold are discarded after
+/// recognition. The dominant filter for spurious detections from non-text image regions (the
+/// per-pixel `DET_SCORE_THRESHOLD` and per-character `REC_MIN_SCORE` gates accept
+/// individually-weak signals; this rejects whole lines that never look strong on average).
+const REC_DROP_SCORE: f32 = 0.5;
 /// One rec session per parallel worker, dispatched via rayon. Mirrors the demo's strategy:
 /// each session runs single-threaded (intra=1) on its own crop. Inter-session parallelism beats
 /// intra-session padding-and-batching on this workload because crop widths are heterogeneous
@@ -25,7 +35,18 @@ const REC_PARALLELISM: usize = 4;
 // step in if something pathological reaches us.
 const DET_MAX_SIDE: u32 = 4096;
 const DET_SCORE_THRESHOLD: f32 = 0.3;
-const DET_MIN_AREA: u32 = 16;
+/// Mean DB-heatmap probability inside a contour's AABB before that contour is allowed to
+/// become a detection. Analogous to upstream PaddleOCR's `det_db_box_thresh` (default 0.6) in
+/// "fast" `score_mode`. Real text masks score 0.7+ on average inside their box; spurious
+/// blobs from texture or compression noise typically sit at 0.35–0.45 — just enough to clear
+/// the per-pixel `DET_SCORE_THRESHOLD` but well below this gate.
+const DET_BOX_MIN_SCORE: f32 = 0.6;
+/// Minimum contour AABB area (in detector-output mask pixels) for a detection to survive.
+/// Tighter than upstream's effective minimum so noise blobs from texture / JPEG ringing /
+/// foliage that just clear `DET_SCORE_THRESHOLD` get dropped before they ever hit the
+/// recognizer. Real text glyphs at typical OCR scale fill many hundreds of mask pixels, so
+/// the floor is comfortably below legitimate text.
+const DET_MIN_AREA: u32 = 64;
 const DET_UNCLIP_RATIO: f32 = 1.6;
 const DET_BOX_BORDER: u32 = 4;
 
@@ -195,10 +216,15 @@ impl PpocrEngine {
 
         let mut lines = Vec::with_capacity(n_crops);
         let mut empty_count = 0usize;
+        let mut low_score_count = 0usize;
         for (index, result) in results.into_iter().enumerate() {
             let result = result?;
             if result.text.trim().is_empty() {
                 empty_count += 1;
+                continue;
+            }
+            if result.confidence < REC_DROP_SCORE {
+                low_score_count += 1;
                 continue;
             }
             {
@@ -224,12 +250,14 @@ impl PpocrEngine {
             }
         }
         log::info!(
-            "ppocr: {}/{} regions recognized ({} empty) — \
+            "ppocr: {}/{} regions recognized ({} empty, {} below drop_score {:.2}) — \
              rgba_pack={:.1}ms crops/dewarp={:.1}ms \
              rec_wall={:.1}ms (cpu pre={:.1}ms infer={:.1}ms post={:.1}ms over {} workers)",
             lines.len(),
             n_crops,
             empty_count,
+            low_score_count,
+            REC_DROP_SCORE,
             rgba_ms,
             crops_ms,
             rec_wall_ms,
@@ -350,7 +378,9 @@ impl PpocrDetector {
             .iter()
             .map(|&v| if v > DET_SCORE_THRESHOLD { 255 } else { 0 })
             .collect();
-        let boxes = extract_boxes(&binary, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h);
+        let boxes = extract_boxes(
+            &binary, &mask, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h,
+        );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
         log::info!(
             "ppocr det: input_pad={}x{} scaled={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{} — pre={:.1}ms infer={:.1}ms post={:.1}ms",
@@ -410,6 +440,7 @@ fn preprocess_for_det(image: &DynamicImage, pad_w: u32, pad_h: u32) -> Vec<f32> 
 
 fn extract_boxes(
     mask: &[u8],
+    heatmap: &[f32],
     mask_w: u32,
     mask_h: u32,
     valid_w: u32,
@@ -424,6 +455,7 @@ fn extract_boxes(
     let scale_x = orig_w as f32 / valid_w as f32;
     let scale_y = orig_h as f32 / valid_h as f32;
     let mut boxes = Vec::new();
+    let mut weak_score_count = 0usize;
 
     for contour in contours {
         if contour.parent.is_some() || contour.points.len() < 4 {
@@ -454,6 +486,29 @@ fn extract_boxes(
         let box_w = (max_x - min_x) as u32;
         let box_h = (max_y - min_y) as u32;
         if box_w * box_h < DET_MIN_AREA {
+            continue;
+        }
+
+        // Box-score gate (PaddleOCR's `det_db_box_thresh`, "fast" score_mode): mean heatmap
+        // probability over the contour's AABB on the *raw* float output. Real text masks
+        // average 0.7+ here; texture/compression noise that just barely cleared the per-pixel
+        // threshold rarely makes it past 0.5.
+        let mut score_sum = 0.0f32;
+        let mut score_n = 0usize;
+        for y in (min_y as u32)..(max_y as u32).min(mask_h) {
+            let row = (y as usize) * (mask_w as usize);
+            for x in (min_x as u32)..(max_x as u32).min(mask_w) {
+                score_sum += heatmap[row + x as usize];
+                score_n += 1;
+            }
+        }
+        let box_score = if score_n > 0 {
+            score_sum / score_n as f32
+        } else {
+            0.0
+        };
+        if box_score < DET_BOX_MIN_SCORE {
+            weak_score_count += 1;
             continue;
         }
 
@@ -495,6 +550,13 @@ fn extract_boxes(
             },
             contour: Some(scaled_contour),
         });
+    }
+    if weak_score_count > 0 {
+        log::info!(
+            "ppocr det: {} contour(s) below box-score gate {:.2}",
+            weak_score_count,
+            DET_BOX_MIN_SCORE,
+        );
     }
     boxes
 }
