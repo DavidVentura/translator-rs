@@ -6,9 +6,11 @@ use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 use crate::ocr::{
-    DetectedWord, PreparedImageOverlay, ReadingOrder, Rect, TextBlock, build_text_blocks,
+    DetectedWord, PreparedImageOverlay, ReadingOrder, Rect, TextBlock, TextLine, build_text_blocks,
     prepare_overlay_image,
 };
+#[cfg(feature = "ppocr")]
+use crate::ppocr::PpocrEngine;
 use crate::settings::BackgroundMode;
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
 use crate::tesseract::{PageSegMode, TesseractWrapper};
@@ -91,6 +93,71 @@ pub(crate) fn translate_image_rgba_in_snapshot(
     reading_order: ReadingOrder,
     background_mode: BackgroundMode,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
+    let blocks = build_tesseract_blocks(
+        ocr_pool,
+        snapshot,
+        rgba_bytes,
+        width,
+        height,
+        source_code,
+        min_confidence,
+        reading_order,
+    )?;
+    finalize_image_overlay(
+        engine,
+        snapshot,
+        rgba_bytes,
+        width,
+        height,
+        source_code,
+        target_code,
+        blocks,
+        background_mode,
+        reading_order,
+    )
+}
+
+#[cfg(feature = "ppocr")]
+pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
+    engine: &Mutex<BergamotEngine>,
+    ppocr: &PpocrEngine,
+    snapshot: &CatalogSnapshot,
+    rgba_bytes: &[u8],
+    width: u32,
+    height: u32,
+    source_code: &LanguageCode,
+    target_code: &LanguageCode,
+    background_mode: BackgroundMode,
+    reading_order: ReadingOrder,
+) -> Result<PreparedImageOverlay, TranslatorError> {
+    let lines = ppocr
+        .recognize_rgba(rgba_bytes, width, height)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
+    let blocks = ppocr_lines_to_blocks(lines);
+    finalize_image_overlay(
+        engine,
+        snapshot,
+        rgba_bytes,
+        width,
+        height,
+        source_code,
+        target_code,
+        blocks,
+        background_mode,
+        reading_order,
+    )
+}
+
+fn build_tesseract_blocks(
+    ocr_pool: &OcrPool,
+    snapshot: &CatalogSnapshot,
+    rgba_bytes: &[u8],
+    width: u32,
+    height: u32,
+    source_code: &LanguageCode,
+    min_confidence: u32,
+    reading_order: ReadingOrder,
+) -> Result<Vec<TextBlock>, TranslatorError> {
     let bytes_per_pixel = 4i32;
     let i_width = width as i32;
     let i_height = height as i32;
@@ -106,45 +173,75 @@ pub(crate) fn translate_image_rgba_in_snapshot(
     let join_without_spaces = source_code.as_str() == "ja";
     let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomLeftToRight;
 
-    // OCR phase: leases an idle pool worker, runs to completion, releases.
-    // Holding the bergamot engine lock here would serialize parallel callers.
-    let blocks = {
-        let mut cache_guard = ocr_pool.lease();
-        with_ocr_engine(
-            &mut cache_guard,
-            snapshot,
-            source_code.as_str(),
-            reading_order,
-            |ocr| {
-                ocr.set_page_seg_mode(page_seg_mode);
-                ocr.set_frame(
-                    rgba_bytes,
-                    i_width,
-                    i_height,
-                    bytes_per_pixel,
-                    bytes_per_line,
-                )
-                .map_err(|err| format!("failed to set OCR frame: {err}"))?;
-                let words = ocr
-                    .get_word_boxes()
-                    .map_err(|err| format!("failed to read OCR words: {err}"))?;
-                let detected_words = words
-                    .into_iter()
-                    .map(map_tesseract_word)
-                    .collect::<Vec<_>>();
-                Ok(build_text_blocks(
-                    &detected_words,
-                    min_confidence,
-                    join_without_spaces,
-                    relax_single_char_confidence,
-                ))
-            },
-        )
-        .map_err(TranslatorError::ocr)?
-    };
+    let mut cache_guard = ocr_pool.lease();
+    with_ocr_engine(
+        &mut cache_guard,
+        snapshot,
+        source_code.as_str(),
+        reading_order,
+        |ocr| {
+            ocr.set_page_seg_mode(page_seg_mode);
+            ocr.set_frame(
+                rgba_bytes,
+                i_width,
+                i_height,
+                bytes_per_pixel,
+                bytes_per_line,
+            )
+            .map_err(|err| format!("failed to set OCR frame: {err}"))?;
+            let words = ocr
+                .get_word_boxes()
+                .map_err(|err| format!("failed to read OCR words: {err}"))?;
+            let detected_words = words
+                .into_iter()
+                .map(map_tesseract_word)
+                .collect::<Vec<_>>();
+            Ok(build_text_blocks(
+                &detected_words,
+                min_confidence,
+                join_without_spaces,
+                relax_single_char_confidence,
+            ))
+        },
+    )
+    .map_err(TranslatorError::ocr)
+}
 
-    // Translation phase: bergamot engine is single-instance + Mutex-protected.
-    // Slimt internally pools workers, so contention is fine.
+#[cfg(feature = "ppocr")]
+fn ppocr_lines_to_blocks(lines: Vec<crate::ppocr::PpocrLine>) -> Vec<TextBlock> {
+    lines
+        .into_iter()
+        .filter(|line| !line.text.trim().is_empty())
+        .map(|line| {
+            let rect = Rect {
+                left: line.bounding_box.left,
+                top: line.bounding_box.top,
+                right: line.bounding_box.right,
+                bottom: line.bounding_box.bottom,
+            };
+            TextBlock {
+                lines: vec![TextLine {
+                    text: line.text,
+                    bounding_box: rect,
+                    word_rects: vec![rect],
+                }],
+            }
+        })
+        .collect()
+}
+
+fn finalize_image_overlay(
+    engine: &Mutex<BergamotEngine>,
+    snapshot: &CatalogSnapshot,
+    rgba_bytes: &[u8],
+    width: u32,
+    height: u32,
+    source_code: &LanguageCode,
+    target_code: &LanguageCode,
+    blocks: Vec<TextBlock>,
+    background_mode: BackgroundMode,
+    reading_order: ReadingOrder,
+) -> Result<PreparedImageOverlay, TranslatorError> {
     let translated_blocks = {
         let mut engine_guard = engine.lock().expect("bergamot engine lock poisoned");
         translate_block_texts(

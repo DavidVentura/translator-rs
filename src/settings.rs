@@ -9,6 +9,14 @@ pub enum BackgroundMode {
     AutoDetect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PreferredOcrEngine {
+    Tesseract,
+    #[default]
+    Paddle,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSettings {
     pub default_target_language_code: String,

@@ -28,8 +28,14 @@ use crate::tarkka::{
 use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
 #[cfg(feature = "tesseract")]
 use crate::ocr::{PreparedImageOverlay, ReadingOrder};
+#[cfg(feature = "ppocr")]
+use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
 #[cfg(feature = "tesseract")]
 use crate::ocr_runtime::{OcrPool, translate_image_rgba_in_snapshot};
+#[cfg(feature = "ppocr")]
+use crate::ppocr::PpocrEngine;
+#[cfg(feature = "tesseract")]
+use crate::settings::PreferredOcrEngine;
 
 #[cfg(feature = "tts")]
 use crate::api::VoiceName;
@@ -61,6 +67,8 @@ pub struct TranslatorSession {
     ocr: OcrPool,
     #[cfg(feature = "doc-align")]
     doc_align: Mutex<DocAlignCache>,
+    #[cfg(feature = "ppocr")]
+    ppocr: Mutex<PpocrCache>,
 }
 
 #[cfg(feature = "doc-align")]
@@ -70,6 +78,21 @@ struct DocAlignCache {
 
 #[cfg(feature = "doc-align")]
 impl DocAlignCache {
+    fn new() -> Self {
+        Self { state: None }
+    }
+}
+
+#[cfg(feature = "ppocr")]
+struct PpocrCache {
+    /// Cache key: (det path, rec path, keys path). Tied to the script — when the user
+    /// switches source language, we may need to rebuild the recognizer for a different
+    /// charset.
+    state: Option<(String, String, String, Arc<PpocrEngine>)>,
+}
+
+#[cfg(feature = "ppocr")]
+impl PpocrCache {
     fn new() -> Self {
         Self { state: None }
     }
@@ -93,6 +116,8 @@ impl TranslatorSession {
             ocr: OcrPool::new(OCR_POOL_SIZE),
             #[cfg(feature = "doc-align")]
             doc_align: Mutex::new(DocAlignCache::new()),
+            #[cfg(feature = "ppocr")]
+            ppocr: Mutex::new(PpocrCache::new()),
         }
     }
 
@@ -305,8 +330,45 @@ impl TranslatorSession {
         min_confidence: u32,
         reading_order: ReadingOrder,
         background_mode: BackgroundMode,
+        preferred_engine: PreferredOcrEngine,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
+        let src = LanguageCode::from(source_code);
+        let tgt = LanguageCode::from(target_code);
+
+        #[cfg(feature = "ppocr")]
+        if matches!(preferred_engine, PreferredOcrEngine::Paddle) {
+            match self.ppocr_engine_for(&src) {
+                Ok(ppocr) => {
+                    log::info!("ocr engine: ppocr (source={})", source_code);
+                    return translate_image_rgba_ppocr_in_snapshot(
+                        self.engine(),
+                        &ppocr,
+                        &snap,
+                        rgba_bytes,
+                        width,
+                        height,
+                        &src,
+                        &tgt,
+                        background_mode,
+                        reading_order,
+                    )
+                    .map_err(|e| {
+                        if e.message.to_lowercase().contains("no text found") {
+                            TranslatorError::ocr("No text found in image (engine=ppocr)")
+                        } else {
+                            e
+                        }
+                    });
+                }
+                Err(err) => log::warn!(
+                    "ppocr unavailable for {}, falling back to tesseract: {err}",
+                    source_code
+                ),
+            }
+        }
+        log::info!("ocr engine: tesseract (source={})", source_code);
+
         translate_image_rgba_in_snapshot(
             self.engine(),
             &self.ocr,
@@ -314,12 +376,123 @@ impl TranslatorSession {
             rgba_bytes,
             width,
             height,
-            &LanguageCode::from(source_code),
-            &LanguageCode::from(target_code),
+            &src,
+            &tgt,
             min_confidence,
             reading_order,
             background_mode,
         )
+        .map_err(|e| {
+            if e.message.to_lowercase().contains("no text found") {
+                TranslatorError::ocr("No text found in image (engine=tesseract)")
+            } else {
+                e
+            }
+        })
+    }
+
+    #[cfg(feature = "ppocr")]
+    fn ppocr_engine_for(
+        &self,
+        source_code: &LanguageCode,
+    ) -> Result<Arc<PpocrEngine>, TranslatorError> {
+        use crate::api::TranslatorErrorKind;
+
+        let snap = self.snapshot();
+        let catalog = &snap.catalog;
+        let rec_pack_id = catalog
+            .ocr_pack_id_for_engine(source_code, "ppocr")
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::MissingAsset,
+                    format!("no ppocr pack for language {}", source_code.as_str()),
+                )
+            })?;
+        let rec_pack = catalog.pack(&rec_pack_id).ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
+                format!("ppocr pack {rec_pack_id} missing from catalog"),
+            )
+        })?;
+        let det_pack_id = rec_pack.depends_on.first().ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
+                format!("ppocr pack {rec_pack_id} has no detector dependency"),
+            )
+        })?;
+        let det_pack = catalog.pack(det_pack_id).ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
+                format!("ppocr detector pack {det_pack_id} missing from catalog"),
+            )
+        })?;
+
+        let pack_installed = |pack_id: &str| {
+            snap.pack_statuses
+                .get(pack_id)
+                .map(|s| s.installed)
+                .unwrap_or(false)
+        };
+        if !pack_installed(&rec_pack_id) || !pack_installed(det_pack_id) {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
+                format!(
+                    "ppocr models not installed for {} (rec={}, det={})",
+                    source_code.as_str(),
+                    rec_pack_id,
+                    det_pack_id
+                ),
+            ));
+        }
+
+        let base = std::path::Path::new(&snap.base_dir);
+        let det_path = det_pack
+            .files
+            .iter()
+            .find(|f| f.name.ends_with(".onnx"))
+            .map(|f| base.join(&f.install_path))
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::MissingAsset,
+                    "ppocr detector pack has no .onnx file",
+                )
+            })?;
+        let rec_path = rec_pack
+            .files
+            .iter()
+            .find(|f| f.name.ends_with(".onnx"))
+            .map(|f| base.join(&f.install_path))
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::MissingAsset,
+                    "ppocr rec pack has no .onnx file",
+                )
+            })?;
+        let keys_path = rec_pack
+            .files
+            .iter()
+            .find(|f| f.name.ends_with("_keys.txt"))
+            .map(|f| base.join(&f.install_path))
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::MissingAsset,
+                    "ppocr rec pack has no _keys.txt file",
+                )
+            })?;
+
+        let det_str = det_path.to_string_lossy().into_owned();
+        let rec_str = rec_path.to_string_lossy().into_owned();
+        let keys_str = keys_path.to_string_lossy().into_owned();
+
+        let mut cache = self.ppocr.lock().expect("ppocr cache poisoned");
+        if let Some((d, r, k, engine)) = &cache.state {
+            if d == &det_str && r == &rec_str && k == &keys_str {
+                return Ok(Arc::clone(engine));
+            }
+        }
+        let engine = Arc::new(PpocrEngine::load(&det_path, &rec_path, &keys_path, 4)?);
+        cache.state = Some((det_str, rec_str, keys_str, Arc::clone(&engine)));
+        Ok(engine)
     }
 
     pub fn plan_download(
@@ -579,7 +752,14 @@ impl TranslatorSession {
         let Some(mut detection) = self.doc_aligner()?.detect(rgba, width, height)? else {
             return Ok(None);
         };
-        detection.quad = crate::doc_align_refine::refine_quad(rgba, width, height, &detection.quad);
+        let refined =
+            crate::doc_align_refine::refine_quad_with_quality(rgba, width, height, &detection.quad);
+        // Suppress the pre-fill when the model's quad doesn't trace real image edges. Better to
+        // show "no document detected" than to hand the user a confidently-wrong quad to nudge.
+        if refined.quality == crate::doc_align_refine::QuadQuality::Bad {
+            return Ok(None);
+        }
+        detection.quad = refined.quad;
         Ok(Some(detection))
     }
 

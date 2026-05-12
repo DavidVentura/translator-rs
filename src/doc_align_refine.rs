@@ -31,21 +31,63 @@ const MIN_INLIERS: usize = 12;
 const GRAD_MIN_MAGNITUDE: f32 = 30.0;
 const MAX_CORNER_DELTA_FRAC: f32 = 0.08;
 
-/// Refine `model_quad` by snapping its sides to nearby strong image edges. Returns the model
-/// quad unchanged if edge support is too weak or refinement disagrees by more than
-/// `MAX_CORNER_DELTA_FRAC` of the image diagonal.
-pub fn refine_quad(
+/// Coverage analysis: split each side into N_COVERAGE_BUCKETS segments along its length, and
+/// require ≥MIN_CANDIDATES_PER_BUCKET candidate edge points in at least MIN_SUPPORTED_BUCKETS
+/// of them for the side to count as "supported." This catches the failure mode where the model
+/// predicts a side that lies on a real edge for only one segment (the rest extending through
+/// unrelated scene content) — total inlier count alone passes that case, coverage rejects it.
+const N_COVERAGE_BUCKETS: usize = 3;
+const MIN_CANDIDATES_PER_BUCKET: usize = 3;
+const MIN_SUPPORTED_BUCKETS: usize = 2;
+
+/// Quality of the refined quad — how much of the model's predicted boundary actually lies on
+/// real image edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum QuadQuality {
+    /// All 4 sides have edge support spread along their length. The refined quad is
+    /// trustworthy.
+    Good,
+    /// 3 of 4 sides are supported; one is occluded or low-contrast. Usually still close, but
+    /// callers may want to surface "double-check this" to the user.
+    Weak,
+    /// 2 or fewer sides have spread edge support. The model's quad does not trace real image
+    /// edges — likely a hallucination. Callers should typically suppress the pre-fill and let
+    /// the user draw the quad manually.
+    Bad,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RefinementResult {
+    pub quad: DocumentQuad,
+    pub quality: QuadQuality,
+    /// How many of the 4 model-predicted sides had edge support spread across ≥2 of 3 segments.
+    pub supported_sides: u8,
+}
+
+/// Refine `model_quad` and report quality. See [`RefinementResult`] for the meaning of
+/// `quality` / `supported_sides`. The returned `quad` is the refined quad (or the model quad
+/// if refinement was rejected because it would have moved corners too far); use `quality` to
+/// decide whether to use it at all.
+pub fn refine_quad_with_quality(
     rgba: &[u8],
     width: u32,
     height: u32,
     model_quad: &DocumentQuad,
-) -> DocumentQuad {
+) -> RefinementResult {
+    let fallback = |q: DocumentQuad, supported: u8| RefinementResult {
+        quad: q,
+        quality: classify(supported),
+        supported_sides: supported,
+    };
+
     if width < 4 || height < 4 {
-        return model_quad.clone();
+        return fallback(model_quad.clone(), 0);
     }
     let expected = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected {
-        return model_quad.clone();
+        return fallback(model_quad.clone(), 0);
     }
 
     let gray = rgba_to_gray(rgba, width, height);
@@ -60,11 +102,15 @@ pub fn refine_quad(
     let side_pairs = [(0, 1), (1, 2), (2, 3), (3, 0)];
 
     let mut refined_sides = [Line::ZERO; 4];
+    let mut supported_sides: u8 = 0;
     for (i, (a_idx, b_idx)) in side_pairs.iter().enumerate() {
         let a = corners[*a_idx];
         let b = corners[*b_idx];
         let baseline = Line::through_two_points(a, b);
         let candidates = collect_edge_candidates(&gx, &gy, width, height, a, b, band);
+        if side_is_supported(&candidates, a, b) {
+            supported_sides += 1;
+        }
         let refined = if candidates.len() >= MIN_INLIERS {
             ransac_line_fit(
                 &candidates,
@@ -81,16 +127,16 @@ pub fn refine_quad(
 
     // Intersect adjacent refined sides to recover corners.
     let Some(tl) = intersect(&refined_sides[3], &refined_sides[0]) else {
-        return model_quad.clone();
+        return fallback(model_quad.clone(), supported_sides);
     };
     let Some(tr) = intersect(&refined_sides[0], &refined_sides[1]) else {
-        return model_quad.clone();
+        return fallback(model_quad.clone(), supported_sides);
     };
     let Some(br) = intersect(&refined_sides[1], &refined_sides[2]) else {
-        return model_quad.clone();
+        return fallback(model_quad.clone(), supported_sides);
     };
     let Some(bl) = intersect(&refined_sides[2], &refined_sides[3]) else {
-        return model_quad.clone();
+        return fallback(model_quad.clone(), supported_sides);
     };
 
     let refined_corners = [tl, tr, br, bl];
@@ -99,11 +145,59 @@ pub fn refine_quad(
         let dx = refined_corners[i].x - corners[i].x;
         let dy = refined_corners[i].y - corners[i].y;
         if (dx * dx + dy * dy).sqrt() > max_delta {
-            return model_quad.clone();
+            return fallback(model_quad.clone(), supported_sides);
         }
     }
 
-    DocumentQuad::from_corners(refined_corners)
+    fallback(DocumentQuad::from_corners(refined_corners), supported_sides)
+}
+
+/// Backwards-compatible thin wrapper: refine and return just the quad, discarding quality.
+/// Most callers should use [`refine_quad_with_quality`] so they can suppress the pre-fill on
+/// `QuadQuality::Bad`.
+pub fn refine_quad(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    model_quad: &DocumentQuad,
+) -> DocumentQuad {
+    refine_quad_with_quality(rgba, width, height, model_quad).quad
+}
+
+fn classify(supported_sides: u8) -> QuadQuality {
+    match supported_sides {
+        4 => QuadQuality::Good,
+        3 => QuadQuality::Weak,
+        _ => QuadQuality::Bad,
+    }
+}
+
+/// A side is "supported" when candidate edge points exist along most of its length, not just
+/// bunched at one end. Project each candidate onto the side's tangent direction to get its
+/// fractional position along the side, bucket into `N_COVERAGE_BUCKETS` segments, and require
+/// ≥`MIN_CANDIDATES_PER_BUCKET` candidates in ≥`MIN_SUPPORTED_BUCKETS` buckets.
+fn side_is_supported(candidates: &[(f32, f32)], a: DocumentPoint, b: DocumentPoint) -> bool {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1.0 {
+        return false;
+    }
+    let mut bucket_counts = [0usize; N_COVERAGE_BUCKETS];
+    for (px, py) in candidates {
+        // Fractional position along the side: t = ((p - a) · (b - a)) / |b - a|²
+        let t = ((px - a.x) * dx + (py - a.y) * dy) / len_sq;
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+        let idx = ((t * N_COVERAGE_BUCKETS as f32) as usize).min(N_COVERAGE_BUCKETS - 1);
+        bucket_counts[idx] += 1;
+    }
+    let populated = bucket_counts
+        .iter()
+        .filter(|&&c| c >= MIN_CANDIDATES_PER_BUCKET)
+        .count();
+    populated >= MIN_SUPPORTED_BUCKETS
 }
 
 fn rgba_to_gray(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -397,7 +491,8 @@ mod tests {
 
     #[test]
     fn refine_quad_falls_back_when_no_edges_present() {
-        // Uniform image: no gradient anywhere. Refinement must return the model quad untouched.
+        // Uniform image: no gradient anywhere. Refinement must return the model quad untouched
+        // and report Bad quality (no side has edge support).
         let w = 100u32;
         let h = 100u32;
         let rgba = vec![200u8; (w * h * 4) as usize];
@@ -407,7 +502,69 @@ mod tests {
             DocumentPoint { x: 90.0, y: 90.0 },
             DocumentPoint { x: 10.0, y: 90.0 },
         ]);
-        let refined = refine_quad(&rgba, w, h, &model);
-        assert_eq!(refined, model);
+        let result = refine_quad_with_quality(&rgba, w, h, &model);
+        assert_eq!(result.quad, model);
+        assert_eq!(result.supported_sides, 0);
+        assert_eq!(result.quality, QuadQuality::Bad);
+    }
+
+    #[test]
+    fn refine_quad_reports_good_quality_when_all_sides_have_edges() {
+        // Same synthetic rectangle as the snap test — all 4 sides have a strong edge running
+        // their full length, so all 4 sides should count as supported.
+        let w = 200u32;
+        let h = 200u32;
+        let mut rgba = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let on_top = y == 40 && (40..=160).contains(&x);
+                let on_bot = y == 160 && (40..=160).contains(&x);
+                let on_left = x == 40 && (40..=160).contains(&y);
+                let on_right = x == 160 && (40..=160).contains(&y);
+                if on_top || on_bot || on_left || on_right {
+                    let i = ((y * w + x) * 4) as usize;
+                    rgba[i] = 0;
+                    rgba[i + 1] = 0;
+                    rgba[i + 2] = 0;
+                }
+            }
+        }
+        let model = DocumentQuad::from_corners([
+            DocumentPoint { x: 34.0, y: 34.0 },
+            DocumentPoint { x: 166.0, y: 34.0 },
+            DocumentPoint { x: 166.0, y: 166.0 },
+            DocumentPoint { x: 34.0, y: 166.0 },
+        ]);
+        let result = refine_quad_with_quality(&rgba, w, h, &model);
+        assert_eq!(result.supported_sides, 4);
+        assert_eq!(result.quality, QuadQuality::Good);
+    }
+
+    #[test]
+    fn refine_quad_reports_bad_when_only_one_side_supported() {
+        // Image with a single horizontal black line across the top — only the top side of the
+        // quad has any edge to snap to; left/right/bottom run through uniform white.
+        let w = 200u32;
+        let h = 200u32;
+        let mut rgba = vec![255u8; (w * h * 4) as usize];
+        for x in 0..w {
+            let i = ((40 * w + x) * 4) as usize;
+            rgba[i] = 0;
+            rgba[i + 1] = 0;
+            rgba[i + 2] = 0;
+        }
+        let model = DocumentQuad::from_corners([
+            DocumentPoint { x: 20.0, y: 38.0 },
+            DocumentPoint { x: 180.0, y: 38.0 },
+            DocumentPoint { x: 180.0, y: 180.0 },
+            DocumentPoint { x: 20.0, y: 180.0 },
+        ]);
+        let result = refine_quad_with_quality(&rgba, w, h, &model);
+        assert!(
+            result.supported_sides <= 1,
+            "expected ≤1 supported sides, got {}",
+            result.supported_sides
+        );
+        assert_eq!(result.quality, QuadQuality::Bad);
     }
 }

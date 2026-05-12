@@ -817,6 +817,7 @@ fn translate_one_xobject(
             DEFAULT_MIN_CONFIDENCE,
             ReadingOrder::LeftToRight,
             BackgroundMode::AutoDetect,
+            crate::settings::PreferredOcrEngine::default(),
         )
         .map_err(|e: TranslatorError| {
             // The OCR layer returns "No text found in image" as a normal
@@ -1765,6 +1766,7 @@ fn ocr_page(
             DEFAULT_MIN_CONFIDENCE,
             ReadingOrder::LeftToRight,
             BackgroundMode::AutoDetect,
+            crate::settings::PreferredOcrEngine::default(),
         )
         .map_err(|e: TranslatorError| {
             if e.message.to_lowercase().contains("no text") {

@@ -16,7 +16,7 @@ pub mod font_provider;
 pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub mod image_render;
-#[cfg(feature = "doc-align")]
+#[cfg(any(feature = "doc-align", feature = "ppocr"))]
 mod inference;
 pub mod language;
 pub mod language_detect;
@@ -49,6 +49,8 @@ mod pdf_text_overlay;
 pub mod pdf_translate;
 #[cfg(feature = "pdf")]
 pub mod pdf_write;
+#[cfg(feature = "ppocr")]
+pub mod ppocr;
 mod routing;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod script;
@@ -80,7 +82,7 @@ pub use language_detect::DetectionResult;
 pub use ocr::{OverlayColors, PreparedImageOverlay, ReadingOrder, Rect, sample_overlay_colors};
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
-pub use settings::BackgroundMode;
+pub use settings::{BackgroundMode, PreferredOcrEngine};
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
 };
