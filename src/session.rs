@@ -26,8 +26,9 @@ use crate::tarkka::{
 
 #[cfg(feature = "doc-align")]
 use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
+use crate::ocr::PreparedImageOverlay;
 #[cfg(feature = "tesseract")]
-use crate::ocr::{PreparedImageOverlay, ReadingOrder};
+use crate::ocr::ReadingOrder;
 #[cfg(feature = "ppocr")]
 use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
 #[cfg(feature = "tesseract")]
@@ -325,6 +326,7 @@ impl TranslatorSession {
         rgba_bytes: &[u8],
         width: u32,
         height: u32,
+        max_image_size: u32,
         source_code: &str,
         target_code: &str,
         min_confidence: u32,
@@ -336,6 +338,10 @@ impl TranslatorSession {
         let src = LanguageCode::from(source_code);
         let tgt = LanguageCode::from(target_code);
 
+        let (prepared_rgba, prepared_w, prepared_h) =
+            prepare_image_for_ocr(rgba_bytes, width, height, max_image_size)?;
+        let rgba_view: &[u8] = &prepared_rgba;
+
         #[cfg(feature = "ppocr")]
         if matches!(preferred_engine, PreferredOcrEngine::Paddle) {
             match self.ppocr_engine_for(&src) {
@@ -345,9 +351,9 @@ impl TranslatorSession {
                         self.engine(),
                         &ppocr,
                         &snap,
-                        rgba_bytes,
-                        width,
-                        height,
+                        rgba_view,
+                        prepared_w,
+                        prepared_h,
                         &src,
                         &tgt,
                         background_mode,
@@ -373,9 +379,9 @@ impl TranslatorSession {
             self.engine(),
             &self.ocr,
             &snap,
-            rgba_bytes,
-            width,
-            height,
+            rgba_view,
+            prepared_w,
+            prepared_h,
             &src,
             &tgt,
             min_confidence,
@@ -389,6 +395,74 @@ impl TranslatorSession {
                 e
             }
         })
+    }
+
+    pub fn retranslate_prepared_overlay(
+        &self,
+        mut prepared: PreparedImageOverlay,
+        source_code: &str,
+        target_code: &str,
+    ) -> Result<PreparedImageOverlay, TranslatorError> {
+        let snap = self.snapshot();
+        let src = LanguageCode::from(source_code);
+        let tgt = LanguageCode::from(target_code);
+
+        let block_texts: Vec<String> = prepared
+            .blocks
+            .iter()
+            .map(|block| {
+                block
+                    .lines
+                    .iter()
+                    .map(|line| line.text.trim())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+
+        let non_empty_indices: Vec<usize> = block_texts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, text)| (!text.trim().is_empty()).then_some(index))
+            .collect();
+
+        if non_empty_indices.is_empty() {
+            return Err(TranslatorError::ocr("No text found in image"));
+        }
+
+        let translated_blocks: Vec<String> = if src == tgt {
+            block_texts.clone()
+        } else {
+            let texts_to_translate: Vec<String> = non_empty_indices
+                .iter()
+                .map(|&index| block_texts[index].clone())
+                .collect();
+            let translated = {
+                let mut engine_guard = self.engine().lock().expect("bergamot engine lock poisoned");
+                Translator::new(&mut engine_guard, &snap).translate_texts(
+                    &src,
+                    &tgt,
+                    &texts_to_translate,
+                )?
+            };
+            let mut merged = block_texts.clone();
+            for (index, translated_text) in non_empty_indices
+                .iter()
+                .copied()
+                .zip(translated.into_iter())
+            {
+                merged[index] = translated_text;
+            }
+            merged
+        };
+
+        for (block, translated_text) in prepared.blocks.iter_mut().zip(translated_blocks.iter()) {
+            block.translated_text = translated_text.clone();
+        }
+        prepared.translated_text = translated_blocks.join("\n");
+
+        Ok(prepared)
     }
 
     #[cfg(feature = "ppocr")]
@@ -449,23 +523,23 @@ impl TranslatorSession {
         let det_path = det_pack
             .files
             .iter()
-            .find(|f| f.name.ends_with(".onnx"))
+            .find(|f| f.name.ends_with(".mnn"))
             .map(|f| base.join(&f.install_path))
             .ok_or_else(|| {
                 TranslatorError::new(
                     TranslatorErrorKind::MissingAsset,
-                    "ppocr detector pack has no .onnx file",
+                    "ppocr detector pack has no .mnn file",
                 )
             })?;
         let rec_path = rec_pack
             .files
             .iter()
-            .find(|f| f.name.ends_with(".onnx"))
+            .find(|f| f.name.ends_with(".mnn"))
             .map(|f| base.join(&f.install_path))
             .ok_or_else(|| {
                 TranslatorError::new(
                     TranslatorErrorKind::MissingAsset,
-                    "ppocr rec pack has no .onnx file",
+                    "ppocr rec pack has no .mnn file",
                 )
             })?;
         let keys_path = rec_pack
@@ -784,6 +858,74 @@ impl TranslatorSession {
     pub fn suggested_warp_dims(&self, quad: &DocumentQuad) -> (u32, u32) {
         crate::doc_align::suggested_output_dims(quad)
     }
+}
+
+/// Resize RGBA to `max_image_size` on the longest side (if larger) and apply CLAHE on the result.
+/// Centralizes what was previously split between Kotlin's `ImageProcessor.downscaleImage` and
+/// `doc_align::warp`'s post-process step. Single CLAHE pass at OCR-target resolution → less work
+/// when input is larger than the OCR target, no double-CLAHE on doc-aligned inputs.
+fn prepare_image_for_ocr(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    max_image_size: u32,
+) -> Result<(Vec<u8>, u32, u32), TranslatorError> {
+    let t_total = std::time::Instant::now();
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| TranslatorError::ocr("image dims overflow"))?;
+    if rgba.len() != expected {
+        return Err(TranslatorError::ocr(format!(
+            "rgba length {} != {}x{}x4 ({})",
+            rgba.len(),
+            width,
+            height,
+            expected
+        )));
+    }
+    let longest = width.max(height);
+    // Skip resize when the source is already within 5% of the cap. A full Triangle convolution
+    // on millions of RGBA pixels costs ~75ms just to shrink by a couple percent; the OCR engines
+    // tolerate that slack fine.
+    let resize_threshold = (max_image_size as f32 * 1.05) as u32;
+    let (mut out, out_w, out_h, resize_ms) = if longest <= resize_threshold {
+        (rgba.to_vec(), width, height, 0.0_f32)
+    } else {
+        let t = std::time::Instant::now();
+        let scale = max_image_size as f32 / longest as f32;
+        let new_w = ((width as f32 * scale).round() as u32).max(1);
+        let new_h = ((height as f32 * scale).round() as u32).max(1);
+        let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| TranslatorError::ocr("internal: failed to wrap rgba in RgbaImage"))?;
+        let resized =
+            image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
+        let resize_ms = t.elapsed().as_secs_f32() * 1000.0;
+        (resized.into_raw(), new_w, new_h, resize_ms)
+    };
+    let t_clahe = std::time::Instant::now();
+    #[cfg(feature = "doc-align")]
+    crate::doc_align::apply_clahe(
+        &mut out,
+        out_w,
+        out_h,
+        crate::doc_align::CLAHE_CLIP_LIMIT,
+        crate::doc_align::CLAHE_TILES,
+        crate::doc_align::CLAHE_TILES,
+    );
+    let clahe_ms = t_clahe.elapsed().as_secs_f32() * 1000.0;
+    log::info!(
+        "prepare_image_for_ocr: {}x{} -> {}x{} (max={}) resize={:.1}ms clahe={:.1}ms total={:.1}ms",
+        width,
+        height,
+        out_w,
+        out_h,
+        max_image_size,
+        resize_ms,
+        clahe_ms,
+        t_total.elapsed().as_secs_f32() * 1000.0,
+    );
+    Ok((out, out_w, out_h))
 }
 
 pub fn parse_selected_catalog(

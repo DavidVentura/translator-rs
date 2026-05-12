@@ -607,12 +607,10 @@ fn render_per_line(
 
     // Greedy break: try to assign words from `translated` to each block
     // line such that each line's shaped width fits its target box. If any
-    // line overflows, shrink size by 1 and retry.
-    let target_widths: Vec<f32> = block
-        .lines
-        .iter()
-        .map(|l| l.bounding_box.right.saturating_sub(l.bounding_box.left) as f32)
-        .collect();
+    // line overflows, shrink size by 1 and retry. We use the oriented_box's width
+    // (reading-direction extent) rather than the AABB width — for tilted text the
+    // AABB is wider than the actual line and would let us pack more glyphs than fit.
+    let target_widths: Vec<f32> = block.lines.iter().map(|l| l.oriented_box.width).collect();
 
     let lines_text: Option<Vec<String>> = loop {
         match break_into_lines_by_words(translated, &shaped_full, size, &target_widths) {
@@ -642,15 +640,30 @@ fn render_per_line(
         if line_shape.runs.is_empty() {
             continue;
         }
-        let baseline_y = prepared_line.bounding_box.top as f32 + line_shape.ascent_px(size);
-        let cursor_x = prepared_line.bounding_box.left as f32;
+        // Origin in image space at line-local cursor=0 along the baseline. In line-local
+        // coords this point is at u=-width/2 (left edge), v=-height/2 + ascent_px (baseline
+        // measured from the rect's top). For an axis-aligned rect, the formulas collapse to
+        // the previous (bbox.left, bbox.top + ascent_px).
+        let oriented = prepared_line.oriented_box;
+        let cos = oriented.angle_radians.cos();
+        let sin = oriented.angle_radians.sin();
+        let half_w = oriented.width * 0.5;
+        let half_h = oriented.height * 0.5;
+        let ascent_px = line_shape.ascent_px(size);
+        // Vertical offset from the rect's centre to the baseline, in line-local v.
+        let v_from_center = -half_h + ascent_px;
+        // perp_down direction (line-local +v) in image space is (-sin, cos).
+        let origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
+        let origin_y = oriented.cy - half_w * sin + v_from_center * cos;
         draw_shaped_line(
             canvas,
             prepared.width,
             prepared.height,
             &line_shape,
-            cursor_x,
-            baseline_y,
+            origin_x,
+            origin_y,
+            cos,
+            sin,
             size,
             prepared_line.foreground_argb,
         );
@@ -821,6 +834,8 @@ fn render_block_rect(
             baseline_y += line_h;
             continue;
         }
+        // Block-rect layout (CJK vertical / multi-line block) never rotates — block boxes are
+        // axis-aligned. Pass identity rotation (cos=1, sin=0).
         draw_shaped_line(
             canvas,
             prepared.width,
@@ -828,6 +843,8 @@ fn render_block_rect(
             &line_shape,
             block.bounding_box.left as f32,
             baseline_y,
+            1.0,
+            0.0,
             size,
             block.foreground_argb,
         );
@@ -900,12 +917,17 @@ fn draw_shaped_line(
     width: u32,
     height: u32,
     line: &LineShape,
-    start_x: f32,
-    baseline_y: f32,
+    origin_x: f32,
+    origin_y: f32,
+    cos_angle: f32,
+    sin_angle: f32,
     font_size: f32,
     fg_argb: u32,
 ) {
-    let mut cursor_x = start_x;
+    // cursor_x advances in line-local space (along the reading direction). The image-space
+    // pen position for each glyph is obtained by rotating the local pen offset by the line's
+    // angle and adding the origin.
+    let mut cursor_x = 0.0f32;
     for run in &line.runs {
         let scale = font_size / run.units_per_em as f32;
         let face = match Face::from_slice(run.font_bytes.as_slice(), run.ttc_index) {
@@ -913,8 +935,11 @@ fn draw_shaped_line(
             None => continue,
         };
         for glyph in &run.glyphs {
-            let glyph_x = cursor_x + glyph.offset_x as f32 * scale;
-            let glyph_y = baseline_y - glyph.offset_y as f32 * scale;
+            // Pen position for this glyph in line-local coords (font y points up; flip).
+            let pen_local_x = cursor_x + glyph.offset_x as f32 * scale;
+            let pen_local_y = -(glyph.offset_y as f32) * scale;
+            let glyph_x = origin_x + pen_local_x * cos_angle - pen_local_y * sin_angle;
+            let glyph_y = origin_y + pen_local_x * sin_angle + pen_local_y * cos_angle;
 
             let mut commands: Vec<Command> = Vec::new();
             let mut sink = OutlineSink {
@@ -922,6 +947,8 @@ fn draw_shaped_line(
                 origin_x: glyph_x,
                 origin_y: glyph_y,
                 scale,
+                cos_angle,
+                sin_angle,
             };
             if face
                 .outline_glyph(ttf_parser::GlyphId(glyph.gid), &mut sink)
@@ -953,13 +980,24 @@ struct OutlineSink<'a> {
     origin_x: f32,
     origin_y: f32,
     scale: f32,
+    /// Rotation of the line's reading direction from the image's +x axis, encoded as
+    /// (cos θ, sin θ). For horizontal text these are (1, 0) and `px()` collapses to the
+    /// original "translate + y-flip" transform.
+    cos_angle: f32,
+    sin_angle: f32,
 }
 
 impl OutlineSink<'_> {
     fn px(&self, x: f32, y: f32) -> (f32, f32) {
+        // Scale glyph contour from font units into pixels; flip y because font coords have y
+        // pointing up but image coords have y pointing down.
+        let lx = x * self.scale;
+        let ly = -y * self.scale;
+        // Rotate the local offset into image space by the line's angle, then translate to the
+        // glyph's pen origin.
         (
-            self.origin_x + x * self.scale,
-            self.origin_y - y * self.scale,
+            self.origin_x + lx * self.cos_angle - ly * self.sin_angle,
+            self.origin_y + lx * self.sin_angle + ly * self.cos_angle,
         )
     }
 }

@@ -395,15 +395,15 @@ fn warp_geometric(
     })
 }
 
-const CLAHE_CLIP_LIMIT: f32 = 2.0;
-const CLAHE_TILES: u32 = 8;
+pub(crate) const CLAHE_CLIP_LIMIT: f32 = 2.0;
+pub(crate) const CLAHE_TILES: u32 = 8;
 
 /// Contrast Limited Adaptive Histogram Equalization on the luma channel. Operates in place on an
 /// RGBA8 buffer (`width * height * 4` bytes). Converts each pixel to YCbCr (BT.601), equalizes Y
 /// per [tiles_x × tiles_y] tile with bilinear interpolation between adjacent tile LUTs, and
 /// recombines with the original chroma so colour is preserved. Doc-align outputs are real photos
 /// with uneven lighting; CLAHE flattens that so OCR sees consistent local contrast.
-fn apply_clahe(
+pub(crate) fn apply_clahe(
     rgba: &mut [u8],
     width: u32,
     height: u32,

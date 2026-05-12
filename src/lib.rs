@@ -16,10 +16,12 @@ pub mod font_provider;
 pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub mod image_render;
-#[cfg(any(feature = "doc-align", feature = "ppocr"))]
+#[cfg(feature = "doc-align")]
 mod inference;
 pub mod language;
 pub mod language_detect;
+#[cfg(feature = "ppocr")]
+mod mnn_inference;
 #[cfg(feature = "mucab")]
 pub mod mucab;
 pub mod ocr;
@@ -75,8 +77,9 @@ pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, Transla
 pub use catalog::{
     CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker,
     InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, TtsSpeakerEntry,
-    TtsVoicePickerRegion, installed_tts_voice_picker_regions, language_rows_in_snapshot,
-    parse_and_validate_catalog,
+    TtsVoicePickerRegion, available_ocr_engines_for_language, installed_ocr_engines_for_language,
+    installed_tts_voice_picker_regions, language_rows_in_snapshot, parse_and_validate_catalog,
+    plan_ocr_engine_download,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{OverlayColors, PreparedImageOverlay, ReadingOrder, Rect, sample_overlay_colors};

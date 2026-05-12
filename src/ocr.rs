@@ -7,6 +7,92 @@ pub struct Rect {
     pub bottom: u32,
 }
 
+/// A rotated rectangle. `cx`/`cy` are the centre in image pixels, `width` runs along the
+/// reading direction (so for horizontal text it's the visible text width), `height` is
+/// perpendicular to it, and `angle_radians` is the rotation of the reading direction relative
+/// to the image's +x axis (image y points down, so a positive angle tilts text downward to the
+/// right when read left-to-right).
+///
+/// We keep both `Rect` (AABB) and this type on detection structs. The AABB is fine for sorting,
+/// hit-testing, and the Tesseract path which has no rotation information; the oriented rect is
+/// what the erase/render steps consult so that tilted text (PPOCR detections) doesn't pick up
+/// the inflated AABB height as its layout box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct OrientedRect {
+    pub cx: f32,
+    pub cy: f32,
+    pub width: f32,
+    pub height: f32,
+    pub angle_radians: f32,
+}
+
+impl OrientedRect {
+    /// Lift an axis-aligned rectangle into an unrotated oriented rectangle. Used wherever a
+    /// pipeline (e.g. Tesseract) only produces AABBs.
+    pub fn axis_aligned(rect: Rect) -> Self {
+        let cx = (rect.left as f32 + rect.right as f32) * 0.5;
+        let cy = (rect.top as f32 + rect.bottom as f32) * 0.5;
+        Self {
+            cx,
+            cy,
+            width: rect.width() as f32,
+            height: rect.height() as f32,
+            angle_radians: 0.0,
+        }
+    }
+
+    /// Axis-aligned bounding box of the oriented rect — the smallest `Rect` that contains all
+    /// four corners. Useful for coarse hit-testing, sorting, and falling back to AABB-only
+    /// downstream consumers.
+    pub fn to_aabb(&self) -> Rect {
+        let abs_cos = self.angle_radians.cos().abs();
+        let abs_sin = self.angle_radians.sin().abs();
+        let hw = self.width * 0.5;
+        let hh = self.height * 0.5;
+        let half_aabb_w = hw * abs_cos + hh * abs_sin;
+        let half_aabb_h = hw * abs_sin + hh * abs_cos;
+        Rect {
+            left: (self.cx - half_aabb_w).max(0.0).round() as u32,
+            top: (self.cy - half_aabb_h).max(0.0).round() as u32,
+            right: (self.cx + half_aabb_w).max(0.0).round() as u32,
+            bottom: (self.cy + half_aabb_h).max(0.0).round() as u32,
+        }
+    }
+
+    /// Four corners in image-pixel coordinates, ordered TL, TR, BR, BL relative to the line's
+    /// reading direction (so "TL" is the corner the first glyph's ascent touches, even for a
+    /// rotated line).
+    pub fn corners(&self) -> [(f32, f32); 4] {
+        let cos = self.angle_radians.cos();
+        let sin = self.angle_radians.sin();
+        let hw = self.width * 0.5;
+        let hh = self.height * 0.5;
+        // Tangent (reading direction): (cos, sin). Perpendicular pointing across the line in
+        // the +y direction of image space: (-sin, cos).
+        let (tx, ty) = (cos, sin);
+        let (px, py) = (-sin, cos);
+        [
+            (self.cx - hw * tx - hh * px, self.cy - hw * ty - hh * py),
+            (self.cx + hw * tx - hh * px, self.cy + hw * ty - hh * py),
+            (self.cx + hw * tx + hh * px, self.cy + hw * ty + hh * py),
+            (self.cx - hw * tx + hh * px, self.cy - hw * ty + hh * py),
+        ]
+    }
+
+    /// True when the oriented rect is within `epsilon` of axis-aligned; the renderer uses this
+    /// to skip the rotated-rasterization path when there's nothing to rotate.
+    pub fn is_axis_aligned(&self, epsilon: f32) -> bool {
+        self.angle_radians.abs() < epsilon
+    }
+}
+
+impl Default for OrientedRect {
+    fn default() -> Self {
+        Self::axis_aligned(Rect::default())
+    }
+}
+
 impl Rect {
     pub fn width(&self) -> u32 {
         self.right.saturating_sub(self.left)
@@ -63,14 +149,25 @@ pub struct DetectedWord {
     pub end_line: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextLine {
     pub text: String,
     pub bounding_box: Rect,
+    /// Oriented bounding box of this line. For Tesseract output and other axis-aligned
+    /// pipelines this is just `bounding_box` lifted via `OrientedRect::axis_aligned`. For
+    /// PPOCR it's the min-area rotated rectangle around the detection contour, so tilted
+    /// text gets a tight box instead of the inflated AABB.
+    pub oriented_box: OrientedRect,
+    /// Glyph-tight oriented rect — same centre/angle as `oriented_box` but without
+    /// ascender/descender padding (for PPOCR, the pre-unclip mask kernel). Used by paragraph
+    /// grouping to cluster lines by x-height-like metric and to measure inter-line gaps in
+    /// "tight heights" instead of inflated bounding-box heights. Falls back to `oriented_box`
+    /// for engines that don't expose a tighter metric.
+    pub tight_box: OrientedRect,
     pub word_rects: Vec<Rect>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextBlock {
     pub lines: Vec<TextLine>,
 }
@@ -89,11 +186,14 @@ pub struct OverlayLayoutHints {
     pub suggested_font_size_px: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextLine {
     pub text: String,
     pub bounding_box: Rect,
+    /// Oriented box used by the overlay renderer to position rotated text. Mirror of
+    /// `TextLine::oriented_box`.
+    pub oriented_box: OrientedRect,
     pub word_rects: Vec<Rect>,
     pub background_argb: u32,
     pub foreground_argb: u32,
@@ -133,6 +233,27 @@ struct WordInfo {
     is_last_in_para: bool,
 }
 
+enum LineJoin {
+    /// Insert a single space between the two lines (default for Latin/Cyrillic/Greek text).
+    Space,
+    /// Concatenate with nothing between (CJK, or after stripping an end-of-line hyphen).
+    Concat,
+}
+
+fn is_cjk_char(c: char) -> bool {
+    let cp = c as u32;
+    // Han Unified Ideographs + Ext A + Compatibility, plus Hiragana, Katakana, and Hangul
+    // syllables/Jamo. Excludes the Halfwidth/Fullwidth Forms block to avoid falsely matching
+    // half-width ASCII surrogates that some OCR outputs use.
+    (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0x3040..=0x309F).contains(&cp)
+        || (0x30A0..=0x30FF).contains(&cp)
+        || (0xAC00..=0xD7AF).contains(&cp)
+        || (0x1100..=0x11FF).contains(&cp)
+}
+
 impl TextBlock {
     pub fn source_text(&self) -> String {
         self.lines
@@ -143,12 +264,43 @@ impl TextBlock {
     }
 
     pub fn translation_text(&self) -> String {
-        self.lines
+        let mut out = String::new();
+        for line in self
+            .lines
             .iter()
-            .map(|line| line.text.trim())
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
+            .map(|l| l.text.trim())
+            .filter(|l| !l.is_empty())
+        {
+            if out.is_empty() {
+                out.push_str(line);
+                continue;
+            }
+            let prev_last = out.chars().next_back();
+            let next_first = line.chars().next();
+            let separator = match (prev_last, next_first) {
+                // OCR-style soft hyphen at end of line preceding a lowercase letter: the source
+                // word was broken at the hyphen, so glue the halves together and drop the
+                // dangling hyphen. We use a permissive lowercase test to catch German/Spanish
+                // diacritics, not just ASCII. Mirrors the Tesseract path's behaviour in
+                // `merge_hyphenated_words`.
+                (Some(prev), Some(next))
+                    if matches!(prev, '-' | '\u{2010}' | '\u{00AD}') && next.is_lowercase() =>
+                {
+                    out.pop();
+                    LineJoin::Concat
+                }
+                // CJK on both sides of the line break: no space.
+                (Some(prev), Some(next)) if is_cjk_char(prev) && is_cjk_char(next) => {
+                    LineJoin::Concat
+                }
+                _ => LineJoin::Space,
+            };
+            if matches!(separator, LineJoin::Space) {
+                out.push(' ');
+            }
+            out.push_str(line);
+        }
+        out
     }
 
     pub fn bounds(&self) -> Rect {
@@ -163,6 +315,321 @@ impl TextBlock {
     }
 }
 
+/// Tunables for `group_lines_into_paragraphs`. All distance tolerances are expressed in units of
+/// the paragraph's running median tight-height, so the same values work across font sizes.
+#[derive(Debug, Clone, Copy)]
+pub struct ParagraphGroupingOptions {
+    /// Max permitted relative height jitter between a new line and the paragraph's running
+    /// median tight-height, once the paragraph has 2+ lines (the size has been "confirmed" by
+    /// at least one accepted body→body match). `0.25` accepts lines within ±25% of the running
+    /// paragraph height.
+    pub height_tolerance: f32,
+    /// Tighter height tolerance used when the paragraph still has only its opening line. Until
+    /// we have a second body-shaped line, the "paragraph" might actually be a heading or a
+    /// caption — and a slightly-shorter body line beneath a heading is still a paragraph
+    /// break, not a join. Once the second line is accepted the size is "confirmed" and we
+    /// switch to the looser `height_tolerance`.
+    pub opening_height_tolerance: f32,
+    /// Max vertical gap (top-of-new-line minus bottom-of-prev-line) in median-tight-height
+    /// units before we call it a paragraph break. ~1.8 leaves room for generous leading
+    /// without merging across blank lines.
+    pub max_gap_ratio: f32,
+    /// Max negative gap (overlap) in median-tight-height units. Allows a sliver of overlap so
+    /// rasterisation jitter or `sort_lines_reading_order` bucket aliasing doesn't split
+    /// paragraphs. A more-negative gap (the next "line" sits well above the previous line's
+    /// bottom) is the signature of column interleaving, and should break.
+    pub max_overlap_ratio: f32,
+    /// Maximum left-edge jitter in median-tight-height units for two lines to count as
+    /// belonging to the same column. Used both for justified text (left edges align tightly)
+    /// and ragged-right (same column edge, varying right edges).
+    pub edge_alignment_tolerance: f32,
+    /// Maximum first-line indent in median-tight-height units. Body lines that sit further
+    /// LEFT than the running `column_left` by up to this amount are accepted, and `column_left`
+    /// shifts to follow them — that's how an indented first line plus flush body gets glued
+    /// into one paragraph.
+    pub max_first_line_indent: f32,
+}
+
+impl Default for ParagraphGroupingOptions {
+    fn default() -> Self {
+        Self {
+            height_tolerance: 0.25,
+            opening_height_tolerance: 0.15,
+            max_gap_ratio: 1.8,
+            max_overlap_ratio: 0.5,
+            edge_alignment_tolerance: 0.6,
+            max_first_line_indent: 4.0,
+        }
+    }
+}
+
+/// Column-tolerance for `assign_column_ids` and for the grouper's first-line-indent gate, in
+/// units of median tight-height. Anything left-edge-shift smaller than this is "same column";
+/// larger is a column hop. Sized so that a typical first-line indent (~2 em ≈ 3-4 × x-height)
+/// stays within one column while a multi-column page's column gap (typically ≥ 8 × x-height)
+/// triggers a new column.
+const COLUMN_TOLERANCE_HEIGHTS: f32 = 4.0;
+
+/// PPOCR's `sort_lines_reading_order` interleaves columns by binning on `top`, which means a
+/// two-column page comes in as A0, B0, A1, B1, … — breaking the gap and alignment heuristics
+/// that paragraph grouping relies on. We cluster lines into "columns" by left edge first, then
+/// sort within each column top-to-bottom. The grouper then walks each column's lines in order
+/// and can rely on vertical-gap / left-alignment without column-induced jitter.
+///
+/// Bucket-based bucketing (e.g. `left / bucket`) doesn't work here because an indented
+/// first-line at `left=50` and body lines at `left=20` straddle any fixed bucket boundary near
+/// 40-50 px. So we sort by left edge and grow column IDs greedily based on inter-line gaps.
+/// Tight (pre-inflate) top/bottom/left edges, used for all grouping math. The AABB in
+/// `TextLine::bounding_box` is unclip-and-border-inflated for PPOCR detections, so adjacent
+/// lines' AABBs often overlap vertically even when the actual ink is well-separated.
+/// `tight_box.cy ± height/2` and `cx - width/2` give us the actual ink extents.
+fn tight_top(line: &TextLine) -> f32 {
+    line.tight_box.cy - line.tight_box.height * 0.5
+}
+fn tight_bottom(line: &TextLine) -> f32 {
+    line.tight_box.cy + line.tight_box.height * 0.5
+}
+fn tight_left(line: &TextLine) -> f32 {
+    line.tight_box.cx - line.tight_box.width * 0.5
+}
+
+fn reorder_lines_for_grouping(mut lines: Vec<TextLine>) -> Vec<TextLine> {
+    if lines.len() < 2 {
+        return lines;
+    }
+    let mut heights: Vec<f32> = lines.iter().map(|l| l.tight_box.height.max(1.0)).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_h = heights[heights.len() / 2].max(1.0);
+    let tolerance = COLUMN_TOLERANCE_HEIGHTS * median_h;
+    let column_ids = assign_column_ids(&lines, tolerance);
+    let mut indexed: Vec<(usize, TextLine)> = column_ids.into_iter().zip(lines).collect();
+    indexed.sort_by(|(id_a, a), (id_b, b)| {
+        id_a.cmp(id_b).then_with(|| {
+            tight_top(a)
+                .partial_cmp(&tight_top(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    indexed.into_iter().map(|(_, line)| line).collect()
+}
+
+/// Assigns each line a column ID by sorting by tight-left and growing a new ID whenever the
+/// gap between two consecutive tight-left edges exceeds `tolerance` pixels. The walk is in
+/// sort order, so a staircase of left edges within tolerance steps still ends up as a single
+/// column — this is what lets an indented first-line stay in the same column as its flush
+/// body lines.
+fn assign_column_ids(lines: &[TextLine], tolerance: f32) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by(|&a, &b| {
+        tight_left(&lines[a])
+            .partial_cmp(&tight_left(&lines[b]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut ids = vec![0usize; lines.len()];
+    let mut current_id = 0usize;
+    let mut prev_left: Option<f32> = None;
+    for &i in &order {
+        let left = tight_left(&lines[i]);
+        if let Some(p) = prev_left
+            && (left - p) > tolerance
+        {
+            current_id += 1;
+        }
+        ids[i] = current_id;
+        prev_left = Some(left);
+    }
+    ids
+}
+
+struct ParaState {
+    lines: Vec<TextLine>,
+    /// Running `min(left)` across the paragraph's lines. For both justified and ragged-right
+    /// blocks, every line's left edge sits at this value (modulo first-line indent which
+    /// drives the min downward when the body line arrives). This single value lets us reject
+    /// new-column lines (large positive delta) while still admitting indented first lines
+    /// (negative delta within `max_first_line_indent`).
+    column_left: f32,
+    /// Running estimate of the paragraph's tight-height. Updated as a simple EMA so the gate
+    /// drifts with the paragraph but isn't pinned to the first line.
+    median_h: f32,
+}
+
+/// Group already-line-detected text into paragraphs.
+///
+/// Input is expected to be in reading order (top-to-bottom, left-to-right within row) — for the
+/// PPOCR pipeline that's what `sort_lines_reading_order` produces. Each `TextLine` should carry
+/// its glyph-tight `tight_box` (PPOCR's pre-unclip mask rect); engines that don't expose one
+/// can pass `oriented_box` as the tight box at the cost of slightly looser gap/height checks
+/// because of ascender/descender padding.
+///
+/// V1 grouping criteria (all must pass to merge a new line into the running paragraph):
+///   * **Height match.** New line's tight-height within `±height_tolerance` of running median.
+///   * **Vertical gap.** Baseline-to-baseline gap within `[-max_overlap_ratio, max_gap_ratio]`
+///     median-tight-height units. Stops column-interleaved sort artifacts (large negative gap)
+///     and blank-line paragraph breaks (large positive gap).
+///   * **Column alignment.** New line's left edge within `edge_alignment_tolerance` of running
+///     `column_left`, OR up to `max_first_line_indent` units to the left of it (in which case
+///     `column_left` shifts to follow the new line — handles first-line indent).
+///
+/// We don't gate on the oriented-rect angle in V1 — perspective shift and DB-mask jitter make
+/// the per-line angle estimate too unstable to trust as a paragraph-break signal.
+///
+/// Right-justified and centered blocks aren't detected as multi-line paragraphs here; their
+/// lines will fall out as one-line paragraphs (same as the pre-change behaviour). That's a
+/// deliberate scope cut.
+pub fn group_lines_into_paragraphs(
+    lines: Vec<TextLine>,
+    opts: ParagraphGroupingOptions,
+) -> Vec<TextBlock> {
+    let input_count = lines.len();
+    let lines = reorder_lines_for_grouping(lines);
+    let mut paragraphs: Vec<TextBlock> = Vec::new();
+    let mut current: Option<ParaState> = None;
+
+    for line in lines {
+        let h = line.tight_box.height.max(1.0);
+        let top = tight_top(&line);
+        let left = tight_left(&line);
+
+        let decision = match current.as_ref() {
+            None => JoinDecision::OpenFirst,
+            Some(state) => {
+                let unit = state.median_h.max(1.0);
+                let last = state
+                    .lines
+                    .last()
+                    .expect("paragraph state always has at least one line");
+                let last_bottom = tight_bottom(last);
+
+                let big_h = h.max(state.median_h);
+                let small_h = h.min(state.median_h).max(1.0);
+                let height_ratio_excess = big_h / small_h - 1.0;
+                // Use the tighter "opening" tolerance until the paragraph's height has been
+                // confirmed by at least one accepted line. After that, real per-line OCR
+                // jitter can be a touch larger than the heading/body gap we want to catch,
+                // so we relax to `height_tolerance`.
+                let active_height_tolerance = if state.lines.len() == 1 {
+                    opts.opening_height_tolerance
+                } else {
+                    opts.height_tolerance
+                };
+                let height_ok = height_ratio_excess <= active_height_tolerance;
+
+                let gap = top - last_bottom;
+                let gap_ratio = gap / unit;
+                let gap_ok = gap >= -opts.max_overlap_ratio * unit
+                    && gap.max(0.0) <= opts.max_gap_ratio * unit;
+
+                let delta = left - state.column_left;
+                let abs_delta = delta.abs();
+                let aligned = abs_delta <= opts.edge_alignment_tolerance * unit;
+                let indent_shift = delta < 0.0 && (-delta) <= opts.max_first_line_indent * unit;
+                let align_ok = aligned || indent_shift;
+
+                if height_ok && gap_ok && align_ok {
+                    JoinDecision::Join
+                } else {
+                    JoinDecision::Break {
+                        height_excess: height_ratio_excess,
+                        height_limit: active_height_tolerance,
+                        gap_ratio,
+                        delta,
+                        unit,
+                    }
+                }
+            }
+        };
+
+        match decision {
+            JoinDecision::Join => {
+                let state = current
+                    .as_mut()
+                    .expect("join implies a current paragraph exists");
+                state.column_left = state.column_left.min(left);
+                // EMA towards each new line's tight-height. Reacts to drift over a few lines
+                // without letting a single outlier dominate.
+                state.median_h = state.median_h * 0.7 + h * 0.3;
+                state.lines.push(line);
+            }
+            JoinDecision::OpenFirst | JoinDecision::Break { .. } => {
+                if let JoinDecision::Break {
+                    height_excess,
+                    height_limit,
+                    gap_ratio,
+                    delta,
+                    unit,
+                } = decision
+                {
+                    log::debug!(
+                        "ppocr group break: \"{}\" h={:.1} top={:.1} left={:.1} \
+                         vs prev unit={:.1} → height_excess={:.2} (limit {:.2}) \
+                         gap_ratio={:.2} (overlap {:.2}, gap {:.2}) \
+                         delta_left={:.1} (align {:.1}, indent {:.1})",
+                        truncate_for_log(&line.text),
+                        h,
+                        top,
+                        left,
+                        unit,
+                        height_excess,
+                        height_limit,
+                        gap_ratio,
+                        -opts.max_overlap_ratio,
+                        opts.max_gap_ratio,
+                        delta,
+                        opts.edge_alignment_tolerance * unit,
+                        opts.max_first_line_indent * unit,
+                    );
+                }
+                if let Some(state) = current.take() {
+                    paragraphs.push(TextBlock { lines: state.lines });
+                }
+                current = Some(ParaState {
+                    lines: vec![line],
+                    column_left: left,
+                    median_h: h,
+                });
+            }
+        }
+    }
+
+    if let Some(state) = current.take() {
+        paragraphs.push(TextBlock { lines: state.lines });
+    }
+
+    log::info!(
+        "ppocr paragraph grouping: {} lines → {} paragraph(s)",
+        input_count,
+        paragraphs.len(),
+    );
+
+    paragraphs
+}
+
+enum JoinDecision {
+    OpenFirst,
+    Join,
+    Break {
+        height_excess: f32,
+        height_limit: f32,
+        gap_ratio: f32,
+        delta: f32,
+        unit: f32,
+    },
+}
+
+fn truncate_for_log(text: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    let mut out = String::with_capacity(MAX_CHARS + 3);
+    for (i, c) in text.chars().enumerate() {
+        if i >= MAX_CHARS {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> OverlayLayoutHints {
     let layout_mode = match reading_order {
         ReadingOrder::LeftToRight => OverlayLayoutMode::PerLine,
@@ -174,11 +641,15 @@ fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> Overl
             ReadingOrder::TopToBottomLeftToRight => block.bounds().width() as f32,
         }
     } else {
+        // For per-line layout, use the oriented box's height (perpendicular to reading
+        // direction) so tilted lines aren't sized off their inflated AABB height. For block-
+        // rect (top-to-bottom) layout the box is axis-aligned, so the oriented and AABB widths
+        // are equal.
         let total = block
             .lines
             .iter()
             .map(|line| match reading_order {
-                ReadingOrder::LeftToRight => line.bounding_box.height() as f32,
+                ReadingOrder::LeftToRight => line.oriented_box.height,
                 ReadingOrder::TopToBottomLeftToRight => line.bounding_box.width() as f32,
             })
             .sum::<f32>();
@@ -317,7 +788,112 @@ impl RasterImageMut {
             FillPlan::Bilinear { tl, tr, bl, br } => self.fill_bilinear(rect, tl, tr, bl, br),
         }
     }
+
+    /// Fill a rotated rectangle with a flat color. Iterates over the rect's AABB and accepts
+    /// pixels whose line-local coordinates fall inside the half-extents. Falls back to
+    /// `fill_rect` when the rect is effectively axis-aligned so the unrotated path stays
+    /// pixel-exact.
+    fn fill_oriented_rect(&mut self, rect: OrientedRect, argb: u32) {
+        if rect.is_axis_aligned(AXIS_ALIGNED_EPSILON_RAD) {
+            self.fill_rect(rect.to_aabb(), argb);
+            return;
+        }
+        let cos = rect.angle_radians.cos();
+        let sin = rect.angle_radians.sin();
+        let Some(aabb) = clamp_rect(rect.to_aabb(), self.width, self.height) else {
+            return;
+        };
+        let hw = rect.width * 0.5;
+        let hh = rect.height * 0.5;
+        let bytes = argb.to_ne_bytes();
+        for y in aabb.top..aabb.bottom {
+            for x in aabb.left..aabb.right {
+                let dx = x as f32 + 0.5 - rect.cx;
+                let dy = y as f32 + 0.5 - rect.cy;
+                let lx = dx * cos + dy * sin;
+                let ly = -dx * sin + dy * cos;
+                if lx.abs() <= hw && ly.abs() <= hh {
+                    let index = ((y * self.width + x) * 4) as usize;
+                    self.rgba[index..index + 4].copy_from_slice(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Bilinear corner-color gradient in line-local (u, v) ∈ [0,1] space inside the rotated
+    /// rectangle. Mirrors `fill_bilinear`'s semantics so AutoDetect's gradient erase works
+    /// equally well on tilted lines.
+    fn fill_oriented_bilinear(&mut self, rect: OrientedRect, tl: u32, tr: u32, bl: u32, br: u32) {
+        if rect.is_axis_aligned(AXIS_ALIGNED_EPSILON_RAD) {
+            self.fill_bilinear(rect.to_aabb(), tl, tr, bl, br);
+            return;
+        }
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let cos = rect.angle_radians.cos();
+        let sin = rect.angle_radians.sin();
+        let Some(aabb) = clamp_rect(rect.to_aabb(), self.width, self.height) else {
+            return;
+        };
+        let hw = rect.width * 0.5;
+        let hh = rect.height * 0.5;
+        let rgb = |c: u32| -> [f32; 3] {
+            [
+                channel_r(c) as f32,
+                channel_g(c) as f32,
+                channel_b(c) as f32,
+            ]
+        };
+        let tl_c = rgb(tl);
+        let tr_c = rgb(tr);
+        let bl_c = rgb(bl);
+        let br_c = rgb(br);
+        for y in aabb.top..aabb.bottom {
+            for x in aabb.left..aabb.right {
+                let dx = x as f32 + 0.5 - rect.cx;
+                let dy = y as f32 + 0.5 - rect.cy;
+                let lx = dx * cos + dy * sin;
+                let ly = -dx * sin + dy * cos;
+                if lx.abs() > hw || ly.abs() > hh {
+                    continue;
+                }
+                let u = (lx + hw) / rect.width;
+                let v = (ly + hh) / rect.height;
+                let left = [
+                    tl_c[0] + (bl_c[0] - tl_c[0]) * v,
+                    tl_c[1] + (bl_c[1] - tl_c[1]) * v,
+                    tl_c[2] + (bl_c[2] - tl_c[2]) * v,
+                ];
+                let right = [
+                    tr_c[0] + (br_c[0] - tr_c[0]) * v,
+                    tr_c[1] + (br_c[1] - tr_c[1]) * v,
+                    tr_c[2] + (br_c[2] - tr_c[2]) * v,
+                ];
+                let r = (left[0] + (right[0] - left[0]) * u).clamp(0.0, 255.0) as u8;
+                let g = (left[1] + (right[1] - left[1]) * u).clamp(0.0, 255.0) as u8;
+                let b = (left[2] + (right[2] - left[2]) * u).clamp(0.0, 255.0) as u8;
+                let bytes = argb(r, g, b).to_ne_bytes();
+                let idx = ((y * self.width + x) * 4) as usize;
+                self.rgba[idx..idx + 4].copy_from_slice(&bytes);
+            }
+        }
+    }
+
+    fn apply_fill_plan_oriented(&mut self, rect: OrientedRect, plan: FillPlan) {
+        match plan {
+            FillPlan::Flat(color) => self.fill_oriented_rect(rect, color),
+            FillPlan::Bilinear { tl, tr, bl, br } => {
+                self.fill_oriented_bilinear(rect, tl, tr, bl, br)
+            }
+        }
+    }
 }
+
+/// Within ~0.057° of horizontal we treat the rect as axis-aligned and use the pixel-exact
+/// `fill_rect` path; below this threshold the rotated rasterization's sub-pixel error is
+/// larger than the rotation itself.
+const AXIS_ALIGNED_EPSILON_RAD: f32 = 0.001;
 
 fn channel_r(color: u32) -> u8 {
     ((color >> 16) & 0xFF) as u8
@@ -761,16 +1337,22 @@ pub fn sample_overlay_colors(
 
 fn erase_text_region(
     image: &mut RasterImageMut,
-    text_bounds: Rect,
+    oriented: OrientedRect,
     background_mode: crate::BackgroundMode,
 ) -> OverlayColors {
+    // The oriented rect carries the same DB-unclip + DET_BOX_BORDER inflation the AABB path
+    // applies (see `oriented_rect_from_contour`), so it reliably covers ascenders/descenders
+    // without spilling sideways the way an AABB does for tilted lines. AutoDetect samples
+    // surrounding colours via the rect's AABB; that's only used to pick a colour, not for the
+    // erase shape itself.
+    let aabb = oriented.to_aabb();
     match background_mode {
         crate::BackgroundMode::WhiteOnBlack => {
             let colors = OverlayColors {
                 background_argb: argb(0, 0, 0),
                 foreground_argb: argb(255, 255, 255),
             };
-            image.fill_rect(text_bounds, colors.background_argb);
+            image.fill_oriented_rect(oriented, colors.background_argb);
             colors
         }
         crate::BackgroundMode::BlackOnWhite => {
@@ -778,12 +1360,12 @@ fn erase_text_region(
                 background_argb: argb(255, 255, 255),
                 foreground_argb: argb(0, 0, 0),
             };
-            image.fill_rect(text_bounds, colors.background_argb);
+            image.fill_oriented_rect(oriented, colors.background_argb);
             colors
         }
         crate::BackgroundMode::AutoDetect => {
-            let paint = autodetect_paint(&image.as_image(), text_bounds);
-            image.apply_fill_plan(text_bounds, paint.fill);
+            let paint = autodetect_paint(&image.as_image(), aabb);
+            image.apply_fill_plan_oriented(oriented, paint.fill);
             paint.colors
         }
     }
@@ -810,7 +1392,7 @@ pub fn prepare_overlay_image(
                 let mut block_background = argb(255, 255, 255);
                 let mut block_foreground = argb(0, 0, 0);
                 for (index, line) in block.lines.iter().enumerate() {
-                    let colors = erase_text_region(&mut image, line.bounding_box, background_mode);
+                    let colors = erase_text_region(&mut image, line.oriented_box, background_mode);
                     if index == 0 {
                         block_background = colors.background_argb;
                         block_foreground = colors.foreground_argb;
@@ -818,6 +1400,7 @@ pub fn prepare_overlay_image(
                     prepared_lines.push(PreparedTextLine {
                         text: line.text.clone(),
                         bounding_box: line.bounding_box,
+                        oriented_box: line.oriented_box,
                         word_rects: line.word_rects.clone(),
                         background_argb: colors.background_argb,
                         foreground_argb: colors.foreground_argb,
@@ -834,13 +1417,21 @@ pub fn prepare_overlay_image(
                 });
             }
             ReadingOrder::TopToBottomLeftToRight => {
-                let colors = erase_text_region(&mut image, block_bounds, background_mode);
+                // Block-rect (CJK vertical) layout: the per-block region is the union of
+                // possibly differently-rotated lines, so rotation doesn't carry up. Erase the
+                // block AABB unrotated.
+                let colors = erase_text_region(
+                    &mut image,
+                    OrientedRect::axis_aligned(block_bounds),
+                    background_mode,
+                );
                 let prepared_lines = block
                     .lines
                     .iter()
                     .map(|line| PreparedTextLine {
                         text: line.text.clone(),
                         bounding_box: line.bounding_box,
+                        oriented_box: line.oriented_box,
                         word_rects: line.word_rects.clone(),
                         background_argb: colors.background_argb,
                         foreground_argb: colors.foreground_argb,
@@ -1019,6 +1610,8 @@ pub fn build_text_blocks(
             current_line = Some(TextLine {
                 text: word.text.clone(),
                 bounding_box: word.bounding_box,
+                oriented_box: OrientedRect::axis_aligned(word.bounding_box),
+                tight_box: OrientedRect::axis_aligned(word.bounding_box),
                 word_rects: vec![word.bounding_box],
             });
         } else if let Some(line) = current_line.as_mut() {
@@ -1035,6 +1628,8 @@ pub fn build_text_blocks(
                 *line = TextLine {
                     text: word.text.clone(),
                     bounding_box: word.bounding_box,
+                    oriented_box: OrientedRect::axis_aligned(word.bounding_box),
+                    tight_box: OrientedRect::axis_aligned(word.bounding_box),
                     word_rects: vec![word.bounding_box],
                 };
                 if !lines.is_empty() {
@@ -1051,6 +1646,11 @@ pub fn build_text_blocks(
                 }
                 line.word_rects.push(word.bounding_box);
                 line.bounding_box.union(word.bounding_box);
+                // Tesseract path: words are axis-aligned, so the line's oriented box is just
+                // the AABB lifted. PPOCR detects whole lines as one "word" and never reaches
+                // this merge branch.
+                line.oriented_box = OrientedRect::axis_aligned(line.bounding_box);
+                line.tight_box = OrientedRect::axis_aligned(line.bounding_box);
             }
         }
 
@@ -1086,10 +1686,36 @@ pub fn build_text_blocks(
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectedWord, OverlayLayoutMode, Rect, TextBlock, TextLine, build_text_blocks,
-        prepare_overlay_image,
+        DetectedWord, OrientedRect, OverlayLayoutMode, ParagraphGroupingOptions, Rect, TextBlock,
+        TextLine, build_text_blocks, group_lines_into_paragraphs, prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
+
+    fn line(text: &str, left: u32, top: u32, right: u32, bottom: u32, tight_h: f32) -> TextLine {
+        let rect = Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let cx = (left + right) as f32 * 0.5;
+        let cy = (top + bottom) as f32 * 0.5;
+        let width = (right - left) as f32;
+        let tight = OrientedRect {
+            cx,
+            cy,
+            width,
+            height: tight_h,
+            angle_radians: 0.0,
+        };
+        TextLine {
+            text: text.to_string(),
+            bounding_box: rect,
+            oriented_box: OrientedRect::axis_aligned(rect),
+            tight_box: tight,
+            word_rects: vec![rect],
+        }
+    }
 
     fn word(
         text: &str,
@@ -1160,37 +1786,33 @@ mod tests {
             }
         }
 
+        let top_rect = Rect {
+            left: 1,
+            top: 1,
+            right: 7,
+            bottom: 3,
+        };
+        let bottom_rect = Rect {
+            left: 1,
+            top: 4,
+            right: 7,
+            bottom: 6,
+        };
         let blocks = vec![TextBlock {
             lines: vec![
                 TextLine {
                     text: "top".to_string(),
-                    bounding_box: Rect {
-                        left: 1,
-                        top: 1,
-                        right: 7,
-                        bottom: 3,
-                    },
-                    word_rects: vec![Rect {
-                        left: 1,
-                        top: 1,
-                        right: 7,
-                        bottom: 3,
-                    }],
+                    bounding_box: top_rect,
+                    oriented_box: super::OrientedRect::axis_aligned(top_rect),
+                    tight_box: super::OrientedRect::axis_aligned(top_rect),
+                    word_rects: vec![top_rect],
                 },
                 TextLine {
                     text: "bottom".to_string(),
-                    bounding_box: Rect {
-                        left: 1,
-                        top: 4,
-                        right: 7,
-                        bottom: 6,
-                    },
-                    word_rects: vec![Rect {
-                        left: 1,
-                        top: 4,
-                        right: 7,
-                        bottom: 6,
-                    }],
+                    bounding_box: bottom_rect,
+                    oriented_box: super::OrientedRect::axis_aligned(bottom_rect),
+                    tight_box: super::OrientedRect::axis_aligned(bottom_rect),
+                    word_rects: vec![bottom_rect],
                 },
             ],
         }];
@@ -1229,5 +1851,141 @@ mod tests {
             OverlayLayoutMode::PerLine
         );
         assert_eq!(prepared.blocks[0].layout_hints.suggested_font_size_px, 2.0);
+    }
+
+    #[test]
+    fn grouping_single_paragraph_with_similar_heights_and_normal_gap() {
+        // Three lines, x-height 10, baseline-gap 4 (line height ~14 ⇒ gap_ratio ~ 0.4).
+        // Same column. Should collapse to one paragraph.
+        let lines = vec![
+            line("first body line", 20, 10, 200, 24, 10.0),
+            line("second body line", 20, 28, 200, 42, 10.0),
+            line("third body line", 20, 46, 180, 60, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn grouping_breaks_on_blank_line() {
+        // Big vertical gap between line 1 and line 2 — gap is ~3.5 × tight_h, well past 1.8.
+        let lines = vec![
+            line("paragraph one", 20, 10, 200, 24, 10.0),
+            line("paragraph two", 20, 70, 200, 84, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lines.len(), 1);
+        assert_eq!(blocks[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn grouping_breaks_on_heading_size_change() {
+        // The big-font line should not glue to the body line beneath it.
+        let lines = vec![
+            line("Big Heading", 20, 10, 220, 40, 26.0),
+            line("body line one", 20, 48, 200, 62, 10.0),
+            line("body line two", 20, 66, 200, 80, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lines.len(), 1);
+        assert_eq!(blocks[1].lines.len(), 2);
+    }
+
+    #[test]
+    fn grouping_keeps_first_line_indent_in_paragraph() {
+        // First line indented by ~3× tight_h; body lines flush at left=20.
+        let lines = vec![
+            line("Indented opener", 50, 10, 200, 24, 10.0),
+            line("flush body line", 20, 28, 200, 42, 10.0),
+            line("more flush body", 20, 46, 180, 60, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn grouping_breaks_at_column_change() {
+        // Reading-order sort interleaves two columns, alternating: A0, B0, A1, B1.
+        // The grouper should split them by left-edge mismatch / large overlap.
+        let lines = vec![
+            line("col A line 1", 20, 10, 180, 24, 10.0),
+            line("col B line 1", 220, 10, 380, 24, 10.0),
+            line("col A line 2", 20, 28, 180, 42, 10.0),
+            line("col B line 2", 220, 28, 380, 42, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lines.len(), 2);
+        assert_eq!(blocks[1].lines.len(), 2);
+        assert_eq!(blocks[0].lines[0].text, "col A line 1");
+        assert_eq!(blocks[0].lines[1].text, "col A line 2");
+        assert_eq!(blocks[1].lines[0].text, "col B line 1");
+        assert_eq!(blocks[1].lines[1].text, "col B line 2");
+    }
+
+    #[test]
+    fn grouping_does_not_split_paragraph_just_because_last_line_is_short() {
+        let lines = vec![
+            line("long full-width body line", 20, 10, 280, 24, 10.0),
+            line("also long body line", 20, 28, 270, 42, 10.0),
+            line("short tail.", 20, 46, 90, 60, 10.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn grouping_separates_heading_from_body_when_size_is_only_modestly_larger() {
+        // Mirrors the Stadsdorp poster case: a heading whose tight-height is ~22% over the
+        // body. The pre-`opening_height_tolerance` version (0.25) merged this pair; the new
+        // 0.15 opening gate must split them.
+        let lines = vec![
+            line("Section heading", 20, 10, 200, 34, 24.4),
+            line("body line one", 20, 38, 200, 56, 20.0),
+            line("body line two", 20, 60, 200, 78, 20.0),
+        ];
+        let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lines.len(), 1);
+        assert_eq!(blocks[0].lines[0].text, "Section heading");
+        assert_eq!(blocks[1].lines.len(), 2);
+    }
+
+    #[test]
+    fn translation_text_drops_hyphen_for_broken_word() {
+        let block = TextBlock {
+            lines: vec![
+                line("self-", 20, 10, 90, 24, 10.0),
+                line("awareness builds", 20, 28, 200, 42, 10.0),
+            ],
+        };
+        assert_eq!(block.translation_text(), "selfawareness builds");
+    }
+
+    #[test]
+    fn translation_text_joins_cjk_without_space() {
+        let block = TextBlock {
+            lines: vec![
+                line("今日は晴れ", 20, 10, 200, 28, 16.0),
+                line("ています。", 20, 32, 200, 50, 16.0),
+            ],
+        };
+        assert_eq!(block.translation_text(), "今日は晴れています。");
+    }
+
+    #[test]
+    fn translation_text_joins_latin_with_space() {
+        let block = TextBlock {
+            lines: vec![
+                line("hello world", 20, 10, 200, 24, 10.0),
+                line("from rust", 20, 28, 200, 42, 10.0),
+            ],
+        };
+        assert_eq!(block.translation_text(), "hello world from rust");
     }
 }

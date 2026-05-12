@@ -1,23 +1,25 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use image::{DynamicImage, GenericImageView, GrayImage, RgbImage, imageops::FilterType};
 use imageproc::contours::find_contours;
 use imageproc::point::Point;
-use ndarray::Array4;
-use ort::inputs;
-use ort::session::Session;
-use ort::value::Tensor;
+use rayon::ThreadPool;
+use rayon::prelude::*;
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
-use crate::inference::load_onnx_session;
+use crate::mnn_inference::MnnSession;
 
-const DET_INPUT_NAME: &str = "x";
-const REC_INPUT_NAME: &str = "x";
 const REC_TARGET_HEIGHT: u32 = 48;
 const REC_MIN_SCORE: f32 = 0.3;
 const REC_PUNCT_MIN_SCORE: f32 = 0.1;
-const REC_BATCH_SIZE: usize = 16;
+/// One rec session per parallel worker, dispatched via rayon. Mirrors the demo's strategy:
+/// each session runs single-threaded (intra=1) on its own crop. Inter-session parallelism beats
+/// intra-session padding-and-batching on this workload because crop widths are heterogeneous
+/// and the per-graph compute is small enough that ORT/MNN intra-threading scales poorly.
+const REC_PARALLELISM: usize = 4;
 // Hard OOM ceiling, not a perf cap. The user's `maxImageSize` setting (and
 // the doc-align warp step) already determine the working resolution; we only
 // step in if something pathological reaches us.
@@ -60,15 +62,31 @@ pub struct PpocrLine {
     pub text: String,
     pub confidence: f32,
     pub bounding_box: PpocrRect,
+    /// Min-area-aligned rotated rectangle around the detection contour. The principal axis is
+    /// the text's reading direction, so for tilted signs/paper this stays tight to the glyphs
+    /// instead of inflating to an axis-aligned bounding box like `bounding_box` does.
+    pub oriented_box: crate::ocr::OrientedRect,
+    /// Pre-inflate min-area rect from the raw DB mask contour — same centre/angle as
+    /// `oriented_box` but without the unclip/border padding. Tight to the segmentation kernel,
+    /// so its height excludes most ascender/descender whitespace, making it the right metric
+    /// for paragraph grouping (line-height clustering, gap-as-multiple-of-x-height). For
+    /// detections that come back without a contour (axis-aligned fallback), this equals
+    /// `oriented_box`.
+    pub tight_box: crate::ocr::OrientedRect,
 }
 
 pub struct PpocrDetector {
-    session: Mutex<Session>,
+    session: MnnSession,
 }
 
 pub struct PpocrRecognizer {
-    session: Mutex<Session>,
+    /// One MnnSession per parallel worker. Each is wrapped in a Mutex but contention is zero —
+    /// the rayon worker at index `i` only touches `sessions[i]`. The Mutex is just there to
+    /// satisfy Sync on MnnSession's interior mutability without making assumptions about MNN's
+    /// thread-safety guarantees.
+    sessions: Vec<Mutex<MnnSession>>,
     charset: Vec<char>,
+    pool: ThreadPool,
 }
 
 pub struct PpocrEngine {
@@ -81,10 +99,12 @@ impl PpocrEngine {
         det_path: &Path,
         rec_path: &Path,
         keys_path: &Path,
-        intra_threads: usize,
+        det_intra_threads: usize,
     ) -> Result<Self, TranslatorError> {
-        let detector = PpocrDetector::load(det_path, intra_threads)?;
-        let recognizer = PpocrRecognizer::load(rec_path, keys_path, intra_threads)?;
+        // Det is one big graph and benefits from intra-session threading. Rec uses a
+        // single-threaded session pool dispatched in parallel — see PpocrRecognizer::load.
+        let detector = PpocrDetector::load(det_path, det_intra_threads)?;
+        let recognizer = PpocrRecognizer::load(rec_path, keys_path)?;
         Ok(Self {
             detector,
             recognizer,
@@ -116,7 +136,10 @@ impl PpocrEngine {
             ));
         }
 
+        let t_rgba = Instant::now();
         let image = rgba_to_dynamic(rgba, width, height);
+        let rgba_ms = t_rgba.elapsed().as_secs_f32() * 1000.0;
+
         let boxes = self.detector.detect(&image)?;
         log::info!(
             "ppocr: detector returned {} boxes ({}x{})",
@@ -128,11 +151,17 @@ impl PpocrEngine {
             return Ok(Vec::new());
         }
 
+        let t_crops = Instant::now();
         let gray = image.to_luma8();
         let mut crops = Vec::with_capacity(boxes.len());
         let mut box_meta = Vec::with_capacity(boxes.len());
+        let mut oriented_meta: Vec<Option<ContourBoxes>> = Vec::with_capacity(boxes.len());
         for tb in boxes {
             let expanded = expand_box(&tb.rect, DET_BOX_BORDER, width, height);
+            let oriented = tb
+                .contour
+                .as_ref()
+                .and_then(|c| oriented_boxes_from_contour(c));
             let crop_image = tb
                 .contour
                 .as_ref()
@@ -141,32 +170,73 @@ impl PpocrEngine {
                 .unwrap_or_else(|| crop_dynamic(&image, &expanded));
             crops.push(crop_image);
             box_meta.push(expanded);
+            oriented_meta.push(oriented);
         }
+        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
 
         let n_crops = crops.len();
+        let timings_us = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let recognizer = &self.recognizer;
+        let t_rec_wall = Instant::now();
+        let results: Vec<Result<RecResult, TranslatorError>> = recognizer.pool.install(|| {
+            crops
+                .par_iter()
+                .map(|crop| {
+                    let worker_idx =
+                        rayon::current_thread_index().unwrap_or(0) % recognizer.sessions.len();
+                    recognizer.recognize_one(crop, worker_idx, &timings_us)
+                })
+                .collect()
+        });
+        let rec_wall_ms = t_rec_wall.elapsed().as_secs_f32() * 1000.0;
+        let rec_pre_ms = timings_us.0.load(Ordering::Relaxed) as f32 / 1000.0;
+        let rec_infer_ms = timings_us.1.load(Ordering::Relaxed) as f32 / 1000.0;
+        let rec_post_ms = timings_us.2.load(Ordering::Relaxed) as f32 / 1000.0;
+
         let mut lines = Vec::with_capacity(n_crops);
         let mut empty_count = 0usize;
-        for chunk_start in (0..n_crops).step_by(REC_BATCH_SIZE) {
-            let end = (chunk_start + REC_BATCH_SIZE).min(n_crops);
-            let chunk = &crops[chunk_start..end];
-            let results = self.recognizer.recognize_batch(chunk)?;
-            for (offset, result) in results.into_iter().enumerate() {
-                if result.text.trim().is_empty() {
-                    empty_count += 1;
-                    continue;
-                }
+        for (index, result) in results.into_iter().enumerate() {
+            let result = result?;
+            if result.text.trim().is_empty() {
+                empty_count += 1;
+                continue;
+            }
+            {
+                let (oriented, tight) = match oriented_meta[index] {
+                    Some(ContourBoxes { tight, inflated }) => (inflated, tight),
+                    None => {
+                        let aabb = crate::ocr::OrientedRect::axis_aligned(crate::ocr::Rect {
+                            left: box_meta[index].left,
+                            top: box_meta[index].top,
+                            right: box_meta[index].right,
+                            bottom: box_meta[index].bottom,
+                        });
+                        (aabb, aabb)
+                    }
+                };
                 lines.push(PpocrLine {
                     text: result.text,
                     confidence: result.confidence,
-                    bounding_box: box_meta[chunk_start + offset],
+                    bounding_box: box_meta[index],
+                    oriented_box: oriented,
+                    tight_box: tight,
                 });
             }
         }
         log::info!(
-            "ppocr: {}/{} regions recognized ({} empty)",
+            "ppocr: {}/{} regions recognized ({} empty) — \
+             rgba_pack={:.1}ms crops/dewarp={:.1}ms \
+             rec_wall={:.1}ms (cpu pre={:.1}ms infer={:.1}ms post={:.1}ms over {} workers)",
             lines.len(),
             n_crops,
-            empty_count
+            empty_count,
+            rgba_ms,
+            crops_ms,
+            rec_wall_ms,
+            rec_pre_ms,
+            rec_infer_ms,
+            rec_post_ms,
+            REC_PARALLELISM,
         );
         sort_lines_reading_order(&mut lines);
         Ok(lines)
@@ -202,17 +272,22 @@ fn expand_box(rect: &PpocrRect, border: u32, max_w: u32, max_h: u32) -> PpocrRec
 }
 
 fn sort_lines_reading_order(lines: &mut [PpocrLine]) {
-    lines.sort_by(|a, b| {
-        let ay = a.bounding_box.top;
-        let by = b.bounding_box.top;
-        let row_height = a.bounding_box.height().max(b.bounding_box.height()).max(1);
-        let same_row = ay.abs_diff(by) <= row_height / 2;
-        if same_row {
-            a.bounding_box.left.cmp(&b.bounding_box.left)
-        } else {
-            ay.cmp(&by)
-        }
-    });
+    if lines.is_empty() {
+        return;
+    }
+    // Bucket by `top / (median_height / 2)` so lines that share a row land in the same bucket
+    // regardless of small vertical jitter. Using a global bucket size (rather than per-pair) is
+    // what keeps the comparator a true total order — the previous per-pair `max(height_a,
+    // height_b)` approach made `same_row` non-transitive and panicked under Rust's tightened
+    // sort checks.
+    let mut heights: Vec<u32> = lines
+        .iter()
+        .map(|l| l.bounding_box.height().max(1))
+        .collect();
+    heights.sort_unstable();
+    let median_h = heights[heights.len() / 2].max(1);
+    let bucket = (median_h / 2).max(1);
+    lines.sort_by_key(|l| (l.bounding_box.top / bucket, l.bounding_box.left));
 }
 
 // ---------- Detector ----------
@@ -225,47 +300,25 @@ struct DetBox {
 
 impl PpocrDetector {
     fn load(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
-        let session = load_onnx_session(model_path, intra_threads)?;
-        Ok(Self {
-            session: Mutex::new(session),
-        })
+        let session = MnnSession::load(model_path, intra_threads)?;
+        Ok(Self { session })
     }
 
     fn detect(&self, image: &DynamicImage) -> Result<Vec<DetBox>, TranslatorError> {
         let (orig_w, orig_h) = image.dimensions();
+        let t_pre = Instant::now();
         let scaled = resize_to_max_side(image, DET_MAX_SIDE);
         let (scaled_w, scaled_h) = scaled.dimensions();
         let pad_w = pad_to_multiple(scaled_w, 32);
         let pad_h = pad_to_multiple(scaled_h, 32);
         let tensor_buf = preprocess_for_det(&scaled, pad_w, pad_h);
+        let pre_ms = t_pre.elapsed().as_secs_f32() * 1000.0;
 
-        let input = Tensor::from_array((
-            [1usize, 3, pad_h as usize, pad_w as usize],
-            tensor_buf.into_boxed_slice(),
-        ))
-        .map_err(|e| {
-            TranslatorError::new(
-                TranslatorErrorKind::Internal,
-                format!("ppocr det tensor build failed: {e}"),
-            )
-        })?;
-
-        let (out_shape, mask) = {
-            let mut session = self.session.lock().expect("ppocr det session poisoned");
-            let outputs = session.run(inputs![DET_INPUT_NAME => input]).map_err(|e| {
-                TranslatorError::new(
-                    TranslatorErrorKind::Internal,
-                    format!("ppocr det inference failed: {e}"),
-                )
-            })?;
-            let (shape, mask) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
-                TranslatorError::new(
-                    TranslatorErrorKind::Internal,
-                    format!("ppocr det output not f32: {e}"),
-                )
-            })?;
-            (shape.to_vec(), mask.to_vec())
-        };
+        let t_infer = Instant::now();
+        let (mask, out_shape) = self
+            .session
+            .run(&tensor_buf, &[1, 3, pad_h as usize, pad_w as usize])?;
+        let infer_ms = t_infer.elapsed().as_secs_f32() * 1000.0;
 
         if out_shape.len() < 4 {
             return Err(TranslatorError::new(
@@ -292,8 +345,15 @@ impl PpocrDetector {
             }
         }
         let mask_mean = mask_sum / mask.len() as f32;
+        let t_post = Instant::now();
+        let binary: Vec<u8> = mask
+            .iter()
+            .map(|&v| if v > DET_SCORE_THRESHOLD { 255 } else { 0 })
+            .collect();
+        let boxes = extract_boxes(&binary, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h);
+        let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
         log::info!(
-            "ppocr det: input_pad={}x{} scaled={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{}",
+            "ppocr det: input_pad={}x{} scaled={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{} — pre={:.1}ms infer={:.1}ms post={:.1}ms",
             pad_w,
             pad_h,
             scaled_w,
@@ -305,16 +365,12 @@ impl PpocrDetector {
             mask_mean,
             DET_SCORE_THRESHOLD,
             over_thresh,
-            mask.len()
+            mask.len(),
+            pre_ms,
+            infer_ms,
+            post_ms,
         );
-        let binary: Vec<u8> = mask
-            .iter()
-            .map(|&v| if v > DET_SCORE_THRESHOLD { 255 } else { 0 })
-            .collect();
-
-        Ok(extract_boxes(
-            &binary, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h,
-        ))
+        Ok(boxes)
     }
 }
 
@@ -450,97 +506,94 @@ struct RecResult {
     confidence: f32,
 }
 
-impl PpocrRecognizer {
-    fn load(
-        model_path: &Path,
-        keys_path: &Path,
-        intra_threads: usize,
-    ) -> Result<Self, TranslatorError> {
-        let session = load_onnx_session(model_path, intra_threads)?;
-        let charset = load_charset(keys_path)?;
-        Ok(Self {
-            session: Mutex::new(session),
-            charset,
-        })
-    }
+struct RecTiming {
+    pre_ms: f32,
+    infer_ms: f32,
+    post_ms: f32,
+}
 
-    fn recognize_batch(&self, images: &[DynamicImage]) -> Result<Vec<RecResult>, TranslatorError> {
-        if images.is_empty() {
-            return Ok(Vec::new());
+impl PpocrRecognizer {
+    fn load(model_path: &Path, keys_path: &Path) -> Result<Self, TranslatorError> {
+        let mut sessions = Vec::with_capacity(REC_PARALLELISM);
+        for _ in 0..REC_PARALLELISM {
+            sessions.push(Mutex::new(MnnSession::load(model_path, 1)?));
         }
-        let target_h = REC_TARGET_HEIGHT as usize;
-        let scaled_widths: Vec<u32> = images
-            .iter()
-            .map(|img| {
-                let (w, h) = img.dimensions();
-                let scale = REC_TARGET_HEIGHT as f32 / h as f32;
-                (w as f32 * scale).round().max(1.0) as u32
-            })
-            .collect();
-        let max_w = *scaled_widths.iter().max().unwrap() as usize;
-        let n = images.len();
-        let mut batch = Array4::<f32>::zeros((n, 3, target_h, max_w));
-        for (i, (img, &sw)) in images.iter().zip(scaled_widths.iter()).enumerate() {
-            let resized = img.resize_exact(sw, REC_TARGET_HEIGHT, FilterType::Triangle);
-            let rgb = resized.to_rgb8();
-            for y in 0..target_h {
-                for x in 0..sw as usize {
-                    let pixel = rgb.get_pixel(x as u32, y as u32);
-                    batch[[i, 0, y, x]] =
-                        (pixel[0] as f32 / 255.0 - PPOCR_REC_MEAN[0]) / PPOCR_REC_STD[0];
-                    batch[[i, 1, y, x]] =
-                        (pixel[1] as f32 / 255.0 - PPOCR_REC_MEAN[1]) / PPOCR_REC_STD[1];
-                    batch[[i, 2, y, x]] =
-                        (pixel[2] as f32 / 255.0 - PPOCR_REC_MEAN[2]) / PPOCR_REC_STD[2];
-                }
-            }
-        }
-        let (input_data, _offset) = batch.into_raw_vec_and_offset();
-        let input = Tensor::from_array(([n, 3, target_h, max_w], input_data.into_boxed_slice()))
+        let charset = load_charset(keys_path)?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(REC_PARALLELISM)
+            .thread_name(|i| format!("ppocr-rec-{i}"))
+            .build()
             .map_err(|e| {
                 TranslatorError::new(
                     TranslatorErrorKind::Internal,
-                    format!("ppocr rec tensor build failed: {e}"),
+                    format!("failed to build ppocr rec thread pool: {e}"),
                 )
             })?;
+        Ok(Self {
+            sessions,
+            charset,
+            pool,
+        })
+    }
 
-        let (out_shape, out_data) = {
-            let mut session = self.session.lock().expect("ppocr rec session poisoned");
-            let outputs = session.run(inputs![REC_INPUT_NAME => input]).map_err(|e| {
-                TranslatorError::new(
-                    TranslatorErrorKind::Internal,
-                    format!("ppocr rec inference failed: {e}"),
-                )
-            })?;
-            let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
-                TranslatorError::new(
-                    TranslatorErrorKind::Internal,
-                    format!("ppocr rec output not f32: {e}"),
-                )
-            })?;
-            (shape.to_vec(), data.to_vec())
+    /// Run rec on a single crop using `sessions[session_idx]`. Each call is a batch-of-1 MNN
+    /// inference at the crop's actual aspect ratio — no padding waste.
+    fn recognize_one(
+        &self,
+        image: &DynamicImage,
+        session_idx: usize,
+        timings_us: &(AtomicU64, AtomicU64, AtomicU64),
+    ) -> Result<RecResult, TranslatorError> {
+        let t_pre = Instant::now();
+        let target_h = REC_TARGET_HEIGHT as usize;
+        let (orig_w, orig_h) = image.dimensions();
+        let scale = REC_TARGET_HEIGHT as f32 / orig_h as f32;
+        let sw = ((orig_w as f32 * scale).round().max(1.0)) as u32;
+
+        let resized = image.resize_exact(sw, REC_TARGET_HEIGHT, FilterType::Triangle);
+        let rgb = resized.to_rgb8();
+        let w_us = sw as usize;
+        let mut buf = vec![0.0f32; 3 * target_h * w_us];
+        let plane = target_h * w_us;
+        for y in 0..target_h {
+            for x in 0..w_us {
+                let pixel = rgb.get_pixel(x as u32, y as u32);
+                let idx = y * w_us + x;
+                buf[idx] = (pixel[0] as f32 / 255.0 - PPOCR_REC_MEAN[0]) / PPOCR_REC_STD[0];
+                buf[plane + idx] = (pixel[1] as f32 / 255.0 - PPOCR_REC_MEAN[1]) / PPOCR_REC_STD[1];
+                buf[2 * plane + idx] =
+                    (pixel[2] as f32 / 255.0 - PPOCR_REC_MEAN[2]) / PPOCR_REC_STD[2];
+            }
+        }
+        timings_us
+            .0
+            .fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t_infer = Instant::now();
+        let (out_data, out_shape) = {
+            let session = self.sessions[session_idx]
+                .lock()
+                .expect("ppocr rec session mutex poisoned");
+            session.run(&buf, &[1, 3, target_h, w_us])?
         };
+        timings_us
+            .1
+            .fetch_add(t_infer.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        if out_shape.len() != 3 {
+        if out_shape.len() != 3 || out_shape[0] != 1 {
             return Err(TranslatorError::new(
                 TranslatorErrorKind::Internal,
                 format!("ppocr rec output shape unexpected: {:?}", out_shape),
             ));
         }
-        let batch_n = out_shape[0] as usize;
-        let seq_len = out_shape[1] as usize;
-        let num_classes = out_shape[2] as usize;
-        let mut results = Vec::with_capacity(batch_n);
-        for b in 0..batch_n {
-            let sample_offset = b * seq_len * num_classes;
-            results.push(decode_ctc(
-                &out_data[sample_offset..sample_offset + seq_len * num_classes],
-                seq_len,
-                num_classes,
-                &self.charset,
-            ));
-        }
-        Ok(results)
+        let t_post = Instant::now();
+        let seq_len = out_shape[1];
+        let num_classes = out_shape[2];
+        let result = decode_ctc(&out_data, seq_len, num_classes, &self.charset);
+        timings_us
+            .2
+            .fetch_add(t_post.elapsed().as_micros() as u64, Ordering::Relaxed);
+        Ok(result)
     }
 }
 
@@ -608,6 +661,128 @@ fn decode_ctc(logits: &[f32], seq_len: usize, num_classes: usize, charset: &[cha
 }
 
 // ---------- Per-line contour-based dewarp (ported from OCR PoC) ----------
+
+/// Compute the min-area-aligned (PCA-axis) rotated rectangle around a detection contour. The
+/// principal axis is the line's reading direction; perpendicular extent gives the height. For
+/// elongated text shapes this is within a fraction of a degree of the true min-area rect, but
+/// is much cheaper than the rotating-calipers algorithm.
+#[derive(Debug, Clone, Copy)]
+struct ContourBoxes {
+    /// Min-area rotated rectangle around the *raw* DB mask contour. Tight to the segmentation
+    /// kernel — no ascender/descender padding, no unclip inflation. Used for layout heuristics
+    /// (paragraph grouping, line-height clustering) where character whitespace would skew the
+    /// metric.
+    tight: crate::ocr::OrientedRect,
+    /// `tight` inflated by `unclip + DET_BOX_BORDER`, matching the AABB pipeline. Used for
+    /// erase/render so the box covers actual ink including ascenders/descenders.
+    inflated: crate::ocr::OrientedRect,
+}
+
+fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
+    if contour.len() < 4 {
+        return None;
+    }
+    let n = contour.len() as f32;
+
+    let mut mean_x = 0.0f32;
+    let mut mean_y = 0.0f32;
+    for &(x, y) in contour {
+        mean_x += x;
+        mean_y += y;
+    }
+    mean_x /= n;
+    mean_y /= n;
+
+    let mut cxx = 0.0f32;
+    let mut cyy = 0.0f32;
+    let mut cxy = 0.0f32;
+    for &(x, y) in contour {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        cxx += dx * dx;
+        cyy += dy * dy;
+        cxy += dx * dy;
+    }
+    cxx /= n;
+    cyy /= n;
+    cxy /= n;
+
+    let trace = cxx + cyy;
+    let det = cxx * cyy - cxy * cxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let lambda1 = (trace + disc) * 0.5;
+    let (ex, ey) = if cxy.abs() > 1e-6 {
+        (lambda1 - cyy, cxy)
+    } else if cxx >= cyy {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
+    let mut ux = ex / norm;
+    let mut uy = ey / norm;
+    // Canonicalize tangent to point in +x so angle ∈ (-π/2, π/2]. Without this, lines tilted
+    // counterclockwise from horizontal could come back with the tangent pointing leftward and
+    // an angle near ±π — the renderer would draw the text backwards.
+    if ux < 0.0 {
+        ux = -ux;
+        uy = -uy;
+    }
+    let vx = -uy;
+    let vy = ux;
+
+    let mut u_min = f32::INFINITY;
+    let mut u_max = f32::NEG_INFINITY;
+    let mut v_min = f32::INFINITY;
+    let mut v_max = f32::NEG_INFINITY;
+    for &(x, y) in contour {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        let u = dx * ux + dy * uy;
+        let v = dx * vx + dy * vy;
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    let raw_width = u_max - u_min;
+    let raw_height = v_max - v_min;
+    if raw_width < 4.0 || raw_height < 2.0 {
+        return None;
+    }
+    let u_center = (u_min + u_max) * 0.5;
+    let v_center = (v_min + v_max) * 0.5;
+    let cx = mean_x + ux * u_center + vx * v_center;
+    let cy = mean_y + uy * u_center + vy * v_center;
+    let angle_radians = uy.atan2(ux);
+
+    let tight = crate::ocr::OrientedRect {
+        cx,
+        cy,
+        width: raw_width,
+        height: raw_height,
+        angle_radians,
+    };
+
+    // DB segmentation produces a *shrunken* contour relative to the actual ink. The AABB path
+    // recovers the full text region by expanding by `expand_dist = area * UNCLIP / perimeter`
+    // plus a small border (see `extract_boxes` and `expand_box`). Apply the same inflation
+    // here so the oriented rect covers ascenders/descenders for erase, and so its height
+    // matches the AABB pipeline's height — what the renderer uses to size the font.
+    let area = raw_width * raw_height;
+    let perimeter = 2.0 * (raw_width + raw_height);
+    let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0);
+    let pad = expand_dist + DET_BOX_BORDER as f32;
+    let inflated = crate::ocr::OrientedRect {
+        cx,
+        cy,
+        width: raw_width + 2.0 * pad,
+        height: raw_height + 2.0 * pad,
+        angle_radians,
+    };
+
+    Some(ContourBoxes { tight, inflated })
+}
 
 fn dewarp_contour_to_strip(gray: &GrayImage, contour: &[(f32, f32)]) -> Option<GrayImage> {
     if contour.len() < 8 {

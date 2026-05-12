@@ -299,6 +299,52 @@ fn pack_installed_in_snapshot(snapshot: &CatalogSnapshot, pack_id: &str) -> bool
         .is_some_and(|status| status.installed)
 }
 
+pub fn installed_ocr_engines_for_language(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Vec<String> {
+    snapshot
+        .catalog
+        .ocr_engines_for_language(language_code)
+        .into_iter()
+        .filter(|(_, pack_id)| pack_installed_in_snapshot(snapshot, pack_id))
+        .map(|(engine, _)| engine)
+        .collect()
+}
+
+pub fn available_ocr_engines_for_language(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Vec<String> {
+    snapshot
+        .catalog
+        .ocr_engines_for_language(language_code)
+        .into_iter()
+        .map(|(engine, _)| engine)
+        .collect()
+}
+
+pub fn plan_ocr_engine_download(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+    engine: &str,
+) -> Option<DownloadPlan> {
+    let pack_id = snapshot
+        .catalog
+        .ocr_pack_id_for_engine(language_code, engine)?;
+    let tasks = missing_files_in_snapshot(snapshot, [pack_id.as_str()])
+        .into_iter()
+        .filter_map(|item| {
+            let pack = snapshot.catalog.pack(&item.pack_id)?;
+            Some(download_task_for(pack, &item.file))
+        })
+        .collect::<Vec<_>>();
+    Some(DownloadPlan {
+        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
+        tasks,
+    })
+}
+
 fn missing_files_in_snapshot<'a, I>(
     snapshot: &'a CatalogSnapshot,
     pack_ids: I,

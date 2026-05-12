@@ -209,7 +209,7 @@ fn build_tesseract_blocks(
 
 #[cfg(feature = "ppocr")]
 fn ppocr_lines_to_blocks(lines: Vec<crate::ppocr::PpocrLine>) -> Vec<TextBlock> {
-    lines
+    let text_lines: Vec<TextLine> = lines
         .into_iter()
         .filter(|line| !line.text.trim().is_empty())
         .map(|line| {
@@ -219,15 +219,16 @@ fn ppocr_lines_to_blocks(lines: Vec<crate::ppocr::PpocrLine>) -> Vec<TextBlock> 
                 right: line.bounding_box.right,
                 bottom: line.bounding_box.bottom,
             };
-            TextBlock {
-                lines: vec![TextLine {
-                    text: line.text,
-                    bounding_box: rect,
-                    word_rects: vec![rect],
-                }],
+            TextLine {
+                text: line.text,
+                bounding_box: rect,
+                oriented_box: line.oriented_box,
+                tight_box: line.tight_box,
+                word_rects: vec![rect],
             }
         })
-        .collect()
+        .collect();
+    crate::ocr::group_lines_into_paragraphs(text_lines, Default::default())
 }
 
 fn finalize_image_overlay(
@@ -242,6 +243,7 @@ fn finalize_image_overlay(
     background_mode: BackgroundMode,
     reading_order: ReadingOrder,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
+    let t_translate = std::time::Instant::now();
     let translated_blocks = {
         let mut engine_guard = engine.lock().expect("bergamot engine lock poisoned");
         translate_block_texts(
@@ -252,8 +254,10 @@ fn finalize_image_overlay(
             &blocks,
         )?
     };
+    let translate_ms = t_translate.elapsed().as_secs_f32() * 1000.0;
 
-    prepare_overlay_image(
+    let t_overlay = std::time::Instant::now();
+    let result = prepare_overlay_image(
         rgba_bytes,
         width,
         height,
@@ -262,7 +266,15 @@ fn finalize_image_overlay(
         background_mode,
         reading_order,
     )
-    .map_err(TranslatorError::ocr)
+    .map_err(TranslatorError::ocr);
+    let overlay_ms = t_overlay.elapsed().as_secs_f32() * 1000.0;
+    log::info!(
+        "finalize_image_overlay: {} blocks — translate={:.1}ms overlay_prep={:.1}ms",
+        blocks.len(),
+        translate_ms,
+        overlay_ms,
+    );
+    result
 }
 
 fn map_tesseract_word(word: TesseractDetectedWord) -> DetectedWord {
