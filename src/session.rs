@@ -576,7 +576,11 @@ impl TranslatorSession {
         width: u32,
         height: u32,
     ) -> Result<Option<DocumentDetection>, TranslatorError> {
-        self.doc_aligner()?.detect(rgba, width, height)
+        let Some(mut detection) = self.doc_aligner()?.detect(rgba, width, height)? else {
+            return Ok(None);
+        };
+        detection.quad = crate::doc_align_refine::refine_quad(rgba, width, height, &detection.quad);
+        Ok(Some(detection))
     }
 
     #[cfg(feature = "doc-align")]
@@ -588,11 +592,12 @@ impl TranslatorSession {
         quad: &DocumentQuad,
         out_width: Option<u32>,
         out_height: Option<u32>,
+        postprocess: bool,
     ) -> Result<WarpedImageRgba, TranslatorError> {
         let (default_w, default_h) = crate::doc_align::suggested_output_dims(quad);
         let out_w = out_width.unwrap_or(default_w);
         let out_h = out_height.unwrap_or(default_h);
-        crate::doc_align::warp(rgba, width, height, quad, out_w, out_h)
+        crate::doc_align::warp(rgba, width, height, quad, out_w, out_h, postprocess)
     }
 
     #[cfg(feature = "doc-align")]

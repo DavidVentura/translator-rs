@@ -6,6 +6,8 @@ pub mod bergamot;
 pub mod catalog;
 #[cfg(feature = "doc-align")]
 pub mod doc_align;
+#[cfg(feature = "doc-align")]
+pub mod doc_align_refine;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]

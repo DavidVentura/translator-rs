@@ -32,7 +32,7 @@ pub struct DocumentQuad {
 }
 
 impl DocumentQuad {
-    fn corners(&self) -> [DocumentPoint; 4] {
+    pub fn corners(&self) -> [DocumentPoint; 4] {
         [
             self.top_left,
             self.top_right,
@@ -41,7 +41,7 @@ impl DocumentQuad {
         ]
     }
 
-    fn from_corners(corners: [DocumentPoint; 4]) -> Self {
+    pub fn from_corners(corners: [DocumentPoint; 4]) -> Self {
         Self {
             top_left: corners[0],
             top_right: corners[1],
@@ -250,9 +250,10 @@ fn edge_len(a: DocumentPoint, b: DocumentPoint) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Perspective-warp `rgba` so that `quad` maps to the full output rectangle (0,0)-(out_w,out_h),
-/// then apply CLAHE on the luma channel. Sampling: bilinear; out-of-bounds source coords sample
-/// as transparent black. The output is RGBA8, opaque (alpha=255) for in-bounds samples.
+/// Perspective-warp `rgba` so that `quad` maps to the full output rectangle (0,0)-(out_w,out_h).
+/// When `postprocess` is true, apply CLAHE on the luma channel afterwards. Sampling: bilinear;
+/// out-of-bounds source coords sample as transparent black. The output is RGBA8, opaque
+/// (alpha=255) for in-bounds samples.
 pub fn warp(
     rgba: &[u8],
     width: u32,
@@ -260,8 +261,12 @@ pub fn warp(
     quad: &DocumentQuad,
     out_w: u32,
     out_h: u32,
+    postprocess: bool,
 ) -> Result<WarpedImageRgba, TranslatorError> {
     let mut warped = warp_geometric(rgba, width, height, quad, out_w, out_h)?;
+    if !postprocess {
+        return Ok(warped);
+    }
     apply_clahe(
         &mut warped.rgba,
         warped.width,
@@ -407,6 +412,13 @@ fn apply_clahe(
     tiles_y: u32,
 ) {
     if width < tiles_x || height < tiles_y {
+        log::info!(
+            "apply_clahe: skipping (image {}x{} smaller than {}x{} tile grid)",
+            width,
+            height,
+            tiles_x,
+            tiles_y
+        );
         return;
     }
     let w = width as usize;
@@ -419,6 +431,7 @@ fn apply_clahe(
     let mut luma = vec![0u8; pixels];
     let mut cb = vec![0u8; pixels];
     let mut cr = vec![0u8; pixels];
+    let mut luma_sum_before: u64 = 0;
     for i in 0..pixels {
         let r = rgba[i * 4] as f32;
         let g = rgba[i * 4 + 1] as f32;
@@ -426,10 +439,13 @@ fn apply_clahe(
         let y = 0.299 * r + 0.587 * g + 0.114 * b;
         let cb_v = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
         let cr_v = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
-        luma[i] = y.round().clamp(0.0, 255.0) as u8;
+        let yi = y.round().clamp(0.0, 255.0) as u8;
+        luma[i] = yi;
         cb[i] = cb_v.round().clamp(0.0, 255.0) as u8;
         cr[i] = cr_v.round().clamp(0.0, 255.0) as u8;
+        luma_sum_before += yi as u64;
     }
+    let mean_before = luma_sum_before as f64 / pixels as f64;
 
     // Per-tile LUT: 256 entries mapping old luma → new luma.
     let mut tile_luts = vec![[0u8; 256]; tx * ty];
@@ -482,6 +498,7 @@ fn apply_clahe(
     // LUT outputs. Tile centres sit at ((col+0.5) * w/tx, (row+0.5) * h/ty).
     let tile_w = w as f32 / tx as f32;
     let tile_h = h as f32 / ty as f32;
+    let mut luma_sum_after: u64 = 0;
     for y in 0..h {
         let fy = (y as f32 + 0.5) / tile_h - 0.5;
         let ty0 = fy.floor() as isize;
@@ -507,6 +524,7 @@ fn apply_clahe(
                 + wx * (1.0 - wy) * v10
                 + (1.0 - wx) * wy * v01
                 + wx * wy * v11;
+            luma_sum_after += new_y.round().clamp(0.0, 255.0) as u64;
 
             let cb_v = cb[i] as f32 - 128.0;
             let cr_v = cr[i] as f32 - 128.0;
@@ -519,6 +537,17 @@ fn apply_clahe(
             // alpha untouched
         }
     }
+    let mean_after = luma_sum_after as f64 / pixels as f64;
+    log::info!(
+        "apply_clahe: {}x{} tiles={}x{} clip={:.2} mean_luma {:.1} -> {:.1}",
+        width,
+        height,
+        tiles_x,
+        tiles_y,
+        clip_limit,
+        mean_before,
+        mean_after,
+    );
 }
 
 /// Solve the 3×3 homography H (returned as 9 floats, row-major, h[8] forced to 1) that maps

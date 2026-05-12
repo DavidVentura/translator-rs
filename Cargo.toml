@@ -114,6 +114,11 @@ name = "odt_smoke"
 path = "tests/odt_smoke.rs"
 required-features = ["odt"]
 
+[[test]]
+name = "doc_align_refine_visual"
+path = "tests/doc_align/refine_visual.rs"
+required-features = ["doc-align"]
+
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }
 
