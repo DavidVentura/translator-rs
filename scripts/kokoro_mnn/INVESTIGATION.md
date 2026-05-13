@@ -2009,14 +2009,14 @@ Candidate combined quality+duration model:
 
 Regeneration is now persisted in `rebuild_best_mnn.sh`. The script recreates
 the converter compression params locally under `compression_params/`, edits the
-required ops to `bits=0`, and reconverts from
-`kokoro-v1.0.patched.i32.onnx`. Run:
+required ops to `bits=0`, reconverts from `kokoro-v1.0.patched.i32.onnx`, and
+now also rebuilds the final optfast external-weight dedup pair. Run:
 
 ```sh
 ./rebuild_best_mnn.sh
 ```
 
-The exact final conversion command emitted by the script is:
+The exact clean single-file conversion command emitted by the script is:
 
 ```sh
 uv run mnnconvert -f ONNX \
@@ -2200,6 +2200,220 @@ profile areas:
    duration on the long sentence, but profiling the narrower variants can tell
    whether relaxing either one would be worth further correctness work.
 
+Results of those quick branch checks:
+
+| Candidate/check | Size | Host Japanese samples | Phone profile result | Verdict |
+|-----------------|------|-----------------------|----------------------|---------|
+| current good model | 104,172,172 bytes | 262800 | op-sum `3458 ms`, `While 926 ms`, BERT-`While 477 ms`, decoder-`While 442 ms` | baseline |
+| `--transformerFuse` | 104,172,172 bytes | 262800, byte-identical normalized WAV to current | op-sum `3431 ms`, `While 923 ms`, BERT-`While 469 ms`, decoder-`While 448 ms` | no meaningful effect |
+| `--optimizePrefer 2` | 152,729,404 bytes | 262200 | op-sum `2980 ms`, BERT-`While 9 ms` | unsafe: duration/output changed |
+| `--optimizePrefer 2 --convertMatmulToConv 0` | 121,640,692 bytes | 262800 | op-sum `3403 ms`, `While 911 ms`, BERT-`While 477 ms`, decoder-`While 425 ms` | no real speed win; larger and waveform differs |
+| keep only BERT encoder fp32 | 103,883,720 bytes | not retested here; previous long-duration probe failed | op-sum `3375 ms`, `While 871 ms`, BERT-`While 477 ms` | not enough correctness benefit, no BERT speed win |
+| keep only BERT mapping fp32 | 103,017,416 bytes | not retested here; previous long-duration probe failed | op-sum `3400 ms`, `While 884 ms`, BERT-`While 474 ms` | not enough correctness benefit, no BERT speed win |
+| runtime `precision=low`, `memory=low` | same file | not kept | op-sum `10678 ms`, conv `4766 ms`, decoder-`While 1031 ms`, STFT `1811 ms` | fp16/low precision runtime is much worse |
+
+Short non-profile timing for the only safe-looking graph-fusion variant did
+not confirm a real gain:
+
+| Model | Avg | Min | Max |
+|-------|-----|-----|-----|
+| current good model | 4390.7 ms | 3433.1 ms | 4884.4 ms |
+| `optimizePrefer 2`, MatMul-to-Conv disabled | 4429.8 ms | 3534.5 ms | 4902.9 ms |
+
+For completeness, the unsafe full `--optimizePrefer 2` candidate was also
+timed in the same non-profile phone path:
+
+| Model | Size | Load/init | Runtime memory | Avg | Min | Max | Output length | Avg RTF |
+|-------|------|-----------|----------------|-----|-----|-----|---------------|---------|
+| current good model | 104,172,172 bytes | 267.7 ms | 424.0 MB | 4390.7 ms | 3433.1 ms | 4884.4 ms | 10.950 s | 0.401 |
+| `--optimizePrefer 2` | 152,729,404 bytes | 342.7 ms | 468.4 MB | 3723.0 ms | 3032.4 ms | 4192.1 ms | 10.925 s | 0.341 |
+| `--optimizePrefer 2 --convertMatmulToConv 0` | 121,640,692 bytes | 198.0 ms | 332.1 MB | 4429.8 ms | 3534.5 ms | 4902.9 ms | 10.950 s | 0.405 |
+
+So the full optfast model is about 15% faster by average timing in this quick
+3-run check, and about 12% faster by best-loop timing, but it costs +48.6 MB
+(+46.6%) on disk and changed the Japanese output length from 262800 to 262200
+samples. The generated listening file is
+`kokoro_ja_rainbow_jf_alpha_mnn_optfast.wav`.
+
+Host-side follow-up on whether the optfast speed and size are tied together:
+
+- Hypothesis tested: the size increase might be because the normal graph's
+  compression params were reused after `--optimizePrefer 2` created new
+  MatMul-as-Conv ops, leaving those new ops unquantized.
+- Result: no. Regenerating the compression params under the optfast graph and
+  then applying the same exact eight fp32 exclusions produced the same size
+  (`152,729,404` bytes) and the same 262200-sample output
+  (`kokoro_ja_rainbow_jf_alpha_mnn_optfast_requant.wav` byte-identical to the
+  previous optfast WAV).
+
+Compression-param structure explains the coupling:
+
+| Params file | Weighted layers | BERT weighted layers | Notes |
+|-------------|-----------------|----------------------|-------|
+| normal block128 base | 195 | 1 | current graph keeps ALBERT internals behind the original structure |
+| optfast block128 base | 267 | 73 | optfast exposes/converts many ALBERT FFN/attention projections |
+| current good final | 195, with 8 fp32 exclusions | 1 | shipping candidate |
+| optfast exact-eight final | 267, with 8 fp32 exclusions | 73 | same large optfast size |
+
+This points to `--optimizePrefer 2` + MatMul-to-Conv as the real tradeoff: it
+turns BERT/ALBERT projection work into a faster layout for MNN, but the graph
+materializes many more weighted BERT layers. The converter itself warns:
+`Convert MatMul Convolution use shared const B inputs, may increase the model
+size`.
+
+Host timing on the same Japanese `jf_alpha` input, one warmup + three measured
+forwards in one process:
+
+| Model | Size | Load | Avg | Samples | Notes |
+|-------|------|------|-----|---------|-------|
+| current good | 104,172,172 bytes | 179.0 ms | 3129.8 ms | 262800 | baseline |
+| optfast, old params | 152,729,404 bytes | 284.0 ms | 2866.1 ms | 262200 | faster, larger, duration changed |
+| optfast, regenerated params | 152,729,404 bytes | 279.3 ms | 2940.4 ms | 262200 | same size/output family |
+| optfast, MatMul-to-Conv disabled | 121,640,692 bytes | 203.7 ms | 3243.9 ms | 262800 | smaller than optfast, but slower than current |
+
+Conclusion for stock MNN converter flags: the speedup and +50% size are
+effectively tied together. Disabling the MatMul-to-Conv expansion avoids the
+worst size issue, but also removes the speedup. A better version needs a
+custom/shared-weight BERT projection storage fix, not another compression-param
+pass.
+
+New storage workaround: `--saveExternalData` plus external-weight dedup keeps
+the optfast graph and removes the duplicated ALBERT payload from disk.
+
+Steps are now captured directly in `rebuild_best_mnn.sh`; the short form is:
+
+```sh
+./rebuild_best_mnn.sh
+```
+
+The script first generates compression params under the `--optimizePrefer 2`
+graph, edits the same quality-preserving exclusions, converts with
+`--saveExternalData`, dumps JSON metadata with `mnnconvert -f MNN --JsonFile`,
+then runs `dedup_mnn_external_weights.py` to patch external offsets in the
+original flatbuffer and write the compact sidecar.
+
+Important implementation details:
+
+- `--saveExternalData` alone only moves the large payload to a sidecar file:
+  `1,027,352` byte `.mnn` plus `151,709,247` byte `.mnn.weight`, still the
+  same total size as full optfast.
+- The repeated external blobs are mostly ALBERT attention/FFN projections
+  duplicated across the unrolled/shared layer group: about `151.7 MB`
+  referenced, `86.9 MB` unique, `64.8 MB` removable duplication.
+- The JSON dump must be used as metadata only. JSON -> MNN roundtripping
+  changes the generated waveform, even before dedup. The working helper patches
+  int64 external offsets in the original flatbuffer bytes and writes a compact
+  sidecar `.weight`.
+- Both top-level `oplists` and `subgraphs[].nodes` must be included when
+  collecting external blobs. Deduping only top-level ops leaves stale subgraph
+  offsets and fails at runtime with invalid quantized weight reads.
+- Repeated external offsets are accepted by MNN. A one-offset probe and the full
+  flatbuffer-patched model both ran locally and on Android.
+
+Flatdedup result:
+
+| Model | Total size | Main `.mnn` | Sidecar `.weight` | Host output |
+|-------|------------|-------------|-------------------|-------------|
+| current good | 104,172,172 bytes | single file | none | 262800 samples |
+| full optfast | 152,729,404 bytes | single file | none | 262200 samples |
+| optfast external, not deduped | 152,736,599 bytes | 1,027,352 bytes | 151,709,247 bytes | byte-identical PCM to full optfast |
+| optfast flatdedup | 87,976,907 bytes | 1,027,352 bytes | 86,949,555 bytes | byte-identical PCM to full optfast |
+
+The helper's reproducibility check:
+
+```text
+referenced=151709247 unique=86949555 saved=64759692
+chunks=211 offsets=301 patched_occurrences=255 missing_offsets=0 multi_offsets=0
+mnn_size=1027352 weight_size=86949555 total_size=87976907
+```
+
+Phone timing, same low-memory/dequant-GEMM build, Japanese `jf_alpha` rainbow
+sample, 4 threads, screen kept awake. The timing harness does not print the
+output shape, so the length column below is the host-generated output length
+for the same model/input:
+
+| Model | Total size | Load/init | Runtime memory | Avg | Min | Max | Host output length | Avg RTF |
+|-------|------------|-----------|----------------|-----|-----|-----|--------------------|---------|
+| current good | 104,172,172 bytes | 274.2 ms | 424.0 MB | 4528.9 ms | 3564.5 ms | 5026.5 ms | 10.950 s | 0.414 |
+| full optfast | 152,729,404 bytes | 369.0 ms | 468.4 MB | 4038.0 ms | 3234.7 ms | 4498.3 ms | 10.925 s | 0.370 |
+| optfast flatdedup | 87,976,907 bytes | 49.8 ms | 468.4 MB | 4013.3 ms | 3260.2 ms | 4392.5 ms | 10.925 s | 0.367 |
+
+Follow-up 4-forward non-debug run with PID-pinned `top` sampling:
+`android_ja_rainbow_optfast_flatdedup_4run_pidcpu_trace.txt`. Timing was
+`Avg=3636.3 ms`, `min=3021.2 ms`, `max=4220.2 ms`; `top` sampled
+`ModuleBasic.out` at `320-451%` CPU, average `413.8%`. This matches the visual
+observation that the 4-thread run keeps roughly four cores busy.
+
+This is the first result that gets the optfast speed advantage without the
+extra model size. It is not a stock converter output and still has optfast's
+262200-sample output behavior on the Japanese sample, but the audio PCM is
+identical to the already-listened full optfast WAV.
+
+Pending upstream follow-up: report this dedup limitation to MNN's converter
+side. The concrete repro is Kokoro's shared ALBERT/BERT layer group under
+`--optimizePrefer 2`: MatMul-to-Conv makes the graph fast, but materializes
+many repeated attention/FFN projection weights. With `--saveExternalData`, the
+converted model referenced `151,709,247` bytes of external weights even though
+only `86,949,555` bytes were unique; about `64.8 MB` was duplicated shared
+payload. MNN runtime already accepts multiple external-weight ops pointing at
+the same sidecar offset, so the missing piece appears to be converter/storage
+dedup rather than runtime capability. For now the two-file `.mnn` +
+`.mnn.weight` workaround is acceptable for our package.
+
+Issue draft saved in `MNN_UPSTREAM_DEDUP_ISSUE.md`.
+
+Fresh per-op trace for the flatdedup candidate:
+`android_ja_rainbow_optfast_flatdedup_perop_3run_trace.txt`. Same phone/input,
+debug/per-op mode, three forwards. Absolute timings are tracing-instrumented, so
+the percentages are more useful than the wall-clock numbers.
+
+| Bucket | Current good | Optfast flatdedup | Interpretation |
+|--------|--------------|-------------------|----------------|
+| Convolution | `4450.5 ms` / `38.4%` | `5371.6 ms` / `48.7%` | Conv is now the biggest bucket because BERT got much smaller. |
+| While total | `2986.8 ms` / `25.8%` | `1485.0 ms` / `13.5%` | Main optfast win. |
+| BERT `While` | `1749.1 ms` / `15.1%` | `27.8 ms` / `0.3%` | MatMul-to-Conv essentially removes BERT as a bottleneck. |
+| Decoder `While` | `1217.2 ms` / `10.5%` | `1432.8 ms` / `13.0%` | Decoder elementwise/AdaIN work remains. |
+| UnaryOp | `1303.1 ms` / `11.2%` | `1284.9 ms` / `11.6%` | Mostly sine path; unchanged. |
+| STFT | `949.1 ms` / `8.2%` | `954.4 ms` / `8.6%` | Unchanged. |
+| Raster | `635.8 ms` / `5.5%` | `661.1 ms` / `6.0%` | Unchanged-ish graph overhead. |
+| BinaryOp | `603.9 ms` / `5.2%` | `615.4 ms` / `5.6%` | Unchanged-ish elementwise overhead. |
+| Deconvolution | `339.6 ms` / `2.9%` | `339.1 ms` / `3.1%` | Unchanged. |
+| Reduction | `286.8 ms` / `2.5%` | `285.4 ms` / `2.6%` | Unchanged. |
+
+Top flatdedup individual ops by traced time:
+
+| Op | Time | Share |
+|----|------|-------|
+| `/decoder/decoder/generator/STFT_output_0` | `954.4 ms` | `8.65%` |
+| `/decoder/decoder/generator/ups.1/ConvTranspose_output_0` | `195.6 ms` | `1.77%` |
+| Tail generator K11 conv family under `noise_res.1` / `resblocks.5` | about `177.5-178.8 ms` each | about `1.6%` each |
+| `/decoder/decoder/generator/ups.0/ConvTranspose_output_0` | `128.3 ms` | `1.16%` |
+| Generator `resblocks.4` conv family | about `117.3-117.6 ms` each | about `1.1%` each |
+
+Performance implication: the flatdedup/optfast path already did the easy BERT
+win. The remaining large buckets are vocoder/generator work: convs, STFT,
+decoder `While` elementwise/AdaIN, sine/unary work, and raster/binary overhead.
+There is no longer a single BERT-side target comparable to the old 15% bucket.
+
+Interpretation:
+
+- Decoder-side `While` is mostly non-weight elementwise AdaIN/resblock work.
+  Weight int8 does not directly target it, and MNN runtime fp16 makes it
+  slower, not faster.
+- BERT-side `While` gets much faster from the global `optimizePrefer 2`
+  MatMul-to-Conv rewrite. In stock single-file form that grows the model by
+  about 49 MB, but external flatdedup removes the duplicated shared ALBERT
+  weights and makes the total artifact smaller than the current clean model.
+- Disabling MatMul-to-Conv restores duration but removes the BERT speed win.
+- `--transformerFuse` appears to be a no-op for this graph in the MNN 3.5
+  converter.
+
+So there is still no easy stock-converter win from the checked
+fusion/int8/fp16 knobs, but the external flatdedup workaround decouples optfast
+speed from optfast file size. The remaining caveats are packaging the sidecar
+cleanly and deciding whether the optfast 262200-sample behavior is acceptable
+for the Japanese sample.
+
 Metric interpretation from `whistle_metrics.py`:
 
 - Block128 does **not** have a huge broad high-frequency energy mismatch. It is
@@ -2282,10 +2496,13 @@ Performance next-step decision tree:
 3. Treat the produced native-LSTM PTQ model as a failed fidelity candidate.
    Timing is subjectively correct; the blocker is severe codec-like audio
    degradation.
-4. Treat `kokoro-v1.0.patched.i32.while.wq8.block128.mnn` as the best current
-   MNN candidate by metrics, with `kokoro-v1.0.patched.i32.while.wq8.mnn` as
-   the already-listened fallback. Both are stable and preserve sample count;
-   block128 is also the fastest Android MNN candidate measured so far.
+4. Treat
+   `kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.optfast-flatdedup.mnn`
+   plus its `.weight` sidecar as the current performance/size lead. It keeps
+   the full optfast waveform exactly and is only `87,976,907` bytes total, but
+   it is a flatbuffer-offset workaround rather than a clean converter feature.
+   The previous single-file safe candidate remains
+   `kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.mnn`.
 5. Do not use MNN runtime `precision=low` for this Kokoro graph on the tested
    phone unless a different backend/build proves otherwise. It is roughly 2x
    realtime, much slower than normal-mode CPU.
@@ -2297,15 +2514,94 @@ Performance next-step decision tree:
    effectively silent. The real remaining work is correctness in MNN's dynamic
    low-memory quantized conv path and/or PTQ calibration/graph partitioning.
 
+## Current workaround ledger
+
+This is the current stack of intentional hacks/workarounds in the best MNN
+path:
+
+1. External two-file weight dedup:
+   `--optimizePrefer 2` gives the useful BERT speedup, but MNN converter
+   duplicates shared ALBERT/BERT projection weights. We keep the optfast graph,
+   use `--saveExternalData`, compact identical sidecar blobs, and patch external
+   offsets in the original flatbuffer. This is why the best artifact is a
+   `.mnn` plus `.mnn.weight` pair.
+2. MNN low-memory lifetime/allocation workaround:
+   the fast Android path depends on the low-memory/dequant-GEMM build/runtime
+   route, but the original low-memory path produced bad/silent/distorted output
+   until we worked around the memory/free lifetime issue in the local MNN build.
+   This should become a real MNN-side fix before treating the runtime patch as
+   clean.
+   Current repro status: the hardcoded `MNN_KOKORO_KEEP_CONDITIONING` tensor-id
+   env patch is **not** needed for the current optfast-flatdedup candidate. On
+   phone, `waveform` alone and `F0_conv + waveform` were byte-identical for
+   `kokoro-block128-skip-istft-convpost-duration-bert-optfast-flatdedup.mnn`
+   under low-memory mode: `261000` samples, RMS `0.10125`, `MAE=0`. The old
+   full-PTQ model still reproduces the Android low-memory failure without the
+   pin/workaround: `259800` samples, RMS `5.7e-13` near-silent output. On host,
+   the same full-PTQ low-memory run did not crash or zero out (`82200` samples,
+   RMS `0.061`), so the near-zero failure is Android/ARM low-memory-path
+   specific in our current tests. Practical shipping implication: for the
+   current flatdedup path, an upstream-equivalent MNN runtime should be OK as
+   long as it is built with the needed low-memory/dequant-GEMM support; the
+   Kokoro-specific env var / hardcoded tensor-id patch is not part of the
+   required path.
+3. ONNX graph input-id narrowing:
+   `input_ids` must be `INT32` for MNN `Gather` correctness. Leaving the source
+   as `INT64` caused encoder corruption and downstream duration errors. This is
+   reproducible from git via `uv run python patch_resize.py`, whose default
+   output is now `kokoro-v1.0.patched.i32.onnx`; it is not a manual `.mnn`
+   patch.
+4. Resize/Round source graph cleanup:
+   the patched ONNX source still carries the earlier explicit Resize/Round
+   cleanup. Resize was not the final bug, but the patched source is the stable
+   conversion base used by the current artifacts.
+5. While-LSTM instead of native MNN LSTM:
+   native-LSTM conversion had repeated-forward state mutation. The stable
+   current family keeps the ONNX `While` structure for LSTM behavior.
+6. Selective fp32 exclusions for quality/duration:
+   the block128 model keeps final iSTFT/`conv_post` and the duration/BERT path
+   exclusions needed to remove the whistle/static issues and avoid low-memory
+   rounded-duration drift. These are not converter crashes, but they are
+   deliberate quality-preserving exceptions to "quantize everything".
+7. Runtime/build requirement:
+   the fast conv path requires the Android MNN build/runtime combination with
+   `MNN_LOW_MEMORY=ON`, `MNN_CPU_WEIGHT_DEQUANT_GEMM=ON`, and runtime
+   `memory=low`. This is now wired into `/home/david/git/mnn-sys/build.rs` for
+   Android CMake builds, so the app-side rebuild path should no longer require
+   a hand-built `build64profile-lowmem` MNN directory.
+8. `mnn-sys` API requirement:
+   `/home/david/git/mnn-sys` now has the needed wrapper shape: runtime
+   `memory=low` config, `from_file` backed by MNN `createFromFile`, and generic
+   named dynamic inference rather than a Kokoro-specific `run_kokoro`
+   entrypoint. Kokoro can pass `input_ids: i32 [1, N]`, `style: f32 [1, 256]`,
+   `speed: f32 [1]`, and request selected output `waveform`. Important caveat:
+   MNN `createFromFile` resolves the external sidecar as `<model>.weight`, but
+   its current source still reads/merges the main `.mnn` into memory rather than
+   mmaping it. For the flatdedup split this is acceptable because the main
+   flatbuffer is about 1 MB and the large data lives in the sidecar.
+9. `piper-rs` integration:
+   `/home/david/git/piper-rs` now has an optional `mnn` feature with
+   `mnn-sys = { path = "../mnn-sys", optional = true }`. With that feature,
+   it exports `KokoroMnnModel` beside the existing ONNX `KokoroModel`.
+   `KokoroMnnModel` reuses the same voice archive, vocabulary, espeak/Japanese
+   phonemization, and normalization path, then calls MNN with named inputs
+   `input_ids`, `style`, `speed` and selected output `waveform`. Manual smoke:
+   `cargo run --features "mnn japanese" --example kokoro_mnn_text_wav -- \
+   <model.mnn> <voices.bin> <mucab.bin> ja jf_alpha out.wav <text>`.
+
 ## File index
 
 - `bench.py` — ORT vs MNN comparator with WAV dump. Defaults to no warmup and
   copies MNN output buffers before parity/WAV checks. Supports
   `--mnn-precision`, `--mnn-memory`, and `--mnn-power` for runtime config tests.
 - `bench_onnx.py` — ORT-only multi-model bench.
-- `patch_resize.py` — `onnx_graphsurgeon` script for the Resize + Round
-  rewrites, and now also narrows `input_ids` from `INT64` to `INT32` for MNN
+- `patch_resize.py` — `onnx_graphsurgeon` script for producing
+  `kokoro-v1.0.patched.i32.onnx` from `kokoro-v1.0.onnx`. It applies the Resize
+  + Round rewrites and narrows `input_ids` from `INT64` to `INT32` for MNN
   `Gather` correctness.
+- `rebuild_best_mnn.sh` — end-to-end rebuild script for the clean single-file
+  block128 candidate and the final optfast flatdedup `.mnn` + `.mnn.weight`
+  pair. It regenerates compression params instead of relying on checked-in JSON.
 - `probe_duration.py` — temporary ORT-vs-MNN intermediate tensor probe used to
   identify the first mismatch at the word embedding `Gather`.
 - `probe_mnn.py` — MNN-vs-MNN intermediate tensor probe for comparing fp32 and
@@ -2315,6 +2611,11 @@ Performance next-step decision tree:
 - `make_quant_calib.py` — generates MNN sequence-input calibration folders
   under `/tmp` and writes `quant.json` outside the sample folder for
   `mnnquant`.
+- `dedup_mnn_external_weights.py` — external-weight sidecar deduper. It uses
+  MNN JSON only as metadata, patches external int64 offsets in the original
+  flatbuffer in place, and avoids JSON -> MNN waveform drift.
+- `MNN_UPSTREAM_DEDUP_ISSUE.md` — copy/pasteable upstream issue draft for the
+  MNN converter external-weight dedup limitation.
 - `kokoro-v1.0.onnx` — fp32 source from HuggingFace.
 - `kokoro-v1.0.patched.onnx` — older fp32 source with Resize + Round patches
   applied. Still has `input_ids` as `INT64`, so it is not the fixed MNN source.
@@ -2355,6 +2656,14 @@ Performance next-step decision tree:
 - `kokoro-v1.0.patched.i32.while.wq8.block128.fp16.mnn` — attempted int8+fp16
   hybrid. Size and parity match fp16 behavior, not the 97 MB block128
   weight-only model.
+- `kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.mnn`
+  — current clean single-file quality-preserving candidate; 104,172,172 bytes.
+- `kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.optfast.mnn`
+  — full optfast candidate; 152,729,404 bytes, faster, listened as acceptable,
+  but too large as a single file.
+- `kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.optfast-flatdedup.mnn`
+  plus `.mnn.weight` — external-weight dedup candidate; 87,976,907 bytes total
+  and byte-identical PCM to full optfast.
 - `kokoro-v1.0.*.mnn` — older converted MNN models. The ones without the i32
   patch still produce the parity bug described above.
 - `int8.onnx` — copy of the shipped int8 model.
