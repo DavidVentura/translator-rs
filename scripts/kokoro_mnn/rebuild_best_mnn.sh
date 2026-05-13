@@ -8,10 +8,10 @@ SOURCE_FP32_ONNX="${SOURCE_FP32_ONNX:-kokoro-v1.0.onnx}"
 PATCH_ONNX="${PATCH_ONNX:-1}"
 WORK_DIR="${WORK_DIR:-compression_params}"
 
-CLEAN_MNN="${CLEAN_MNN:-kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.mnn}"
-OPTFAST_EXTERNAL_MNN="${OPTFAST_EXTERNAL_MNN:-kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.optfast-external.mnn}"
-OPTFAST_DEDUP_MNN="${OPTFAST_DEDUP_MNN:-kokoro-v1.0.patched.i32.while.wq8.block128.skip-istft-convpost-duration-bert.optfast-flatdedup.mnn}"
-OPTFAST_JSON="${OPTFAST_JSON:-optfast_external.json}"
+CLEAN_MNN="${CLEAN_MNN:-kokoro-clean.mnn}"
+OPTFAST_EXTERNAL_MNN="${OPTFAST_EXTERNAL_MNN:-kokoro-optfast-external.mnn}"
+OPTFAST_DEDUP_MNN="${OPTFAST_DEDUP_MNN:-kokoro.mnn}"
+OPTFAST_JSON="${OPTFAST_JSON:-kokoro-optfast-external.json}"
 
 CLEAN_BASE_COMPRESS="$WORK_DIR/block128.base.json"
 CLEAN_FINAL_COMPRESS="$WORK_DIR/block128.skip-istft-convpost-duration-bert.json"
@@ -31,6 +31,7 @@ fi
 
 if [[ ! -f "$SOURCE_ONNX" ]]; then
   echo "missing source ONNX: $SOURCE_ONNX" >&2
+  echo "Download from https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx" >&2
   echo "set SOURCE_ONNX or place $SOURCE_FP32_ONNX here and leave PATCH_ONNX=1" >&2
   exit 1
 fi
@@ -56,8 +57,8 @@ uv run python edit_compression_params.py \
   --op /decoder/decoder/generator/istft/stft/ConvTranspose_output_0 \
   --op-prefix /decoder/decoder/generator/conv_post/ \
   --op-prefix /encoder/predictor/ \
-  --op-prefix /encoder/bert/ \
-  --op-prefix /encoder/bert_encoder/
+  --op /encoder/bert/encoder/embedding_hidden_mapping_in/Add_output_0__matmul_converted \
+  --op /encoder/bert_encoder/Add_output_0__matmul_converted
 
 uv run mnnconvert -f ONNX \
   --modelFile "$SOURCE_ONNX" \
@@ -84,8 +85,8 @@ uv run python edit_compression_params.py \
   --op /decoder/decoder/generator/istft/stft/ConvTranspose_output_0 \
   --op-prefix /decoder/decoder/generator/conv_post/ \
   --op-prefix /encoder/predictor/ \
-  --op-prefix /encoder/bert/ \
-  --op-prefix /encoder/bert_encoder/
+  --op /encoder/bert/encoder/embedding_hidden_mapping_in/Add_output_0__matmul_converted \
+  --op /encoder/bert_encoder/Add_output_0__matmul_converted
 
 uv run mnnconvert -f ONNX \
   --modelFile "$SOURCE_ONNX" \

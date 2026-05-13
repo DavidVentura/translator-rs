@@ -1,8 +1,9 @@
 """Patch Kokoro fp32 ONNX into the stable MNN conversion source.
 
 The output is `kokoro-v1.0.patched.i32.onnx` by default. It applies the
-Resize/Round cleanup and narrows `input_ids` from INT64 to INT32 so MNN's
-Gather path matches ORT.
+Resize/Round cleanup and normalizes the token-id graph input to
+`input_ids: INT32` so MNN's Gather path matches ORT. Kokoro ONNX exports have
+used both `tokens` and `input_ids`; this script accepts either source name.
 
 For each Resize node listed in TARGETS we:
   - clear the `scales` input (index 2)
@@ -52,24 +53,29 @@ def replace_round_with_floor_half_up(graph: gs.Graph) -> None:
         print(f"replaced {node.name} (Round) with Add+Floor")
 
 
-def convert_input_ids_to_int32(graph: gs.Graph) -> None:
+def normalize_token_input_to_int32(graph: gs.Graph) -> None:
     """MNN 3.5 miscomputes Gather when the ONNX indices input is INT64.
     Kokoro token ids fit in INT32, and ONNX Gather accepts INT32 indices, so
     narrowing this model input keeps ORT semantics while avoiding the MNN bug.
+    Normalize the public name to `input_ids` because the app integration uses
+    named MNN inputs.
     """
     for inp in graph.inputs:
-        if inp.name == "input_ids":
+        if inp.name in ("input_ids", "tokens"):
+            old_name = inp.name
+            inp.name = "input_ids"
             inp.dtype = np.int32
-            print("changed input_ids input type from INT64 to INT32")
+            print(f"changed token input {old_name} to input_ids INT32")
             return
-    raise SystemExit("input not found: input_ids")
+    names = ", ".join(inp.name for inp in graph.inputs)
+    raise SystemExit(f"token input not found; expected input_ids or tokens, got: {names}")
 
 
 def patch(input_path: Path, output_path: Path) -> None:
     graph = gs.import_onnx(onnx.load(str(input_path)))
     node_by_name = {n.name: n for n in graph.nodes}
 
-    convert_input_ids_to_int32(graph)
+    normalize_token_input_to_int32(graph)
     replace_round_with_floor_half_up(graph)
 
     for name, factor in TARGETS:
