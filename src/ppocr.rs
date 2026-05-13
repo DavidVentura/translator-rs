@@ -489,17 +489,25 @@ fn extract_boxes(
             continue;
         }
 
-        // Box-score gate (PaddleOCR's `det_db_box_thresh`, "fast" score_mode): mean heatmap
-        // probability over the contour's AABB on the *raw* float output. Real text masks
-        // average 0.7+ here; texture/compression noise that just barely cleared the per-pixel
+        // Box-score gate (PaddleOCR's `det_db_box_thresh`): mean heatmap probability over the
+        // contour's *binarised interior* on the raw float output. We restrict the average to
+        // pixels above `DET_SCORE_THRESHOLD` (i.e. pixels that the binarised mask considers
+        // text) rather than the full AABB, because the AABB of a tilted line contains a lot
+        // of background corner pixels that would dilute the mean — penalising tilted text
+        // unfairly. This is effectively the polygon-interior mode upstream calls "slow",
+        // approximated cheaply with the binary mask we already have. Real text masks average
+        // 0.7+ here; texture/compression noise that just barely cleared the per-pixel
         // threshold rarely makes it past 0.5.
         let mut score_sum = 0.0f32;
         let mut score_n = 0usize;
         for y in (min_y as u32)..(max_y as u32).min(mask_h) {
             let row = (y as usize) * (mask_w as usize);
             for x in (min_x as u32)..(max_x as u32).min(mask_w) {
-                score_sum += heatmap[row + x as usize];
-                score_n += 1;
+                let idx = row + x as usize;
+                if mask[idx] != 0 {
+                    score_sum += heatmap[idx];
+                    score_n += 1;
+                }
             }
         }
         let box_score = if score_n > 0 {
@@ -740,6 +748,167 @@ struct ContourBoxes {
     inflated: crate::ocr::OrientedRect,
 }
 
+/// Number of x-bins used to extract the top and bottom edge profile from a contour. 16 is
+/// enough to fit a regression through a real word's edges while staying coarse enough that a
+/// single noisy contour point doesn't dominate any one bin's value.
+const TILT_X_BINS: usize = 16;
+
+/// Maximum |top_slope − bottom_slope| (in dy/dx units) for the contour to be considered
+/// genuinely tilted. ~0.05 ≈ 2.9° — well below typical glyph-asymmetry slope ("Menu"'s top
+/// edge drops 30% of its height across the word, slope ≈ 0.10–0.20) but above any real-world
+/// scanning skew jitter.
+const TILT_AGREEMENT_SLOPE: f32 = 0.05;
+
+/// Per-bin extreme-y tolerance for outlier filtering, expressed as a fraction of the contour's
+/// vertical extent. Descenders / ascenders / random spikes stick out beyond the median edge by
+/// more than this and get dropped from the regression.
+const TILT_EDGE_OUTLIER_FRACTION: f32 = 0.20;
+
+/// Minimum end-to-end y-deviation (slope × contour width), expressed as a fraction of the
+/// contour's height, for a tilt to be reported as non-zero. Short asymmetric contours like a
+/// 4-letter word with a cap-height opener bias both the top and bottom regressions slightly
+/// downward — the agreement gate then averages two biased numbers into a phantom tilt. By
+/// also requiring the actual y-deviation across the contour to be ≥ 20% of its height, we
+/// reject sub-visible tilts where the per-edge slopes likely come from regression artefacts
+/// rather than from a genuine baseline lean.
+const TILT_MIN_DEVIATION_FRACTION: f32 = 0.20;
+
+/// Estimate a contour's horizontal tilt by regressing the top and bottom edges separately and
+/// only trusting a non-zero angle when both edges agree. Returns the angle in radians (+x ⇒ 0,
+/// downward-to-the-right ⇒ positive, image y points down).
+///
+/// Algorithm:
+///   1. Bin contour points by x.
+///   2. Per bin, take the minimum-y point (top edge) and maximum-y point (bottom edge).
+///   3. Discard bins whose extreme-y deviates from the median extreme-y by more than
+///      `TILT_EDGE_OUTLIER_FRACTION × contour_height` (handles ascenders / descenders /
+///      asymmetric capital opener like "Menu"'s `M`).
+///   4. Linear-regress slope on the filtered top points and on the filtered bottom points.
+///   5. If the two slopes differ by more than `TILT_AGREEMENT_SLOPE`, the contour is
+///      content-asymmetric and we report no tilt. Otherwise the average is the line's tilt.
+fn estimate_horizontal_tilt(contour: &[(f32, f32)]) -> f32 {
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &(x, y) in contour {
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    if width < 8.0 || height < 2.0 {
+        return 0.0;
+    }
+
+    let bin_w = width / TILT_X_BINS as f32;
+    let mut top_per_bin: [Option<(f32, f32)>; TILT_X_BINS] = [None; TILT_X_BINS];
+    let mut bot_per_bin: [Option<(f32, f32)>; TILT_X_BINS] = [None; TILT_X_BINS];
+    for &(x, y) in contour {
+        let bin = (((x - min_x) / bin_w) as usize).min(TILT_X_BINS - 1);
+        match top_per_bin[bin] {
+            None => top_per_bin[bin] = Some((x, y)),
+            Some((_, ty)) if y < ty => top_per_bin[bin] = Some((x, y)),
+            _ => {}
+        }
+        match bot_per_bin[bin] {
+            None => bot_per_bin[bin] = Some((x, y)),
+            Some((_, by)) if y > by => bot_per_bin[bin] = Some((x, y)),
+            _ => {}
+        }
+    }
+
+    let top_pts: Vec<(f32, f32)> = top_per_bin.iter().filter_map(|p| *p).collect();
+    let bot_pts: Vec<(f32, f32)> = bot_per_bin.iter().filter_map(|p| *p).collect();
+    if top_pts.len() < 4 || bot_pts.len() < 4 {
+        return 0.0;
+    }
+
+    let tol = height * TILT_EDGE_OUTLIER_FRACTION;
+    let top_slope = robust_regression_slope(&top_pts, tol);
+    let bot_slope = robust_regression_slope(&bot_pts, tol);
+    let diff = (top_slope - bot_slope).abs();
+    let (angle, decision) = if diff > TILT_AGREEMENT_SLOPE {
+        (0.0, "disagree → axis-align")
+    } else {
+        let avg = (top_slope + bot_slope) * 0.5;
+        // Sub-visible tilt rejection: even when top and bot slopes "agree", if the resulting
+        // end-to-end y-deviation is small relative to the contour height, the agreement is
+        // probably just two same-direction regression biases (asymmetric cap on top + AA
+        // jitter on bottom) lining up — not a real lean. Demand a visible deviation.
+        if avg.abs() * width < TILT_MIN_DEVIATION_FRACTION * height {
+            (0.0, "sub-visible → axis-align")
+        } else {
+            (avg.atan(), "agree → use avg")
+        }
+    };
+    log::debug!(
+        "ppocr tilt: w={:.0} h={:.0} top_bins={} bot_bins={} \
+         top_slope={:.4} bot_slope={:.4} diff={:.4} (limit {:.4}) → {:.2}° ({})",
+        width,
+        height,
+        top_pts.len(),
+        bot_pts.len(),
+        top_slope,
+        bot_slope,
+        diff,
+        TILT_AGREEMENT_SLOPE,
+        angle.to_degrees(),
+        decision,
+    );
+    angle
+}
+
+/// Two-pass OLS with a residual-based outlier filter. The first pass captures the dominant
+/// linear trend through the points; the second pass refits after dropping points whose
+/// residual from the first-pass line exceeds `tol`. This is what makes the estimator robust
+/// to descenders/ascenders that protrude from an otherwise straight edge while *keeping* the
+/// edge's tilted endpoints (a median-based filter would discard them as "far from the centre"
+/// which is exactly the position they should occupy in a tilted line).
+fn robust_regression_slope(pts: &[(f32, f32)], tol: f32) -> f32 {
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let first = linear_regression_slope(pts);
+    let mean_x = pts.iter().map(|(x, _)| x).sum::<f32>() / pts.len() as f32;
+    let mean_y = pts.iter().map(|(_, y)| y).sum::<f32>() / pts.len() as f32;
+    let intercept = mean_y - first * mean_x;
+    let filtered: Vec<(f32, f32)> = pts
+        .iter()
+        .copied()
+        .filter(|&(x, y)| (y - (first * x + intercept)).abs() <= tol)
+        .collect();
+    if filtered.len() < 3 {
+        return first;
+    }
+    linear_regression_slope(&filtered)
+}
+
+fn linear_regression_slope(pts: &[(f32, f32)]) -> f32 {
+    if pts.len() < 2 {
+        return 0.0;
+    }
+    let n = pts.len() as f32;
+    let mean_x = pts.iter().map(|(x, _)| x).sum::<f32>() / n;
+    let mean_y = pts.iter().map(|(_, y)| y).sum::<f32>() / n;
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for &(x, y) in pts {
+        let dx = x - mean_x;
+        num += dx * (y - mean_y);
+        den += dx * dx;
+    }
+    if den < 1e-6 { 0.0 } else { num / den }
+}
+
 fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     if contour.len() < 4 {
         return None;
@@ -755,41 +924,15 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     mean_x /= n;
     mean_y /= n;
 
-    let mut cxx = 0.0f32;
-    let mut cyy = 0.0f32;
-    let mut cxy = 0.0f32;
-    for &(x, y) in contour {
-        let dx = x - mean_x;
-        let dy = y - mean_y;
-        cxx += dx * dx;
-        cyy += dy * dy;
-        cxy += dx * dy;
-    }
-    cxx /= n;
-    cyy /= n;
-    cxy /= n;
-
-    let trace = cxx + cyy;
-    let det = cxx * cyy - cxy * cxy;
-    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
-    let lambda1 = (trace + disc) * 0.5;
-    let (ex, ey) = if cxy.abs() > 1e-6 {
-        (lambda1 - cyy, cxy)
-    } else if cxx >= cyy {
-        (1.0, 0.0)
-    } else {
-        (0.0, 1.0)
-    };
-    let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
-    let mut ux = ex / norm;
-    let mut uy = ey / norm;
-    // Canonicalize tangent to point in +x so angle ∈ (-π/2, π/2]. Without this, lines tilted
-    // counterclockwise from horizontal could come back with the tangent pointing leftward and
-    // an angle near ±π — the renderer would draw the text backwards.
-    if ux < 0.0 {
-        ux = -ux;
-        uy = -uy;
-    }
+    // Estimate the line's tilt from the top *and* bottom edges of the contour separately, and
+    // accept a non-zero angle only when both edges agree. PCA on all points (the previous
+    // approach) is fooled by content-asymmetric masks — e.g. "Menu" has a tall M and short
+    // enu, so the top edge slopes down while the baseline stays flat, and PCA's covariance
+    // splits the difference into a phantom tilt. The bottom edge is the baseline (stable for
+    // most words), and demanding agreement with the top filters out asymmetric shapes.
+    let angle_radians = estimate_horizontal_tilt(contour);
+    let ux = angle_radians.cos();
+    let uy = angle_radians.sin();
     let vx = -uy;
     let vy = ux;
 
@@ -816,7 +959,6 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     let v_center = (v_min + v_max) * 0.5;
     let cx = mean_x + ux * u_center + vx * v_center;
     let cy = mean_y + uy * u_center + vy * v_center;
-    let angle_radians = uy.atan2(ux);
 
     let tight = crate::ocr::OrientedRect {
         cx,
@@ -1058,4 +1200,162 @@ fn bilinear_luma(raw: &[u8], stride: usize, w: f32, h: f32, x: f32, y: f32) -> u
     let top = v00 + (v10 - v00) * dx;
     let bot = v01 + (v11 - v01) * dx;
     (top + (bot - top) * dy).clamp(0.0, 255.0) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oriented_boxes_from_contour;
+
+    /// Build a closed polygon contour by sampling each edge at 1-pixel steps. Mimics what
+    /// `imageproc::contours::find_contours` returns for a mask of the given outline shape.
+    fn sample_edges(corners: &[(f32, f32)]) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for i in 0..corners.len() {
+            let (x0, y0) = corners[i];
+            let (x1, y1) = corners[(i + 1) % corners.len()];
+            let dx = x1 - x0;
+            let dy = y1 - y0;
+            let steps = dx.abs().max(dy.abs()).round() as usize;
+            for s in 0..steps {
+                let t = s as f32 / steps.max(1) as f32;
+                out.push((x0 + dx * t, y0 + dy * t));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tilt_estimate_axis_aligns_word_with_uneven_ascenders() {
+        // "Menu"-shaped contour: tall M on the left (cap-height), short enu on the right
+        // (x-height), flat baseline. PCA on all points reports a downward-right tilt because
+        // the top edge slopes down across the word; the new estimator must reject this and
+        // return ~0° because the bottom edge (baseline) is flat.
+        let contour = sample_edges(&[
+            (0.0, 0.0),   // top-left of M cap
+            (20.0, 0.0),  // top-right of M cap
+            (20.0, 10.0), // step down to enu x-height
+            (80.0, 10.0), // top-right of u
+            (80.0, 30.0), // baseline right
+            (0.0, 30.0),  // baseline left
+        ]);
+        let rect = oriented_boxes_from_contour(&contour)
+            .expect("rect")
+            .tight;
+        let angle_deg = rect.angle_radians.to_degrees().abs();
+        assert!(
+            angle_deg < 1.0,
+            "expected near-horizontal angle for asymmetric word mask, got {:.2}°",
+            angle_deg,
+        );
+    }
+
+    #[test]
+    fn tilt_estimate_recovers_real_skew_when_top_and_bottom_agree() {
+        // A flat horizontal rectangle (0,0)–(80,12) sheared so both edges slope down by 8 px
+        // across the 80 px width — about 5.7°. Both top and bottom slope the same, so the
+        // estimator should accept the tilt.
+        let contour = sample_edges(&[
+            (0.0, 0.0),
+            (80.0, 8.0),
+            (80.0, 20.0),
+            (0.0, 12.0),
+        ]);
+        let rect = oriented_boxes_from_contour(&contour)
+            .expect("rect")
+            .tight;
+        let angle_deg = rect.angle_radians.to_degrees();
+        assert!(
+            (angle_deg - 5.7).abs() < 1.0,
+            "expected ~5.7° tilt for genuinely sheared rectangle, got {:.2}°",
+            angle_deg,
+        );
+    }
+
+    #[test]
+    fn tilt_estimate_axis_aligns_short_word_with_coincident_top_and_bottom_bias() {
+        // Real failure from the cyberseceurope.com "Menu" label: short 4-letter word, the
+        // cap-height M biases the top regression down, and AA / DBNet mask asymmetry biases
+        // the bottom regression by a similar amount in the same direction. Top/bot
+        // disagreement is tiny so the agreement gate accepted a ~2° phantom tilt. Sub-visible
+        // deviation rejection catches it because slope × width is only ~14% of height — well
+        // below the 20% visibility floor.
+        let contour = sample_edges(&[
+            (0.0, 0.0),  // top-left of M cap
+            (16.0, 0.0), // top-right of M cap
+            (16.0, 4.0), // step down to enu x-height
+            (66.0, 5.0), // very slight bottom drift on top edge of enu (DBNet artefact)
+            (66.0, 18.0),
+            (0.0, 16.0), // very slight bottom drift on baseline (DBNet/AA artefact)
+        ]);
+        let rect = oriented_boxes_from_contour(&contour)
+            .expect("rect")
+            .tight;
+        let angle_deg = rect.angle_radians.to_degrees().abs();
+        assert!(
+            angle_deg < 0.1,
+            "short word with coincident top/bot bias should axis-align, got {:.2}°",
+            angle_deg,
+        );
+    }
+
+    #[test]
+    fn tilt_estimate_recovers_small_tilt_on_long_line_with_descender_noise() {
+        // Mimics one row of the multilingual packaging label: a long contour (~600 px wide,
+        // ~20 px tall) tilted by ~1° (slope ≈ 0.018) with a single descender protruding 4 px
+        // below the baseline. A median-y outlier filter would have rejected the tilted
+        // endpoints because they sit *farthest* from the centre y, collapsing the estimate
+        // to 0°. Residual-based filtering keeps the endpoints because they sit *on* the
+        // fitted line, and drops only the descender.
+        let tilt = 0.018f32; // ≈ 1.03°
+        let mut contour = sample_edges(&[
+            (0.0, 0.0),
+            (600.0, 600.0 * tilt),
+            (600.0, 20.0 + 600.0 * tilt),
+            (350.0, 20.0 + 350.0 * tilt),
+            (350.0, 24.0 + 350.0 * tilt), // descender drops 4 px below baseline
+            (320.0, 24.0 + 320.0 * tilt),
+            (320.0, 20.0 + 320.0 * tilt),
+            (0.0, 20.0),
+        ]);
+        // Padding to keep enough points in the dense regions for binning.
+        contour.extend(sample_edges(&[
+            (10.0, 10.0 + 10.0 * tilt),
+            (590.0, 10.0 + 590.0 * tilt),
+        ]));
+        let rect = oriented_boxes_from_contour(&contour)
+            .expect("rect")
+            .tight;
+        let angle_deg = rect.angle_radians.to_degrees();
+        assert!(
+            (angle_deg - 1.03).abs() < 0.5,
+            "expected ~1° tilt for long sloped line with one descender, got {:.2}°",
+            angle_deg,
+        );
+    }
+
+    #[test]
+    fn tilt_estimate_ignores_descender_on_otherwise_flat_baseline() {
+        // Like "page": flat top + baseline, with a single descender protrusion in one bin.
+        // Outlier filtering on the bottom edge should drop the descender so the regression
+        // sees a flat baseline and the angle stays ~0°.
+        let contour = sample_edges(&[
+            (0.0, 0.0),
+            (80.0, 0.0),
+            (80.0, 12.0),
+            (50.0, 12.0),
+            (50.0, 16.0), // descender drops 4 px below baseline
+            (40.0, 16.0),
+            (40.0, 12.0),
+            (0.0, 12.0),
+        ]);
+        let rect = oriented_boxes_from_contour(&contour)
+            .expect("rect")
+            .tight;
+        let angle_deg = rect.angle_radians.to_degrees().abs();
+        assert!(
+            angle_deg < 1.0,
+            "expected near-horizontal angle for word with one descender, got {:.2}°",
+            angle_deg,
+        );
+    }
 }
