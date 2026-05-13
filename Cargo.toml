@@ -64,7 +64,7 @@ uniffi = { version = "0.29", optional = true, default-features = false }
 tarkka = { git = "https://github.com/DavidVentura/tarkka", optional = true }
 tesseract = { git = "https://github.com/DavidVentura/tesseract-rs", optional = true }
 mucab = { git = "https://github.com/DavidVentura/mucab", optional = true }
-piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization"] }
+piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization", "mnn"] }
 # mnn-sys = { path = "../mnn-sys", optional = true }
 mnn-sys = { git = "https://github.com/DavidVentura/mnn-sys", optional = true }
 icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
@@ -124,6 +124,11 @@ required-features = ["odt"]
 name = "doc_align_refine_visual"
 path = "tests/doc_align/refine_visual.rs"
 required-features = ["doc-align"]
+
+[[test]]
+name = "ppocr_tilt_dump"
+path = "tests/ppocr_tilt_dump.rs"
+required-features = ["ppocr"]
 
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }

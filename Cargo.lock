@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#2c0a6266e42b0aa4cc65362a7361a2e1dbe03a18"
+source = "git+https://github.com/DavidVentura/piper-rs#331ece18732711eab03172bd0aa961c6d4c0cfe3"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -648,7 +648,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#2c0a6266e42b0aa4cc65362a7361a2e1dbe03a18"
+source = "git+https://github.com/DavidVentura/piper-rs#331ece18732711eab03172bd0aa961c6d4c0cfe3"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -1960,9 +1960,11 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#2c0a6266e42b0aa4cc65362a7361a2e1dbe03a18"
+source = "git+https://github.com/DavidVentura/piper-rs#331ece18732711eab03172bd0aa961c6d4c0cfe3"
 dependencies = [
  "espeak-rs",
+ "log",
+ "mnn-sys",
  "mucab",
  "ndarray 0.16.1",
  "ndarray-npy",
@@ -2514,7 +2516,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slimt-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/slimt-sys#38930c2043165dc4befceb1c49b3b41d14c14357"
+source = "git+https://github.com/DavidVentura/slimt-sys#7d8dd0cd391b025faaff20521f1390b54f1bf547"
 dependencies = [
  "cmake",
 ]
