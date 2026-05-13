@@ -2523,8 +2523,14 @@ path:
    `--optimizePrefer 2` gives the useful BERT speedup, but MNN converter
    duplicates shared ALBERT/BERT projection weights. We keep the optfast graph,
    use `--saveExternalData`, compact identical sidecar blobs, and patch external
-   offsets in the original flatbuffer. This is why the best artifact is a
-   `.mnn` plus `.mnn.weight` pair.
+   offsets in the original flatbuffer. This is why the best artifact is the
+   short-named `kokoro.mnn` plus `kokoro.mnn.weight` pair.
+   Important rebuild detail: do not exclude `/encoder/bert/` by prefix under
+   the optfast graph. `--optimizePrefer 2` exposes 73 extra ALBERT projection
+   weight layers under that prefix. Broadly setting them to `bits=0` makes the
+   deduped sidecar about `103,118,991` bytes (`~99 MiB`) instead of the intended
+   `86,949,555` bytes. The script uses exact BERT projection op names plus the
+   predictor/conv/iSTFT exclusions, for 8 fp32 exclusions total.
 2. MNN low-memory lifetime/allocation workaround:
    the fast Android path depends on the low-memory/dequant-GEMM build/runtime
    route, but the original low-memory path produced bad/silent/distorted output
@@ -2546,11 +2552,12 @@ path:
    Kokoro-specific env var / hardcoded tensor-id patch is not part of the
    required path.
 3. ONNX graph input-id narrowing:
-   `input_ids` must be `INT32` for MNN `Gather` correctness. Leaving the source
-   as `INT64` caused encoder corruption and downstream duration errors. This is
-   reproducible from git via `uv run python patch_resize.py`, whose default
-   output is now `kokoro-v1.0.patched.i32.onnx`; it is not a manual `.mnn`
-   patch.
+   the token-id input must be `INT32` for MNN `Gather` correctness. Leaving the
+   source as `INT64` caused encoder corruption and downstream duration errors.
+   Kokoro ONNX exports have used both `tokens` and `input_ids`; `patch_resize.py`
+   accepts either source name, normalizes the public graph input to
+   `input_ids: INT32`, and writes `kokoro-v1.0.patched.i32.onnx`. This is not a
+   manual `.mnn` patch.
 4. Resize/Round source graph cleanup:
    the patched ONNX source still carries the earlier explicit Resize/Round
    cleanup. Resize was not the final bug, but the patched source is the stable
@@ -2597,11 +2604,12 @@ path:
 - `bench_onnx.py` — ORT-only multi-model bench.
 - `patch_resize.py` — `onnx_graphsurgeon` script for producing
   `kokoro-v1.0.patched.i32.onnx` from `kokoro-v1.0.onnx`. It applies the Resize
-  + Round rewrites and narrows `input_ids` from `INT64` to `INT32` for MNN
-  `Gather` correctness.
-- `rebuild_best_mnn.sh` — end-to-end rebuild script for the clean single-file
-  block128 candidate and the final optfast flatdedup `.mnn` + `.mnn.weight`
-  pair. It regenerates compression params instead of relying on checked-in JSON.
+  + Round rewrites, accepts either `tokens` or `input_ids` source naming, and
+  normalizes the public token input to `input_ids: INT32` for MNN `Gather`
+  correctness.
+- `rebuild_best_mnn.sh` — end-to-end rebuild script for `kokoro-clean.mnn` and
+  the final optfast flatdedup `kokoro.mnn` + `kokoro.mnn.weight` pair. It
+  regenerates compression params instead of relying on checked-in JSON.
 - `probe_duration.py` — temporary ORT-vs-MNN intermediate tensor probe used to
   identify the first mismatch at the word embedding `Gather`.
 - `probe_mnn.py` — MNN-vs-MNN intermediate tensor probe for comparing fp32 and
