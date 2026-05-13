@@ -1,0 +1,11 @@
+[project]
+name = "kokoro-mnn"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "mnn>=3.5.0",
+    "numpy>=2.4.4",
+    "onnx>=1.21.0",
+    "onnx-graphsurgeon>=0.6.1",
+    "onnxruntime>=1.26.0",
+]

@@ -1,0 +1,28 @@
+CPU Group: [ 0  1  2  3 ], 300000 - 1804800
+CPU Group: [ 4  5  6 ], 710400 - 2419200
+CPU Group: [ 7 ], 844800 - 2841600
+(last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK))=0x 4100d440 in _getInfoArm, 1234 
+The device supports: i8sdot:1, fp16:1, i8mm: 0, sve2: 0, sme2: 0
+Test ../kokoro_conv_micro/conv_microbench/hot_c128_w8040_k11_d1.wq8b128.mnn from input info: ../kokoro_conv_micro/conv_microbench/hot_c128_w8040_k11_d1.input_repeat1
+input
+output: output
+Use extra forward type: 0
+cpuIds: 
+precision=0 in main, 256 
+memory=0 in main, 257 
+power=0 in main, 258 
+cacheFileName=s micro-normal in main, 259 
+enableKleidiAI=0 in main, 260 
+mixedRatio=17 in main, 261 
+Can't open file:micro-normal
+Load Cache file error.
+main, 353, cost time: 2.573000 ms
+Run for 0 time
+[kokoro-conv] CPUBackend::onCreate name=output op=Convolution selected=Convolution inputQuant=0 outputQuant=0 inputApply=0 outputApply=0
+[kokoro-conv] FloatFactory loadedQuan name=output hasScaleInt=0 lowMemoryArg=1 weight=180224 weightFloat=0 alpha=256
+[kokoro-conv] FloatFactory::_createUnit name=output k=1x11 d=1x1 inC=128 outC=128 inShape=128x8040x1 outShape=128x8040x1 weightQuant=1 originWeightSize=0 lowMemory=1 memoryMode=0 hasScaleInt=0 scaleIn=0.000000 scaleOut=0.000000
+[kokoro-conv] FloatFactory choice=DenseConvolutionTiled low-memory-int8-weight name=output
+[kokoro-conv] DenseConvolutionTiled ctor k=1x11 d=1x1 inC=128 outC=128 useInt8Weight=1 originWeightSize=180224 int8Info=1 bytes=4
+Skip check output
+Write output output to output/0_0.txt
+memoryInMB=f 12.210510 in main, 485 

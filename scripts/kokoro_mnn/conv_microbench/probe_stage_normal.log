@@ -1,0 +1,80 @@
+CPU Group: [ 0  1  2  3 ], 300000 - 1804800
+CPU Group: [ 4  5  6 ], 710400 - 2419200
+CPU Group: [ 7 ], 844800 - 2841600
+(last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK))=0x 4100d440 in _getInfoArm, 1234 
+The device supports: i8sdot:1, fp16:1, i8mm: 0, sve2: 0, sme2: 0
+Test ../kokoro_mnn_bench/kokoro-ptq-ema.mnn from input info: ../kokoro_mnn_bench/input_probe_stage
+input_ids
+style
+speed
+output: /encoder/text_encoder/cnn.0/cnn.0.0/Conv_output_0
+output: /encoder/text_encoder/cnn.1/cnn.1.0/Conv_output_0
+output: /encoder/text_encoder/cnn.2/cnn.2.0/Conv_output_0
+output: /encoder/Div_output_0
+output: /encoder/Round_output_0
+output: /encoder/F0_proj/Conv_output_0
+output: /encoder/N_proj/Conv_output_0
+output: /decoder/decoder/encode/conv2/Conv_output_0
+output: /decoder/decoder/generator/noise_convs.0/Conv_output_0
+output: /decoder/decoder/generator/noise_convs.1/Conv_output_0
+output: /decoder/decoder/generator/conv_post/Conv_output_0
+output: waveform
+Use extra forward type: 0
+cpuIds: 
+precision=0 in main, 256 
+memory=0 in main, 257 
+power=0 in main, 258 
+cacheFileName=s probe-normal in main, 259 
+enableKleidiAI=0 in main, 260 
+mixedRatio=17 in main, 261 
+Can't open file:probe-normal
+Load Cache file error.
+main, 353, cost time: 277.880005 ms
+Run for 0 time
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+Skip check /encoder/text_encoder/cnn.0/cnn.0.0/Conv_output_0
+Skip check /encoder/text_encoder/cnn.1/cnn.1.0/Conv_output_0
+Skip check /encoder/text_encoder/cnn.2/cnn.2.0/Conv_output_0
+Skip check /encoder/Div_output_0
+Skip check /encoder/Round_output_0
+Skip check /encoder/F0_proj/Conv_output_0
+Skip check /encoder/N_proj/Conv_output_0
+Skip check /decoder/decoder/encode/conv2/Conv_output_0
+Skip check /decoder/decoder/generator/noise_convs.0/Conv_output_0
+Skip check /decoder/decoder/generator/noise_convs.1/Conv_output_0
+Skip check /decoder/decoder/generator/conv_post/Conv_output_0
+Skip check waveform
+Write /encoder/text_encoder/cnn.0/cnn.0.0/Conv_output_0 output to output/0_0.txt
+Write /encoder/text_encoder/cnn.1/cnn.1.0/Conv_output_0 output to output/0_1.txt
+Write /encoder/text_encoder/cnn.2/cnn.2.0/Conv_output_0 output to output/0_2.txt
+Write /encoder/Div_output_0 output to output/0_3.txt
+Write /encoder/Round_output_0 output to output/0_4.txt
+Write /encoder/F0_proj/Conv_output_0 output to output/0_5.txt
+Write /encoder/N_proj/Conv_output_0 output to output/0_6.txt
+Write /decoder/decoder/encode/conv2/Conv_output_0 output to output/0_7.txt
+Write /decoder/decoder/generator/noise_convs.0/Conv_output_0 output to output/0_8.txt
+Write /decoder/decoder/generator/noise_convs.1/Conv_output_0 output to output/0_9.txt
+Write /decoder/decoder/generator/conv_post/Conv_output_0 output to output/0_10.txt
+Write waveform output to output/0_11.txt
+memoryInMB=f 210.885376 in main, 485 

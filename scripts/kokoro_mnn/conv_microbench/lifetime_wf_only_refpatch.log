@@ -1,0 +1,59 @@
+CPU Group: [ 0  1  2  3 ], 300000 - 1804800
+CPU Group: [ 4  5  6 ], 710400 - 2419200
+CPU Group: [ 7 ], 844800 - 2841600
+(last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK))=0x 4100d440 in _getInfoArm, 1234 
+The device supports: i8sdot:1, fp16:1, i8mm: 0, sve2: 0, sme2: 0
+Test ../kokoro_mnn_bench/kokoro-ptq-ema.mnn from input info: ../kokoro_mnn_bench/probe_variants/wf_only
+input_ids
+style
+speed
+output: waveform
+Use extra forward type: 0
+cpuIds: 
+precision=0 in main, 256 
+memory=2 in main, 257 
+power=0 in main, 258 
+cacheFileName=s patched-life-wf in main, 259 
+enableKleidiAI=0 in main, 260 
+mixedRatio=17 in main, 261 
+Can't open file:patched-life-wf
+Load Cache file error.
+main, 353, cost time: 250.223999 ms
+Run for 0 time
+[kokoro-life] alloc idx=2447 label=F0_conv use=21 usage=0 group=0 storage=1
+[kokoro-life] alloc-result idx=2447 label=F0_conv ok=1 mem=0xb4000075ff2b1810 backend=0xb40000779f21d410
+[kokoro-life] alloc idx=2651 label=N_conv use=21 usage=0 group=0 storage=1
+[kokoro-life] alloc-result idx=2651 label=N_conv ok=1 mem=0xb4000075ff2b4510 backend=0xb40000779f21d410
+[kokoro-life] release-input idx=2447 label=F0_conv oldUse=21 newUse=20 usage=0 group=0 curGroup=0 mem=0xb4000075ff2b1810 backend=0xb40000779f21d410
+[kokoro-life] release-decision idx=2447 label=F0_conv need=0 memBefore=0xb4000075ff2b1810
+[kokoro-life] release-input idx=2651 label=N_conv oldUse=21 newUse=20 usage=0 group=0 curGroup=0 mem=0xb4000075ff2b4510 backend=0xb40000779f21d410
+[kokoro-life] release-decision idx=2651 label=N_conv need=0 memBefore=0xb4000075ff2b4510
+[kokoro-life] alloc idx=2834 label=Concat4 use=1 usage=0 group=0 storage=1
+[kokoro-life] alloc-result idx=2834 label=Concat4 ok=1 mem=0xb4000075ff2b52d0 backend=0xb40000779f21d410
+[kokoro-life] release-input idx=2834 label=Concat4 oldUse=1 newUse=0 usage=0 group=0 curGroup=0 mem=0xb4000075ff2b52d0 backend=0xb40000779f21d410
+[kokoro-life] release-decision idx=2834 label=Concat4 need=1 memBefore=0xb4000075ff2b52d0
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+No quant info for Cast
+Skip check waveform
+Write waveform output to output/0_0.txt
+memoryInMB=f 363.695770 in main, 485 

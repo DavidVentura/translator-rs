@@ -1,0 +1,28 @@
+CPU Group: [ 0  1  2  3 ], 300000 - 1804800
+CPU Group: [ 4  5  6 ], 710400 - 2419200
+CPU Group: [ 7 ], 844800 - 2841600
+(last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK))=0x 4100d440 in _getInfoArm, 1234 
+The device supports: i8sdot:1, fp16:1, i8mm: 0, sve2: 0, sme2: 0
+Test ../kokoro_mnn_bench/kokoro.mnn from input info: ../kokoro_mnn_bench/probe_views/f0conv
+input_ids
+style
+speed
+output: /decoder/decoder/F0_conv/Conv_output_0
+output: waveform
+Use extra forward type: 0
+cpuIds: 
+precision=0 in main, 256 
+memory=2 in main, 257 
+power=0 in main, 258 
+cacheFileName=s block128-low-f0pin in main, 259 
+enableKleidiAI=0 in main, 260 
+mixedRatio=17 in main, 261 
+Can't open file:block128-low-f0pin
+Load Cache file error.
+main, 353, cost time: 203.115997 ms
+Run for 0 time
+Skip check /decoder/decoder/F0_conv/Conv_output_0
+Skip check waveform
+Write /decoder/decoder/F0_conv/Conv_output_0 output to output/0_0.txt
+Write waveform output to output/0_1.txt
+memoryInMB=f 203.402954 in main, 485 
