@@ -1,5 +1,8 @@
-"""Patch the F0/upsample Resize ops in Kokoro fp32 ONNX so MNN computes
-identical output shapes to ORT.
+"""Patch Kokoro fp32 ONNX into the stable MNN conversion source.
+
+The output is `kokoro-v1.0.patched.i32.onnx` by default. It applies the
+Resize/Round cleanup and narrows `input_ids` from INT64 to INT32 so MNN's
+Gather path matches ORT.
 
 For each Resize node listed in TARGETS we:
   - clear the `scales` input (index 2)
@@ -132,7 +135,7 @@ def patch(input_path: Path, output_path: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default="kokoro-v1.0.onnx")
-    ap.add_argument("--output", default="kokoro-v1.0.patched.onnx")
+    ap.add_argument("--output", default="kokoro-v1.0.patched.i32.onnx")
     args = ap.parse_args()
     patch(Path(args.input), Path(args.output))
 
