@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::api::{LanguageCode, TranslatorError, VoiceName};
-use crate::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles, resolve_tts_voice_files};
+use crate::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
 use crate::tts::{
     PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
 };
 use piper_rs::{
-    Backend, BoundaryAfter, CoquiVitsModel, KokoroModel, MmsModel,
+    Backend, BoundaryAfter, CoquiVitsModel, KokoroMnnModel, KokoroModel, MmsModel,
     PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
 };
 
@@ -49,6 +49,7 @@ fn audio_duration_ms(sample_count: usize, sample_rate: u32) -> u64 {
 enum SpeechModel {
     Piper(PiperModel),
     Kokoro(KokoroModel),
+    KokoroMnn(KokoroMnnModel),
     Mms(MmsModel),
     CoquiVits(CoquiVitsModel),
     SherpaVits(SherpaVitsModel),
@@ -140,6 +141,15 @@ fn available_voices(model: &SpeechModel) -> Vec<(String, i64)> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        SpeechModel::KokoroMnn(model) => model
+            .voices()
+            .map(|voices| {
+                voices
+                    .iter()
+                    .map(|(name, id)| (name.clone(), *id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
         SpeechModel::Mms(model) => model
             .voices()
             .map(|voices| {
@@ -212,7 +222,7 @@ fn visible_voices(
     language_code: &str,
     voices: &[(String, i64)],
 ) -> Vec<TtsVoiceOption> {
-    let filtered = if engine == "kokoro" {
+    let filtered = if engine == "kokoro" || engine == "kokoro_mnn" {
         let prefixes = kokoro_voice_prefixes(language_code);
         let matching = voices
             .iter()
@@ -247,7 +257,7 @@ fn select_default_voice(
         return None;
     }
 
-    if engine != "kokoro" {
+    if engine != "kokoro" && engine != "kokoro_mnn" {
         return None;
     }
 
@@ -464,6 +474,17 @@ fn load_speech_model(
             }
             Ok(SpeechModel::Kokoro(model))
         }
+        "kokoro_mnn" => {
+            let mut model =
+                KokoroMnnModel::new(Path::new(model_path), Path::new(aux_path), language_code)
+                    .map_err(|err| format!("Failed to load Kokoro MNN voice: {err}"))?;
+            if let Some(dict_path) = derive_japanese_dict_path(support_data_root, language_code) {
+                model
+                    .load_japanese_dict(dict_path.to_string_lossy().as_ref())
+                    .map_err(|err| format!("Failed to load Japanese dictionary: {err}"))?;
+            }
+            Ok(SpeechModel::KokoroMnn(model))
+        }
         "mms" => MmsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
             .map(SpeechModel::Mms)
             .map_err(|err| format!("Failed to load MMS voice: {err}")),
@@ -635,6 +656,9 @@ fn phonemize(model: &mut SpeechModel, text: &str) -> Result<String, String> {
         SpeechModel::Kokoro(model) => model
             .phonemize(text)
             .map_err(|err| format!("Speech synthesis failed: {err}")),
+        SpeechModel::KokoroMnn(model) => model
+            .phonemize(text)
+            .map_err(|err| format!("Speech synthesis failed: {err}")),
         SpeechModel::Mms(model) => model
             .phonemize(text)
             .map_err(|err| format!("Speech synthesis failed: {err}")),
@@ -688,6 +712,26 @@ fn synthesize(
             }
         }
         SpeechModel::Kokoro(model) => {
+            if let Some((name, id)) = selected_voice.as_ref() {
+                log_debug(format!(
+                    "using voice {name}={id} for engine={} language={} speech_speed={} ({} available)",
+                    cached_model.engine,
+                    cached_model.language_code,
+                    clamped_speech_speed,
+                    cached_model.voices.len()
+                ));
+            }
+            if is_phonemes {
+                model
+                    .synthesize_phonemes(text, effective_speaker_id, Some(clamped_speech_speed))
+                    .map_err(|err| format!("Speech synthesis failed: {err}"))
+            } else {
+                model
+                    .synthesize(text, effective_speaker_id, Some(clamped_speech_speed))
+                    .map_err(|err| format!("Speech synthesis failed: {err}"))
+            }
+        }
+        SpeechModel::KokoroMnn(model) => {
             if let Some((name, id)) = selected_voice.as_ref() {
                 log_debug(format!(
                     "using voice {name}={id} for engine={} language={} speech_speed={} ({} available)",

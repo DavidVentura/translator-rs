@@ -1238,9 +1238,7 @@ mod tests {
             (80.0, 30.0), // baseline right
             (0.0, 30.0),  // baseline left
         ]);
-        let rect = oriented_boxes_from_contour(&contour)
-            .expect("rect")
-            .tight;
+        let rect = oriented_boxes_from_contour(&contour).expect("rect").tight;
         let angle_deg = rect.angle_radians.to_degrees().abs();
         assert!(
             angle_deg < 1.0,
@@ -1254,15 +1252,8 @@ mod tests {
         // A flat horizontal rectangle (0,0)–(80,12) sheared so both edges slope down by 8 px
         // across the 80 px width — about 5.7°. Both top and bottom slope the same, so the
         // estimator should accept the tilt.
-        let contour = sample_edges(&[
-            (0.0, 0.0),
-            (80.0, 8.0),
-            (80.0, 20.0),
-            (0.0, 12.0),
-        ]);
-        let rect = oriented_boxes_from_contour(&contour)
-            .expect("rect")
-            .tight;
+        let contour = sample_edges(&[(0.0, 0.0), (80.0, 8.0), (80.0, 20.0), (0.0, 12.0)]);
+        let rect = oriented_boxes_from_contour(&contour).expect("rect").tight;
         let angle_deg = rect.angle_radians.to_degrees();
         assert!(
             (angle_deg - 5.7).abs() < 1.0,
@@ -1287,9 +1278,7 @@ mod tests {
             (66.0, 18.0),
             (0.0, 16.0), // very slight bottom drift on baseline (DBNet/AA artefact)
         ]);
-        let rect = oriented_boxes_from_contour(&contour)
-            .expect("rect")
-            .tight;
+        let rect = oriented_boxes_from_contour(&contour).expect("rect").tight;
         let angle_deg = rect.angle_radians.to_degrees().abs();
         assert!(
             angle_deg < 0.1,
@@ -1322,9 +1311,7 @@ mod tests {
             (10.0, 10.0 + 10.0 * tilt),
             (590.0, 10.0 + 590.0 * tilt),
         ]));
-        let rect = oriented_boxes_from_contour(&contour)
-            .expect("rect")
-            .tight;
+        let rect = oriented_boxes_from_contour(&contour).expect("rect").tight;
         let angle_deg = rect.angle_radians.to_degrees();
         assert!(
             (angle_deg - 1.03).abs() < 0.5,
@@ -1348,9 +1335,7 @@ mod tests {
             (40.0, 12.0),
             (0.0, 12.0),
         ]);
-        let rect = oriented_boxes_from_contour(&contour)
-            .expect("rect")
-            .tight;
+        let rect = oriented_boxes_from_contour(&contour).expect("rect").tight;
         let angle_deg = rect.angle_radians.to_degrees().abs();
         assert!(
             angle_deg < 1.0,

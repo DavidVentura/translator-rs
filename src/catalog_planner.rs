@@ -503,12 +503,15 @@ pub fn resolve_tts_voice_files_for_pack(
     let pack_files = snapshot
         .catalog
         .pack_files_with_dependencies(&voice_pack_id);
-    let model_asset = pack_files
-        .iter()
-        .find(|file| file.name.ends_with(".onnx") && !file.name.ends_with(".onnx.json"))?;
     let engine = tts.engine.clone().unwrap_or_else(|| "piper".to_string());
+    let model_asset = match engine.as_str() {
+        "kokoro_mnn" => pack_files.iter().find(|file| file.name.ends_with(".mnn")),
+        _ => pack_files
+            .iter()
+            .find(|file| file.name.ends_with(".onnx") && !file.name.ends_with(".onnx.json")),
+    }?;
     let aux_asset = match engine.as_str() {
-        "kokoro" => pack_files.iter().find(|file| file.name.ends_with(".bin")),
+        "kokoro" | "kokoro_mnn" => pack_files.iter().find(|file| file.name.ends_with(".bin")),
         "mms" => pack_files
             .iter()
             .find(|file| file.name.ends_with("tokens.txt")),
