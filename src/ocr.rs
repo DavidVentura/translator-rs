@@ -222,6 +222,33 @@ pub struct PreparedImageOverlay {
     pub blocks: Vec<PreparedTextBlock>,
 }
 
+/// Lightweight detection result — what the PaddlePaddle detector produces before
+/// the recognizer is run. Exposes only the box geometry so callers can cheaply
+/// track box motion across frames (live mode) and selectively run recognition.
+///
+/// `contour` is the raw detection polygon flattened to alternating x,y in image
+/// pixels (length is even). Empty means the detector didn't produce a usable
+/// contour and the recognizer should fall back to AABB cropping. When non-empty
+/// the recognizer dewarps along the contour for tilted/curved text.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DetectedTextBox {
+    pub rect: Rect,
+    pub oriented_box: OrientedRect,
+    pub contour: Vec<f32>,
+}
+
+/// Output of recognition over a previously-detected box. The caller can feed
+/// `text` to a translation/cache layer.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RecognizedTextLine {
+    pub rect: Rect,
+    pub oriented_box: OrientedRect,
+    pub text: String,
+    pub confidence: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct WordInfo {
     text: String,

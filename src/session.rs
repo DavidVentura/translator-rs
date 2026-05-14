@@ -397,6 +397,67 @@ impl TranslatorSession {
         })
     }
 
+    /// Run PaddlePaddle's detector only (no recognition). Designed for live-OCR overlay loops
+    /// where the detector runs every frame at low resolution and recognition is dispatched
+    /// only for boxes that don't track to a previously-recognized one.
+    #[cfg(feature = "ppocr")]
+    pub fn detect_text_boxes_rgba(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        source_code: &str,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        let src = LanguageCode::from(source_code);
+        let ppocr = self.ppocr_engine_for(&src)?;
+        ppocr.detect_only_rgba(rgba_bytes, width, height)
+    }
+
+    /// Run PaddlePaddle's recognizer on caller-provided boxes.
+    #[cfg(feature = "ppocr")]
+    pub fn recognize_text_in_boxes_rgba(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        boxes: &[crate::ocr::DetectedTextBox],
+        source_code: &str,
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        let src = LanguageCode::from(source_code);
+        let ppocr = self.ppocr_engine_for(&src)?;
+        ppocr.recognize_text_in_boxes_rgba(rgba_bytes, width, height, boxes)
+    }
+
+    /// Live-OCR detect: takes a pre-built `OrientedImage` (the live pipeline's
+    /// FrameHandle holds one of these). Boxes returned are in detection-image
+    /// coords; multiply by `oriented.det_to_full_scale` to lift to the full
+    /// display-orient crop's coord space.
+    #[cfg(feature = "ppocr")]
+    pub fn detect_in_oriented_image(
+        &self,
+        oriented: &crate::live_frame::OrientedImage,
+        source_code: &str,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        let src = LanguageCode::from(source_code);
+        let ppocr = self.ppocr_engine_for(&src)?;
+        ppocr.detect_only_image(&oriented.rgb_det)
+    }
+
+    /// Live-OCR recognize: takes the same `OrientedImage` (full-resolution crop +
+    /// pre-built grayscale) and caller-supplied boxes in *display-orient
+    /// full-crop* coords (i.e. already scaled up from detection coords).
+    #[cfg(feature = "ppocr")]
+    pub fn recognize_in_oriented_image(
+        &self,
+        oriented: &crate::live_frame::OrientedImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+        source_code: &str,
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        let src = LanguageCode::from(source_code);
+        let ppocr = self.ppocr_engine_for(&src)?;
+        ppocr.recognize_text_in_boxes_image(&oriented.rgb, &oriented.gray, boxes)
+    }
+
     pub fn retranslate_prepared_overlay(
         &self,
         mut prepared: PreparedImageOverlay,

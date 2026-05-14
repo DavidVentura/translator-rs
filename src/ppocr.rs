@@ -269,9 +269,249 @@ impl PpocrEngine {
         sort_lines_reading_order(&mut lines);
         Ok(lines)
     }
+
+    /// Detect-only path for live OCR overlays: run the detector and return geometry only,
+    /// without recognition. Callers can match new boxes against previous frames (e.g. via IoU)
+    /// and only call `recognize_text_in_boxes_rgba` on novel boxes.
+    pub fn detect_only_rgba(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                TranslatorError::new(TranslatorErrorKind::InvalidInput, "image dims overflow")
+            })?;
+        if rgba.len() != expected {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::InvalidInput,
+                format!(
+                    "rgba length {} != {}x{}x4 ({})",
+                    rgba.len(),
+                    width,
+                    height,
+                    expected
+                ),
+            ));
+        }
+        let image = rgba_to_dynamic(rgba, width, height);
+        self.detect_only_image(&image)
+    }
+
+    /// Image-based detect. Same as `detect_only_rgba` but caller has already produced a
+    /// `DynamicImage` (e.g. via `FrameHandle`), so we skip the rgba→dynamic copy.
+    pub fn detect_only_image(
+        &self,
+        image: &DynamicImage,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        let width = image.width();
+        let height = image.height();
+        let boxes = self.detector.detect(image)?;
+        let out: Vec<crate::ocr::DetectedTextBox> = boxes
+            .into_iter()
+            .map(|tb| {
+                let expanded = expand_box(&tb.rect, DET_BOX_BORDER, width, height);
+                let aabb = crate::ocr::Rect {
+                    left: expanded.left,
+                    top: expanded.top,
+                    right: expanded.right,
+                    bottom: expanded.bottom,
+                };
+                let oriented = tb
+                    .contour
+                    .as_ref()
+                    .and_then(|c| oriented_boxes_from_contour(c))
+                    .map(|cb| cb.inflated)
+                    .unwrap_or_else(|| crate::ocr::OrientedRect::axis_aligned(aabb));
+                let contour_flat: Vec<f32> = tb
+                    .contour
+                    .as_ref()
+                    .map(|c| {
+                        let mut v = Vec::with_capacity(c.len() * 2);
+                        for &(x, y) in c {
+                            v.push(x);
+                            v.push(y);
+                        }
+                        v
+                    })
+                    .unwrap_or_default();
+                crate::ocr::DetectedTextBox {
+                    rect: aabb,
+                    oriented_box: oriented,
+                    contour: contour_flat,
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Recognize text in caller-supplied boxes (typically from `detect_only_rgba`). The boxes
+    /// must be in the same image coordinate space as `rgba`. Empty / low-confidence results are
+    /// dropped, matching the full `recognize_rgba` filter.
+    pub fn recognize_text_in_boxes_rgba(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                TranslatorError::new(TranslatorErrorKind::InvalidInput, "image dims overflow")
+            })?;
+        if rgba.len() != expected {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::InvalidInput,
+                format!(
+                    "rgba length {} != {}x{}x4 ({})",
+                    rgba.len(),
+                    width,
+                    height,
+                    expected
+                ),
+            ));
+        }
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let image = rgba_to_dynamic(rgba, width, height);
+        let gray = image.to_luma8();
+        self.recognize_text_in_boxes_image(&image, &gray, boxes)
+    }
+
+    /// Image-based recognize. The caller passes a pre-built `DynamicImage` (and its
+    /// grayscale view) so we skip the rgba→dynamic+to_luma8 work on every call. Used
+    /// by `FrameHandle` to avoid copying the bitmap across FFI per recognition.
+    pub fn recognize_text_in_boxes_image(
+        &self,
+        image: &DynamicImage,
+        gray: &GrayImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let width = image.width();
+        let height = image.height();
+        let rgba_ms = 0.0_f32;
+
+        let t_crops = Instant::now();
+        let mut dewarp_count: usize = 0;
+        let crops: Vec<DynamicImage> = boxes
+            .iter()
+            .map(|b| {
+                let contour_pairs: Option<Vec<(f32, f32)>> =
+                    if !b.contour.is_empty() && b.contour.len() % 2 == 0 {
+                        Some(b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect())
+                    } else {
+                        None
+                    };
+                let dewarped = contour_pairs
+                    .as_deref()
+                    .and_then(|c| dewarp_contour_to_strip(gray, c))
+                    .map(DynamicImage::ImageLuma8);
+                if dewarped.is_some() {
+                    dewarp_count += 1;
+                    dewarped.unwrap()
+                } else {
+                    let rect = PpocrRect {
+                        left: b.rect.left,
+                        top: b.rect.top,
+                        right: b.rect.right,
+                        bottom: b.rect.bottom,
+                    };
+                    crop_dynamic(image, &rect)
+                }
+            })
+            .collect();
+        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
+        let mean_crop_w: f32 = if crops.is_empty() {
+            0.0
+        } else {
+            crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32
+        };
+        let mean_crop_h: f32 = if crops.is_empty() {
+            0.0
+        } else {
+            crops.iter().map(|c| c.height() as f32).sum::<f32>() / crops.len() as f32
+        };
+
+        let recognizer = &self.recognizer;
+        let timings_us = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let t_rec_wall = Instant::now();
+        let results: Vec<Result<RecResult, TranslatorError>> = recognizer.pool.install(|| {
+            crops
+                .par_iter()
+                .map(|crop| {
+                    let worker_idx =
+                        rayon::current_thread_index().unwrap_or(0) % recognizer.sessions.len();
+                    recognizer.recognize_one(crop, worker_idx, &timings_us)
+                })
+                .collect()
+        });
+        let rec_wall_ms = t_rec_wall.elapsed().as_secs_f32() * 1000.0;
+        let rec_pre_ms = timings_us.0.load(Ordering::Relaxed) as f32 / 1000.0;
+        let rec_infer_ms = timings_us.1.load(Ordering::Relaxed) as f32 / 1000.0;
+        let rec_post_ms = timings_us.2.load(Ordering::Relaxed) as f32 / 1000.0;
+
+        // Keep the output aligned 1:1 with the input boxes so callers can correlate by
+        // index instead of having to re-match results by rect/IoU. Filtered entries
+        // (empty text or below `REC_DROP_SCORE`) come back with empty text and
+        // confidence=0.0; callers decide whether to render them.
+        let mut lines = Vec::with_capacity(boxes.len());
+        let mut empty_count = 0usize;
+        let mut low_score_count = 0usize;
+        for (idx, result) in results.into_iter().enumerate() {
+            let r = result?;
+            let (text, confidence) = if r.text.trim().is_empty() {
+                empty_count += 1;
+                (String::new(), 0.0)
+            } else if r.confidence < REC_DROP_SCORE {
+                low_score_count += 1;
+                (String::new(), 0.0)
+            } else {
+                (r.text, r.confidence)
+            };
+            lines.push(crate::ocr::RecognizedTextLine {
+                rect: boxes[idx].rect,
+                oriented_box: boxes[idx].oriented_box,
+                text,
+                confidence,
+            });
+        }
+        log::debug!(
+            "ppocr live rec: src={}x{} boxes={} dewarped={}/{} mean_crop={:.0}x{:.0} \
+             accepted={} empty={} low_score={} (drop {:.2}) — \
+             rgba_pack={:.1}ms crops/dewarp={:.1}ms \
+             rec_wall={:.1}ms (cpu pre={:.1}ms infer={:.1}ms post={:.1}ms)",
+            width,
+            height,
+            boxes.len(),
+            dewarp_count,
+            boxes.len(),
+            mean_crop_w,
+            mean_crop_h,
+            lines.iter().filter(|l| !l.text.is_empty()).count(),
+            empty_count,
+            low_score_count,
+            REC_DROP_SCORE,
+            rgba_ms,
+            crops_ms,
+            rec_wall_ms,
+            rec_pre_ms,
+            rec_infer_ms,
+            rec_post_ms,
+        );
+        Ok(lines)
+    }
 }
 
-fn rgba_to_dynamic(rgba: &[u8], width: u32, height: u32) -> DynamicImage {
+pub(crate) fn rgba_to_dynamic(rgba: &[u8], width: u32, height: u32) -> DynamicImage {
     let n_pixels = (width as usize) * (height as usize);
     let mut rgb = Vec::with_capacity(n_pixels * 3);
     for i in 0..n_pixels {
@@ -382,7 +622,7 @@ impl PpocrDetector {
             &binary, &mask, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h,
         );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
-        log::info!(
+        log::debug!(
             "ppocr det: input_pad={}x{} scaled={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{} — pre={:.1}ms infer={:.1}ms post={:.1}ms",
             pad_w,
             pad_h,

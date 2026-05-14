@@ -21,6 +21,8 @@ mod inference;
 pub mod language;
 pub mod language_detect;
 #[cfg(feature = "ppocr")]
+pub mod live_frame;
+#[cfg(feature = "ppocr")]
 mod mnn_inference;
 #[cfg(feature = "mucab")]
 pub mod mucab;
@@ -82,7 +84,10 @@ pub use catalog::{
     plan_ocr_engine_download,
 };
 pub use language_detect::DetectionResult;
-pub use ocr::{OverlayColors, PreparedImageOverlay, ReadingOrder, Rect, sample_overlay_colors};
+pub use ocr::{
+    DetectedTextBox, OverlayColors, PreparedImageOverlay, ReadingOrder, RecognizedTextLine, Rect,
+    sample_overlay_colors,
+};
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
 pub use settings::{BackgroundMode, PreferredOcrEngine};
