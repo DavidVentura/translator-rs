@@ -235,7 +235,9 @@ pub struct PreparedImageOverlay {
 pub struct DetectedTextBox {
     pub rect: Rect,
     pub oriented_box: OrientedRect,
+    pub tight_box: OrientedRect,
     pub contour: Vec<f32>,
+    pub score: f32,
 }
 
 /// Output of recognition over a previously-detected box. The caller can feed

@@ -23,6 +23,8 @@ pub mod language_detect;
 #[cfg(feature = "ppocr")]
 pub mod live_frame;
 #[cfg(feature = "ppocr")]
+pub mod live_tracking;
+#[cfg(feature = "ppocr")]
 mod mnn_inference;
 #[cfg(feature = "mucab")]
 pub mod mucab;

@@ -49,11 +49,36 @@ const DET_BOX_MIN_SCORE: f32 = 0.6;
 const DET_MIN_AREA: u32 = 64;
 const DET_UNCLIP_RATIO: f32 = 1.6;
 const DET_BOX_BORDER: u32 = 4;
+const LIVE_REC_DROP_SCORE: f32 = 0.65;
+const LIVE_DET_BOX_MIN_SCORE: f32 = 0.68;
+const LIVE_DET_MIN_AREA: u32 = 96;
 
 const PPOCR_DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PPOCR_DET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const PPOCR_REC_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 const PPOCR_REC_STD: [f32; 3] = [0.5, 0.5, 0.5];
+
+#[derive(Debug, Clone, Copy)]
+struct PpocrThresholds {
+    det_score_threshold: f32,
+    det_box_min_score: f32,
+    det_min_area: u32,
+    rec_drop_score: f32,
+}
+
+const STILL_THRESHOLDS: PpocrThresholds = PpocrThresholds {
+    det_score_threshold: DET_SCORE_THRESHOLD,
+    det_box_min_score: DET_BOX_MIN_SCORE,
+    det_min_area: DET_MIN_AREA,
+    rec_drop_score: REC_DROP_SCORE,
+};
+
+const LIVE_THRESHOLDS: PpocrThresholds = PpocrThresholds {
+    det_score_threshold: DET_SCORE_THRESHOLD,
+    det_box_min_score: LIVE_DET_BOX_MIN_SCORE,
+    det_min_area: LIVE_DET_MIN_AREA,
+    rec_drop_score: LIVE_REC_DROP_SCORE,
+};
 
 const PUNCTUATIONS: &[char] = &[
     ',', '.', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']', '{', '}', '-', '_', '/', '\\',
@@ -307,9 +332,26 @@ impl PpocrEngine {
         &self,
         image: &DynamicImage,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        self.detect_only_image_with_thresholds(image, STILL_THRESHOLDS)
+    }
+
+    /// Live camera detection uses a stricter profile than still-image OCR so transient
+    /// texture/compression blobs do not become stable tracked overlays.
+    pub fn detect_only_image_live(
+        &self,
+        image: &DynamicImage,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        self.detect_only_image_with_thresholds(image, LIVE_THRESHOLDS)
+    }
+
+    fn detect_only_image_with_thresholds(
+        &self,
+        image: &DynamicImage,
+        thresholds: PpocrThresholds,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
         let width = image.width();
         let height = image.height();
-        let boxes = self.detector.detect(image)?;
+        let boxes = self.detector.detect_with_thresholds(image, thresholds)?;
         let out: Vec<crate::ocr::DetectedTextBox> = boxes
             .into_iter()
             .map(|tb| {
@@ -320,12 +362,17 @@ impl PpocrEngine {
                     right: expanded.right,
                     bottom: expanded.bottom,
                 };
-                let oriented = tb
+                let contour_boxes = tb
                     .contour
                     .as_ref()
-                    .and_then(|c| oriented_boxes_from_contour(c))
-                    .map(|cb| cb.inflated)
-                    .unwrap_or_else(|| crate::ocr::OrientedRect::axis_aligned(aabb));
+                    .and_then(|c| oriented_boxes_from_contour(c));
+                let (oriented, tight) = match contour_boxes {
+                    Some(ContourBoxes { tight, inflated }) => (inflated, tight),
+                    None => {
+                        let aligned = crate::ocr::OrientedRect::axis_aligned(aabb);
+                        (aligned, aligned)
+                    }
+                };
                 let contour_flat: Vec<f32> = tb
                     .contour
                     .as_ref()
@@ -341,7 +388,9 @@ impl PpocrEngine {
                 crate::ocr::DetectedTextBox {
                     rect: aabb,
                     oriented_box: oriented,
+                    tight_box: tight,
                     contour: contour_flat,
+                    score: tb.score,
                 }
             })
             .collect();
@@ -392,6 +441,25 @@ impl PpocrEngine {
         image: &DynamicImage,
         gray: &GrayImage,
         boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        self.recognize_text_in_boxes_image_with_thresholds(image, gray, boxes, STILL_THRESHOLDS)
+    }
+
+    pub fn recognize_text_in_boxes_image_live(
+        &self,
+        image: &DynamicImage,
+        gray: &GrayImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        self.recognize_text_in_boxes_image_with_thresholds(image, gray, boxes, LIVE_THRESHOLDS)
+    }
+
+    fn recognize_text_in_boxes_image_with_thresholds(
+        &self,
+        image: &DynamicImage,
+        gray: &GrayImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+        thresholds: PpocrThresholds,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
         if boxes.is_empty() {
             return Ok(Vec::new());
@@ -471,7 +539,7 @@ impl PpocrEngine {
             let (text, confidence) = if r.text.trim().is_empty() {
                 empty_count += 1;
                 (String::new(), 0.0)
-            } else if r.confidence < REC_DROP_SCORE {
+            } else if r.confidence < thresholds.rec_drop_score {
                 low_score_count += 1;
                 (String::new(), 0.0)
             } else {
@@ -499,7 +567,7 @@ impl PpocrEngine {
             lines.iter().filter(|l| !l.text.is_empty()).count(),
             empty_count,
             low_score_count,
-            REC_DROP_SCORE,
+            thresholds.rec_drop_score,
             rgba_ms,
             crops_ms,
             rec_wall_ms,
@@ -564,6 +632,7 @@ fn sort_lines_reading_order(lines: &mut [PpocrLine]) {
 struct DetBox {
     rect: PpocrRect,
     contour: Option<Vec<(f32, f32)>>,
+    score: f32,
 }
 
 impl PpocrDetector {
@@ -573,6 +642,14 @@ impl PpocrDetector {
     }
 
     fn detect(&self, image: &DynamicImage) -> Result<Vec<DetBox>, TranslatorError> {
+        self.detect_with_thresholds(image, STILL_THRESHOLDS)
+    }
+
+    fn detect_with_thresholds(
+        &self,
+        image: &DynamicImage,
+        thresholds: PpocrThresholds,
+    ) -> Result<Vec<DetBox>, TranslatorError> {
         let (orig_w, orig_h) = image.dimensions();
         let t_pre = Instant::now();
         let scaled = resize_to_max_side(image, DET_MAX_SIDE);
@@ -608,7 +685,7 @@ impl PpocrDetector {
                 mask_max = v;
             }
             mask_sum += v;
-            if v > DET_SCORE_THRESHOLD {
+            if v > thresholds.det_score_threshold {
                 over_thresh += 1;
             }
         }
@@ -616,10 +693,16 @@ impl PpocrDetector {
         let t_post = Instant::now();
         let binary: Vec<u8> = mask
             .iter()
-            .map(|&v| if v > DET_SCORE_THRESHOLD { 255 } else { 0 })
+            .map(|&v| {
+                if v > thresholds.det_score_threshold {
+                    255
+                } else {
+                    0
+                }
+            })
             .collect();
         let boxes = extract_boxes(
-            &binary, &mask, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h,
+            &binary, &mask, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h, thresholds,
         );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
         log::debug!(
@@ -633,7 +716,7 @@ impl PpocrDetector {
             mask_min,
             mask_max,
             mask_mean,
-            DET_SCORE_THRESHOLD,
+            thresholds.det_score_threshold,
             over_thresh,
             mask.len(),
             pre_ms,
@@ -687,6 +770,7 @@ fn extract_boxes(
     valid_h: u32,
     orig_w: u32,
     orig_h: u32,
+    thresholds: PpocrThresholds,
 ) -> Vec<DetBox> {
     let Some(gray) = GrayImage::from_raw(mask_w, mask_h, mask.to_vec()) else {
         return Vec::new();
@@ -725,7 +809,7 @@ fn extract_boxes(
         let max_y = max_y.min(valid_h as i32);
         let box_w = (max_x - min_x) as u32;
         let box_h = (max_y - min_y) as u32;
-        if box_w * box_h < DET_MIN_AREA {
+        if box_w * box_h < thresholds.det_min_area {
             continue;
         }
 
@@ -755,7 +839,7 @@ fn extract_boxes(
         } else {
             0.0
         };
-        if box_score < DET_BOX_MIN_SCORE {
+        if box_score < thresholds.det_box_min_score {
             weak_score_count += 1;
             continue;
         }
@@ -797,13 +881,14 @@ fn extract_boxes(
                 bottom: final_y + final_h,
             },
             contour: Some(scaled_contour),
+            score: box_score,
         });
     }
     if weak_score_count > 0 {
         log::info!(
             "ppocr det: {} contour(s) below box-score gate {:.2}",
             weak_score_count,
-            DET_BOX_MIN_SCORE,
+            thresholds.det_box_min_score,
         );
     }
     boxes

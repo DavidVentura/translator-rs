@@ -440,7 +440,7 @@ impl TranslatorSession {
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
         let src = LanguageCode::from(source_code);
         let ppocr = self.ppocr_engine_for(&src)?;
-        ppocr.detect_only_image(&oriented.rgb_det)
+        ppocr.detect_only_image_live(&oriented.rgb_det)
     }
 
     /// Live-OCR recognize: takes the same `OrientedImage` (full-resolution crop +
@@ -455,7 +455,7 @@ impl TranslatorSession {
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
         let src = LanguageCode::from(source_code);
         let ppocr = self.ppocr_engine_for(&src)?;
-        ppocr.recognize_text_in_boxes_image(&oriented.rgb, &oriented.gray, boxes)
+        ppocr.recognize_text_in_boxes_image_live(&oriented.rgb, &oriented.gray, boxes)
     }
 
     pub fn retranslate_prepared_overlay(
