@@ -85,9 +85,98 @@ pub struct TranslationPack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OcrPack {
-    pub language: String,
-    pub engine: String,
+pub enum OcrPack {
+    Tesseract { language: String },
+    PpocrDetector,
+    PpocrRecognizer { script: PpocrScript },
+}
+
+impl OcrPack {
+    pub fn engine(&self) -> OcrEngine {
+        match self {
+            OcrPack::Tesseract { .. } => OcrEngine::Tesseract,
+            OcrPack::PpocrDetector | OcrPack::PpocrRecognizer { .. } => OcrEngine::Ppocr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OcrEngine {
+    Tesseract,
+    Ppocr,
+}
+
+impl OcrEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OcrEngine::Tesseract => "tesseract",
+            OcrEngine::Ppocr => "ppocr",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "tesseract" => Some(OcrEngine::Tesseract),
+            "ppocr" => Some(OcrEngine::Ppocr),
+            _ => None,
+        }
+    }
+}
+
+/// PPOCR recognizer script slugs.
+///
+/// One PPOCR recognizer model covers every language that uses the script.
+/// `Cj` is the shared Chinese + Japanese model (Korean uses its own).
+/// `Eslav` is the East-Slavic specialization (be/ru/uk); `Cyrillic` is the
+/// non-East-Slavic Cyrillic fallback (bg/sr).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PpocrScript {
+    Arabic,
+    Cj,
+    Cyrillic,
+    Devanagari,
+    El,
+    Eslav,
+    Korean,
+    Latin,
+    Ta,
+    Te,
+    Th,
+}
+
+impl PpocrScript {
+    pub fn as_slug(&self) -> &'static str {
+        match self {
+            PpocrScript::Arabic => "arabic",
+            PpocrScript::Cj => "cj",
+            PpocrScript::Cyrillic => "cyrillic",
+            PpocrScript::Devanagari => "devanagari",
+            PpocrScript::El => "el",
+            PpocrScript::Eslav => "eslav",
+            PpocrScript::Korean => "korean",
+            PpocrScript::Latin => "latin",
+            PpocrScript::Ta => "ta",
+            PpocrScript::Te => "te",
+            PpocrScript::Th => "th",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "arabic" => Some(PpocrScript::Arabic),
+            "cj" => Some(PpocrScript::Cj),
+            "cyrillic" => Some(PpocrScript::Cyrillic),
+            "devanagari" => Some(PpocrScript::Devanagari),
+            "el" => Some(PpocrScript::El),
+            "eslav" => Some(PpocrScript::Eslav),
+            "korean" => Some(PpocrScript::Korean),
+            "latin" => Some(PpocrScript::Latin),
+            "ta" => Some(PpocrScript::Ta),
+            "te" => Some(PpocrScript::Te),
+            "th" => Some(PpocrScript::Th),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

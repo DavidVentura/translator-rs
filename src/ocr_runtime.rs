@@ -11,16 +11,18 @@ use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 #[cfg(feature = "ppocr")]
+use crate::catalog::{OcrPack, PackKind, PpocrScript};
+#[cfg(feature = "ppocr")]
+use crate::language_detect::detect_language_robust_code;
+#[cfg(feature = "ppocr")]
 use crate::live_frame::OrientedImage;
 #[cfg(feature = "ppocr")]
-use crate::ocr::{DetectedTextBox, OrientedRect, RecognizedTextLine};
+use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine};
 #[cfg(feature = "tesseract")]
 use crate::ocr::{DetectedWord, build_text_blocks};
-use crate::ocr::{
-    PreparedImageOverlay, ReadingOrder, Rect, TextBlock, TextLine, prepare_overlay_image,
-};
+use crate::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock, prepare_overlay_image};
 #[cfg(feature = "ppocr")]
-use crate::ppocr::PpocrEngine;
+use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
 use crate::settings::BackgroundMode;
 #[cfg(feature = "tesseract")]
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
@@ -146,7 +148,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     width: u32,
     height: u32,
     max_image_size: u32,
-    source_code: &LanguageCode,
+    source_selection: &OcrSourceSelection,
     target_code: &LanguageCode,
     background_mode: BackgroundMode,
     reading_order: ReadingOrder,
@@ -162,25 +164,63 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
 
     let det_raw = ppocr
-        .detect_only_image(&oriented.rgb_det)
+        .detect_only_image(&oriented.rgb_det, PpocrProfile::Still)
         .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?;
     let det_boxes: Vec<DetectedTextBox> = det_raw
         .into_iter()
         .map(|b| scale_detected_box(b, oriented.det_to_full_scale, width, height))
         .collect();
 
+    let scripts = match source_selection {
+        OcrSourceSelection::Auto => {
+            let predictions = ppocr
+                .classify_text_boxes_image(&oriented.rgb, &oriented.gray, &det_boxes)
+                .map_err(|e| {
+                    TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
+                })?;
+            route_ppocr_predictions(ppocr, &predictions, &det_boxes)?
+        }
+        OcrSourceSelection::Specific { language_code } => {
+            let script = recognizer_script_for_language(snapshot, language_code)?;
+            vec![script; det_boxes.len()]
+        }
+    };
+
     let lines = ppocr
-        .recognize_text_in_boxes_image(&oriented.rgb, &oriented.gray, &det_boxes)
+        .recognize_text_in_boxes_image(
+            &oriented.rgb,
+            &oriented.gray,
+            &det_boxes,
+            &scripts,
+            PpocrProfile::Still,
+        )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
     let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines);
+    let source_code = match source_selection {
+        OcrSourceSelection::Specific { language_code } => language_code.clone(),
+        OcrSourceSelection::Auto => {
+            let blocks_text = blocks
+                .iter()
+                .map(TextBlock::translation_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let Some(detected) = ocr_source_from_text(snapshot, &blocks_text, Some(target_code))
+            else {
+                return Err(TranslatorError::ocr(
+                    "could not detect image source language",
+                ));
+            };
+            detected
+        }
+    };
     finalize_image_overlay(
         engine,
         snapshot,
         rgba_bytes,
         width,
         height,
-        source_code,
+        &source_code,
         target_code,
         blocks,
         background_mode,
@@ -305,6 +345,256 @@ fn still_ppocr_lines_to_blocks(
         })
         .collect();
     crate::ocr::group_lines_into_paragraphs(text_lines, Default::default())
+}
+
+/// Map a PULC script class to the best installed PPOCR recognizer script. Tries the
+/// specialist first (Eslav for Cyrillic), then a general fallback. Returns `None`
+/// when nothing applicable is installed.
+#[cfg(feature = "ppocr")]
+fn ppocr_script_for_class(ppocr: &PpocrEngine, class: PpocrScriptClass) -> Option<PpocrScript> {
+    let candidates: &[PpocrScript] = match class {
+        PpocrScriptClass::Arabic => &[PpocrScript::Arabic],
+        PpocrScriptClass::Chinese | PpocrScriptClass::Japanese => &[PpocrScript::Cj],
+        PpocrScriptClass::Cyrillic => &[PpocrScript::Eslav, PpocrScript::Cyrillic],
+        PpocrScriptClass::Devanagari => &[PpocrScript::Devanagari],
+        // PULC has a Kannada class but PPOCR has no Kannada recognizer; falls through to
+        // the dominant-pack fallback in `route_ppocr_predictions`.
+        PpocrScriptClass::Kannada => &[],
+        PpocrScriptClass::Korean => &[PpocrScript::Korean],
+        PpocrScriptClass::Tamil => &[PpocrScript::Ta],
+        PpocrScriptClass::Telugu => &[PpocrScript::Te],
+        PpocrScriptClass::Latin => &[PpocrScript::Latin],
+    };
+    let installed: std::collections::HashSet<PpocrScript> = ppocr.installed_scripts().collect();
+    candidates.iter().find(|s| installed.contains(s)).copied()
+}
+
+#[cfg(feature = "ppocr")]
+pub(crate) fn recognizer_script_for_language(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Result<PpocrScript, TranslatorError> {
+    let pack_id = snapshot
+        .catalog
+        .ocr_pack_id_for_engine(language_code, "ppocr")
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "no ppocr pack for language {}",
+                language_code.as_str()
+            ))
+        })?;
+    let pack = snapshot.catalog.pack(&pack_id).ok_or_else(|| {
+        TranslatorError::missing_asset(format!("ppocr pack {pack_id} missing from catalog"))
+    })?;
+    match &pack.kind {
+        PackKind::Ocr(OcrPack::PpocrRecognizer { script }) => Ok(*script),
+        _ => Err(TranslatorError::missing_asset(format!(
+            "pack {pack_id} is not a ppocr recognizer"
+        ))),
+    }
+}
+
+#[cfg(feature = "ppocr")]
+const PPOCR_ROUTE_DOMINANT_MIN_RATIO: f32 = 0.55;
+#[cfg(feature = "ppocr")]
+const PPOCR_ROUTE_MINOR_KEEP_RATIO: f32 = 0.20;
+#[cfg(feature = "ppocr")]
+const PPOCR_ROUTE_SMOOTH_MIN_CLASSIFIED: usize = 8;
+
+/// Resolve per-strip PULC predictions into per-strip PPOCR recognizer scripts. Strips
+/// PULC could not classify fall back to the dominant classified script; minority
+/// scripts below `PPOCR_ROUTE_MINOR_KEEP_RATIO` are folded into the dominant; Latin
+/// strips in an otherwise single non-Latin batch fold into that non-Latin script
+/// (PPOCR's non-Latin recognizers can handle Latin glyphs but not vice versa).
+#[cfg(feature = "ppocr")]
+pub(crate) fn route_ppocr_predictions(
+    ppocr: &PpocrEngine,
+    predictions: &[Option<PpocrScriptPrediction>],
+    boxes: &[DetectedTextBox],
+) -> Result<Vec<PpocrScript>, TranslatorError> {
+    let latin_installed = ppocr
+        .installed_scripts()
+        .any(|s| s == PpocrScript::Latin)
+        .then_some(PpocrScript::Latin);
+    let mut routed: Vec<Option<PpocrScript>> = Vec::with_capacity(predictions.len());
+    let mut classified = Vec::new();
+    let mut missing_indices = Vec::new();
+    for (idx, prediction) in predictions.iter().enumerate() {
+        let Some(prediction) = prediction else {
+            missing_indices.push(idx);
+            routed.push(None);
+            continue;
+        };
+        let script = ppocr_script_for_class(ppocr, prediction.class);
+        if let Some(box_) = boxes.get(idx) {
+            log::debug!(
+                "ppocr route strip={} class={} score={:.3} det_score={:.3} width={} height={} area={} script={:?}",
+                idx,
+                prediction.class.name(),
+                prediction.score,
+                box_.score,
+                box_.rect.width(),
+                box_.rect.height(),
+                box_.rect.width().saturating_mul(box_.rect.height()),
+                script.as_ref().map(PpocrScript::as_slug),
+            );
+        }
+        match script {
+            Some(script) => {
+                classified.push(script);
+                routed.push(Some(script));
+            }
+            None => {
+                missing_indices.push(idx);
+                routed.push(None);
+            }
+        }
+    }
+
+    let fallback = dominant_script(&classified);
+    if !missing_indices.is_empty() {
+        let Some(fallback) = fallback else {
+            return Err(TranslatorError::ocr(
+                "could not classify script for any detected text strip",
+            ));
+        };
+        for idx in missing_indices {
+            log::debug!(
+                "ppocr route strip={} script=unknown -> {} (fallback=dominant)",
+                idx,
+                fallback.as_slug(),
+            );
+            routed[idx] = Some(fallback);
+        }
+    }
+
+    smooth_dominant_routes(&mut routed, &classified);
+
+    if let Some(latin) = latin_installed {
+        let non_latin: std::collections::HashSet<PpocrScript> = routed
+            .iter()
+            .filter_map(|s| *s)
+            .filter(|s| *s != latin)
+            .collect();
+        if non_latin.len() == 1 {
+            let target = *non_latin.iter().next().unwrap();
+            for slot in &mut routed {
+                if *slot == Some(latin) {
+                    *slot = Some(target);
+                }
+            }
+            log::debug!(
+                "ppocr route merged latin into {} for mixed-script batch",
+                target.as_slug(),
+            );
+        }
+    }
+
+    Ok(routed
+        .into_iter()
+        .map(|s| s.expect("all ppocr routes populated"))
+        .collect())
+}
+
+#[cfg(feature = "ppocr")]
+fn dominant_script(scripts: &[PpocrScript]) -> Option<PpocrScript> {
+    scripts
+        .iter()
+        .fold(
+            std::collections::HashMap::<PpocrScript, usize>::new(),
+            |mut counts, script| {
+                *counts.entry(*script).or_default() += 1;
+                counts
+            },
+        )
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(script, _)| script)
+}
+
+#[cfg(feature = "ppocr")]
+fn smooth_dominant_routes(routed: &mut [Option<PpocrScript>], classified: &[PpocrScript]) {
+    if classified.len() < PPOCR_ROUTE_SMOOTH_MIN_CLASSIFIED {
+        return;
+    }
+    let counts: std::collections::HashMap<PpocrScript, usize> =
+        classified
+            .iter()
+            .fold(std::collections::HashMap::new(), |mut counts, script| {
+                *counts.entry(*script).or_default() += 1;
+                counts
+            });
+    let Some((&dominant, &dominant_count)) = counts.iter().max_by_key(|(_, count)| **count) else {
+        return;
+    };
+    let total = classified.len() as f32;
+    let dominant_ratio = dominant_count as f32 / total;
+    if dominant_ratio < PPOCR_ROUTE_DOMINANT_MIN_RATIO {
+        return;
+    }
+
+    let minority: std::collections::HashSet<PpocrScript> = counts
+        .iter()
+        .filter_map(|(&script, &count)| {
+            let ratio = count as f32 / total;
+            (script != dominant && ratio < PPOCR_ROUTE_MINOR_KEEP_RATIO).then_some(script)
+        })
+        .collect();
+    for script in &minority {
+        log::debug!(
+            "ppocr route smoothing: folding script={} into dominant={} dominant_ratio={:.2}",
+            script.as_slug(),
+            dominant.as_slug(),
+            dominant_ratio,
+        );
+    }
+    for slot in routed.iter_mut() {
+        if let Some(s) = slot {
+            if minority.contains(s) {
+                *slot = Some(dominant);
+            }
+        }
+    }
+}
+
+/// Run CLD over recognized text and pick the best installed source language. When
+/// `target_code` is given, the picked language must also be translatable to that
+/// target (otherwise returns `None`). Used both still-mode (where the caller turns
+/// `None` into a `MissingAsset`) and live-mode (where the caller keeps `None` so the
+/// frame renders as untranslated text).
+#[cfg(feature = "ppocr")]
+fn ocr_source_from_text(
+    snapshot: &CatalogSnapshot,
+    text: &str,
+    target_code: Option<&LanguageCode>,
+) -> Option<LanguageCode> {
+    let available = snapshot
+        .availability_by_code
+        .keys()
+        .map(|code| LanguageCode::from(code.as_str()))
+        .collect::<Vec<_>>();
+    let detected = detect_language_robust_code(text, None, &available)?;
+    if let Some(target) = target_code {
+        if !snapshot.can_translate(&detected, target) {
+            return None;
+        }
+    }
+    Some(detected)
+}
+
+#[cfg(feature = "ppocr")]
+pub(crate) fn ocr_source_for_lines(
+    snapshot: &CatalogSnapshot,
+    lines: &[RecognizedTextLine],
+    target_code: Option<&LanguageCode>,
+) -> Option<LanguageCode> {
+    let text = lines
+        .iter()
+        .map(|line| line.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    ocr_source_from_text(snapshot, &text, target_code)
 }
 
 fn finalize_image_overlay(

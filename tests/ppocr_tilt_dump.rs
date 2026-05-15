@@ -19,8 +19,9 @@
 
 use std::path::PathBuf;
 
-use image::ImageReader;
-use translator::ppocr::PpocrEngine;
+use image::{DynamicImage, ImageReader};
+use translator::PpocrScript;
+use translator::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
 
 #[test]
 fn dump_tilt_for_real_image() {
@@ -43,25 +44,32 @@ fn dump_tilt_for_real_image() {
         return;
     };
 
-    let dyn_image = ImageReader::open(&image_path)
+    let dyn_image: DynamicImage = ImageReader::open(&image_path)
         .expect("open image")
         .decode()
-        .expect("decode image")
-        .to_rgba8();
-    let (w, h) = (dyn_image.width(), dyn_image.height());
-    let rgba = dyn_image.into_raw();
+        .expect("decode image");
+    let gray = dyn_image.to_luma8();
 
-    let engine = PpocrEngine::load(&det_path, &rec_path, &keys_path, 1).expect("load ppocr");
+    let recognizer_spec = PpocrRecognizerSpec {
+        script: PpocrScript::Latin,
+        model_path: rec_path.clone(),
+        keys_path: keys_path.clone(),
+    };
+    let engine = PpocrEngine::load(&det_path, None, vec![recognizer_spec], 1).expect("load ppocr");
+    let det_boxes = engine
+        .detect_only_image(&dyn_image, PpocrProfile::Still)
+        .expect("detection succeeds");
+    let scripts = vec![PpocrScript::Latin; det_boxes.len()];
     let lines = engine
-        .recognize_rgba(&rgba, w, h)
+        .recognize_text_in_boxes_image(&dyn_image, &gray, &det_boxes, &scripts, PpocrProfile::Still)
         .expect("recognize succeeds");
 
     eprintln!("\n=== {} detections ===", lines.len());
     for (i, line) in lines.iter().enumerate() {
         let angle_deg = line.oriented_box.angle_radians.to_degrees();
         eprintln!(
-            "[{:>2}] angle={:+6.2}°  tight w={:6.1} h={:5.1}  conf={:.2}  text={:?}",
-            i, angle_deg, line.tight_box.width, line.tight_box.height, line.confidence, line.text,
+            "[{:>2}] angle={:+6.2}°  conf={:.2}  text={:?}",
+            i, angle_deg, line.confidence, line.text,
         );
     }
     eprintln!("=========================\n");

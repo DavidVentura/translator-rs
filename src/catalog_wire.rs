@@ -7,7 +7,8 @@ use crate::language::Language;
 use super::model::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, LanguageCatalog,
     LanguageFeature, LanguageInfo, LanguageResources, LanguageTtsRegionV2, LanguageTtsV2, OcrPack,
-    PackKind, PackRecord, SupportPack, TranslationPack, TtsPack, tts_pack_ids_from_config,
+    PackKind, PackRecord, PpocrScript, SupportPack, TranslationPack, TtsPack,
+    tts_pack_ids_from_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -115,8 +116,13 @@ enum AssetPackWire {
     },
     #[serde(rename = "ocr")]
     Ocr {
-        language: String,
         engine: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        script: Option<String>,
+        #[serde(default)]
+        language: Option<String>,
         #[serde(flatten)]
         common: PackCommonWire,
     },
@@ -222,6 +228,29 @@ fn normalized(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
+fn parse_ocr_pack(
+    engine: &str,
+    role: Option<&str>,
+    script: Option<&str>,
+    language: Option<String>,
+) -> Option<OcrPack> {
+    match engine {
+        "tesseract" => {
+            let language = normalized(language)?;
+            Some(OcrPack::Tesseract { language })
+        }
+        "ppocr" => match role? {
+            "detector" => Some(OcrPack::PpocrDetector),
+            "recognizer" => {
+                let script = PpocrScript::from_slug(script?)?;
+                Some(OcrPack::PpocrRecognizer { script })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl AssetPackWire {
     fn into_record(self, id: String) -> Option<PackRecord> {
         Some(match self {
@@ -232,15 +261,21 @@ impl AssetPackWire {
                 kind: PackKind::Translation(TranslationPack { from, to }),
             },
             AssetPackWire::Ocr {
-                language,
                 engine,
+                role,
+                script,
+                language,
                 common,
-            } => PackRecord {
-                id,
-                files: common.files.into_iter().map(Into::into).collect(),
-                depends_on: common.depends_on,
-                kind: PackKind::Ocr(OcrPack { language, engine }),
-            },
+            } => {
+                let ocr_pack =
+                    parse_ocr_pack(&engine, role.as_deref(), script.as_deref(), language)?;
+                PackRecord {
+                    id,
+                    files: common.files.into_iter().map(Into::into).collect(),
+                    depends_on: common.depends_on,
+                    kind: PackKind::Ocr(ocr_pack),
+                }
+            }
             AssetPackWire::Tts {
                 language,
                 engine,

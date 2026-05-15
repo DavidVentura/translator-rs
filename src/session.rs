@@ -2,14 +2,15 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
+#[cfg(feature = "ppocr")]
+use crate::catalog::PackKind;
 use crate::catalog::{
-    CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, InstalledTtsPack,
-    LanguageAvailabilityRow, LanguageOverview, PackInstallChecker, build_catalog_snapshot,
-    build_language_overview, installed_tts_voices_for_language, language_rows_in_snapshot,
-    parse_and_validate_catalog, plan_delete_dictionary, plan_delete_language,
-    plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts, plan_delete_tts_pack,
-    plan_dictionary_download, plan_language_download, plan_support_download_by_kind,
-    plan_tts_download, select_best_catalog,
+    CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
+    LanguageOverview, PackInstallChecker, build_catalog_snapshot, build_language_overview,
+    language_rows_in_snapshot, parse_and_validate_catalog, plan_delete_dictionary,
+    plan_delete_language, plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts,
+    plan_delete_tts_pack, plan_dictionary_download, plan_language_download,
+    plan_support_download_by_kind, plan_tts_download, select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
@@ -28,18 +29,23 @@ use crate::tarkka::{
 use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
 use crate::ocr::PreparedImageOverlay;
 #[cfg(any(feature = "tesseract", feature = "ppocr"))]
-use crate::ocr::ReadingOrder;
-#[cfg(feature = "ppocr")]
-use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
+use crate::ocr::{OcrSourceSelection, ReadingOrder};
 #[cfg(feature = "tesseract")]
 use crate::ocr_runtime::{OcrPool, translate_image_rgba_in_snapshot};
 #[cfg(feature = "ppocr")]
-use crate::ppocr::PpocrEngine;
+use crate::ocr_runtime::{
+    ocr_source_for_lines, recognizer_script_for_language, route_ppocr_predictions,
+    translate_image_rgba_ppocr_in_snapshot,
+};
+#[cfg(feature = "ppocr")]
+use crate::ppocr::{PpocrEngine, PpocrRecognizerSpec};
 #[cfg(any(feature = "tesseract", feature = "ppocr"))]
 use crate::settings::PreferredOcrEngine;
 
 #[cfg(feature = "tts")]
 use crate::api::VoiceName;
+#[cfg(feature = "tts")]
+use crate::catalog::{InstalledTtsPack, installed_tts_voices_for_language};
 #[cfg(feature = "tts")]
 use crate::speech::{
     SpeechCache, available_tts_voices_in_snapshot, plan_speech_chunks_for_text_in_snapshot,
@@ -86,10 +92,21 @@ impl DocAlignCache {
 
 #[cfg(feature = "ppocr")]
 struct PpocrCache {
-    /// Cache key: (det path, rec path, keys path). Tied to the script — when the user
-    /// switches source language, we may need to rebuild the recognizer for a different
-    /// charset.
-    state: Option<(String, String, String, Arc<PpocrEngine>)>,
+    /// Cache key: (detector path, optional classifier path, sorted list of
+    /// installed recognizer (script, model, keys) tuples). One engine per
+    /// session is enough: detector + classifier load once, recognizers load
+    /// lazily per script via internal `OnceLock`. The key invalidates when
+    /// the installed pack set changes so a freshly-downloaded recognizer
+    /// gets picked up.
+    state: Option<(PpocrEngineKey, Arc<PpocrEngine>)>,
+}
+
+#[cfg(feature = "ppocr")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PpocrEngineKey {
+    detector_path: String,
+    classifier_path: Option<String>,
+    recognizers: Vec<(crate::catalog::PpocrScript, String, String)>,
 }
 
 #[cfg(feature = "ppocr")]
@@ -327,7 +344,7 @@ impl TranslatorSession {
         width: u32,
         height: u32,
         max_image_size: u32,
-        source_code: &str,
+        source_selection: OcrSourceSelection,
         target_code: &str,
         min_confidence: u32,
         reading_order: ReadingOrder,
@@ -335,14 +352,13 @@ impl TranslatorSession {
         preferred_engine: PreferredOcrEngine,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
-        let src = LanguageCode::from(source_code);
         let tgt = LanguageCode::from(target_code);
 
         #[cfg(feature = "ppocr")]
         if matches!(preferred_engine, PreferredOcrEngine::Paddle) {
-            match self.ppocr_engine_for(&src) {
+            match self.ppocr_engine(&snap) {
                 Ok(ppocr) => {
-                    log::info!("ocr engine: ppocr (source={})", source_code);
+                    log::info!("ocr engine: ppocr ({:?})", source_selection);
                     return translate_image_rgba_ppocr_in_snapshot(
                         self.engine(),
                         &ppocr,
@@ -351,7 +367,7 @@ impl TranslatorSession {
                         width,
                         height,
                         max_image_size,
-                        &src,
+                        &source_selection,
                         &tgt,
                         background_mode,
                         reading_order,
@@ -367,10 +383,7 @@ impl TranslatorSession {
                 Err(err) => {
                     #[cfg(feature = "tesseract")]
                     {
-                        log::warn!(
-                            "ppocr unavailable for {}, falling back to tesseract: {err}",
-                            source_code
-                        );
+                        log::warn!("ppocr unavailable, falling back to tesseract: {err}");
                     }
                     #[cfg(not(feature = "tesseract"))]
                     {
@@ -382,7 +395,12 @@ impl TranslatorSession {
 
         #[cfg(feature = "tesseract")]
         {
-            log::info!("ocr engine: tesseract (source={})", source_code);
+            let OcrSourceSelection::Specific { language_code } = &source_selection else {
+                return Err(TranslatorError::missing_asset(
+                    "auto-source OCR requires the ppocr engine",
+                ));
+            };
+            log::info!("ocr engine: tesseract (source={})", language_code.as_str());
             let _ = max_image_size;
 
             translate_image_rgba_in_snapshot(
@@ -392,7 +410,7 @@ impl TranslatorSession {
                 rgba_bytes,
                 width,
                 height,
-                &src,
+                language_code,
                 &tgt,
                 min_confidence,
                 reading_order,
@@ -419,7 +437,7 @@ impl TranslatorSession {
                 preferred_engine,
             );
             Err(TranslatorError::missing_asset(
-                "requested OCR engine unavailable without tesseract feature",
+                "requested OCR engine unavailable",
             ))
         }
     }
@@ -429,14 +447,13 @@ impl TranslatorSession {
     /// coords; multiply by `oriented.det_to_full_scale` to lift to the full
     /// display-orient crop's coord space.
     #[cfg(feature = "ppocr")]
-    pub fn detect_in_oriented_image(
+    pub fn detect_text_in_oriented_image(
         &self,
         oriented: &crate::live_frame::OrientedImage,
-        source_code: &str,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
-        let src = LanguageCode::from(source_code);
-        let ppocr = self.ppocr_engine_for(&src)?;
-        ppocr.detect_only_image_live(&oriented.rgb_det)
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        ppocr.detect_only_image(&oriented.rgb_det, crate::ppocr::PpocrProfile::Live)
     }
 
     /// Live-OCR recognize: takes the same `OrientedImage` (full-resolution crop +
@@ -447,11 +464,47 @@ impl TranslatorSession {
         &self,
         oriented: &crate::live_frame::OrientedImage,
         boxes: &[crate::ocr::DetectedTextBox],
-        source_code: &str,
+        source_selection: OcrSourceSelection,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
-        let src = LanguageCode::from(source_code);
-        let ppocr = self.ppocr_engine_for(&src)?;
-        ppocr.recognize_text_in_boxes_image_live(&oriented.rgb, &oriented.gray, boxes)
+        use crate::ppocr::PpocrProfile;
+
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        match source_selection {
+            OcrSourceSelection::Auto => {
+                let predictions =
+                    ppocr.classify_text_boxes_image(&oriented.rgb, &oriented.gray, boxes)?;
+                let scripts = route_ppocr_predictions(&ppocr, &predictions, boxes)?;
+                let mut lines = ppocr.recognize_text_in_boxes_image(
+                    &oriented.rgb,
+                    &oriented.gray,
+                    boxes,
+                    &scripts,
+                    PpocrProfile::Live,
+                )?;
+                let source = ocr_source_for_lines(&snap, &lines, None);
+                if let Some(code) = source {
+                    let code = code.as_str().to_owned();
+                    for line in &mut lines {
+                        if !line.text.trim().is_empty() {
+                            line.source_code = Some(code.clone());
+                        }
+                    }
+                }
+                Ok(lines)
+            }
+            OcrSourceSelection::Specific { language_code } => {
+                let script = recognizer_script_for_language(&snap, &language_code)?;
+                let scripts = vec![script; boxes.len()];
+                ppocr.recognize_text_in_boxes_image(
+                    &oriented.rgb,
+                    &oriented.gray,
+                    boxes,
+                    &scripts,
+                    PpocrProfile::Live,
+                )
+            }
+        }
     }
 
     pub fn retranslate_prepared_overlay(
@@ -522,57 +575,39 @@ impl TranslatorSession {
         Ok(prepared)
     }
 
+    /// Build (or reuse) the session's PPOCR engine. One engine per session covers
+    /// detect / classify / recognize for every installed recognizer pack; the engine
+    /// loads each recognizer model lazily on first use. The cache key invalidates
+    /// only when the installed pack set changes (e.g. after a download), so day-to-day
+    /// switches between auto and forced source reuse the same loaded detector and
+    /// recognizers.
     #[cfg(feature = "ppocr")]
-    fn ppocr_engine_for(
-        &self,
-        source_code: &LanguageCode,
-    ) -> Result<Arc<PpocrEngine>, TranslatorError> {
+    fn ppocr_engine(&self, snap: &CatalogSnapshot) -> Result<Arc<PpocrEngine>, TranslatorError> {
         use crate::api::TranslatorErrorKind;
+        use crate::catalog::OcrPack;
 
-        let snap = self.snapshot();
         let catalog = &snap.catalog;
-        let rec_pack_id = catalog
-            .ocr_pack_id_for_engine(source_code, "ppocr")
-            .ok_or_else(|| {
-                TranslatorError::new(
-                    TranslatorErrorKind::MissingAsset,
-                    format!("no ppocr pack for language {}", source_code.as_str()),
-                )
-            })?;
-        let rec_pack = catalog.pack(&rec_pack_id).ok_or_else(|| {
-            TranslatorError::new(
-                TranslatorErrorKind::MissingAsset,
-                format!("ppocr pack {rec_pack_id} missing from catalog"),
-            )
-        })?;
-        let det_pack_id = rec_pack.depends_on.first().ok_or_else(|| {
-            TranslatorError::new(
-                TranslatorErrorKind::MissingAsset,
-                format!("ppocr pack {rec_pack_id} has no detector dependency"),
-            )
-        })?;
-        let det_pack = catalog.pack(det_pack_id).ok_or_else(|| {
-            TranslatorError::new(
-                TranslatorErrorKind::MissingAsset,
-                format!("ppocr detector pack {det_pack_id} missing from catalog"),
-            )
-        })?;
-
         let pack_installed = |pack_id: &str| {
             snap.pack_statuses
                 .get(pack_id)
                 .map(|s| s.installed)
                 .unwrap_or(false)
         };
-        if !pack_installed(&rec_pack_id) || !pack_installed(det_pack_id) {
+
+        let (det_pack_id, det_pack) = catalog
+            .packs
+            .iter()
+            .find(|(_, pack)| matches!(&pack.kind, PackKind::Ocr(OcrPack::PpocrDetector)))
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::MissingAsset,
+                    "ppocr detector pack missing from catalog",
+                )
+            })?;
+        if !pack_installed(det_pack_id) {
             return Err(TranslatorError::new(
                 TranslatorErrorKind::MissingAsset,
-                format!(
-                    "ppocr models not installed for {} (rec={}, det={})",
-                    source_code.as_str(),
-                    rec_pack_id,
-                    det_pack_id
-                ),
+                "ppocr detector pack is not installed",
             ));
         }
 
@@ -580,49 +615,77 @@ impl TranslatorSession {
         let det_path = det_pack
             .files
             .iter()
-            .find(|f| f.name.ends_with(".mnn"))
+            .find(|f| f.name.ends_with(".mnn") && f.name.contains("_det"))
             .map(|f| base.join(&f.install_path))
-            .ok_or_else(|| {
-                TranslatorError::new(
-                    TranslatorErrorKind::MissingAsset,
-                    "ppocr detector pack has no .mnn file",
-                )
-            })?;
-        let rec_path = rec_pack
+            .ok_or_else(|| TranslatorError::missing_asset("ppocr detector pack has no det .mnn"))?;
+        let classifier_path = det_pack
             .files
             .iter()
-            .find(|f| f.name.ends_with(".mnn"))
-            .map(|f| base.join(&f.install_path))
-            .ok_or_else(|| {
-                TranslatorError::new(
-                    TranslatorErrorKind::MissingAsset,
-                    "ppocr rec pack has no .mnn file",
-                )
-            })?;
-        let keys_path = rec_pack
-            .files
-            .iter()
-            .find(|f| f.name.ends_with("_keys.txt"))
-            .map(|f| base.join(&f.install_path))
-            .ok_or_else(|| {
-                TranslatorError::new(
-                    TranslatorErrorKind::MissingAsset,
-                    "ppocr rec pack has no _keys.txt file",
-                )
-            })?;
+            .find(|f| f.name == "PULC.mnn")
+            .map(|f| base.join(&f.install_path));
 
-        let det_str = det_path.to_string_lossy().into_owned();
-        let rec_str = rec_path.to_string_lossy().into_owned();
-        let keys_str = keys_path.to_string_lossy().into_owned();
+        let mut specs = Vec::new();
+        for (pack_id, pack) in &catalog.packs {
+            if !pack_installed(pack_id) {
+                continue;
+            }
+            let PackKind::Ocr(OcrPack::PpocrRecognizer { script }) = &pack.kind else {
+                continue;
+            };
+            let Some(model_path) = pack
+                .files
+                .iter()
+                .find(|f| f.name.ends_with(".mnn"))
+                .map(|f| base.join(&f.install_path))
+            else {
+                continue;
+            };
+            let Some(keys_path) = pack
+                .files
+                .iter()
+                .find(|f| f.name.ends_with("_keys.txt"))
+                .map(|f| base.join(&f.install_path))
+            else {
+                continue;
+            };
+            specs.push(PpocrRecognizerSpec {
+                script: *script,
+                model_path,
+                keys_path,
+            });
+        }
+        specs.sort_by_key(|s| s.script.as_slug());
+
+        let key = PpocrEngineKey {
+            detector_path: det_path.to_string_lossy().into_owned(),
+            classifier_path: classifier_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            recognizers: specs
+                .iter()
+                .map(|s| {
+                    (
+                        s.script,
+                        s.model_path.to_string_lossy().into_owned(),
+                        s.keys_path.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        };
 
         let mut cache = self.ppocr.lock().expect("ppocr cache poisoned");
-        if let Some((d, r, k, engine)) = &cache.state {
-            if d == &det_str && r == &rec_str && k == &keys_str {
+        if let Some((cached_key, engine)) = &cache.state {
+            if cached_key == &key {
                 return Ok(Arc::clone(engine));
             }
         }
-        let engine = Arc::new(PpocrEngine::load(&det_path, &rec_path, &keys_path, 4)?);
-        cache.state = Some((det_str, rec_str, keys_str, Arc::clone(&engine)));
+        let engine = Arc::new(PpocrEngine::load(
+            &det_path,
+            classifier_path.as_deref(),
+            specs,
+            4,
+        )?);
+        cache.state = Some((key, Arc::clone(&engine)));
         Ok(engine)
     }
 

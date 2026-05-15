@@ -38,11 +38,13 @@ fn main() {
                 &[],
                 1,
                 1,
-                "en",
+                u32::MAX,
+                translator::OcrSourceSelection::specific(translator::LanguageCode::from("en")),
                 "nl",
                 75,
                 ReadingOrder::LeftToRight,
                 BackgroundMode::AutoDetect,
+                translator::PreferredOcrEngine::default(),
             );
             let _ = session.plan_download("en", Feature::Core, None);
             let _ = session.plan_download("en", Feature::Dictionary, None);
@@ -56,8 +58,8 @@ fn main() {
             let _ = session.lookup_dictionary("en", "hello");
             let _ = session.available_tts_voices("en");
             let _ = session.warm_tts_model("en");
-            let _ = session.plan_speech_chunks("en", "hello");
-            let _ = session.synthesize_pcm("en", "hello", 1.0, None, false);
+            let _ = session.plan_speech_chunks("en", "hello", None);
+            let _ = session.synthesize_pcm("en", "hello", 1.0, None, false, None);
             let _ = session.transliterate("hello", "ja");
 
             let _ = translator::sample_overlay_colors(

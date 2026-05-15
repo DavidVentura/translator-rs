@@ -131,6 +131,34 @@ pub enum ReadingOrder {
     TopToBottomLeftToRight,
 }
 
+/// Source-language selection for OCR.
+///
+/// `Auto` runs PPOCR's PULC script classifier per detected strip, then derives a
+/// translation source language with CLD over the recognized text. `Specific`
+/// pins the recognizer to one language and skips classification + detection
+/// post-processing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum OcrSourceSelection {
+    #[default]
+    Auto,
+    Specific {
+        language_code: crate::api::LanguageCode,
+    },
+}
+
+impl OcrSourceSelection {
+    pub fn auto() -> Self {
+        Self::Auto
+    }
+
+    pub fn specific(language_code: impl Into<crate::api::LanguageCode>) -> Self {
+        Self::Specific {
+            language_code: language_code.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum OverlayLayoutMode {
@@ -249,6 +277,10 @@ pub struct RecognizedTextLine {
     pub oriented_box: OrientedRect,
     pub text: String,
     pub confidence: f32,
+    /// Source language selected for this recognition result when the caller used auto-source
+    /// OCR. `None` in forced-source mode or when post-OCR language detection could not choose
+    /// a translation source.
+    pub source_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

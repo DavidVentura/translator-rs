@@ -80,15 +80,16 @@ pub mod tts;
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{
     CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker,
-    InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, TtsSpeakerEntry,
-    TtsVoicePickerRegion, available_ocr_engines_for_language, installed_ocr_engines_for_language,
+    InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, OcrEngine,
+    OcrPack, PpocrScript, TtsSpeakerEntry, TtsVoicePickerRegion,
+    available_ocr_engines_for_language, installed_ocr_engines_for_language,
     installed_tts_voice_picker_regions, language_rows_in_snapshot, parse_and_validate_catalog,
     plan_ocr_engine_download, plan_ocr_engine_downloads,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{
-    DetectedTextBox, OverlayColors, PreparedImageOverlay, ReadingOrder, RecognizedTextLine, Rect,
-    sample_overlay_colors,
+    DetectedTextBox, OcrSourceSelection, OverlayColors, PreparedImageOverlay, ReadingOrder,
+    RecognizedTextLine, Rect, sample_overlay_colors,
 };
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};

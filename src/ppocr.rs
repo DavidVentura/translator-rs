@@ -1,6 +1,7 @@
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use image::{DynamicImage, GenericImageView, GrayImage, RgbImage, imageops::FilterType};
@@ -10,7 +11,9 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
+use crate::catalog::PpocrScript;
 use crate::mnn_inference::MnnSession;
+use mnn_sys::{MemoryMode, PrecisionMode};
 
 const REC_TARGET_HEIGHT: u32 = 48;
 const REC_MIN_SCORE: f32 = 0.3;
@@ -57,6 +60,27 @@ const PPOCR_DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PPOCR_DET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const PPOCR_REC_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 const PPOCR_REC_STD: [f32; 3] = [0.5, 0.5, 0.5];
+const PULC_WIDTH: u32 = 160;
+const PULC_HEIGHT: u32 = 80;
+const PULC_MIN_SCORE: f32 = 0.85;
+const PULC_MIN_STRIP_AREA: u32 = 768;
+const PULC_MIN_STRIP_WIDTH: u32 = 24;
+const PULC_MIN_STRIP_HEIGHT: u32 = 8;
+const PULC_MIN_IMAGE_AREA_RATIO: f32 = 0.00030;
+/// PULC class index order — matches the model's softmax output layout. PULC's `chinese_cht`
+/// class is trained on both simplified and traditional Chinese, so we name it `Chinese`.
+const PULC_CLASSES: [PpocrScriptClass; 10] = [
+    PpocrScriptClass::Arabic,
+    PpocrScriptClass::Chinese,
+    PpocrScriptClass::Cyrillic,
+    PpocrScriptClass::Devanagari,
+    PpocrScriptClass::Japanese,
+    PpocrScriptClass::Kannada,
+    PpocrScriptClass::Korean,
+    PpocrScriptClass::Tamil,
+    PpocrScriptClass::Telugu,
+    PpocrScriptClass::Latin,
+];
 
 #[derive(Debug, Clone, Copy)]
 struct PpocrThresholds {
@@ -79,6 +103,66 @@ const LIVE_THRESHOLDS: PpocrThresholds = PpocrThresholds {
     det_min_area: LIVE_DET_MIN_AREA,
     rec_drop_score: LIVE_REC_DROP_SCORE,
 };
+
+/// Detection / recognition profile. `Live` uses stricter thresholds so transient texture
+/// noise from a moving camera does not become a stable tracked overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PpocrProfile {
+    Still,
+    Live,
+}
+
+impl PpocrProfile {
+    fn thresholds(self) -> PpocrThresholds {
+        match self {
+            PpocrProfile::Still => STILL_THRESHOLDS,
+            PpocrProfile::Live => LIVE_THRESHOLDS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PpocrScriptClass {
+    Arabic,
+    Chinese,
+    Cyrillic,
+    Devanagari,
+    Japanese,
+    Kannada,
+    Korean,
+    Tamil,
+    Telugu,
+    Latin,
+}
+
+impl PpocrScriptClass {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PpocrScriptClass::Arabic => "arabic",
+            PpocrScriptClass::Chinese => "chinese",
+            PpocrScriptClass::Cyrillic => "cyrillic",
+            PpocrScriptClass::Devanagari => "devanagari",
+            PpocrScriptClass::Japanese => "japanese",
+            PpocrScriptClass::Kannada => "kannada",
+            PpocrScriptClass::Korean => "korean",
+            PpocrScriptClass::Tamil => "tamil",
+            PpocrScriptClass::Telugu => "telugu",
+            PpocrScriptClass::Latin => "latin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PpocrScriptPrediction {
+    pub class: PpocrScriptClass,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PpocrScriptCandidate {
+    class: PpocrScriptClass,
+    score: f32,
+}
 
 const PUNCTUATIONS: &[char] = &[
     ',', '.', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']', '{', '}', '-', '_', '/', '\\',
@@ -103,24 +187,6 @@ impl PpocrRect {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PpocrLine {
-    pub text: String,
-    pub confidence: f32,
-    pub bounding_box: PpocrRect,
-    /// Min-area-aligned rotated rectangle around the detection contour. The principal axis is
-    /// the text's reading direction, so for tilted signs/paper this stays tight to the glyphs
-    /// instead of inflating to an axis-aligned bounding box like `bounding_box` does.
-    pub oriented_box: crate::ocr::OrientedRect,
-    /// Pre-inflate min-area rect from the raw DB mask contour — same centre/angle as
-    /// `oriented_box` but without the unclip/border padding. Tight to the segmentation kernel,
-    /// so its height excludes most ascender/descender whitespace, making it the right metric
-    /// for paragraph grouping (line-height clustering, gap-as-multiple-of-x-height). For
-    /// detections that come back without a contour (axis-aligned fallback), this equals
-    /// `oriented_box`.
-    pub tight_box: crate::ocr::OrientedRect,
-}
-
 pub struct PpocrDetector {
     session: MnnSession,
 }
@@ -135,184 +201,97 @@ pub struct PpocrRecognizer {
     pool: ThreadPool,
 }
 
+pub struct PpocrScriptClassifier {
+    session: MnnSession,
+}
+
+#[derive(Debug, Clone)]
+pub struct PpocrRecognizerSpec {
+    pub script: PpocrScript,
+    pub model_path: PathBuf,
+    pub keys_path: PathBuf,
+}
+
+struct PpocrRecognizerSlot {
+    spec: PpocrRecognizerSpec,
+    loaded: OnceLock<Arc<PpocrRecognizer>>,
+}
+
 pub struct PpocrEngine {
     detector: PpocrDetector,
-    recognizer: PpocrRecognizer,
+    classifier: Option<PpocrScriptClassifier>,
+    recognizers: HashMap<PpocrScript, PpocrRecognizerSlot>,
 }
 
 impl PpocrEngine {
     pub fn load(
         det_path: &Path,
-        rec_path: &Path,
-        keys_path: &Path,
+        classifier_path: Option<&Path>,
+        recognizer_specs: Vec<PpocrRecognizerSpec>,
         det_intra_threads: usize,
     ) -> Result<Self, TranslatorError> {
-        // Det is one big graph and benefits from intra-session threading. Rec uses a
-        // single-threaded session pool dispatched in parallel — see PpocrRecognizer::load.
+        // Det is one big graph and benefits from intra-session threading. Rec models are loaded
+        // lazily per script so auto mode can route strips to multiple scripts without
+        // constructing every recognizer up front.
         let detector = PpocrDetector::load(det_path, det_intra_threads)?;
-        let recognizer = PpocrRecognizer::load(rec_path, keys_path)?;
+        let classifier = classifier_path
+            .map(PpocrScriptClassifier::load)
+            .transpose()?;
+        let recognizers = recognizer_specs
+            .into_iter()
+            .map(|spec| {
+                (
+                    spec.script,
+                    PpocrRecognizerSlot {
+                        spec,
+                        loaded: OnceLock::new(),
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
             detector,
-            recognizer,
+            classifier,
+            recognizers,
         })
     }
 
-    pub fn recognize_rgba(
-        &self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<PpocrLine>, TranslatorError> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                TranslatorError::new(TranslatorErrorKind::InvalidInput, "image dims overflow")
-            })?;
-        if rgba.len() != expected {
-            return Err(TranslatorError::new(
-                TranslatorErrorKind::InvalidInput,
+    pub fn has_classifier(&self) -> bool {
+        self.classifier.is_some()
+    }
+
+    pub fn installed_scripts(&self) -> impl Iterator<Item = PpocrScript> + '_ {
+        self.recognizers.keys().copied()
+    }
+
+    fn recognizer(&self, script: PpocrScript) -> Result<Arc<PpocrRecognizer>, TranslatorError> {
+        let slot = self.recognizers.get(&script).ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
                 format!(
-                    "rgba length {} != {}x{}x4 ({})",
-                    rgba.len(),
-                    width,
-                    height,
-                    expected
+                    "ppocr recognizer for script {} is not installed",
+                    script.as_slug()
                 ),
-            ));
+            )
+        })?;
+        if let Some(rec) = slot.loaded.get() {
+            return Ok(Arc::clone(rec));
         }
-
-        let t_rgba = Instant::now();
-        let image = rgba_to_dynamic(rgba, width, height);
-        let rgba_ms = t_rgba.elapsed().as_secs_f32() * 1000.0;
-
-        let boxes = self.detector.detect(&image)?;
-        log::info!(
-            "ppocr: detector returned {} boxes ({}x{})",
-            boxes.len(),
-            width,
-            height
-        );
-        if boxes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let t_crops = Instant::now();
-        let gray = image.to_luma8();
-        let mut crops = Vec::with_capacity(boxes.len());
-        let mut box_meta = Vec::with_capacity(boxes.len());
-        let mut oriented_meta: Vec<Option<ContourBoxes>> = Vec::with_capacity(boxes.len());
-        for tb in boxes {
-            let expanded = expand_box(&tb.rect, DET_BOX_BORDER, width, height);
-            let oriented = tb
-                .contour
-                .as_ref()
-                .and_then(|c| oriented_boxes_from_contour(c));
-            let crop_image = tb
-                .contour
-                .as_ref()
-                .and_then(|c| dewarp_contour_to_strip(&gray, c))
-                .map(DynamicImage::ImageLuma8)
-                .unwrap_or_else(|| crop_dynamic(&image, &expanded));
-            crops.push(crop_image);
-            box_meta.push(expanded);
-            oriented_meta.push(oriented);
-        }
-        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
-
-        let n_crops = crops.len();
-        let timings_us = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-        let recognizer = &self.recognizer;
-        let t_rec_wall = Instant::now();
-        let results: Vec<Result<RecResult, TranslatorError>> = recognizer.pool.install(|| {
-            crops
-                .par_iter()
-                .map(|crop| {
-                    let worker_idx =
-                        rayon::current_thread_index().unwrap_or(0) % recognizer.sessions.len();
-                    recognizer.recognize_one(crop, worker_idx, &timings_us)
-                })
-                .collect()
-        });
-        let rec_wall_ms = t_rec_wall.elapsed().as_secs_f32() * 1000.0;
-        let rec_pre_ms = timings_us.0.load(Ordering::Relaxed) as f32 / 1000.0;
-        let rec_infer_ms = timings_us.1.load(Ordering::Relaxed) as f32 / 1000.0;
-        let rec_post_ms = timings_us.2.load(Ordering::Relaxed) as f32 / 1000.0;
-
-        let mut lines = Vec::with_capacity(n_crops);
-        let mut empty_count = 0usize;
-        let mut low_score_count = 0usize;
-        for (index, result) in results.into_iter().enumerate() {
-            let result = result?;
-            if result.text.trim().is_empty() {
-                empty_count += 1;
-                continue;
-            }
-            if result.confidence < REC_DROP_SCORE {
-                low_score_count += 1;
-                continue;
-            }
-            {
-                let (oriented, tight) = match oriented_meta[index] {
-                    Some(ContourBoxes { tight, inflated }) => (inflated, tight),
-                    None => {
-                        let aabb = crate::ocr::OrientedRect::axis_aligned(crate::ocr::Rect {
-                            left: box_meta[index].left,
-                            top: box_meta[index].top,
-                            right: box_meta[index].right,
-                            bottom: box_meta[index].bottom,
-                        });
-                        (aabb, aabb)
-                    }
-                };
-                lines.push(PpocrLine {
-                    text: result.text,
-                    confidence: result.confidence,
-                    bounding_box: box_meta[index],
-                    oriented_box: oriented,
-                    tight_box: tight,
-                });
-            }
-        }
-        log::info!(
-            "ppocr: {}/{} regions recognized ({} empty, {} below drop_score {:.2}) — \
-             rgba_pack={:.1}ms crops/dewarp={:.1}ms \
-             rec_wall={:.1}ms (cpu pre={:.1}ms infer={:.1}ms post={:.1}ms over {} workers)",
-            lines.len(),
-            n_crops,
-            empty_count,
-            low_score_count,
-            REC_DROP_SCORE,
-            rgba_ms,
-            crops_ms,
-            rec_wall_ms,
-            rec_pre_ms,
-            rec_infer_ms,
-            rec_post_ms,
-            REC_PARALLELISM,
-        );
-        sort_lines_reading_order(&mut lines);
-        Ok(lines)
+        let fresh = Arc::new(PpocrRecognizer::load(
+            &slot.spec.model_path,
+            &slot.spec.keys_path,
+        )?);
+        Ok(Arc::clone(slot.loaded.get_or_init(|| fresh)))
     }
 
     /// Run the detector on a pre-built `DynamicImage` and return geometry only,
-    /// without recognition. Used by the still-image overlay flow (which builds the
-    /// detection image from an `OrientedImage`) and the live-OCR loop via the
-    /// `_live` variant.
+    /// without recognition. `profile` selects still vs live thresholds.
     pub fn detect_only_image(
         &self,
         image: &DynamicImage,
+        profile: PpocrProfile,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
-        self.detect_only_image_with_thresholds(image, STILL_THRESHOLDS)
-    }
-
-    /// Live camera detection uses a stricter profile than still-image OCR so transient
-    /// texture/compression blobs do not become stable tracked overlays.
-    pub fn detect_only_image_live(
-        &self,
-        image: &DynamicImage,
-    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
-        self.detect_only_image_with_thresholds(image, LIVE_THRESHOLDS)
+        self.detect_only_image_with_thresholds(image, profile.thresholds())
     }
 
     fn detect_only_image_with_thresholds(
@@ -368,130 +347,211 @@ impl PpocrEngine {
         Ok(out)
     }
 
-    /// Recognize text in caller-supplied boxes. The caller passes a pre-built
-    /// `DynamicImage` (and its grayscale view) so we skip the rgba→dynamic+to_luma8
-    /// work on every call. Used by both the still-image overlay flow and the live
-    /// `FrameHandle` loop (via the `_live` variant).
+    pub fn classify_text_boxes_image(
+        &self,
+        image: &DynamicImage,
+        gray: &GrayImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<Option<PpocrScriptPrediction>>, TranslatorError> {
+        let Some(classifier) = &self.classifier else {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
+                "ppocr script classifier is not available",
+            ));
+        };
+        let crops = crop_text_strips(image, gray, boxes).0;
+        let image_area = (image.width() as f32) * (image.height() as f32);
+        let mut predictions = vec![None; boxes.len()];
+        let mut eligible_crops = Vec::new();
+        let mut eligible_indices = Vec::new();
+        for (idx, (box_, crop)) in boxes.iter().zip(crops.iter()).enumerate() {
+            if pulc_strip_eligible(box_, crop, image_area) {
+                eligible_indices.push(idx);
+                eligible_crops.push(crop.clone());
+            } else {
+                let area = box_.rect.width().saturating_mul(box_.rect.height());
+                log::debug!(
+                    "ppocr pulc strip={} skipped small det_score={:.3} width={} height={} area={} area_ratio={:.6} min_area_ratio={:.6} crop={}x{}",
+                    idx,
+                    box_.score,
+                    box_.rect.width(),
+                    box_.rect.height(),
+                    area,
+                    area as f32 / image_area.max(1.0),
+                    PULC_MIN_IMAGE_AREA_RATIO,
+                    crop.width(),
+                    crop.height(),
+                );
+            }
+        }
+        let classified = classifier.classify_many(&eligible_crops)?;
+        for (idx, candidate) in eligible_indices.into_iter().zip(classified.into_iter()) {
+            let box_ = &boxes[idx];
+            let crop = &crops[idx];
+            let area = box_.rect.width().saturating_mul(box_.rect.height());
+            let area_ratio = area as f32 / image_area.max(1.0);
+            let Some(candidate) = candidate else {
+                log::debug!(
+                    "ppocr pulc strip={} no_candidate det_score={:.3} width={} height={} area={} area_ratio={:.6} crop={}x{}",
+                    idx,
+                    box_.score,
+                    box_.rect.width(),
+                    box_.rect.height(),
+                    area,
+                    area_ratio,
+                    crop.width(),
+                    crop.height(),
+                );
+                continue;
+            };
+            if candidate.score >= PULC_MIN_SCORE {
+                log::debug!(
+                    "ppocr pulc strip={} script={} score={:.3} det_score={:.3} width={} height={} area={} area_ratio={:.6} crop={}x{}",
+                    idx,
+                    candidate.class.name(),
+                    candidate.score,
+                    box_.score,
+                    box_.rect.width(),
+                    box_.rect.height(),
+                    area,
+                    area_ratio,
+                    crop.width(),
+                    crop.height(),
+                );
+                predictions[idx] = Some(PpocrScriptPrediction {
+                    class: candidate.class,
+                    score: candidate.score,
+                });
+            } else {
+                log::debug!(
+                    "ppocr pulc strip={} script={} score={:.3} below_threshold={:.2} det_score={:.3} width={} height={} area={} area_ratio={:.6} crop={}x{}",
+                    idx,
+                    candidate.class.name(),
+                    candidate.score,
+                    PULC_MIN_SCORE,
+                    box_.score,
+                    box_.rect.width(),
+                    box_.rect.height(),
+                    area,
+                    area_ratio,
+                    crop.width(),
+                    crop.height(),
+                );
+            }
+        }
+        Ok(predictions)
+    }
+
+    /// Recognize text in caller-supplied boxes. `scripts` selects the recognizer pack
+    /// per box (parallel to `boxes`); strips with the same script are dispatched as a
+    /// batch to a single recognizer session pool. `profile` selects still vs live
+    /// thresholds. Output is 1:1 aligned with input boxes; filtered entries come back
+    /// with empty text and `confidence = 0.0`.
     pub fn recognize_text_in_boxes_image(
         &self,
         image: &DynamicImage,
         gray: &GrayImage,
         boxes: &[crate::ocr::DetectedTextBox],
-    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
-        self.recognize_text_in_boxes_image_with_thresholds(image, gray, boxes, STILL_THRESHOLDS)
-    }
-
-    pub fn recognize_text_in_boxes_image_live(
-        &self,
-        image: &DynamicImage,
-        gray: &GrayImage,
-        boxes: &[crate::ocr::DetectedTextBox],
-    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
-        self.recognize_text_in_boxes_image_with_thresholds(image, gray, boxes, LIVE_THRESHOLDS)
-    }
-
-    fn recognize_text_in_boxes_image_with_thresholds(
-        &self,
-        image: &DynamicImage,
-        gray: &GrayImage,
-        boxes: &[crate::ocr::DetectedTextBox],
-        thresholds: PpocrThresholds,
+        scripts: &[PpocrScript],
+        profile: PpocrProfile,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
         if boxes.is_empty() {
             return Ok(Vec::new());
         }
+        if scripts.len() != boxes.len() {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::InvalidInput,
+                "ppocr recognition scripts length must match boxes length",
+            ));
+        }
+        let thresholds = profile.thresholds();
         let width = image.width();
         let height = image.height();
-        let rgba_ms = 0.0_f32;
 
         let t_crops = Instant::now();
-        let mut dewarp_count: usize = 0;
-        let crops: Vec<DynamicImage> = boxes
-            .iter()
-            .map(|b| {
-                let contour_pairs: Option<Vec<(f32, f32)>> =
-                    if !b.contour.is_empty() && b.contour.len() % 2 == 0 {
-                        Some(b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect())
-                    } else {
-                        None
-                    };
-                let dewarped = contour_pairs
-                    .as_deref()
-                    .and_then(|c| dewarp_contour_to_strip(gray, c))
-                    .map(DynamicImage::ImageLuma8);
-                if dewarped.is_some() {
-                    dewarp_count += 1;
-                    dewarped.unwrap()
-                } else {
-                    let rect = PpocrRect {
-                        left: b.rect.left,
-                        top: b.rect.top,
-                        right: b.rect.right,
-                        bottom: b.rect.bottom,
-                    };
-                    crop_dynamic(image, &rect)
-                }
-            })
-            .collect();
+        let (crops, dewarp_count) = crop_text_strips(image, gray, boxes);
         let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
-        let mean_crop_w: f32 = if crops.is_empty() {
-            0.0
-        } else {
-            crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32
-        };
-        let mean_crop_h: f32 = if crops.is_empty() {
-            0.0
-        } else {
-            crops.iter().map(|c| c.height() as f32).sum::<f32>() / crops.len() as f32
-        };
+        let mean_crop_w: f32 =
+            crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32;
+        let mean_crop_h: f32 =
+            crops.iter().map(|c| c.height() as f32).sum::<f32>() / crops.len() as f32;
 
-        let recognizer = &self.recognizer;
-        let timings_us = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-        let t_rec_wall = Instant::now();
-        let results: Vec<Result<RecResult, TranslatorError>> = recognizer.pool.install(|| {
-            crops
-                .par_iter()
-                .map(|crop| {
-                    let worker_idx =
-                        rayon::current_thread_index().unwrap_or(0) % recognizer.sessions.len();
-                    recognizer.recognize_one(crop, worker_idx, &timings_us)
-                })
-                .collect()
-        });
-        let rec_wall_ms = t_rec_wall.elapsed().as_secs_f32() * 1000.0;
-        let rec_pre_ms = timings_us.0.load(Ordering::Relaxed) as f32 / 1000.0;
-        let rec_infer_ms = timings_us.1.load(Ordering::Relaxed) as f32 / 1000.0;
-        let rec_post_ms = timings_us.2.load(Ordering::Relaxed) as f32 / 1000.0;
+        let mut results: Vec<Option<RecResult>> = (0..boxes.len()).map(|_| None).collect();
+        let mut rec_wall_ms = 0.0;
+        let mut rec_pre_ms = 0.0;
+        let mut rec_infer_ms = 0.0;
+        let mut rec_post_ms = 0.0;
+        let mut grouped = HashMap::<PpocrScript, Vec<usize>>::new();
+        for (idx, script) in scripts.iter().enumerate() {
+            grouped.entry(*script).or_default().push(idx);
+        }
+        for (script, indices) in grouped {
+            let recognizer = self.recognizer(script)?;
+            let timings_us = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+            let t_rec_wall = Instant::now();
+            let group_results: Vec<Result<RecResult, TranslatorError>> =
+                recognizer.pool.install(|| {
+                    indices
+                        .par_iter()
+                        .map(|&idx| {
+                            let worker_idx = rayon::current_thread_index().unwrap_or(0)
+                                % recognizer.sessions.len();
+                            recognizer.recognize_one(&crops[idx], worker_idx, &timings_us)
+                        })
+                        .collect()
+                });
+            rec_wall_ms += t_rec_wall.elapsed().as_secs_f32() * 1000.0;
+            rec_pre_ms += timings_us.0.load(Ordering::Relaxed) as f32 / 1000.0;
+            rec_infer_ms += timings_us.1.load(Ordering::Relaxed) as f32 / 1000.0;
+            rec_post_ms += timings_us.2.load(Ordering::Relaxed) as f32 / 1000.0;
+            for (idx, result) in indices.into_iter().zip(group_results.into_iter()) {
+                results[idx] = Some(result?);
+            }
+        }
 
-        // Keep the output aligned 1:1 with the input boxes so callers can correlate by
-        // index instead of having to re-match results by rect/IoU. Filtered entries
-        // (empty text or below `REC_DROP_SCORE`) come back with empty text and
-        // confidence=0.0; callers decide whether to render them.
         let mut lines = Vec::with_capacity(boxes.len());
         let mut empty_count = 0usize;
         let mut low_score_count = 0usize;
         for (idx, result) in results.into_iter().enumerate() {
-            let r = result?;
-            let (text, confidence) = if r.text.trim().is_empty() {
+            let r = result.expect("all routed ppocr recognition results populated");
+            let raw_text = r.text.trim().to_owned();
+            let raw_confidence = r.confidence;
+            let (text, confidence, status) = if raw_text.is_empty() {
                 empty_count += 1;
-                (String::new(), 0.0)
-            } else if r.confidence < thresholds.rec_drop_score {
+                (String::new(), 0.0, "empty")
+            } else if raw_confidence < thresholds.rec_drop_score {
                 low_score_count += 1;
-                (String::new(), 0.0)
+                (String::new(), 0.0, "low_score")
             } else {
-                (r.text, r.confidence)
+                (r.text, r.confidence, "accepted")
             };
+            log::debug!(
+                "ppocr rec strip={} script={} det_score={:.3} width={} height={} area={} conf={:.3} status={} text=\"{}\"",
+                idx,
+                scripts[idx].as_slug(),
+                boxes[idx].score,
+                boxes[idx].rect.width(),
+                boxes[idx].rect.height(),
+                boxes[idx]
+                    .rect
+                    .width()
+                    .saturating_mul(boxes[idx].rect.height()),
+                raw_confidence,
+                status,
+                log_text_preview(&raw_text),
+            );
             lines.push(crate::ocr::RecognizedTextLine {
                 rect: boxes[idx].rect,
                 oriented_box: boxes[idx].oriented_box,
                 text,
                 confidence,
+                source_code: None,
             });
         }
         log::debug!(
-            "ppocr live rec: src={}x{} boxes={} dewarped={}/{} mean_crop={:.0}x{:.0} \
+            "ppocr rec: src={}x{} boxes={} dewarped={}/{} mean_crop={:.0}x{:.0} \
              accepted={} empty={} low_score={} (drop {:.2}) — \
-             rgba_pack={:.1}ms crops/dewarp={:.1}ms \
+             crops/dewarp={:.1}ms \
              rec_wall={:.1}ms (cpu pre={:.1}ms infer={:.1}ms post={:.1}ms)",
             width,
             height,
@@ -504,7 +564,6 @@ impl PpocrEngine {
             empty_count,
             low_score_count,
             thresholds.rec_drop_score,
-            rgba_ms,
             crops_ms,
             rec_wall_ms,
             rec_pre_ms,
@@ -513,6 +572,31 @@ impl PpocrEngine {
         );
         Ok(lines)
     }
+}
+
+fn log_text_preview(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars().flat_map(char::escape_default).take(80) {
+        out.push(ch);
+    }
+    out
+}
+
+fn pulc_strip_eligible(
+    box_: &crate::ocr::DetectedTextBox,
+    crop: &DynamicImage,
+    image_area: f32,
+) -> bool {
+    let box_area = box_.rect.width().saturating_mul(box_.rect.height());
+    let crop_area = crop.width().saturating_mul(crop.height());
+    let box_area_ratio = box_area as f32 / image_area.max(1.0);
+    box_.rect.width() >= PULC_MIN_STRIP_WIDTH
+        && box_.rect.height() >= PULC_MIN_STRIP_HEIGHT
+        && box_area >= PULC_MIN_STRIP_AREA
+        && box_area_ratio >= PULC_MIN_IMAGE_AREA_RATIO
+        && crop.width() >= PULC_MIN_STRIP_WIDTH
+        && crop.height() >= PULC_MIN_STRIP_HEIGHT
+        && crop_area >= PULC_MIN_STRIP_AREA
 }
 
 pub(crate) fn rgba_to_dynamic(rgba: &[u8], width: u32, height: u32) -> DynamicImage {
@@ -534,6 +618,42 @@ fn crop_dynamic(image: &DynamicImage, rect: &PpocrRect) -> DynamicImage {
     image.crop_imm(rect.left, rect.top, w, h)
 }
 
+fn crop_text_strips(
+    image: &DynamicImage,
+    gray: &GrayImage,
+    boxes: &[crate::ocr::DetectedTextBox],
+) -> (Vec<DynamicImage>, usize) {
+    let mut dewarp_count = 0usize;
+    let crops = boxes
+        .iter()
+        .map(|b| {
+            let contour_pairs: Option<Vec<(f32, f32)>> =
+                if !b.contour.is_empty() && b.contour.len() % 2 == 0 {
+                    Some(b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect())
+                } else {
+                    None
+                };
+            let dewarped = contour_pairs
+                .as_deref()
+                .and_then(|c| dewarp_contour_to_strip(gray, c))
+                .map(DynamicImage::ImageLuma8);
+            if let Some(dewarped) = dewarped {
+                dewarp_count += 1;
+                dewarped
+            } else {
+                let rect = PpocrRect {
+                    left: b.rect.left,
+                    top: b.rect.top,
+                    right: b.rect.right,
+                    bottom: b.rect.bottom,
+                };
+                crop_dynamic(image, &rect)
+            }
+        })
+        .collect();
+    (crops, dewarp_count)
+}
+
 fn expand_box(rect: &PpocrRect, border: u32, max_w: u32, max_h: u32) -> PpocrRect {
     PpocrRect {
         left: rect.left.saturating_sub(border),
@@ -541,25 +661,6 @@ fn expand_box(rect: &PpocrRect, border: u32, max_w: u32, max_h: u32) -> PpocrRec
         right: (rect.right + border).min(max_w),
         bottom: (rect.bottom + border).min(max_h),
     }
-}
-
-fn sort_lines_reading_order(lines: &mut [PpocrLine]) {
-    if lines.is_empty() {
-        return;
-    }
-    // Bucket by `top / (median_height / 2)` so lines that share a row land in the same bucket
-    // regardless of small vertical jitter. Using a global bucket size (rather than per-pair) is
-    // what keeps the comparator a true total order — the previous per-pair `max(height_a,
-    // height_b)` approach made `same_row` non-transitive and panicked under Rust's tightened
-    // sort checks.
-    let mut heights: Vec<u32> = lines
-        .iter()
-        .map(|l| l.bounding_box.height().max(1))
-        .collect();
-    heights.sort_unstable();
-    let median_h = heights[heights.len() / 2].max(1);
-    let bucket = (median_h / 2).max(1);
-    lines.sort_by_key(|l| (l.bounding_box.top / bucket, l.bounding_box.left));
 }
 
 // ---------- Detector ----------
@@ -575,10 +676,6 @@ impl PpocrDetector {
     fn load(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
         let session = MnnSession::load(model_path, intra_threads)?;
         Ok(Self { session })
-    }
-
-    fn detect(&self, image: &DynamicImage) -> Result<Vec<DetBox>, TranslatorError> {
-        self.detect_with_thresholds(image, STILL_THRESHOLDS)
     }
 
     fn detect_with_thresholds(
@@ -663,6 +760,42 @@ impl PpocrDetector {
     }
 }
 
+impl PpocrScriptClassifier {
+    fn load(model_path: &Path) -> Result<Self, TranslatorError> {
+        let session =
+            MnnSession::load_with_modes(model_path, 4, PrecisionMode::Low, MemoryMode::Low)?;
+        Ok(Self { session })
+    }
+
+    fn classify_many(
+        &self,
+        crops: &[DynamicImage],
+    ) -> Result<Vec<Option<PpocrScriptCandidate>>, TranslatorError> {
+        if crops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input = preprocess_for_pulc(crops);
+        let (out, out_shape) = self.session.run(
+            &input,
+            &[crops.len(), 3, PULC_HEIGHT as usize, PULC_WIDTH as usize],
+        )?;
+        if out_shape.len() != 2 || out_shape[0] != crops.len() || out_shape[1] != PULC_CLASSES.len()
+        {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                format!(
+                    "ppocr script classifier output shape unexpected: {:?}",
+                    out_shape
+                ),
+            ));
+        }
+        Ok(out
+            .chunks_exact(PULC_CLASSES.len())
+            .map(top_pulc_candidate)
+            .collect())
+    }
+}
+
 fn pad_to_multiple(v: u32, m: u32) -> u32 {
     v.div_ceil(m) * m
 }
@@ -695,6 +828,58 @@ fn preprocess_for_det(image: &DynamicImage, pad_w: u32, pad_h: u32) -> Vec<f32> 
         }
     }
     buf
+}
+
+fn preprocess_for_pulc(crops: &[DynamicImage]) -> Vec<f32> {
+    let plane = (PULC_HEIGHT as usize) * (PULC_WIDTH as usize);
+    let mut buf = vec![0.0f32; crops.len() * 3 * plane];
+    for (batch, crop) in crops.iter().enumerate() {
+        let resized = crop.resize_exact(PULC_WIDTH, PULC_HEIGHT, FilterType::Triangle);
+        let rgb = resized.to_rgb8();
+        let batch_base = batch * 3 * plane;
+        for y in 0..PULC_HEIGHT as usize {
+            for x in 0..PULC_WIDTH as usize {
+                let pixel = rgb.get_pixel(x as u32, y as u32);
+                let idx = y * PULC_WIDTH as usize + x;
+                buf[batch_base + idx] =
+                    (pixel[0] as f32 / 255.0 - PPOCR_DET_MEAN[0]) / PPOCR_DET_STD[0];
+                buf[batch_base + plane + idx] =
+                    (pixel[1] as f32 / 255.0 - PPOCR_DET_MEAN[1]) / PPOCR_DET_STD[1];
+                buf[batch_base + 2 * plane + idx] =
+                    (pixel[2] as f32 / 255.0 - PPOCR_DET_MEAN[2]) / PPOCR_DET_STD[2];
+            }
+        }
+    }
+    buf
+}
+
+fn top_pulc_candidate(row: &[f32]) -> Option<PpocrScriptCandidate> {
+    let probs = if row.iter().all(|v| v.is_finite()) {
+        let sum = row.iter().sum::<f32>();
+        if (0.95..=1.05).contains(&sum) {
+            row.to_vec()
+        } else {
+            softmax(row)
+        }
+    } else {
+        return None;
+    };
+    let (idx, score) = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())?;
+    Some(PpocrScriptCandidate {
+        class: PULC_CLASSES[idx],
+        score,
+    })
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps = logits.iter().map(|v| (v - max).exp()).collect::<Vec<_>>();
+    let sum = exps.iter().sum::<f32>();
+    exps.into_iter().map(|v| v / sum).collect()
 }
 
 fn extract_boxes(
@@ -835,12 +1020,6 @@ fn extract_boxes(
 struct RecResult {
     text: String,
     confidence: f32,
-}
-
-struct RecTiming {
-    pre_ms: f32,
-    infer_ms: f32,
-    post_ms: f32,
 }
 
 impl PpocrRecognizer {

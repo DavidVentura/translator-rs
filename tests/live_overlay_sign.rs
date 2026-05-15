@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use image::ImageReader;
 use translator::DetectedTextBox;
+use translator::PpocrScript;
 use translator::live_frame::OrientedImage;
 use translator::ocr::{OrientedRect, Rect, TextBlock, TextLine, group_live_lines_into_blocks};
-use translator::ppocr::PpocrEngine;
+use translator::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
 
 const DET_MAX_PIXELS: u32 = 350_000;
 const MODEL_DIR: &str = "/home/david/AndroidStudioProjects/bucket/ocr/1/PP-OCRv5";
@@ -174,9 +175,14 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
     let frame = OrientedImage::build(&rgba.into_raw(), width, height, 0, crop, DET_MAX_PIXELS)
         .expect("build live frame");
 
-    let engine = PpocrEngine::load(&det_path, &rec_path, &keys_path, 1).expect("load ppocr");
+    let recognizer_spec = PpocrRecognizerSpec {
+        script: PpocrScript::Latin,
+        model_path: rec_path.clone(),
+        keys_path: keys_path.clone(),
+    };
+    let engine = PpocrEngine::load(&det_path, None, vec![recognizer_spec], 1).expect("load ppocr");
     let det_boxes = engine
-        .detect_only_image_live(&frame.rgb_det)
+        .detect_only_image(&frame.rgb_det, PpocrProfile::Live)
         .expect("live detection succeeds");
     let boxes: Vec<_> = det_boxes
         .into_iter()
@@ -189,8 +195,15 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
             )
         })
         .collect();
+    let scripts = vec![PpocrScript::Latin; boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image_live(&frame.rgb, &frame.gray, &boxes)
+        .recognize_text_in_boxes_image(
+            &frame.rgb,
+            &frame.gray,
+            &boxes,
+            &scripts,
+            PpocrProfile::Live,
+        )
         .expect("live recognition succeeds");
     let recognised: Vec<_> = lines
         .into_iter()
