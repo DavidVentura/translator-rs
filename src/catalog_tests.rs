@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::api::{DictionaryCode, LanguageCode};
+use crate::catalog::plan_ocr_engine_downloads;
 use crate::catalog::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, LangAvailability, LanguageCatalog,
     LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker, PackRecord,
@@ -95,6 +96,24 @@ fn ocr_pack(id: &str, language: &str, file: AssetFileV2) -> PackRecord {
         }),
         vec![file],
         vec![],
+    )
+}
+
+fn ocr_pack_with_deps(
+    id: &str,
+    language: &str,
+    engine: &str,
+    file: AssetFileV2,
+    depends_on: Vec<&str>,
+) -> PackRecord {
+    pack_record(
+        id,
+        PackKind::Ocr(OcrPack {
+            language: language.to_string(),
+            engine: engine.to_string(),
+        }),
+        vec![file],
+        depends_on,
     )
 }
 
@@ -468,6 +487,85 @@ fn resolves_missing_pack_files_through_install_boundary() {
             "bin/lex.enen.bin".to_string(),
             "bin/vocab.aa.spm".to_string(),
             "bin/vocab.zz.spm".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn batch_ocr_download_plan_dedupes_shared_dependencies() {
+    let mut catalog = base_catalog();
+    catalog.packs.insert(
+        "ocr-ppocr-detector".to_string(),
+        pack_record(
+            "ocr-ppocr-detector",
+            PackKind::Ocr(OcrPack {
+                language: "_detector".to_string(),
+                engine: "ppocr".to_string(),
+            }),
+            vec![asset_file(
+                "det.mnn",
+                "ppocr/PP-OCRv5/PP-OCRv5_mobile_det.mnn",
+                100,
+            )],
+            vec![],
+        ),
+    );
+    catalog.packs.insert(
+        "ocr-ppocr-en".to_string(),
+        ocr_pack_with_deps(
+            "ocr-ppocr-en",
+            "en",
+            "ppocr",
+            asset_file("en.mnn", "ppocr/PP-OCRv5/en.mnn", 10),
+            vec!["ocr-ppocr-detector"],
+        ),
+    );
+    catalog.packs.insert(
+        "ocr-ppocr-es".to_string(),
+        ocr_pack_with_deps(
+            "ocr-ppocr-es",
+            "es",
+            "ppocr",
+            asset_file("es.mnn", "ppocr/PP-OCRv5/es.mnn", 20),
+            vec!["ocr-ppocr-detector"],
+        ),
+    );
+    catalog
+        .languages
+        .get_mut("en")
+        .unwrap()
+        .resources
+        .ocr_packs
+        .push(("ppocr".to_string(), "ocr-ppocr-en".to_string()));
+    catalog
+        .languages
+        .get_mut("es")
+        .unwrap()
+        .resources
+        .ocr_packs
+        .push(("ppocr".to_string(), "ocr-ppocr-es".to_string()));
+
+    let checker = FakeInstallChecker::with_files(&[]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+    let plan = plan_ocr_engine_downloads(
+        &snapshot,
+        &[LanguageCode::from("en"), LanguageCode::from("es")],
+        "ppocr",
+    );
+    let mut paths = plan
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+
+    assert_eq!(plan.total_size, 130);
+    assert_eq!(
+        paths,
+        vec![
+            "ppocr/PP-OCRv5/PP-OCRv5_mobile_det.mnn",
+            "ppocr/PP-OCRv5/en.mnn",
+            "ppocr/PP-OCRv5/es.mnn",
         ]
     );
 }

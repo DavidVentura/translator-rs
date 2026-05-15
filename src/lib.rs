@@ -83,7 +83,7 @@ pub use catalog::{
     InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, TtsSpeakerEntry,
     TtsVoicePickerRegion, available_ocr_engines_for_language, installed_ocr_engines_for_language,
     installed_tts_voice_picker_regions, language_rows_in_snapshot, parse_and_validate_catalog,
-    plan_ocr_engine_download,
+    plan_ocr_engine_download, plan_ocr_engine_downloads,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{

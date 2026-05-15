@@ -19,8 +19,8 @@ pub use planner::{
     installed_tts_voices_for_language, language_rows_in_snapshot, plan_delete_dictionary,
     plan_delete_language, plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts,
     plan_delete_tts_pack, plan_dictionary_download, plan_language_download,
-    plan_ocr_engine_download, plan_support_download_by_kind, plan_tts_download,
-    resolve_tts_voice_files, resolve_tts_voice_files_for_pack,
+    plan_ocr_engine_download, plan_ocr_engine_downloads, plan_support_download_by_kind,
+    plan_tts_download, resolve_tts_voice_files, resolve_tts_voice_files_for_pack,
 };
 pub use wire::{parse_and_validate_catalog, parse_language_catalog, select_best_catalog};
 

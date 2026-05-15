@@ -295,39 +295,10 @@ impl PpocrEngine {
         Ok(lines)
     }
 
-    /// Detect-only path for live OCR overlays: run the detector and return geometry only,
-    /// without recognition. Callers can match new boxes against previous frames (e.g. via IoU)
-    /// and only call `recognize_text_in_boxes_rgba` on novel boxes.
-    pub fn detect_only_rgba(
-        &self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                TranslatorError::new(TranslatorErrorKind::InvalidInput, "image dims overflow")
-            })?;
-        if rgba.len() != expected {
-            return Err(TranslatorError::new(
-                TranslatorErrorKind::InvalidInput,
-                format!(
-                    "rgba length {} != {}x{}x4 ({})",
-                    rgba.len(),
-                    width,
-                    height,
-                    expected
-                ),
-            ));
-        }
-        let image = rgba_to_dynamic(rgba, width, height);
-        self.detect_only_image(&image)
-    }
-
-    /// Image-based detect. Same as `detect_only_rgba` but caller has already produced a
-    /// `DynamicImage` (e.g. via `FrameHandle`), so we skip the rgba→dynamic copy.
+    /// Run the detector on a pre-built `DynamicImage` and return geometry only,
+    /// without recognition. Used by the still-image overlay flow (which builds the
+    /// detection image from an `OrientedImage`) and the live-OCR loop via the
+    /// `_live` variant.
     pub fn detect_only_image(
         &self,
         image: &DynamicImage,
@@ -397,45 +368,10 @@ impl PpocrEngine {
         Ok(out)
     }
 
-    /// Recognize text in caller-supplied boxes (typically from `detect_only_rgba`). The boxes
-    /// must be in the same image coordinate space as `rgba`. Empty / low-confidence results are
-    /// dropped, matching the full `recognize_rgba` filter.
-    pub fn recognize_text_in_boxes_rgba(
-        &self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-        boxes: &[crate::ocr::DetectedTextBox],
-    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                TranslatorError::new(TranslatorErrorKind::InvalidInput, "image dims overflow")
-            })?;
-        if rgba.len() != expected {
-            return Err(TranslatorError::new(
-                TranslatorErrorKind::InvalidInput,
-                format!(
-                    "rgba length {} != {}x{}x4 ({})",
-                    rgba.len(),
-                    width,
-                    height,
-                    expected
-                ),
-            ));
-        }
-        if boxes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let image = rgba_to_dynamic(rgba, width, height);
-        let gray = image.to_luma8();
-        self.recognize_text_in_boxes_image(&image, &gray, boxes)
-    }
-
-    /// Image-based recognize. The caller passes a pre-built `DynamicImage` (and its
-    /// grayscale view) so we skip the rgba→dynamic+to_luma8 work on every call. Used
-    /// by `FrameHandle` to avoid copying the bitmap across FFI per recognition.
+    /// Recognize text in caller-supplied boxes. The caller passes a pre-built
+    /// `DynamicImage` (and its grayscale view) so we skip the rgba→dynamic+to_luma8
+    /// work on every call. Used by both the still-image overlay flow and the live
+    /// `FrameHandle` loop (via the `_live` variant).
     pub fn recognize_text_in_boxes_image(
         &self,
         image: &DynamicImage,

@@ -463,7 +463,7 @@ fn tight_left(line: &TextLine) -> f32 {
     line.tight_box.cx - line.tight_box.width * 0.5
 }
 
-fn reorder_lines_for_grouping(mut lines: Vec<TextLine>) -> Vec<TextLine> {
+fn reorder_lines_for_grouping(lines: Vec<TextLine>) -> Vec<TextLine> {
     if lines.len() < 2 {
         return lines;
     }
@@ -858,6 +858,95 @@ pub fn group_lines_into_paragraphs(
     );
 
     paragraphs
+}
+
+/// Live camera overlays see more centered packaging/signage text than document paragraphs.
+/// This keeps the conservative document grouper intact and adds a simpler visual grouping pass
+/// for stacked, center-aligned labels such as product names and compact package claims.
+pub fn group_live_lines_into_blocks(lines: Vec<TextLine>) -> Vec<TextBlock> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ordered = lines;
+    ordered.sort_by(|a, b| {
+        tight_top(a)
+            .partial_cmp(&tight_top(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                tight_left(a)
+                    .partial_cmp(&tight_left(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut groups: Vec<TextBlock> = Vec::new();
+    for line in ordered {
+        let target = groups
+            .iter_mut()
+            .rev()
+            .find(|group| live_lines_should_merge(group.lines.last().unwrap(), &line));
+        if let Some(group) = target {
+            group.lines.push(line);
+        } else {
+            groups.push(TextBlock { lines: vec![line] });
+        }
+    }
+    groups
+}
+
+fn live_lines_should_merge(prev: &TextLine, next: &TextLine) -> bool {
+    if is_live_measurement_token(prev.text.trim()) || is_live_measurement_token(next.text.trim()) {
+        return false;
+    }
+
+    let prev_h = prev.tight_box.height.max(1.0);
+    let next_h = next.tight_box.height.max(1.0);
+    let big_h = prev_h.max(next_h);
+    let small_h = prev_h.min(next_h);
+    let height_ratio = big_h / small_h;
+
+    let gap = tight_top(next) - tight_bottom(prev);
+    if gap < -big_h * 0.75 || gap > big_h * 4.25 {
+        return false;
+    }
+
+    let max_w = prev.tight_box.width.max(next.tight_box.width).max(1.0);
+    let min_w = prev.tight_box.width.min(next.tight_box.width).max(1.0);
+    let center_aligned = (prev.tight_box.cx - next.tight_box.cx).abs() <= max_w * 0.25;
+    let edge_tol = big_h * 2.0;
+    let similar_width = max_w / min_w <= 1.8;
+    let left_aligned = similar_width && (tight_left(prev) - tight_left(next)).abs() <= edge_tol;
+    let right_aligned = similar_width && (tight_right(prev) - tight_right(next)).abs() <= edge_tol;
+    let strongly_centered = (prev.tight_box.cx - next.tight_box.cx).abs() <= max_w * 0.12;
+    let very_close = gap <= big_h * 1.25;
+
+    let height_compatible =
+        height_ratio <= 1.8 || (height_ratio <= 2.2 && strongly_centered && very_close);
+    if !height_compatible {
+        return false;
+    }
+
+    center_aligned || left_aligned || right_aligned
+}
+
+fn is_live_measurement_token(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let normalized = text
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if normalized.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    matches!(
+        normalized.as_str(),
+        "mg" | "g" | "kg" | "ml" | "l" | "mcg" | "ug" | "iu" | "%"
+    )
 }
 
 enum JoinDecision {

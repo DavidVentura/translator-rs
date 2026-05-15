@@ -345,6 +345,32 @@ pub fn plan_ocr_engine_download(
     })
 }
 
+pub fn plan_ocr_engine_downloads(
+    snapshot: &CatalogSnapshot,
+    language_codes: &[LanguageCode],
+    engine: &str,
+) -> DownloadPlan {
+    let pack_ids = language_codes
+        .iter()
+        .filter_map(|language_code| {
+            snapshot
+                .catalog
+                .ocr_pack_id_for_engine(language_code, engine)
+        })
+        .collect::<Vec<_>>();
+    let tasks = missing_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
+        .into_iter()
+        .filter_map(|item| {
+            let pack = snapshot.catalog.pack(&item.pack_id)?;
+            Some(download_task_for(pack, &item.file))
+        })
+        .collect::<Vec<_>>();
+    DownloadPlan {
+        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
+        tasks,
+    }
+}
+
 fn missing_files_in_snapshot<'a, I>(
     snapshot: &'a CatalogSnapshot,
     pack_ids: I,

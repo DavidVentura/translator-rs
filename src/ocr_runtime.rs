@@ -5,6 +5,10 @@ use std::sync::{Mutex, MutexGuard};
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
+#[cfg(feature = "ppocr")]
+use crate::live_frame::OrientedImage;
+#[cfg(feature = "ppocr")]
+use crate::ocr::{DetectedTextBox, OrientedRect, RecognizedTextLine};
 use crate::ocr::{
     DetectedWord, PreparedImageOverlay, ReadingOrder, Rect, TextBlock, TextLine, build_text_blocks,
     prepare_overlay_image,
@@ -125,15 +129,35 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     rgba_bytes: &[u8],
     width: u32,
     height: u32,
+    max_image_size: u32,
     source_code: &LanguageCode,
     target_code: &LanguageCode,
     background_mode: BackgroundMode,
     reading_order: ReadingOrder,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
+    let full_rect = Rect {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let det_max_pixels = saturating_square(max_image_size);
+    let oriented = OrientedImage::build(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
+
+    let det_raw = ppocr
+        .detect_only_image(&oriented.rgb_det)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?;
+    let det_boxes: Vec<DetectedTextBox> = det_raw
+        .into_iter()
+        .map(|b| scale_detected_box(b, oriented.det_to_full_scale, width, height))
+        .collect();
+
     let lines = ppocr
-        .recognize_rgba(rgba_bytes, width, height)
+        .recognize_text_in_boxes_image(&oriented.rgb, &oriented.gray, &det_boxes)
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
-    let blocks = ppocr_lines_to_blocks(lines);
+
+    let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines);
     finalize_image_overlay(
         engine,
         snapshot,
@@ -146,6 +170,41 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         background_mode,
         reading_order,
     )
+}
+
+#[cfg(feature = "ppocr")]
+fn saturating_square(side: u32) -> u32 {
+    let n = (side as u64).saturating_mul(side as u64);
+    n.min(u32::MAX as u64) as u32
+}
+
+#[cfg(feature = "ppocr")]
+fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) -> DetectedTextBox {
+    let left = ((b.rect.left as f32) * scale).max(0.0) as u32;
+    let top = ((b.rect.top as f32) * scale).max(0.0) as u32;
+    let right = ((b.rect.right as f32) * scale).min(max_w as f32) as u32;
+    let bottom = ((b.rect.bottom as f32) * scale).min(max_h as f32) as u32;
+    let rect = Rect {
+        left: left.min(right.saturating_sub(1)),
+        top: top.min(bottom.saturating_sub(1)),
+        right: right.max(left + 1),
+        bottom: bottom.max(top + 1),
+    };
+    let scale_oriented = |o: OrientedRect| OrientedRect {
+        cx: o.cx * scale,
+        cy: o.cy * scale,
+        width: o.width * scale,
+        height: o.height * scale,
+        angle_radians: o.angle_radians,
+    };
+    let contour = b.contour.iter().map(|v| v * scale).collect();
+    DetectedTextBox {
+        rect,
+        oriented_box: scale_oriented(b.oriented_box),
+        tight_box: scale_oriented(b.tight_box),
+        contour,
+        score: b.score,
+    }
 }
 
 fn build_tesseract_blocks(
@@ -207,25 +266,25 @@ fn build_tesseract_blocks(
     .map_err(TranslatorError::ocr)
 }
 
+/// Pair the still-path detector boxes with their recognised lines, carrying the
+/// tight oriented rect forward into [`TextLine`] so paragraph grouping has the
+/// glyph-tight metric (the `RecognizedTextLine` shape doesn't carry it on its
+/// own).
 #[cfg(feature = "ppocr")]
-fn ppocr_lines_to_blocks(lines: Vec<crate::ppocr::PpocrLine>) -> Vec<TextBlock> {
-    let text_lines: Vec<TextLine> = lines
-        .into_iter()
-        .filter(|line| !line.text.trim().is_empty())
-        .map(|line| {
-            let rect = Rect {
-                left: line.bounding_box.left,
-                top: line.bounding_box.top,
-                right: line.bounding_box.right,
-                bottom: line.bounding_box.bottom,
-            };
-            TextLine {
-                text: line.text,
-                bounding_box: rect,
-                oriented_box: line.oriented_box,
-                tight_box: line.tight_box,
-                word_rects: vec![rect],
-            }
+fn still_ppocr_lines_to_blocks(
+    boxes: &[DetectedTextBox],
+    lines: Vec<RecognizedTextLine>,
+) -> Vec<TextBlock> {
+    let text_lines: Vec<TextLine> = boxes
+        .iter()
+        .zip(lines.into_iter())
+        .filter(|(_, line)| !line.text.trim().is_empty())
+        .map(|(b, line)| TextLine {
+            text: line.text,
+            bounding_box: line.rect,
+            oriented_box: line.oriented_box,
+            tight_box: b.tight_box,
+            word_rects: vec![line.rect],
         })
         .collect();
     crate::ocr::group_lines_into_paragraphs(text_lines, Default::default())

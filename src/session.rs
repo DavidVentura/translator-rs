@@ -338,10 +338,6 @@ impl TranslatorSession {
         let src = LanguageCode::from(source_code);
         let tgt = LanguageCode::from(target_code);
 
-        let (prepared_rgba, prepared_w, prepared_h) =
-            prepare_image_for_ocr(rgba_bytes, width, height, max_image_size)?;
-        let rgba_view: &[u8] = &prepared_rgba;
-
         #[cfg(feature = "ppocr")]
         if matches!(preferred_engine, PreferredOcrEngine::Paddle) {
             match self.ppocr_engine_for(&src) {
@@ -351,9 +347,10 @@ impl TranslatorSession {
                         self.engine(),
                         &ppocr,
                         &snap,
-                        rgba_view,
-                        prepared_w,
-                        prepared_h,
+                        rgba_bytes,
+                        width,
+                        height,
+                        max_image_size,
                         &src,
                         &tgt,
                         background_mode,
@@ -374,14 +371,15 @@ impl TranslatorSession {
             }
         }
         log::info!("ocr engine: tesseract (source={})", source_code);
+        let _ = max_image_size;
 
         translate_image_rgba_in_snapshot(
             self.engine(),
             &self.ocr,
             &snap,
-            rgba_view,
-            prepared_w,
-            prepared_h,
+            rgba_bytes,
+            width,
+            height,
             &src,
             &tgt,
             min_confidence,
@@ -395,37 +393,6 @@ impl TranslatorSession {
                 e
             }
         })
-    }
-
-    /// Run PaddlePaddle's detector only (no recognition). Designed for live-OCR overlay loops
-    /// where the detector runs every frame at low resolution and recognition is dispatched
-    /// only for boxes that don't track to a previously-recognized one.
-    #[cfg(feature = "ppocr")]
-    pub fn detect_text_boxes_rgba(
-        &self,
-        rgba_bytes: &[u8],
-        width: u32,
-        height: u32,
-        source_code: &str,
-    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
-        let src = LanguageCode::from(source_code);
-        let ppocr = self.ppocr_engine_for(&src)?;
-        ppocr.detect_only_rgba(rgba_bytes, width, height)
-    }
-
-    /// Run PaddlePaddle's recognizer on caller-provided boxes.
-    #[cfg(feature = "ppocr")]
-    pub fn recognize_text_in_boxes_rgba(
-        &self,
-        rgba_bytes: &[u8],
-        width: u32,
-        height: u32,
-        boxes: &[crate::ocr::DetectedTextBox],
-        source_code: &str,
-    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
-        let src = LanguageCode::from(source_code);
-        let ppocr = self.ppocr_engine_for(&src)?;
-        ppocr.recognize_text_in_boxes_rgba(rgba_bytes, width, height, boxes)
     }
 
     /// Live-OCR detect: takes a pre-built `OrientedImage` (the live pipeline's
@@ -919,74 +886,6 @@ impl TranslatorSession {
     pub fn suggested_warp_dims(&self, quad: &DocumentQuad) -> (u32, u32) {
         crate::doc_align::suggested_output_dims(quad)
     }
-}
-
-/// Resize RGBA to `max_image_size` on the longest side (if larger) and apply CLAHE on the result.
-/// Centralizes what was previously split between Kotlin's `ImageProcessor.downscaleImage` and
-/// `doc_align::warp`'s post-process step. Single CLAHE pass at OCR-target resolution → less work
-/// when input is larger than the OCR target, no double-CLAHE on doc-aligned inputs.
-fn prepare_image_for_ocr(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-    max_image_size: u32,
-) -> Result<(Vec<u8>, u32, u32), TranslatorError> {
-    let t_total = std::time::Instant::now();
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| TranslatorError::ocr("image dims overflow"))?;
-    if rgba.len() != expected {
-        return Err(TranslatorError::ocr(format!(
-            "rgba length {} != {}x{}x4 ({})",
-            rgba.len(),
-            width,
-            height,
-            expected
-        )));
-    }
-    let longest = width.max(height);
-    // Skip resize when the source is already within 5% of the cap. A full Triangle convolution
-    // on millions of RGBA pixels costs ~75ms just to shrink by a couple percent; the OCR engines
-    // tolerate that slack fine.
-    let resize_threshold = (max_image_size as f32 * 1.05) as u32;
-    let (mut out, out_w, out_h, resize_ms) = if longest <= resize_threshold {
-        (rgba.to_vec(), width, height, 0.0_f32)
-    } else {
-        let t = std::time::Instant::now();
-        let scale = max_image_size as f32 / longest as f32;
-        let new_w = ((width as f32 * scale).round() as u32).max(1);
-        let new_h = ((height as f32 * scale).round() as u32).max(1);
-        let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
-            .ok_or_else(|| TranslatorError::ocr("internal: failed to wrap rgba in RgbaImage"))?;
-        let resized =
-            image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
-        let resize_ms = t.elapsed().as_secs_f32() * 1000.0;
-        (resized.into_raw(), new_w, new_h, resize_ms)
-    };
-    let t_clahe = std::time::Instant::now();
-    #[cfg(feature = "doc-align")]
-    crate::doc_align::apply_clahe(
-        &mut out,
-        out_w,
-        out_h,
-        crate::doc_align::CLAHE_CLIP_LIMIT,
-        crate::doc_align::CLAHE_TILES,
-        crate::doc_align::CLAHE_TILES,
-    );
-    let clahe_ms = t_clahe.elapsed().as_secs_f32() * 1000.0;
-    log::info!(
-        "prepare_image_for_ocr: {}x{} -> {}x{} (max={}) resize={:.1}ms clahe={:.1}ms total={:.1}ms",
-        width,
-        height,
-        out_w,
-        out_h,
-        max_image_size,
-        resize_ms,
-        clahe_ms,
-        t_total.elapsed().as_secs_f32() * 1000.0,
-    );
-    Ok((out, out_w, out_h))
 }
 
 pub fn parse_selected_catalog(
