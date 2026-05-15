@@ -9,6 +9,12 @@ use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::ocr::Rect;
 
 const DEFAULT_TARGET_PIXELS: u32 = 96_000;
+
+/// Tracking-image pixel budget used by `update()`. Exposed so binding code that
+/// calls `update_with_regions` can pass the same default.
+pub const fn default_target_pixels() -> u32 {
+    DEFAULT_TARGET_PIXELS
+}
 const MIN_DIMENSION: u32 = 48;
 const PATCH_RADIUS: i32 = 4;
 const GRID_COLS: u32 = 9;
@@ -17,6 +23,12 @@ const MIN_TEXTURE: f32 = 16.0;
 const MAX_MEAN_ABS_DIFF: f32 = 42.0;
 const INLIER_RADIUS_PX: f32 = 3.0;
 const MIN_INLIERS: usize = 8;
+
+const REGION_GRID_COLS: u32 = 5;
+const REGION_GRID_ROWS: u32 = 5;
+const REGION_LOCAL_SEARCH_PX: i32 = 5;
+const REGION_MIN_INLIERS: usize = 6;
+const REGION_INLIER_RESIDUAL_PX: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveMotionEstimate {
@@ -27,6 +39,25 @@ pub struct LiveMotionEstimate {
     pub matches: u32,
     pub inliers: u32,
     pub reset: bool,
+}
+
+/// Per-region similarity (4-DOF: translation + uniform scale + rotation),
+/// returned as a 2x3 affine matrix in display-coord space:
+///   new_x = a * old_x + b * old_y + c
+///   new_y = d * old_x + e * old_y + f
+/// For a similarity, e == a and d == -b; the struct just stores the full
+/// six coefficients so callers don't need to know which model produced them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LiveRegionMotion {
+    pub valid: bool,
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+    pub inliers: u32,
+    pub matches: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -42,15 +73,22 @@ struct TrackingImage {
 #[derive(Debug, Default)]
 pub struct LiveFrameTracker {
     previous: Option<TrackingImage>,
+    /// Last successful global motion, in *tracking-image* pixels. Used as a
+    /// search prior so the bounded SAD window only has to cover the change in
+    /// velocity, not absolute velocity.
+    prior_dx_track: f32,
+    prior_dy_track: f32,
 }
 
 impl LiveFrameTracker {
     pub fn new() -> Self {
-        Self { previous: None }
+        Self::default()
     }
 
     pub fn reset(&mut self) {
         self.previous = None;
+        self.prior_dx_track = 0.0;
+        self.prior_dy_track = 0.0;
     }
 
     pub fn update(
@@ -80,6 +118,33 @@ impl LiveFrameTracker {
         display_crop: Rect,
         target_pixels: u32,
     ) -> Result<LiveMotionEstimate, TranslatorError> {
+        let (estimate, _) = self.update_with_regions(
+            rgba,
+            sensor_width,
+            sensor_height,
+            rotation_degrees,
+            display_crop,
+            target_pixels,
+            &[],
+        )?;
+        Ok(estimate)
+    }
+
+    /// Like `update`, but additionally fits a per-region similarity for each
+    /// supplied region rect (in display coords). Returns (global, per-region)
+    /// with the per-region vec aligned to `regions`. Invalid entries (too few
+    /// inliers etc.) come back with `valid = false`; callers should fall back
+    /// to global motion for those tracks.
+    pub fn update_with_regions(
+        &mut self,
+        rgba: &[u8],
+        sensor_width: u32,
+        sensor_height: u32,
+        rotation_degrees: i32,
+        display_crop: Rect,
+        target_pixels: u32,
+        regions: &[Rect],
+    ) -> Result<(LiveMotionEstimate, Vec<LiveRegionMotion>), TranslatorError> {
         let current = build_tracking_image(
             rgba,
             sensor_width,
@@ -90,10 +155,13 @@ impl LiveFrameTracker {
         )?;
         let Some(previous) = self.previous.as_ref() else {
             self.previous = Some(current);
-            return Ok(LiveMotionEstimate {
-                reset: true,
-                ..LiveMotionEstimate::default()
-            });
+            return Ok((
+                LiveMotionEstimate {
+                    reset: true,
+                    ..LiveMotionEstimate::default()
+                },
+                vec![LiveRegionMotion::default(); regions.len()],
+            ));
         };
 
         let compatible = previous.width == current.width
@@ -102,15 +170,32 @@ impl LiveFrameTracker {
             && previous.crop.height() == current.crop.height();
         if !compatible {
             self.previous = Some(current);
-            return Ok(LiveMotionEstimate {
-                reset: true,
-                ..LiveMotionEstimate::default()
-            });
+            return Ok((
+                LiveMotionEstimate {
+                    reset: true,
+                    ..LiveMotionEstimate::default()
+                },
+                vec![LiveRegionMotion::default(); regions.len()],
+            ));
         }
 
-        let estimate = estimate_translation(previous, &current);
+        let prior_dx = self.prior_dx_track.round() as i32;
+        let prior_dy = self.prior_dy_track.round() as i32;
+        let global = estimate_translation(previous, &current, prior_dx, prior_dy);
+        let region_motions = if global.valid && !regions.is_empty() {
+            estimate_per_region(previous, &current, regions, global.dx, global.dy)
+        } else {
+            vec![LiveRegionMotion::default(); regions.len()]
+        };
+        if global.valid && current.scale_to_full_x > 0.0 && current.scale_to_full_y > 0.0 {
+            self.prior_dx_track = global.dx / current.scale_to_full_x;
+            self.prior_dy_track = global.dy / current.scale_to_full_y;
+        } else {
+            self.prior_dx_track = 0.0;
+            self.prior_dy_track = 0.0;
+        }
         self.previous = Some(current);
-        Ok(estimate)
+        Ok((global, region_motions))
     }
 }
 
@@ -221,11 +306,16 @@ fn display_to_sensor(
     ))
 }
 
-fn estimate_translation(previous: &TrackingImage, current: &TrackingImage) -> LiveMotionEstimate {
+fn estimate_translation(
+    previous: &TrackingImage,
+    current: &TrackingImage,
+    prior_dx: i32,
+    prior_dy: i32,
+) -> LiveMotionEstimate {
     let w = previous.width as i32;
     let h = previous.height as i32;
     let search_radius = ((w.min(h) as f32) * 0.055).round().clamp(6.0, 24.0) as i32;
-    let margin = PATCH_RADIUS + search_radius + 1;
+    let margin = PATCH_RADIUS + search_radius + 1 + prior_dx.abs().max(prior_dy.abs());
     if w <= margin * 2 || h <= margin * 2 {
         return LiveMotionEstimate::default();
     }
@@ -239,7 +329,8 @@ fn estimate_translation(previous: &TrackingImage, current: &TrackingImage) -> Li
             if patch_texture(previous, x, y) < MIN_TEXTURE {
                 continue;
             }
-            if let Some(m) = match_patch(previous, current, x, y, search_radius) {
+            if let Some(m) = match_patch(previous, current, x, y, search_radius, prior_dx, prior_dy)
+            {
                 matches.push(m);
             }
         }
@@ -252,15 +343,15 @@ fn estimate_translation(previous: &TrackingImage, current: &TrackingImage) -> Li
         };
     }
 
-    let mut dxs: Vec<f32> = matches.iter().map(|m| m.dx as f32).collect();
-    let mut dys: Vec<f32> = matches.iter().map(|m| m.dy as f32).collect();
+    let mut dxs: Vec<f32> = matches.iter().map(|m| m.dx).collect();
+    let mut dys: Vec<f32> = matches.iter().map(|m| m.dy).collect();
     let med_dx = median(&mut dxs);
     let med_dy = median(&mut dys);
 
     let mut inliers = Vec::with_capacity(matches.len());
     for m in &matches {
-        let ddx = m.dx as f32 - med_dx;
-        let ddy = m.dy as f32 - med_dy;
+        let ddx = m.dx - med_dx;
+        let ddy = m.dy - med_dy;
         if (ddx * ddx + ddy * ddy).sqrt() <= INLIER_RADIUS_PX {
             inliers.push(*m);
         }
@@ -273,8 +364,8 @@ fn estimate_translation(previous: &TrackingImage, current: &TrackingImage) -> Li
         };
     }
 
-    let dx = inliers.iter().map(|m| m.dx as f32).sum::<f32>() / inliers.len() as f32;
-    let dy = inliers.iter().map(|m| m.dy as f32).sum::<f32>() / inliers.len() as f32;
+    let dx = inliers.iter().map(|m| m.dx).sum::<f32>() / inliers.len() as f32;
+    let dy = inliers.iter().map(|m| m.dy).sum::<f32>() / inliers.len() as f32;
     let mean_error = inliers.iter().map(|m| m.mean_abs_diff).sum::<f32>() / inliers.len() as f32;
     let inlier_ratio = inliers.len() as f32 / matches.len() as f32;
     let error_score = (1.0 - mean_error / MAX_MEAN_ABS_DIFF).clamp(0.0, 1.0);
@@ -301,8 +392,12 @@ fn estimate_translation(previous: &TrackingImage, current: &TrackingImage) -> Li
 
 #[derive(Debug, Clone, Copy)]
 struct PatchMatch {
-    dx: i32,
-    dy: i32,
+    /// Patch centre in the previous tracking image (integer pixel).
+    prev_x: f32,
+    prev_y: f32,
+    /// Sub-pixel displacement in the current tracking image.
+    dx: f32,
+    dy: f32,
     mean_abs_diff: f32,
 }
 
@@ -319,19 +414,45 @@ fn patch_texture(image: &TrackingImage, cx: i32, cy: i32) -> f32 {
     (max_v - min_v) as f32
 }
 
+/// Search around `(x, y)` for the patch that minimises SAD with the previous
+/// patch at `(x, y)`. The search is centred on `(prior_dx, prior_dy)` — pass
+/// zero for global search, or the predicted displacement for a localised refine.
+/// On success returns a `PatchMatch` whose `dx`/`dy` include parabolic sub-pixel
+/// refinement around the integer minimum.
 fn match_patch(
     previous: &TrackingImage,
     current: &TrackingImage,
     x: i32,
     y: i32,
     search_radius: i32,
+    prior_dx: i32,
+    prior_dy: i32,
 ) -> Option<PatchMatch> {
+    // Reject anything that would walk off either image (the current centre
+    // moves to `(x + prior_dx + dx, y + prior_dy + dy)`).
+    let w = current.width as i32;
+    let h = current.height as i32;
+    let cx_min = (x + prior_dx) - search_radius;
+    let cx_max = (x + prior_dx) + search_radius;
+    let cy_min = (y + prior_dy) - search_radius;
+    let cy_max = (y + prior_dy) + search_radius;
+    if cx_min - PATCH_RADIUS < 0
+        || cx_max + PATCH_RADIUS >= w
+        || cy_min - PATCH_RADIUS < 0
+        || cy_max + PATCH_RADIUS >= h
+    {
+        return None;
+    }
+    let span = (search_radius * 2 + 1) as usize;
+    let mut sads = vec![u32::MAX; span * span];
     let mut best_sad = u32::MAX;
     let mut best_dx = 0;
     let mut best_dy = 0;
     for dy in -search_radius..=search_radius {
         for dx in -search_radius..=search_radius {
-            let sad = patch_sad(previous, current, x, y, dx, dy);
+            let sad = patch_sad(previous, current, x, y, prior_dx + dx, prior_dy + dy);
+            let idx = ((dy + search_radius) as usize) * span + (dx + search_radius) as usize;
+            sads[idx] = sad;
             if sad < best_sad {
                 best_sad = sad;
                 best_dx = dx;
@@ -341,11 +462,289 @@ fn match_patch(
     }
     let pixels = ((PATCH_RADIUS * 2 + 1) * (PATCH_RADIUS * 2 + 1)) as f32;
     let mean_abs_diff = best_sad as f32 / pixels;
-    (mean_abs_diff <= MAX_MEAN_ABS_DIFF).then_some(PatchMatch {
-        dx: best_dx,
-        dy: best_dy,
+    if mean_abs_diff > MAX_MEAN_ABS_DIFF {
+        return None;
+    }
+    // Parabolic sub-pixel refinement on each axis independently. Only valid when
+    // the integer minimum is strictly inside the search window.
+    let mut sub_dx = 0.0_f32;
+    let mut sub_dy = 0.0_f32;
+    if best_dx > -search_radius && best_dx < search_radius {
+        let idx_center =
+            ((best_dy + search_radius) as usize) * span + (best_dx + search_radius) as usize;
+        let left = sads[idx_center - 1] as f32;
+        let center = sads[idx_center] as f32;
+        let right = sads[idx_center + 1] as f32;
+        let denom = left - 2.0 * center + right;
+        if denom > 1e-3 {
+            sub_dx = ((left - right) / (2.0 * denom)).clamp(-0.5, 0.5);
+        }
+    }
+    if best_dy > -search_radius && best_dy < search_radius {
+        let idx_center =
+            ((best_dy + search_radius) as usize) * span + (best_dx + search_radius) as usize;
+        let up = sads[idx_center - span] as f32;
+        let center = sads[idx_center] as f32;
+        let down = sads[idx_center + span] as f32;
+        let denom = up - 2.0 * center + down;
+        if denom > 1e-3 {
+            sub_dy = ((up - down) / (2.0 * denom)).clamp(-0.5, 0.5);
+        }
+    }
+    Some(PatchMatch {
+        prev_x: x as f32,
+        prev_y: y as f32,
+        dx: prior_dx as f32 + best_dx as f32 + sub_dx,
+        dy: prior_dy as f32 + best_dy as f32 + sub_dy,
         mean_abs_diff,
     })
+}
+
+/// Fit a per-region similarity (translation + uniform scale + rotation) from
+/// matches inside each region's footprint, with the *global* dx/dy as a search
+/// prior. The output affine maps display-coord points from `previous` to
+/// `current`. Regions whose fit doesn't reach `REGION_MIN_INLIERS` come back
+/// invalid; callers should fall back to the global motion for those tracks.
+fn estimate_per_region(
+    previous: &TrackingImage,
+    current: &TrackingImage,
+    regions: &[Rect],
+    global_dx_display: f32,
+    global_dy_display: f32,
+) -> Vec<LiveRegionMotion> {
+    let w = previous.width as i32;
+    let h = previous.height as i32;
+    let scale_to_full_x = previous.scale_to_full_x;
+    let scale_to_full_y = previous.scale_to_full_y;
+    let scale_to_track_x = if scale_to_full_x > 0.0 {
+        1.0 / scale_to_full_x
+    } else {
+        1.0
+    };
+    let scale_to_track_y = if scale_to_full_y > 0.0 {
+        1.0 / scale_to_full_y
+    } else {
+        1.0
+    };
+    let crop_left = previous.crop.left as f32;
+    let crop_top = previous.crop.top as f32;
+    let prior_dx_track = (global_dx_display * scale_to_track_x).round() as i32;
+    let prior_dy_track = (global_dy_display * scale_to_track_y).round() as i32;
+
+    regions
+        .iter()
+        .map(|region| {
+            estimate_region(
+                previous,
+                current,
+                region,
+                w,
+                h,
+                crop_left,
+                crop_top,
+                scale_to_track_x,
+                scale_to_track_y,
+                scale_to_full_x,
+                scale_to_full_y,
+                prior_dx_track,
+                prior_dy_track,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_region(
+    previous: &TrackingImage,
+    current: &TrackingImage,
+    region: &Rect,
+    w: i32,
+    h: i32,
+    crop_left: f32,
+    crop_top: f32,
+    scale_to_track_x: f32,
+    scale_to_track_y: f32,
+    scale_to_full_x: f32,
+    scale_to_full_y: f32,
+    prior_dx_track: i32,
+    prior_dy_track: i32,
+) -> LiveRegionMotion {
+    let invalid = LiveRegionMotion {
+        // Identity affine, so accidental application is a no-op.
+        a: 1.0,
+        e: 1.0,
+        ..LiveRegionMotion::default()
+    };
+    // Convert region (in display coords) into tracking-image coords (clamp to crop).
+    let rx0 = ((region.left as f32 - crop_left) * scale_to_track_x).max(0.0);
+    let ry0 = ((region.top as f32 - crop_top) * scale_to_track_y).max(0.0);
+    let rx1 = ((region.right as f32 - crop_left) * scale_to_track_x).min(w as f32);
+    let ry1 = ((region.bottom as f32 - crop_top) * scale_to_track_y).min(h as f32);
+    if rx1 - rx0 < (REGION_GRID_COLS as f32) || ry1 - ry0 < (REGION_GRID_ROWS as f32) {
+        return invalid;
+    }
+    let margin = PATCH_RADIUS + REGION_LOCAL_SEARCH_PX + 1;
+    let mut matches = Vec::with_capacity((REGION_GRID_COLS * REGION_GRID_ROWS) as usize);
+    for gy in 0..REGION_GRID_ROWS {
+        let py = ry0 + (ry1 - ry0) * (gy as f32 + 0.5) / REGION_GRID_ROWS as f32;
+        let yi = py.round() as i32;
+        if yi - margin < 0 || yi + margin >= h {
+            continue;
+        }
+        for gx in 0..REGION_GRID_COLS {
+            let px = rx0 + (rx1 - rx0) * (gx as f32 + 0.5) / REGION_GRID_COLS as f32;
+            let xi = px.round() as i32;
+            if xi - margin < 0 || xi + margin >= w {
+                continue;
+            }
+            if patch_texture(previous, xi, yi) < MIN_TEXTURE {
+                continue;
+            }
+            if let Some(m) = match_patch(
+                previous,
+                current,
+                xi,
+                yi,
+                REGION_LOCAL_SEARCH_PX,
+                prior_dx_track,
+                prior_dy_track,
+            ) {
+                matches.push(m);
+            }
+        }
+    }
+    let total = matches.len();
+    if total < REGION_MIN_INLIERS {
+        return LiveRegionMotion {
+            matches: total as u32,
+            ..invalid
+        };
+    }
+    // Inlier rejection against the median displacement: same idea as the global
+    // path, but with a tighter radius because we're working in a smaller window.
+    let mut dxs: Vec<f32> = matches.iter().map(|m| m.dx).collect();
+    let mut dys: Vec<f32> = matches.iter().map(|m| m.dy).collect();
+    let med_dx = median(&mut dxs);
+    let med_dy = median(&mut dys);
+    let inliers: Vec<PatchMatch> = matches
+        .iter()
+        .filter(|m| {
+            let ddx = m.dx - med_dx;
+            let ddy = m.dy - med_dy;
+            (ddx * ddx + ddy * ddy).sqrt() <= REGION_INLIER_RESIDUAL_PX
+        })
+        .copied()
+        .collect();
+    if inliers.len() < REGION_MIN_INLIERS {
+        return LiveRegionMotion {
+            matches: total as u32,
+            inliers: inliers.len() as u32,
+            ..invalid
+        };
+    }
+    // Build display-space pairs (p_prev_display, q_curr_display) centred on the
+    // region centre for numerical stability.
+    let region_cx_display = (region.left as f32 + region.right as f32) * 0.5;
+    let region_cy_display = (region.top as f32 + region.bottom as f32) * 0.5;
+    let pairs: Vec<(f32, f32, f32, f32)> = inliers
+        .iter()
+        .map(|m| {
+            let prev_disp_x = m.prev_x * scale_to_full_x + crop_left;
+            let prev_disp_y = m.prev_y * scale_to_full_y + crop_top;
+            let curr_disp_x = (m.prev_x + m.dx) * scale_to_full_x + crop_left;
+            let curr_disp_y = (m.prev_y + m.dy) * scale_to_full_y + crop_top;
+            (
+                prev_disp_x - region_cx_display,
+                prev_disp_y - region_cy_display,
+                curr_disp_x - region_cx_display,
+                curr_disp_y - region_cy_display,
+            )
+        })
+        .collect();
+
+    let Some((aa, bb, tx, ty)) = fit_similarity(&pairs) else {
+        return LiveRegionMotion {
+            matches: total as u32,
+            inliers: inliers.len() as u32,
+            ..invalid
+        };
+    };
+    // Build the 2x3 affine in display coords. fit_similarity solves
+    //   qx = aa * px - bb * py + tx
+    //   qy = bb * px + aa * py + ty
+    // so in 2x3-affine form (new_x = a*x + b*y + c, new_y = d*x + e*y + f):
+    //   a = aa, b = -bb, d = bb, e = aa
+    // The fit is centred on the region centre (rcx, rcy); we expand
+    //   q = M*(p - r) + r + t  →  q = M*p + (r - M*r + t)
+    // to get the un-centred translation:
+    //   c = rcx - (aa*rcx - bb*rcy) + tx
+    //   f = rcy - (bb*rcx + aa*rcy) + ty
+    let rcx = region_cx_display;
+    let rcy = region_cy_display;
+    let c = rcx - (aa * rcx - bb * rcy) + tx;
+    let f = rcy - (bb * rcx + aa * rcy) + ty;
+    LiveRegionMotion {
+        valid: true,
+        a: aa,
+        b: -bb,
+        c,
+        d: bb,
+        e: aa,
+        f,
+        inliers: inliers.len() as u32,
+        matches: total as u32,
+    }
+}
+
+/// Closed-form similarity fit. Given correspondences `(px, py) -> (qx, qy)`,
+/// solves the over-determined system for (A, B, tx, ty) where
+///   qx = A * px - B * py + tx
+///   qy = B * px + A * py + ty
+/// via the standard 4x4 normal equations. Returns `(A, B, tx, ty)` or `None`
+/// if the system is too ill-conditioned (insufficient texture spread).
+fn fit_similarity(pairs: &[(f32, f32, f32, f32)]) -> Option<(f32, f32, f32, f32)> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let n = pairs.len() as f32;
+    let mut sx = 0.0_f32;
+    let mut sy = 0.0_f32;
+    let mut sxx_yy = 0.0_f32;
+    let mut sqx = 0.0_f32;
+    let mut sqy = 0.0_f32;
+    let mut sxq_yq = 0.0_f32;
+    let mut sxq_minus_yq = 0.0_f32;
+    for &(px, py, qx, qy) in pairs {
+        sx += px;
+        sy += py;
+        sxx_yy += px * px + py * py;
+        sqx += qx;
+        sqy += qy;
+        sxq_yq += px * qx + py * qy;
+        sxq_minus_yq += px * qy - py * qx;
+    }
+    // Closed-form solution: see Umeyama (1991) for the rotation-only case;
+    // adapted for centred-only inputs the result reduces to
+    //   A = (Σ px*qx + py*qy - (Σ px)(Σ qx)/n - (Σ py)(Σ qy)/n) / D
+    //   B = (Σ px*qy - py*qx - (Σ px)(Σ qy)/n + (Σ py)(Σ qx)/n) / D
+    //   tx = (Σ qx)/n - A * (Σ px)/n + B * (Σ py)/n
+    //   ty = (Σ qy)/n - B * (Σ px)/n - A * (Σ py)/n
+    // where D = Σ (px^2 + py^2) - (Σ px)^2/n - (Σ py)^2/n.
+    let mean_px = sx / n;
+    let mean_py = sy / n;
+    let mean_qx = sqx / n;
+    let mean_qy = sqy / n;
+    let denom = sxx_yy - n * (mean_px * mean_px + mean_py * mean_py);
+    if denom <= 1e-3 {
+        return None;
+    }
+    let numer_a = sxq_yq - n * (mean_px * mean_qx + mean_py * mean_qy);
+    let numer_b = sxq_minus_yq - n * (mean_px * mean_qy - mean_py * mean_qx);
+    let aa = numer_a / denom;
+    let bb = numer_b / denom;
+    let tx = mean_qx - (aa * mean_px - bb * mean_py);
+    let ty = mean_qy - (bb * mean_px + aa * mean_py);
+    Some((aa, bb, tx, ty))
 }
 
 fn patch_sad(
