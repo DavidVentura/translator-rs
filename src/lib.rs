@@ -29,7 +29,7 @@ mod mnn_inference;
 #[cfg(feature = "mucab")]
 pub mod mucab;
 pub mod ocr;
-#[cfg(feature = "tesseract")]
+#[cfg(any(feature = "tesseract", feature = "ppocr"))]
 mod ocr_runtime;
 #[cfg(feature = "odt")]
 pub mod odt;

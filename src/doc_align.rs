@@ -13,7 +13,7 @@ const MODEL_INPUT_NAME: &str = "img";
 const POINTS_OUTPUT_NAME: &str = "points";
 const HAS_OBJ_OUTPUT_NAME: &str = "has_obj";
 
-const CONFIDENCE_THRESHOLD: f32 = 0.5;
+const CONFIDENCE_THRESHOLD: f32 = 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]

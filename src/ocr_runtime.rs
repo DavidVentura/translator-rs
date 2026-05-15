@@ -1,5 +1,10 @@
+#[cfg(feature = "tesseract")]
 use std::path::Path;
+#[cfg(not(feature = "tesseract"))]
+use std::sync::Mutex;
+#[cfg(feature = "tesseract")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "tesseract")]
 use std::sync::{Mutex, MutexGuard};
 
 use crate::api::{LanguageCode, TranslatorError};
@@ -9,17 +14,21 @@ use crate::catalog::CatalogSnapshot;
 use crate::live_frame::OrientedImage;
 #[cfg(feature = "ppocr")]
 use crate::ocr::{DetectedTextBox, OrientedRect, RecognizedTextLine};
+#[cfg(feature = "tesseract")]
+use crate::ocr::{DetectedWord, build_text_blocks};
 use crate::ocr::{
-    DetectedWord, PreparedImageOverlay, ReadingOrder, Rect, TextBlock, TextLine, build_text_blocks,
-    prepare_overlay_image,
+    PreparedImageOverlay, ReadingOrder, Rect, TextBlock, TextLine, prepare_overlay_image,
 };
 #[cfg(feature = "ppocr")]
 use crate::ppocr::PpocrEngine;
 use crate::settings::BackgroundMode;
+#[cfg(feature = "tesseract")]
 use crate::tesseract::DetectedWord as TesseractDetectedWord;
+#[cfg(feature = "tesseract")]
 use crate::tesseract::{PageSegMode, TesseractWrapper};
 use crate::translate::Translator;
 
+#[cfg(feature = "tesseract")]
 struct OcrEngineState {
     engine: TesseractWrapper,
     language_spec: String,
@@ -27,16 +36,19 @@ struct OcrEngineState {
     tessdata_path: String,
 }
 
+#[cfg(feature = "tesseract")]
 pub struct OcrCache {
     state: Option<OcrEngineState>,
 }
 
+#[cfg(feature = "tesseract")]
 impl OcrCache {
     pub fn new() -> Self {
         Self { state: None }
     }
 }
 
+#[cfg(feature = "tesseract")]
 impl Default for OcrCache {
     fn default() -> Self {
         Self::new()
@@ -47,6 +59,7 @@ impl Default for OcrCache {
 /// callers can run Tesseract in parallel. Single-language workloads keep
 /// each slot's tessdata loaded on first use; the cost is roughly N copies
 /// of the language model in RAM (50–80 MB each for `eng`).
+#[cfg(feature = "tesseract")]
 pub struct OcrPool {
     workers: Vec<Mutex<OcrCache>>,
     /// Round-robin pointer used as a tiebreaker when every worker is busy
@@ -55,6 +68,7 @@ pub struct OcrPool {
     next: AtomicUsize,
 }
 
+#[cfg(feature = "tesseract")]
 impl OcrPool {
     pub fn new(n_workers: usize) -> Self {
         let n = n_workers.max(1);
@@ -78,12 +92,14 @@ impl OcrPool {
     }
 }
 
+#[cfg(feature = "tesseract")]
 impl Default for OcrPool {
     fn default() -> Self {
         Self::new(1)
     }
 }
 
+#[cfg(feature = "tesseract")]
 pub(crate) fn translate_image_rgba_in_snapshot(
     engine: &Mutex<BergamotEngine>,
     ocr_pool: &OcrPool,
@@ -207,6 +223,7 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
     }
 }
 
+#[cfg(feature = "tesseract")]
 fn build_tesseract_blocks(
     ocr_pool: &OcrPool,
     snapshot: &CatalogSnapshot,
@@ -336,6 +353,7 @@ fn finalize_image_overlay(
     result
 }
 
+#[cfg(feature = "tesseract")]
 fn map_tesseract_word(word: TesseractDetectedWord) -> DetectedWord {
     DetectedWord {
         text: word.text,
@@ -410,6 +428,7 @@ fn merge_translated_block_texts(
     translated_blocks
 }
 
+#[cfg(feature = "tesseract")]
 fn with_ocr_engine<T, F>(
     cache: &mut OcrCache,
     snapshot: &CatalogSnapshot,

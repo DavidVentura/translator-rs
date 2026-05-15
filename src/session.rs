@@ -27,7 +27,7 @@ use crate::tarkka::{
 #[cfg(feature = "doc-align")]
 use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
 use crate::ocr::PreparedImageOverlay;
-#[cfg(feature = "tesseract")]
+#[cfg(any(feature = "tesseract", feature = "ppocr"))]
 use crate::ocr::ReadingOrder;
 #[cfg(feature = "ppocr")]
 use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
@@ -35,7 +35,7 @@ use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
 use crate::ocr_runtime::{OcrPool, translate_image_rgba_in_snapshot};
 #[cfg(feature = "ppocr")]
 use crate::ppocr::PpocrEngine;
-#[cfg(feature = "tesseract")]
+#[cfg(any(feature = "tesseract", feature = "ppocr"))]
 use crate::settings::PreferredOcrEngine;
 
 #[cfg(feature = "tts")]
@@ -320,7 +320,7 @@ impl TranslatorSession {
             .translate_texts_with_alignment(from_code, to_code, texts)
     }
 
-    #[cfg(feature = "tesseract")]
+    #[cfg(any(feature = "tesseract", feature = "ppocr"))]
     pub fn translate_image_rgba(
         &self,
         rgba_bytes: &[u8],
@@ -364,35 +364,64 @@ impl TranslatorSession {
                         }
                     });
                 }
-                Err(err) => log::warn!(
-                    "ppocr unavailable for {}, falling back to tesseract: {err}",
-                    source_code
-                ),
+                Err(err) => {
+                    #[cfg(feature = "tesseract")]
+                    {
+                        log::warn!(
+                            "ppocr unavailable for {}, falling back to tesseract: {err}",
+                            source_code
+                        );
+                    }
+                    #[cfg(not(feature = "tesseract"))]
+                    {
+                        return Err(err);
+                    }
+                }
             }
         }
-        log::info!("ocr engine: tesseract (source={})", source_code);
-        let _ = max_image_size;
 
-        translate_image_rgba_in_snapshot(
-            self.engine(),
-            &self.ocr,
-            &snap,
-            rgba_bytes,
-            width,
-            height,
-            &src,
-            &tgt,
-            min_confidence,
-            reading_order,
-            background_mode,
-        )
-        .map_err(|e| {
-            if e.message.to_lowercase().contains("no text found") {
-                TranslatorError::ocr("No text found in image (engine=tesseract)")
-            } else {
-                e
-            }
-        })
+        #[cfg(feature = "tesseract")]
+        {
+            log::info!("ocr engine: tesseract (source={})", source_code);
+            let _ = max_image_size;
+
+            translate_image_rgba_in_snapshot(
+                self.engine(),
+                &self.ocr,
+                &snap,
+                rgba_bytes,
+                width,
+                height,
+                &src,
+                &tgt,
+                min_confidence,
+                reading_order,
+                background_mode,
+            )
+            .map_err(|e| {
+                if e.message.to_lowercase().contains("no text found") {
+                    TranslatorError::ocr("No text found in image (engine=tesseract)")
+                } else {
+                    e
+                }
+            })
+        }
+        #[cfg(not(feature = "tesseract"))]
+        {
+            let _ = (
+                rgba_bytes,
+                width,
+                height,
+                max_image_size,
+                min_confidence,
+                reading_order,
+                background_mode,
+                preferred_engine,
+            );
+            Err(TranslatorError::missing_asset(
+                "requested OCR engine unavailable without tesseract feature",
+            ))
+        }
     }
 
     /// Live-OCR detect: takes a pre-built `OrientedImage` (the live pipeline's

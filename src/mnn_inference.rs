@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use mnn_sys::{InferenceConfig, InferenceEngine, PrecisionMode};
+use mnn_sys::{InferenceConfig, InferenceEngine, MemoryMode, PrecisionMode};
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
 
@@ -10,9 +10,24 @@ pub(crate) struct MnnSession {
 
 impl MnnSession {
     pub fn load(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
+        Self::load_with_modes(
+            model_path,
+            intra_threads,
+            PrecisionMode::Low,
+            MemoryMode::Normal,
+        )
+    }
+
+    pub fn load_with_modes(
+        model_path: &Path,
+        intra_threads: usize,
+        precision: PrecisionMode,
+        memory: MemoryMode,
+    ) -> Result<Self, TranslatorError> {
         let config = InferenceConfig::new()
             .with_threads(intra_threads as i32)
-            .with_precision(PrecisionMode::Low);
+            .with_precision(precision)
+            .with_memory(memory);
         let engine = InferenceEngine::from_file(model_path, Some(config)).map_err(|error| {
             TranslatorError::new(
                 TranslatorErrorKind::Internal,

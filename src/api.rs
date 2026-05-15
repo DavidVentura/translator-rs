@@ -191,7 +191,6 @@ impl TranslatorError {
         Self::new(TranslatorErrorKind::Translation, message)
     }
 
-    #[cfg(feature = "tesseract")]
     pub(crate) fn ocr(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::Ocr, message)
     }
