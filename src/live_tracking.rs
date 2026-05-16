@@ -24,6 +24,8 @@ const MAX_MEAN_ABS_DIFF: f32 = 42.0;
 const INLIER_RADIUS_PX: f32 = 3.0;
 const MIN_INLIERS: usize = 8;
 
+const INVALID_MOTION_PRIOR_DECAY: f32 = 0.5;
+
 const REGION_GRID_COLS: u32 = 5;
 const REGION_GRID_ROWS: u32 = 5;
 const REGION_LOCAL_SEARCH_PX: i32 = 5;
@@ -191,8 +193,14 @@ impl LiveFrameTracker {
             self.prior_dx_track = global.dx / current.scale_to_full_x;
             self.prior_dy_track = global.dy / current.scale_to_full_y;
         } else {
-            self.prior_dx_track = 0.0;
-            self.prior_dy_track = 0.0;
+            // Decay rather than reset: if motion failed because the user is
+            // mid-fast-pan and blur briefly killed SAD, the next frame is
+            // probably still moving at roughly the same velocity. Halving on
+            // each consecutive invalid lets us extrapolate for one or two
+            // frames before the prior fades to zero (avoids overshooting if
+            // the user is actually decelerating).
+            self.prior_dx_track *= INVALID_MOTION_PRIOR_DECAY;
+            self.prior_dy_track *= INVALID_MOTION_PRIOR_DECAY;
         }
         self.previous = Some(current);
         Ok((global, region_motions))
