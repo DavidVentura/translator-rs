@@ -54,7 +54,7 @@ const DET_UNCLIP_RATIO: f32 = 1.6;
 const DET_BOX_BORDER: u32 = 4;
 const LIVE_REC_DROP_SCORE: f32 = 0.65;
 const LIVE_DET_BOX_MIN_SCORE: f32 = 0.68;
-const LIVE_DET_MIN_AREA: u32 = 96;
+const LIVE_DET_MIN_AREA: u32 = 350;
 
 const PPOCR_DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PPOCR_DET_STD: [f32; 3] = [0.229, 0.224, 0.225];

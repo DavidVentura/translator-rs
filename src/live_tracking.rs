@@ -780,3 +780,113 @@ fn median(values: &mut [f32]) -> f32 {
     values.sort_by(|a, b| a.total_cmp(b));
     values[values.len() / 2]
 }
+
+/// Sample a small grayscale patch from `rgba` over the area covered by an
+/// oriented rect in display coordinates. The patch is sampled in the rect's
+/// local frame (axis-aligned with the rect), so rotation and uniform scaling
+/// of the rect produce the same patch — only content changes affect the
+/// output. Used by live-OCR tracks to detect content drift: a track stores
+/// a patch at confirmation time and re-samples each frame; a large NCC drop
+/// means the rect has slid off its original content and should be retired.
+///
+/// Sample coordinates are computed in display space, then transformed to
+/// sensor space via the same rotation logic the tracker uses, and clamped
+/// to the sensor bounds.
+pub fn sample_oriented_gray_patch(
+    rgba: &[u8],
+    sensor_width: u32,
+    sensor_height: u32,
+    rotation_degrees: i32,
+    rect_cx: f32,
+    rect_cy: f32,
+    rect_width: f32,
+    rect_height: f32,
+    rect_angle_radians: f32,
+    patch_w: u32,
+    patch_h: u32,
+) -> Result<Vec<u8>, TranslatorError> {
+    let expected = (sensor_width as usize)
+        .checked_mul(sensor_height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            TranslatorError::new(TranslatorErrorKind::InvalidInput, "image dims overflow")
+        })?;
+    if rgba.len() != expected {
+        return Err(TranslatorError::new(
+            TranslatorErrorKind::InvalidInput,
+            format!(
+                "rgba length {} != {}x{}x4 ({})",
+                rgba.len(),
+                sensor_width,
+                sensor_height,
+                expected,
+            ),
+        ));
+    }
+    if patch_w == 0 || patch_h == 0 {
+        return Err(TranslatorError::new(
+            TranslatorErrorKind::InvalidInput,
+            "patch dimensions must be non-zero",
+        ));
+    }
+    let mut out = vec![0u8; (patch_w as usize) * (patch_h as usize)];
+    let cos_a = rect_angle_radians.cos();
+    let sin_a = rect_angle_radians.sin();
+    let hw = rect_width * 0.5;
+    let hh = rect_height * 0.5;
+    for oy in 0..patch_h {
+        let ny = (oy as f32 + 0.5) / patch_h as f32;
+        let local_y = (ny * 2.0 - 1.0) * hh;
+        for ox in 0..patch_w {
+            let nx = (ox as f32 + 0.5) / patch_w as f32;
+            let local_x = (nx * 2.0 - 1.0) * hw;
+            let display_x = rect_cx + local_x * cos_a - local_y * sin_a;
+            let display_y = rect_cy + local_x * sin_a + local_y * cos_a;
+            let (sx, sy) = display_to_sensor(
+                display_x,
+                display_y,
+                sensor_width,
+                sensor_height,
+                rotation_degrees,
+            )?;
+            let idx = ((sy * sensor_width + sx) * 4) as usize;
+            let r = rgba[idx] as f32;
+            let g = rgba[idx + 1] as f32;
+            let b = rgba[idx + 2] as f32;
+            out[(oy * patch_w + ox) as usize] = (0.299 * r + 0.587 * g + 0.114 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok(out)
+}
+
+/// Normalized cross-correlation between two equal-length grayscale buffers.
+/// Returns a value in [-1, 1] — brightness/contrast invariant. Empty or
+/// mismatched-length inputs return 0.0 (treated as "no match" by callers).
+pub fn ncc_gray(a: &[u8], b: &[u8]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let n = a.len() as f32;
+    let sum_a: f32 = a.iter().map(|&v| v as f32).sum();
+    let sum_b: f32 = b.iter().map(|&v| v as f32).sum();
+    let mean_a = sum_a / n;
+    let mean_b = sum_b / n;
+    let mut num = 0.0_f32;
+    let mut den_a = 0.0_f32;
+    let mut den_b = 0.0_f32;
+    for i in 0..a.len() {
+        let da = a[i] as f32 - mean_a;
+        let db = b[i] as f32 - mean_b;
+        num += da * db;
+        den_a += da * da;
+        den_b += db * db;
+    }
+    let den = (den_a * den_b).sqrt();
+    if den < 1e-6 {
+        0.0
+    } else {
+        (num / den).clamp(-1.0, 1.0)
+    }
+}
