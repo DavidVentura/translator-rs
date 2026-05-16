@@ -24,13 +24,17 @@ const MAX_MEAN_ABS_DIFF: f32 = 42.0;
 const INLIER_RADIUS_PX: f32 = 3.0;
 const MIN_INLIERS: usize = 8;
 
-const INVALID_MOTION_PRIOR_DECAY: f32 = 0.5;
-
 const REGION_GRID_COLS: u32 = 5;
 const REGION_GRID_ROWS: u32 = 5;
 const REGION_LOCAL_SEARCH_PX: i32 = 5;
 const REGION_MIN_INLIERS: usize = 6;
 const REGION_INLIER_RESIDUAL_PX: f32 = 2.0;
+
+/// Diagnostic switch. When false, `estimate_region` skips the homography
+/// fit entirely and always returns a similarity (4 DOF). Used to isolate
+/// whether wobble on a still scene comes from H over-fitting / flip-flop
+/// between H and similarity. Default false until that's ruled out.
+const USE_HOMOGRAPHY: bool = false;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveMotionEstimate {
@@ -58,6 +62,9 @@ pub struct LiveRegionMotion {
     pub d: f32,
     pub e: f32,
     pub f: f32,
+    pub g: f32,
+    pub h: f32,
+    pub i: f32,
     pub inliers: u32,
     pub matches: u32,
 }
@@ -75,11 +82,6 @@ struct TrackingImage {
 #[derive(Debug, Default)]
 pub struct LiveFrameTracker {
     previous: Option<TrackingImage>,
-    /// Last successful global motion, in *tracking-image* pixels. Used as a
-    /// search prior so the bounded SAD window only has to cover the change in
-    /// velocity, not absolute velocity.
-    prior_dx_track: f32,
-    prior_dy_track: f32,
 }
 
 impl LiveFrameTracker {
@@ -89,8 +91,6 @@ impl LiveFrameTracker {
 
     pub fn reset(&mut self) {
         self.previous = None;
-        self.prior_dx_track = 0.0;
-        self.prior_dy_track = 0.0;
     }
 
     pub fn update(
@@ -128,6 +128,8 @@ impl LiveFrameTracker {
             display_crop,
             target_pixels,
             &[],
+            &[],
+            &[],
         )?;
         Ok(estimate)
     }
@@ -146,6 +148,8 @@ impl LiveFrameTracker {
         display_crop: Rect,
         target_pixels: u32,
         regions: &[Rect],
+        region_priors_display: &[(f32, f32)],
+        region_feature_positions_display: &[Vec<(f32, f32)>],
     ) -> Result<(LiveMotionEstimate, Vec<LiveRegionMotion>), TranslatorError> {
         let current = build_tracking_image(
             rgba,
@@ -181,27 +185,37 @@ impl LiveFrameTracker {
             ));
         }
 
-        let prior_dx = self.prior_dx_track.round() as i32;
-        let prior_dy = self.prior_dy_track.round() as i32;
-        let global = estimate_translation(previous, &current, prior_dx, prior_dy);
-        let region_motions = if global.valid && !regions.is_empty() {
-            estimate_per_region(previous, &current, regions, global.dx, global.dy)
+        let has_region_priors =
+            !region_priors_display.is_empty() && region_priors_display.len() == regions.len();
+        let (prior_dx, prior_dy) = if has_region_priors {
+            let n = region_priors_display.len() as f32;
+            let mean_dx: f32 = region_priors_display.iter().map(|p| p.0).sum::<f32>() / n;
+            let mean_dy: f32 = region_priors_display.iter().map(|p| p.1).sum::<f32>() / n;
+            (
+                (mean_dx / current.scale_to_full_x).round() as i32,
+                (mean_dy / current.scale_to_full_y).round() as i32,
+            )
         } else {
-            vec![LiveRegionMotion::default(); regions.len()]
+            (0, 0)
         };
-        if global.valid && current.scale_to_full_x > 0.0 && current.scale_to_full_y > 0.0 {
-            self.prior_dx_track = global.dx / current.scale_to_full_x;
-            self.prior_dy_track = global.dy / current.scale_to_full_y;
+        let global = estimate_translation(previous, &current, prior_dx, prior_dy);
+        let region_motions = if !regions.is_empty() {
+            if has_region_priors {
+                estimate_per_region_with_priors(
+                    previous,
+                    &current,
+                    regions,
+                    region_priors_display,
+                    region_feature_positions_display,
+                )
+            } else if global.valid {
+                estimate_per_region(previous, &current, regions, global.dx, global.dy)
+            } else {
+                vec![LiveRegionMotion::default(); regions.len()]
+            }
         } else {
-            // Decay rather than reset: if motion failed because the user is
-            // mid-fast-pan and blur briefly killed SAD, the next frame is
-            // probably still moving at roughly the same velocity. Halving on
-            // each consecutive invalid lets us extrapolate for one or two
-            // frames before the prior fades to zero (avoids overshooting if
-            // the user is actually decelerating).
-            self.prior_dx_track *= INVALID_MOTION_PRIOR_DECAY;
-            self.prior_dy_track *= INVALID_MOTION_PRIOR_DECAY;
-        }
+            vec![]
+        };
         self.previous = Some(current);
         Ok((global, region_motions))
     }
@@ -513,6 +527,67 @@ fn match_patch(
 /// prior. The output affine maps display-coord points from `previous` to
 /// `current`. Regions whose fit doesn't reach `REGION_MIN_INLIERS` come back
 /// invalid; callers should fall back to the global motion for those tracks.
+/// Per-region variant that takes a separate display-space prior `(dx, dy)`
+/// for each region (aligned 1:1). Each region's local SAD search is centred
+/// on its own predicted next-frame position, which lets us handle rotational
+/// camera motion (where the per-region predicted displacement varies across
+/// the image) the same way we already handle global translation. Priors are
+/// produced by the caller from gyro-derived rotation, projected at each
+/// region's centre.
+fn estimate_per_region_with_priors(
+    previous: &TrackingImage,
+    current: &TrackingImage,
+    regions: &[Rect],
+    region_priors_display: &[(f32, f32)],
+    region_feature_positions_display: &[Vec<(f32, f32)>],
+) -> Vec<LiveRegionMotion> {
+    let w = previous.width as i32;
+    let h = previous.height as i32;
+    let scale_to_full_x = previous.scale_to_full_x;
+    let scale_to_full_y = previous.scale_to_full_y;
+    let scale_to_track_x = if scale_to_full_x > 0.0 {
+        1.0 / scale_to_full_x
+    } else {
+        1.0
+    };
+    let scale_to_track_y = if scale_to_full_y > 0.0 {
+        1.0 / scale_to_full_y
+    } else {
+        1.0
+    };
+    let crop_left = previous.crop.left as f32;
+    let crop_top = previous.crop.top as f32;
+    let empty_features: Vec<(f32, f32)> = Vec::new();
+    regions
+        .iter()
+        .zip(region_priors_display.iter())
+        .enumerate()
+        .map(|(idx, (region, (pdx, pdy)))| {
+            let prior_dx_track = (pdx * scale_to_track_x).round() as i32;
+            let prior_dy_track = (pdy * scale_to_track_y).round() as i32;
+            let features = region_feature_positions_display
+                .get(idx)
+                .unwrap_or(&empty_features);
+            estimate_region(
+                previous,
+                current,
+                region,
+                w,
+                h,
+                crop_left,
+                crop_top,
+                scale_to_track_x,
+                scale_to_track_y,
+                scale_to_full_x,
+                scale_to_full_y,
+                prior_dx_track,
+                prior_dy_track,
+                features,
+            )
+        })
+        .collect()
+}
+
 fn estimate_per_region(
     previous: &TrackingImage,
     current: &TrackingImage,
@@ -520,6 +595,7 @@ fn estimate_per_region(
     global_dx_display: f32,
     global_dy_display: f32,
 ) -> Vec<LiveRegionMotion> {
+    let empty: Vec<(f32, f32)> = Vec::new();
     let w = previous.width as i32;
     let h = previous.height as i32;
     let scale_to_full_x = previous.scale_to_full_x;
@@ -556,6 +632,7 @@ fn estimate_per_region(
                 scale_to_full_y,
                 prior_dx_track,
                 prior_dy_track,
+                &empty,
             )
         })
         .collect()
@@ -576,11 +653,12 @@ fn estimate_region(
     scale_to_full_y: f32,
     prior_dx_track: i32,
     prior_dy_track: i32,
+    feature_positions_display: &[(f32, f32)],
 ) -> LiveRegionMotion {
     let invalid = LiveRegionMotion {
-        // Identity affine, so accidental application is a no-op.
         a: 1.0,
         e: 1.0,
+        i: 1.0,
         ..LiveRegionMotion::default()
     };
     // Convert region (in display coords) into tracking-image coords (clamp to crop).
@@ -592,35 +670,64 @@ fn estimate_region(
         return invalid;
     }
     let margin = PATCH_RADIUS + REGION_LOCAL_SEARCH_PX + 1;
-    let mut matches = Vec::with_capacity((REGION_GRID_COLS * REGION_GRID_ROWS) as usize);
-    for gy in 0..REGION_GRID_ROWS {
-        let py = ry0 + (ry1 - ry0) * (gy as f32 + 0.5) / REGION_GRID_ROWS as f32;
-        let yi = py.round() as i32;
-        if yi - margin < 0 || yi + margin >= h {
-            continue;
-        }
-        for gx in 0..REGION_GRID_COLS {
-            let px = rx0 + (rx1 - rx0) * (gx as f32 + 0.5) / REGION_GRID_COLS as f32;
-            let xi = px.round() as i32;
-            if xi - margin < 0 || xi + margin >= w {
+    let matches: Vec<PatchMatch> = if !feature_positions_display.is_empty() {
+        feature_positions_display
+            .iter()
+            .filter_map(|&(px_d, py_d)| {
+                // Contour anchors are on text-edge gradient by construction,
+                // so skip the patch_texture filter and the per-region bbox
+                // check (they may sit on the contour right at the bbox edge).
+                let xi = ((px_d - crop_left) * scale_to_track_x).round() as i32;
+                let yi = ((py_d - crop_top) * scale_to_track_y).round() as i32;
+                if xi - margin < 0 || xi + margin >= w {
+                    return None;
+                }
+                if yi - margin < 0 || yi + margin >= h {
+                    return None;
+                }
+                match_patch(
+                    previous,
+                    current,
+                    xi,
+                    yi,
+                    REGION_LOCAL_SEARCH_PX,
+                    prior_dx_track,
+                    prior_dy_track,
+                )
+            })
+            .collect()
+    } else {
+        let mut matches = Vec::with_capacity((REGION_GRID_COLS * REGION_GRID_ROWS) as usize);
+        'outer: for gy in 0..REGION_GRID_ROWS {
+            let py = ry0 + (ry1 - ry0) * (gy as f32 + 0.5) / REGION_GRID_ROWS as f32;
+            let yi = py.round() as i32;
+            if yi - margin < 0 || yi + margin >= h {
                 continue;
             }
-            if patch_texture(previous, xi, yi) < MIN_TEXTURE {
-                continue;
-            }
-            if let Some(m) = match_patch(
-                previous,
-                current,
-                xi,
-                yi,
-                REGION_LOCAL_SEARCH_PX,
-                prior_dx_track,
-                prior_dy_track,
-            ) {
-                matches.push(m);
+            for gx in 0..REGION_GRID_COLS {
+                let px = rx0 + (rx1 - rx0) * (gx as f32 + 0.5) / REGION_GRID_COLS as f32;
+                let xi = px.round() as i32;
+                if xi - margin < 0 || xi + margin >= w {
+                    continue;
+                }
+                if patch_texture(previous, xi, yi) < MIN_TEXTURE {
+                    continue;
+                }
+                if let Some(m) = match_patch(
+                    previous,
+                    current,
+                    xi,
+                    yi,
+                    REGION_LOCAL_SEARCH_PX,
+                    prior_dx_track,
+                    prior_dy_track,
+                ) {
+                    matches.push(m);
+                }
             }
         }
-    }
+        matches
+    };
     let total = matches.len();
     if total < REGION_MIN_INLIERS {
         return LiveRegionMotion {
@@ -689,6 +796,50 @@ fn estimate_region(
     //   f = rcy - (bb*rcx + aa*rcy) + ty
     let rcx = region_cx_display;
     let rcy = region_cy_display;
+    // Try a homography fit on the same inliers, expressed in
+    // region-centred coordinates. If it returns a plausible perspective
+    // (small h31/h32 relative to image scale, finite values), use it —
+    // it handles tilt-induced foreshortening that similarity averages out.
+    // Otherwise fall back to the similarity fit.
+    let region_w = (region.right as f32 - region.left as f32).max(1.0);
+    let region_h = (region.bottom as f32 - region.top as f32).max(1.0);
+    let cluster_extent = region_w.max(region_h);
+    if USE_HOMOGRAPHY {
+        if let Some(h_centred) = fit_homography(&pairs) {
+            // Plausibility: in *centred* coords, |h31| and |h32| have units of
+            // 1/pixel. For a reasonable perspective on a region of size R, the
+            // maximum |h31| * R + |h32| * R should stay well below 1 (the
+            // homography would otherwise project points to infinity within the
+            // region). Reject anything that comes close.
+            let perspective_magnitude = (h_centred[6].abs() + h_centred[7].abs()) * cluster_extent;
+            if perspective_magnitude < 0.5 && h_centred.iter().all(|v| v.is_finite()) {
+                // Un-centre: H_uncentred = T(rcx, rcy) * H_centred * T(-rcx, -rcy)
+                let t_neg = [1.0, 0.0, -rcx, 0.0, 1.0, -rcy, 0.0, 0.0, 1.0];
+                let t_pos = [1.0, 0.0, rcx, 0.0, 1.0, rcy, 0.0, 0.0, 1.0];
+                let h1 = mat3_mul(&h_centred, &t_neg);
+                let h_world = mat3_mul(&t_pos, &h1);
+                // Normalise so h33 = 1 (caller assumes this).
+                let h33 = h_world[8];
+                if h33.abs() > 1e-6 {
+                    let inv = 1.0 / h33;
+                    return LiveRegionMotion {
+                        valid: true,
+                        a: h_world[0] * inv,
+                        b: h_world[1] * inv,
+                        c: h_world[2] * inv,
+                        d: h_world[3] * inv,
+                        e: h_world[4] * inv,
+                        f: h_world[5] * inv,
+                        g: h_world[6] * inv,
+                        h: h_world[7] * inv,
+                        i: 1.0,
+                        inliers: inliers.len() as u32,
+                        matches: total as u32,
+                    };
+                }
+            }
+        }
+    }
     let c = rcx - (aa * rcx - bb * rcy) + tx;
     let f = rcy - (bb * rcx + aa * rcy) + ty;
     LiveRegionMotion {
@@ -699,6 +850,9 @@ fn estimate_region(
         d: bb,
         e: aa,
         f,
+        g: 0.0,
+        h: 0.0,
+        i: 1.0,
         inliers: inliers.len() as u32,
         matches: total as u32,
     }
@@ -753,6 +907,170 @@ fn fit_similarity(pairs: &[(f32, f32, f32, f32)]) -> Option<(f32, f32, f32, f32)
     let tx = mean_qx - (aa * mean_px - bb * mean_py);
     let ty = mean_qy - (bb * mean_px + aa * mean_py);
     Some((aa, bb, tx, ty))
+}
+
+/// Direct Linear Transform homography fit with Hartley point normalization.
+/// Given correspondences `(px, py) -> (qx, qy)`, returns a row-major 3x3
+/// matrix `H` such that `(qx, qy, 1) ~ H * (px, py, 1)` in homogeneous
+/// coordinates (i.e. the projected point divided by w gives `(qx, qy)`).
+///
+/// Uses normal equations on the 2N x 8 system that fixes `h33 = 1`. Each
+/// correspondence contributes two rows:
+///
+///   [px, py, 1, 0, 0, 0, -px*qx, -py*qx]   = qx
+///   [0, 0, 0, px, py, 1, -px*qy, -py*qy]   = qy
+///
+/// Returns `None` if the system is too ill-conditioned (e.g. correspondences
+/// are colinear or all clustered at one point). Callers should fall back to
+/// `fit_similarity` for those regions.
+fn fit_homography(pairs: &[(f32, f32, f32, f32)]) -> Option<[f32; 9]> {
+    if pairs.len() < 4 {
+        return None;
+    }
+    // Hartley normalization: shift centroid to origin, scale RMS distance to sqrt(2).
+    let n = pairs.len() as f32;
+    let (mut mpx, mut mpy, mut mqx, mut mqy) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+    for &(px, py, qx, qy) in pairs {
+        mpx += px;
+        mpy += py;
+        mqx += qx;
+        mqy += qy;
+    }
+    mpx /= n;
+    mpy /= n;
+    mqx /= n;
+    mqy /= n;
+    let (mut sp, mut sq) = (0.0_f32, 0.0_f32);
+    for &(px, py, qx, qy) in pairs {
+        let dpx = px - mpx;
+        let dpy = py - mpy;
+        let dqx = qx - mqx;
+        let dqy = qy - mqy;
+        sp += (dpx * dpx + dpy * dpy).sqrt();
+        sq += (dqx * dqx + dqy * dqy).sqrt();
+    }
+    sp /= n;
+    sq /= n;
+    if sp <= 1e-3 || sq <= 1e-3 {
+        return None;
+    }
+    let kp = (2.0_f32).sqrt() / sp;
+    let kq = (2.0_f32).sqrt() / sq;
+
+    // Accumulate 8x8 normal equations A^T A * h = A^T b on the normalised points.
+    let mut ata = [[0.0_f64; 8]; 8];
+    let mut atb = [0.0_f64; 8];
+    for &(px, py, qx, qy) in pairs {
+        let px_n = (px - mpx) * kp;
+        let py_n = (py - mpy) * kp;
+        let qx_n = (qx - mqx) * kq;
+        let qy_n = (qy - mqy) * kq;
+        let r1 = [
+            px_n as f64,
+            py_n as f64,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            (-px_n * qx_n) as f64,
+            (-py_n * qx_n) as f64,
+        ];
+        let r2 = [
+            0.0,
+            0.0,
+            0.0,
+            px_n as f64,
+            py_n as f64,
+            1.0,
+            (-px_n * qy_n) as f64,
+            (-py_n * qy_n) as f64,
+        ];
+        for i in 0..8 {
+            for j in 0..8 {
+                ata[i][j] += r1[i] * r1[j] + r2[i] * r2[j];
+            }
+            atb[i] += r1[i] * qx_n as f64 + r2[i] * qy_n as f64;
+        }
+    }
+    let h_norm = solve_8x8(ata, atb)?;
+    let h_normalised = [
+        h_norm[0] as f32,
+        h_norm[1] as f32,
+        h_norm[2] as f32,
+        h_norm[3] as f32,
+        h_norm[4] as f32,
+        h_norm[5] as f32,
+        h_norm[6] as f32,
+        h_norm[7] as f32,
+        1.0_f32,
+    ];
+    // Denormalise: H = T_q^-1 * H_norm * T_p
+    //   T_p = [[kp, 0, -kp*mpx], [0, kp, -kp*mpy], [0, 0, 1]]
+    //   T_q = [[kq, 0, -kq*mqx], [0, kq, -kq*mqy], [0, 0, 1]]
+    let tp = [kp, 0.0, -kp * mpx, 0.0, kp, -kp * mpy, 0.0, 0.0, 1.0];
+    let tq_inv = [1.0 / kq, 0.0, mqx, 0.0, 1.0 / kq, mqy, 0.0, 0.0, 1.0];
+    let h1 = mat3_mul(&h_normalised, &tp);
+    let h2 = mat3_mul(&tq_inv, &h1);
+    if !h2.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(h2)
+}
+
+fn mat3_mul(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
+    let mut out = [0.0_f32; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s = 0.0_f32;
+            for k in 0..3 {
+                s += a[i * 3 + k] * b[k * 3 + j];
+            }
+            out[i * 3 + j] = s;
+        }
+    }
+    out
+}
+
+/// Gauss-Jordan elimination with partial pivoting on the 8x8 system
+/// `A * x = b`. Returns `None` if the matrix is near-singular.
+fn solve_8x8(mut a: [[f64; 8]; 8], mut b: [f64; 8]) -> Option<[f64; 8]> {
+    for col in 0..8 {
+        let mut piv_row = col;
+        let mut piv_abs = a[col][col].abs();
+        for r in (col + 1)..8 {
+            let v = a[r][col].abs();
+            if v > piv_abs {
+                piv_abs = v;
+                piv_row = r;
+            }
+        }
+        if piv_abs < 1e-9 {
+            return None;
+        }
+        if piv_row != col {
+            a.swap(col, piv_row);
+            b.swap(col, piv_row);
+        }
+        let inv = 1.0 / a[col][col];
+        for j in 0..8 {
+            a[col][j] *= inv;
+        }
+        b[col] *= inv;
+        for r in 0..8 {
+            if r == col {
+                continue;
+            }
+            let factor = a[r][col];
+            if factor == 0.0 {
+                continue;
+            }
+            for j in 0..8 {
+                a[r][j] -= factor * a[col][j];
+            }
+            b[r] -= factor * b[col];
+        }
+    }
+    Some(b)
 }
 
 fn patch_sad(
