@@ -621,7 +621,7 @@ impl TranslatorSession {
         let classifier_path = det_pack
             .files
             .iter()
-            .find(|f| f.name == "PULC.mnn")
+            .find(|f| f.name.ends_with(".mnn") && f.name.contains("PULC"))
             .map(|f| base.join(&f.install_path));
 
         let mut specs = Vec::new();

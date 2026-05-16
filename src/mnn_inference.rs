@@ -14,7 +14,8 @@ impl MnnSession {
             model_path,
             intra_threads,
             PrecisionMode::Low,
-            MemoryMode::Normal,
+            MemoryMode::Low,
+            // MemoryMode::Normal, // EXPERIMENT SPEED
         )
     }
 
