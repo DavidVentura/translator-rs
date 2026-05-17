@@ -105,6 +105,7 @@ fn test_config() -> TrackerConfig {
         ransac_residual_px: 3.0,
         ransac_iters: 400,
         min_inliers: 20,
+        min_inliers_keep_locked: 6,
         nms_radius: 3,
     }
 }

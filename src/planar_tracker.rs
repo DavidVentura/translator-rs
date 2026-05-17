@@ -106,8 +106,15 @@ pub struct TrackerConfig {
     pub ransac_residual_px: f32,
     /// RANSAC iterations.
     pub ransac_iters: usize,
-    /// Minimum inliers to declare a successful track.
+    /// Minimum inliers to *acquire* a successful track (called from a
+    /// cold start or from Lost-recovery). Higher = stricter, but
+    /// avoids locking onto a noisy match.
     pub min_inliers: usize,
+    /// Minimum inliers to *keep* a currently-Locked track. Lower than
+    /// `min_inliers` to give hysteresis — a Locked track that drops a
+    /// frame or two near the threshold shouldn't flicker between
+    /// Locked and Lost on every camera frame.
+    pub min_inliers_keep_locked: usize,
     /// Non-max suppression radius for FAST corners (in pixels).
     pub nms_radius: i32,
 }
@@ -121,6 +128,12 @@ impl Default for TrackerConfig {
             ransac_residual_px: 4.0,
             ransac_iters: 200,
             min_inliers: 12,
+            // Hysteresis floor for keeping a Locked track. 8 is the
+            // minimum that empirically avoids "9-inlier degenerate
+            // homography" cases — below ~8 the RANSAC fit can be
+            // near-singular and the per-pixel projection sends some
+            // bitmap corners to infinity, drawing huge skewed streaks.
+            min_inliers_keep_locked: 8,
             nms_radius: 3,
         }
     }
@@ -248,6 +261,37 @@ pub fn track_against_anchor(
     gray: &GrayImage,
     cfg: &TrackerConfig,
 ) -> Option<TrackResult> {
+    track_against_anchor_with_min(anchor, gray, cfg, cfg.min_inliers)
+}
+
+/// Like [`track_against_anchor`] but lets the caller override the
+/// inlier threshold. Used by the engine to apply hysteresis: a higher
+/// bar for *acquiring* a Locked state vs. a lower bar for *keeping*
+/// one we already have. Without this split the per-frame inlier
+/// count flickers across `min_inliers` and the state machine
+/// thrashes Locked ↔ Lost every frame.
+pub fn track_against_anchor_with_min(
+    anchor: &SceneAnchor,
+    gray: &GrayImage,
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+) -> Option<TrackResult> {
+    track_against_anchor_with_prior(anchor, gray, cfg, min_inliers, None)
+}
+
+/// Like [`track_against_anchor_with_min`] but seeded with a `prior`
+/// homography. The prior is evaluated as the first hypothesis in
+/// RANSAC; if it already has many inliers, RANSAC's random iterations
+/// rarely beat it, so we converge to a clean fit immediately. Use this
+/// with an IMU-derived prediction when fast pan / rotation would
+/// otherwise make random sampling miss the answer.
+pub fn track_against_anchor_with_prior(
+    anchor: &SceneAnchor,
+    gray: &GrayImage,
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+    prior: Option<[f32; 9]>,
+) -> Option<TrackResult> {
     let kps = detect_fast(gray, cfg.fast_threshold, cfg.max_features, cfg.nms_radius);
     if kps.is_empty() {
         return None;
@@ -268,7 +312,7 @@ pub fn track_against_anchor(
             (ax, ay, fk.x, fk.y)
         })
         .collect();
-    ransac_homography(&pairs, cfg)
+    ransac_homography_with_prior(&pairs, cfg, min_inliers, prior)
 }
 
 /// One match between an anchor descriptor and a current-frame descriptor.
@@ -324,6 +368,23 @@ pub fn ransac_homography(
     pairs: &[(f32, f32, f32, f32)],
     cfg: &TrackerConfig,
 ) -> Option<TrackResult> {
+    ransac_homography_with_min(pairs, cfg, cfg.min_inliers)
+}
+
+pub fn ransac_homography_with_min(
+    pairs: &[(f32, f32, f32, f32)],
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+) -> Option<TrackResult> {
+    ransac_homography_with_prior(pairs, cfg, min_inliers, None)
+}
+
+pub fn ransac_homography_with_prior(
+    pairs: &[(f32, f32, f32, f32)],
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+    prior: Option<[f32; 9]>,
+) -> Option<TrackResult> {
     if pairs.len() < 4 {
         return None;
     }
@@ -332,6 +393,26 @@ pub fn ransac_homography(
     let mut best_inliers_idx: Vec<usize> = Vec::new();
     let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
     let n = pairs.len();
+    // If we have a prior (IMU-derived prediction), evaluate it first
+    // as a hypothesis. RANSAC only beats it if random sampling finds
+    // a strictly larger inlier set; otherwise we converge to the
+    // prior immediately and the random iters become cheap no-ops.
+    if let Some(h) = prior {
+        let mut inliers_idx = Vec::with_capacity(n);
+        for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
+            if let Some((px2, py2)) = project(&h, px, py) {
+                let dx = px2 - qx;
+                let dy = py2 - qy;
+                if dx * dx + dy * dy <= r_thresh_sq {
+                    inliers_idx.push(i);
+                }
+            }
+        }
+        if !inliers_idx.is_empty() {
+            best_inliers_idx = inliers_idx;
+            best_h = Some(h);
+        }
+    }
     for _ in 0..cfg.ransac_iters {
         let mut sample = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
         let mut idxs = [0usize; 4];
@@ -365,7 +446,7 @@ pub fn ransac_homography(
             best_h = Some(h);
         }
     }
-    if best_inliers_idx.len() < cfg.min_inliers {
+    if best_inliers_idx.len() < min_inliers {
         return None;
     }
     let _ = best_h?;

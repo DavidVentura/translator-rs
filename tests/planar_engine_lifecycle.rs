@@ -62,6 +62,7 @@ fn test_engine_config() -> EngineConfig {
             ransac_residual_px: 3.0,
             ransac_iters: 400,
             min_inliers: 20,
+            min_inliers_keep_locked: 6,
             nms_radius: 3,
         },
         anchor_cache_size: 5,
@@ -425,6 +426,61 @@ fn bitmap_pipeline_round_trip_under_translation() {
             ey,
             err
         );
+    }
+}
+
+#[test]
+fn imu_prior_locks_under_known_rotation() {
+    // End-to-end: lock onto a real photo, then synthesize a camera
+    // rotation, warp the photo through the corresponding homography,
+    // and feed both frames through `process_frame_with_imu`. The
+    // IMU-derived prior should let the tracker keep the lock even
+    // though the second frame is a non-trivial rotation away from
+    // the canonical frame.
+    use translator::imu_prior::{CameraIntrinsics, device_to_camera, homography_from_rotation};
+
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let intrinsics = CameraIntrinsics {
+        fx: 864.0,
+        fy: 866.3,
+        cx: gray.width() as f32 / 2.0,
+        cy: gray.height() as f32 / 2.0,
+    };
+    let identity = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+    // Acquire anchor on the unrotated frame. First frame primes the
+    // IMU lock state (identity rotation).
+    let _id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    let cmd0 = engine.process_frame_with_imu(&gray, true, 1_001_000, &identity, &intrinsics);
+    assert!(
+        matches!(cmd0, TrackerCommand::Locked { .. }),
+        "first frame should lock; got {:?}",
+        cmd0
+    );
+
+    // Simulate a small camera-frame yaw.
+    let yaw = 0.03_f32;
+    let (s, c) = yaw.sin_cos();
+    let r_cam = [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c];
+    let h_visual = homography_from_rotation(&intrinsics, &r_cam);
+    let warped = warp_with_h(&gray, &h_visual);
+
+    // Device-frame rotation that would produce this camera rotation
+    // (the sandwich is involutive: device_to_camera applied to a
+    // camera-frame matrix gives the device-frame equivalent).
+    let r_curr_dev = device_to_camera(&r_cam);
+
+    let cmd1 = engine.process_frame_with_imu(&warped, true, 2_000_000, &r_curr_dev, &intrinsics);
+    match cmd1 {
+        TrackerCommand::Locked { inliers, .. } => {
+            assert!(
+                inliers >= 20,
+                "expected ≥20 inliers with IMU prior, got {}",
+                inliers
+            );
+        }
+        other => panic!("expected Locked with IMU prior, got {:?}", other),
     }
 }
 

@@ -18,6 +18,8 @@ pub mod homography;
 pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub mod image_render;
+#[cfg(feature = "planar-tracker")]
+pub mod imu_prior;
 #[cfg(feature = "doc-align")]
 mod inference;
 pub mod language;

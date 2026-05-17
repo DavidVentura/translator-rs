@@ -11,9 +11,10 @@
 
 use image::GrayImage;
 
+use crate::imu_prior::{CameraIntrinsics, predict_canonical_to_current};
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
-    track_against_anchor,
+    track_against_anchor, track_against_anchor_with_min, track_against_anchor_with_prior,
 };
 
 #[cfg(feature = "image-render")]
@@ -117,8 +118,12 @@ impl Default for EngineConfig {
             anchor_cache_size: 1,
             acquire_cooldown_ns: 250_000_000, // 250 ms — fast re-acquire after loss
             lost_after_frames: 15,            // ~0.5 s @ 30 fps
-            give_up_after_frames: 90,         // ~3 s @ 30 fps — give cached anchor more chances
-            stable_required_ns: 200_000_000,  // 200 ms
+            // Recovery budget: 30 frames (~1 s) before we go Idle so a
+            // fresh acquire can fire. Bigger values make stuck-Lost
+            // feel glacial when the user has clearly aimed at something
+            // new; smaller values waste re-OCR on momentary blur.
+            give_up_after_frames: 30,
+            stable_required_ns: 200_000_000,       // 200 ms
             anchor_refresh_age_ns: 30_000_000_000, // 30 s
         }
     }
@@ -133,6 +138,18 @@ pub struct LivePlanarEngine {
     last_acquire_ns: u64,
     /// First timestamp at which IMU went quiet (None when moving).
     stable_since_ns: Option<u64>,
+    /// IMU state at the most recent Locked frame: (canonical→frame H,
+    /// device-frame rotation matrix, timestamp). Used to seed RANSAC
+    /// with an IMU-predicted prior on the next frame. Cleared on
+    /// anchor switch, acquire, or sustained loss.
+    last_imu_lock: Option<ImuLockState>,
+}
+
+#[derive(Clone, Debug)]
+struct ImuLockState {
+    canonical_to_frame: [f32; 9],
+    rotation_dev: [f32; 9],
+    timestamp_ns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +244,7 @@ impl LivePlanarEngine {
             next_anchor_id: 1,
             last_acquire_ns: 0,
             stable_since_ns: None,
+            last_imu_lock: None,
         }
     }
 
@@ -238,6 +256,60 @@ impl LivePlanarEngine {
         gray: &GrayImage,
         imu_stable: bool,
         timestamp_ns: u64,
+    ) -> TrackerCommand {
+        self.process_frame_inner(gray, imu_stable, timestamp_ns, None)
+    }
+
+    /// Like [`process_frame`] but with an IMU-derived RANSAC prior.
+    /// `imu_rotation_dev` is the device-frame rotation matrix at this
+    /// camera frame. `intrinsics` are the camera intrinsics in the
+    /// same pixel space as `gray`. The engine remembers these and the
+    /// per-anchor canonical→frame homography from the previous Locked
+    /// frame; the difference becomes a predicted H seeded into RANSAC.
+    pub fn process_frame_with_imu(
+        &mut self,
+        gray: &GrayImage,
+        imu_stable: bool,
+        timestamp_ns: u64,
+        imu_rotation_dev: &[f32; 9],
+        intrinsics: &CameraIntrinsics,
+    ) -> TrackerCommand {
+        let prior = self.compute_imu_prior(imu_rotation_dev, intrinsics);
+        let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, prior);
+        // Stash the new IMU + H for next frame's prior, if we ended up Locked.
+        if let TrackerCommand::Locked { homography, .. } = &cmd {
+            self.last_imu_lock = Some(ImuLockState {
+                canonical_to_frame: *homography,
+                rotation_dev: *imu_rotation_dev,
+                timestamp_ns,
+            });
+        } else if matches!(cmd, TrackerCommand::Idle) {
+            // True Idle: clear stale IMU state.
+            self.last_imu_lock = None;
+        }
+        cmd
+    }
+
+    fn compute_imu_prior(
+        &self,
+        r_curr_dev: &[f32; 9],
+        intrinsics: &CameraIntrinsics,
+    ) -> Option<[f32; 9]> {
+        let last = self.last_imu_lock.as_ref()?;
+        Some(predict_canonical_to_current(
+            intrinsics,
+            &last.rotation_dev,
+            r_curr_dev,
+            &last.canonical_to_frame,
+        ))
+    }
+
+    fn process_frame_inner(
+        &mut self,
+        gray: &GrayImage,
+        imu_stable: bool,
+        timestamp_ns: u64,
+        prior: Option<[f32; 9]>,
     ) -> TrackerCommand {
         self.tick_stable(imu_stable, timestamp_ns);
         match self.state.clone() {
@@ -267,10 +339,32 @@ impl LivePlanarEngine {
                 frames_lost,
                 ..
             } => {
-                let result = self
-                    .cache
-                    .get(anchor_id)
-                    .and_then(|a| track_against_anchor(&a.anchor, gray, &self.config.tracker));
+                // In Locked state we apply hysteresis: a lower inlier
+                // bar to *keep* the lock than to acquire it. Avoids
+                // per-frame Locked↔Lost flicker when inliers wander
+                // around the acquire threshold. Pair with the
+                // IMU-derived prior (if any) to short-circuit RANSAC.
+                let keep_min = self.config.tracker.min_inliers_keep_locked;
+                let result = self.cache.get(anchor_id).and_then(|a| {
+                    let candidate = track_against_anchor_with_prior(
+                        &a.anchor,
+                        gray,
+                        &self.config.tracker,
+                        keep_min,
+                        prior,
+                    )?;
+                    // Reject visibly-degenerate homographies even if
+                    // RANSAC accepted them. A low-inlier fit can be
+                    // mathematically valid but project some bitmap
+                    // corners to infinity, producing the
+                    // "huge diagonal streaks" rendering glitch.
+                    let dims = a.anchor.image_dims;
+                    if homography_is_sane(&candidate.homography, dims.0, dims.1) {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                });
                 if let Some(r) = result {
                     self.cache.touch(anchor_id);
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
@@ -413,6 +507,9 @@ impl LivePlanarEngine {
             last_homography: IDENTITY,
         };
         self.last_acquire_ns = timestamp_ns;
+        // New canonical frame: drop any IMU lock state — composing it
+        // with the new H would be meaningless.
+        self.last_imu_lock = None;
         Some(id)
     }
 
@@ -594,6 +691,7 @@ impl LivePlanarEngine {
         self.next_anchor_id = 1;
         self.last_acquire_ns = 0;
         self.stable_since_ns = None;
+        self.last_imu_lock = None;
     }
 
     // -- internal helpers --------------------------------------------------
@@ -663,6 +761,47 @@ impl LivePlanarEngine {
 }
 
 const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+/// Reject a homography if it would produce a visually-degenerate
+/// projection of the canonical frame's four corners. A "valid" matrix
+/// from RANSAC can still send some bitmap pixels to infinity (when the
+/// homogeneous `w` of a corner is near zero) or produce a wildly
+/// skewed trapezoid; either case manifests as the "huge diagonal
+/// streaks" rendering glitch. Three checks:
+///   1. all 4 corner projections must succeed (finite, non-degenerate `w`)
+///   2. no projected edge longer than 4× the canonical diagonal
+///   3. opposite edges within a 6× length ratio of each other
+fn homography_is_sane(h: &[f32; 9], canonical_w: u32, canonical_h: u32) -> bool {
+    let cw = canonical_w as f32;
+    let ch = canonical_h as f32;
+    let corners = [(0.0_f32, 0.0_f32), (cw, 0.0), (cw, ch), (0.0, ch)];
+    let mut p = [(0.0f32, 0.0f32); 4];
+    for (i, &(x, y)) in corners.iter().enumerate() {
+        match crate::homography::project(h, x, y) {
+            Some(q) if q.0.is_finite() && q.1.is_finite() => p[i] = q,
+            _ => return false,
+        }
+    }
+    let edge = |a: (f32, f32), b: (f32, f32)| -> f32 {
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+    };
+    let w_top = edge(p[0], p[1]);
+    let w_bot = edge(p[3], p[2]);
+    let h_left = edge(p[0], p[3]);
+    let h_right = edge(p[1], p[2]);
+    let max_edge = w_top.max(w_bot).max(h_left).max(h_right);
+    let orig_diag = (cw * cw + ch * ch).sqrt();
+    if !max_edge.is_finite() || max_edge > orig_diag * 4.0 {
+        return false;
+    }
+    let safe_min = |a: f32, b: f32| (a.min(b)).max(1.0);
+    let w_ratio = w_top.max(w_bot) / safe_min(w_top, w_bot);
+    let h_ratio = h_left.max(h_right) / safe_min(h_left, h_right);
+    if w_ratio > 6.0 || h_ratio > 6.0 {
+        return false;
+    }
+    true
+}
 
 /// One translated text region to render into the Phase-2 overlay
 /// bitmap. The bindings layer fills this in from the OCR + translation
