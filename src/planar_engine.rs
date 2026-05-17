@@ -555,20 +555,24 @@ impl LivePlanarEngine {
             return None;
         }
         let pixels = (frame_width as usize) * (frame_height as usize);
-        // Start from a transparent canvas with the *outline* of every
-        // item — including ones with no text yet. Gives the user
+        // Start from a transparent canvas with a translucent fill behind
+        // every item — including ones with no text yet. Gives the user
         // immediate "we've detected something here" feedback while
-        // recognise streams in. Failed-rec items will still be there
-        // after all batches complete; the Kotlin side filters those
-        // out by simply not including them in the next render call.
+        // recognise streams in, and the rendered text sits on this fill
+        // for legibility. Failed-rec items will still be there after all
+        // batches complete; the Kotlin side filters those out by simply
+        // not including them in the next render call. (The detector
+        // contour outline overlay is rendered separately by the Kotlin
+        // debug layer; no need to draw it here.)
         let mut rgba = vec![0u8; pixels * 4];
         for it in items {
-            draw_quad_outline(
+            let oriented = oriented_rect_from_corners(&it.quad);
+            fill_oriented_rect_blended(
                 &mut rgba,
                 frame_width,
                 frame_height,
-                &it.quad,
-                [0, 255, 255, 200],
+                &oriented,
+                argb_u32_to_rgba8(it.bg_argb),
             );
         }
         let blocks: Vec<PreparedTextBlock> = items
@@ -850,45 +854,48 @@ fn oriented_rect_from_corners(quad: &[(f32, f32); 4]) -> OrientedRect {
 // Tiny rasterizer for Phase 1 verification. Once Phase 2 lands we route
 // through `image_render::render_overlay` instead and these go away.
 
-fn draw_quad_outline(rgba: &mut [u8], w: u32, h: u32, quad: &[(f32, f32); 4], color: [u8; 4]) {
-    for i in 0..4 {
-        draw_line(rgba, w, h, quad[i], quad[(i + 1) % 4], color);
-    }
+fn argb_u32_to_rgba8(argb: u32) -> [u8; 4] {
+    let a = ((argb >> 24) & 0xff) as u8;
+    let r = ((argb >> 16) & 0xff) as u8;
+    let g = ((argb >> 8) & 0xff) as u8;
+    let b = (argb & 0xff) as u8;
+    [r, g, b, a]
 }
 
-fn draw_line(rgba: &mut [u8], w: u32, h: u32, a: (f32, f32), b: (f32, f32), color: [u8; 4]) {
-    // Bresenham; clip pixels outside the buffer.
-    let mut x0 = a.0.round() as i32;
-    let mut y0 = a.1.round() as i32;
-    let x1 = b.0.round() as i32;
-    let y1 = b.1.round() as i32;
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let max_iter = (dx.max(-dy)) + 8;
-    let mut iter = 0;
-    loop {
-        if iter > max_iter {
-            break;
-        }
-        iter += 1;
-        if x0 >= 0 && y0 >= 0 && (x0 as u32) < w && (y0 as u32) < h {
-            let idx = ((y0 as u32 * w + x0 as u32) * 4) as usize;
-            blend_pixel(&mut rgba[idx..idx + 4], color);
-        }
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
+/// Alpha-blend a flat colour into the canvas across the oriented rect.
+/// Pixels outside the rect (or canvas) are left untouched. Mirrors
+/// `image_render`'s blending semantics so the rendered text composites
+/// cleanly on top.
+fn fill_oriented_rect_blended(
+    rgba: &mut [u8],
+    w: u32,
+    h: u32,
+    rect: &crate::ocr::OrientedRect,
+    color: [u8; 4],
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let cos = rect.angle_radians.cos();
+    let sin = rect.angle_radians.sin();
+    let hw = rect.width * 0.5;
+    let hh = rect.height * 0.5;
+    // AABB of the rect, clipped to the canvas.
+    let half_diag = (hw * hw + hh * hh).sqrt();
+    let min_x = ((rect.cx - half_diag).floor() as i32).max(0) as u32;
+    let min_y = ((rect.cy - half_diag).floor() as i32).max(0) as u32;
+    let max_x = ((rect.cx + half_diag).ceil() as i32).max(0).min(w as i32) as u32;
+    let max_y = ((rect.cy + half_diag).ceil() as i32).max(0).min(h as i32) as u32;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let dx = x as f32 + 0.5 - rect.cx;
+            let dy = y as f32 + 0.5 - rect.cy;
+            let lx = dx * cos + dy * sin;
+            let ly = -dx * sin + dy * cos;
+            if lx.abs() <= hw && ly.abs() <= hh {
+                let idx = ((y * w + x) * 4) as usize;
+                blend_pixel(&mut rgba[idx..idx + 4], color);
+            }
         }
     }
 }
