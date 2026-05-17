@@ -788,7 +788,7 @@ pub fn render_text_overlay_bitmap(
 /// left-aligned text starting `pad` px inside the bg's rounded edge,
 /// with `pad` px of bg breathing room on the right of short lines.
 #[cfg(feature = "image-render")]
-const OVERLAY_TEXT_HORIZONTAL_INSET_PX: f32 = 8.0;
+pub const OVERLAY_TEXT_HORIZONTAL_INSET_PX: f32 = 8.0;
 
 /// Reject a homography if it would produce a visually-degenerate
 /// projection of the canonical frame's four corners. A "valid" matrix
@@ -894,7 +894,7 @@ fn argb_u32_to_rgba8(argb: u32) -> [u8; 4] {
 ///
 /// All bg fills are expected to use the same RGB; callers paint into a
 /// freshly-zeroed canvas before the text rasterizer runs.
-fn fill_oriented_rect_blended(
+pub fn fill_oriented_rect_blended(
     rgba: &mut [u8],
     w: u32,
     h: u32,
