@@ -12,6 +12,8 @@ pub mod doc_align_refine;
 pub mod font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_provider;
+#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+pub mod homography;
 #[cfg(feature = "html")]
 pub mod html_translate;
 #[cfg(feature = "image-render")]
@@ -22,8 +24,6 @@ pub mod language;
 pub mod language_detect;
 #[cfg(feature = "ppocr")]
 pub mod live_frame;
-#[cfg(feature = "ppocr")]
-pub mod live_tracking;
 #[cfg(feature = "ppocr")]
 mod mnn_inference;
 #[cfg(feature = "mucab")]
@@ -55,6 +55,10 @@ mod pdf_text_overlay;
 pub mod pdf_translate;
 #[cfg(feature = "pdf")]
 pub mod pdf_write;
+#[cfg(feature = "planar-tracker")]
+pub mod planar_engine;
+#[cfg(feature = "planar-tracker")]
+pub mod planar_tracker;
 #[cfg(feature = "ppocr")]
 pub mod ppocr;
 mod routing;

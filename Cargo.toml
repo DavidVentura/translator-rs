@@ -52,6 +52,7 @@ pdf-image-translate = [
 ]
 doc-align = ["dep:ort", "dep:ndarray"]
 ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon"]
+planar-tracker = ["dep:image", "dep:imageproc", "image-render"]
 
 [dependencies]
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
@@ -130,8 +131,19 @@ name = "ppocr_tilt_dump"
 path = "tests/ppocr_tilt_dump.rs"
 required-features = ["ppocr"]
 
+[[test]]
+name = "planar_tracker_synthetic"
+path = "tests/planar_tracker_synthetic.rs"
+required-features = ["planar-tracker"]
+
+[[test]]
+name = "planar_engine_lifecycle"
+path = "tests/planar_engine_lifecycle.rs"
+required-features = ["planar-tracker"]
+
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }
 
 # [patch."https://github.com/DavidVentura/mupdf-rs"]
 # piper-rs = { path = "../mupdf-rs" }
+

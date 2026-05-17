@@ -1,0 +1,455 @@
+//! Lifecycle + LRU cache tests for `planar_engine::LivePlanarEngine`.
+//!
+//! These cover Phases D, E, F, G state-machine behaviour:
+//!   - Idle waits for IMU stability before reporting Acquiring
+//!   - acquire_now → Locked
+//!   - Locked frame with same scene → still Locked, fresh homography
+//!   - Locked frame with unrelated scene → eventually Lost
+//!   - Lost with no recovery → eventually Idle
+//!   - LRU: A → B → A returns the *same* anchor id (page-flip case)
+//!   - Refresh: anchor older than `anchor_refresh_age_ns` triggers refresh
+//!
+//! Uses synthetic warps as the per-frame "current image" so we have
+//! exact ground truth and no I/O variability.
+#![cfg(feature = "planar-tracker")]
+
+use std::f32::consts::PI;
+use std::path::PathBuf;
+
+use image::imageops::FilterType;
+use image::{GrayImage, Luma};
+use imageproc::geometric_transformations::{Interpolation, Projection, warp};
+
+use translator::planar_engine::{
+    AnchorId, CanonicalOverlay, EngineConfig, LivePlanarEngine, TrackerCommand,
+};
+use translator::planar_tracker::TrackerConfig;
+
+fn fixture(name: &str) -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("files");
+    p.push("live-overlay");
+    p.push(name);
+    p
+}
+
+fn load_gray(name: &str, short_edge_px: u32) -> GrayImage {
+    let img = image::open(fixture(name)).expect("open fixture");
+    let (w, h) = (img.width(), img.height());
+    let (nw, nh) = if w <= h {
+        let nw = short_edge_px;
+        let nh = (h as f32 * (short_edge_px as f32 / w as f32)).round() as u32;
+        (nw, nh)
+    } else {
+        let nh = short_edge_px;
+        let nw = (w as f32 * (short_edge_px as f32 / h as f32)).round() as u32;
+        (nw, nh)
+    };
+    img.resize_exact(nw, nh, FilterType::Triangle).to_luma8()
+}
+
+fn warp_with_h(src: &GrayImage, h: &[f32; 9]) -> GrayImage {
+    let projection = Projection::from_matrix(*h).expect("projection invertible");
+    warp(src, &projection, Interpolation::Bilinear, Luma([0u8]))
+}
+
+fn test_engine_config() -> EngineConfig {
+    EngineConfig {
+        tracker: TrackerConfig {
+            fast_threshold: 20,
+            max_features: 800,
+            lowe_ratio: 0.8,
+            ransac_residual_px: 3.0,
+            ransac_iters: 400,
+            min_inliers: 20,
+            nms_radius: 3,
+        },
+        anchor_cache_size: 5,
+        // No cooldown for tests — they re-acquire intentionally.
+        acquire_cooldown_ns: 0,
+        lost_after_frames: 3,
+        give_up_after_frames: 5,
+        stable_required_ns: 100_000_000,
+        anchor_refresh_age_ns: 5_000_000_000,
+    }
+}
+
+#[test]
+fn acquire_then_track_same_frame() {
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+
+    let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    assert!(matches!(
+        engine.process_frame(&gray, true, 2_000_000),
+        TrackerCommand::Locked {
+            anchor_id, is_new: false, ..
+        } if anchor_id == id
+    ));
+    assert_eq!(engine.cache_len(), 1);
+}
+
+#[test]
+fn locked_through_known_translation() {
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+
+    let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    let translated = warp_with_h(&gray, &[1.0, 0.0, 8.0, 0.0, 1.0, -4.0, 0.0, 0.0, 1.0]);
+    let cmd = engine.process_frame(&translated, true, 2_000_000);
+    match cmd {
+        TrackerCommand::Locked {
+            anchor_id,
+            inliers,
+            is_new,
+            ..
+        } => {
+            assert_eq!(anchor_id, id);
+            assert!(!is_new);
+            assert!(inliers >= 20, "expected ≥20 inliers, got {}", inliers);
+        }
+        other => panic!("expected Locked, got {:?}", other),
+    }
+}
+
+#[test]
+fn lost_then_recovered_via_same_anchor() {
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let other = warp_with_h(
+        &load_gray("sign.jpg", 480),
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    // Resize sign to book's dims so it's not a dimensional mismatch.
+    let other = image::DynamicImage::ImageLuma8(other)
+        .resize_exact(gray.width(), gray.height(), FilterType::Triangle)
+        .to_luma8();
+
+    let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    // Three lost frames → Lost.
+    for i in 0..test_engine_config().lost_after_frames {
+        let cmd = engine.process_frame(&other, false, 2_000_000 + i as u64 * 1_000_000);
+        if i == test_engine_config().lost_after_frames - 1 {
+            assert!(
+                matches!(cmd, TrackerCommand::Lost { last_anchor_id } if last_anchor_id == id),
+                "expected Lost at i={}, got {:?}",
+                i,
+                cmd
+            );
+        }
+    }
+    // Re-show original frame → should re-lock via cached anchor.
+    let cmd = engine.process_frame(&gray, true, 10_000_000);
+    assert!(
+        matches!(cmd, TrackerCommand::Locked { anchor_id, .. } if anchor_id == id),
+        "expected re-lock onto cached anchor; got {:?}",
+        cmd
+    );
+}
+
+#[test]
+fn lost_to_idle_after_give_up() {
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let other = load_gray("sign.jpg", 480);
+    let other = image::DynamicImage::ImageLuma8(other)
+        .resize_exact(gray.width(), gray.height(), FilterType::Triangle)
+        .to_luma8();
+
+    engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    // Feed enough unrelated frames to walk through Locked-loss then Lost-give-up.
+    let total = test_engine_config().lost_after_frames + test_engine_config().give_up_after_frames;
+    let mut last_cmd = TrackerCommand::Idle;
+    for i in 0..(total + 1) {
+        last_cmd = engine.process_frame(&other, false, 2_000_000 + i as u64 * 1_000_000);
+    }
+    assert!(
+        matches!(last_cmd, TrackerCommand::Idle),
+        "expected Idle after give-up; got {:?}",
+        last_cmd
+    );
+}
+
+#[test]
+fn idle_waits_for_imu_stability() {
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+
+    // Moving camera → Idle, never Acquiring.
+    let cmd = engine.process_frame(&gray, false, 1_000_000);
+    assert!(matches!(cmd, TrackerCommand::Idle));
+
+    // Stable but not long enough.
+    let cmd = engine.process_frame(&gray, true, 2_000_000);
+    assert!(matches!(cmd, TrackerCommand::Idle));
+
+    // Now stable long enough — engine reports Acquiring.
+    let cmd = engine.process_frame(&gray, true, 200_000_000);
+    assert!(
+        matches!(cmd, TrackerCommand::Acquiring),
+        "expected Acquiring, got {:?}",
+        cmd
+    );
+}
+
+#[test]
+fn lru_page_flip_returns_same_anchor() {
+    // Capture two distinct scenes, flip back to the first, assert the
+    // engine snaps onto the cached anchor (same id), no re-OCR needed.
+    let mut cfg = test_engine_config();
+    cfg.acquire_cooldown_ns = 0;
+    let mut engine = LivePlanarEngine::new(cfg);
+    let scene_a = load_gray("book.jpg", 480);
+    let scene_b = load_gray("sign.jpg", 480);
+    let scene_b = image::DynamicImage::ImageLuma8(scene_b)
+        .resize_exact(scene_a.width(), scene_a.height(), FilterType::Triangle)
+        .to_luma8();
+
+    let id_a = engine.acquire_now(&scene_a, 1_000_000).expect("acquire A");
+    // Force-acquire B (cooldown=0).
+    let id_b = engine.acquire_now(&scene_b, 2_000_000).expect("acquire B");
+    assert_ne!(id_a, id_b);
+
+    // Flip back to scene A. Process_frame should match the cached A
+    // anchor and report Locked with id_a.
+    let cmd = engine.process_frame(&scene_a, true, 3_000_000);
+    match cmd {
+        TrackerCommand::Locked {
+            anchor_id, is_new, ..
+        } => {
+            assert_eq!(anchor_id, id_a, "expected cached A, got {}", anchor_id);
+            assert!(!is_new, "cached re-lock should not set is_new");
+        }
+        other => panic!("expected Locked re-onto A, got {:?}", other),
+    }
+}
+
+#[test]
+fn lru_eviction_at_capacity() {
+    let mut cfg = test_engine_config();
+    cfg.anchor_cache_size = 2;
+    let mut engine = LivePlanarEngine::new(cfg);
+    let scene = load_gray("book.jpg", 480);
+
+    // Forcibly create more distinct anchors than the cache holds.
+    // Different timestamps; each acquire creates a new anchor since we
+    // ignore the cooldown in test config.
+    let id1 = engine.acquire_now(&scene, 1_000).expect("a1");
+    let id2 = engine.acquire_now(&scene, 2_000).expect("a2");
+    let id3 = engine.acquire_now(&scene, 3_000).expect("a3");
+
+    let ids = engine.cached_anchor_ids();
+    assert_eq!(engine.cache_len(), 2);
+    assert!(ids.contains(&id3), "newest must remain");
+    assert!(ids.contains(&id2), "second-newest must remain");
+    assert!(!ids.contains(&id1), "oldest must have been evicted");
+}
+
+#[test]
+fn refresh_after_age_threshold() {
+    let mut cfg = test_engine_config();
+    cfg.anchor_refresh_age_ns = 1_000_000_000; // 1s for test
+    let mut engine = LivePlanarEngine::new(cfg);
+    let gray = load_gray("book.jpg", 480);
+
+    let id = engine.acquire_now(&gray, 0).expect("acquire");
+    assert!(!engine.should_refresh(id, 500_000_000));
+    assert!(engine.should_refresh(id, 1_500_000_000));
+}
+
+#[test]
+fn overlays_project_through_homography() {
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+
+    let overlays = vec![CanonicalOverlay {
+        id: 42,
+        quad: [
+            (100.0, 100.0),
+            (200.0, 100.0),
+            (200.0, 160.0),
+            (100.0, 160.0),
+        ],
+        payload: "hello".to_string(),
+    }];
+    assert!(engine.set_overlays(id, overlays.clone()));
+
+    // Apply a known rotation about the image centre and check that the
+    // projected quad lands where we expect.
+    let cx = gray.width() as f32 / 2.0;
+    let cy = gray.height() as f32 / 2.0;
+    let theta = 12.0 * PI / 180.0;
+    let h = h_rotate_about(cx, cy, theta);
+
+    let projected = engine.project_overlays(id, &h);
+    assert_eq!(projected.len(), 1);
+    let p = &projected[0];
+    assert_eq!(p.id, 42);
+    assert_eq!(p.payload, "hello");
+
+    let (s, c) = theta.sin_cos();
+    for (i, &(x, y)) in overlays[0].quad.iter().enumerate() {
+        let dx = x - cx;
+        let dy = y - cy;
+        let ex = cx + c * dx - s * dy;
+        let ey = cy + s * dx + c * dy;
+        let (ax, ay) = p.quad[i];
+        let err = ((ax - ex).powi(2) + (ay - ey).powi(2)).sqrt();
+        assert!(err < 1e-3, "overlay corner {} drift {}", i, err);
+    }
+}
+
+#[test]
+fn force_acquire_during_lost_state() {
+    // After we give up on tracking, a fresh acquire_now should still
+    // work (no permanent failure state).
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let other = load_gray("sign.jpg", 480);
+    let other = image::DynamicImage::ImageLuma8(other)
+        .resize_exact(gray.width(), gray.height(), FilterType::Triangle)
+        .to_luma8();
+
+    engine.acquire_now(&gray, 1_000_000).expect("acquire 1");
+    for i in 0..30 {
+        engine.process_frame(&other, false, 2_000_000 + i * 1_000_000);
+    }
+    let new_id = engine.acquire_now(&gray, 1_000_000_000).expect("acquire 2");
+    let cmd = engine.process_frame(&gray, true, 1_001_000_000);
+    assert!(
+        matches!(cmd, TrackerCommand::Locked { anchor_id, .. } if anchor_id == new_id),
+        "expected new lock, got {:?}",
+        cmd
+    );
+}
+
+#[test]
+fn bitmap_overlay_outline_inside_outside_alpha() {
+    // Rasterizer unit test for the Phase 2 bitmap path: place a known
+    // canonical overlay quad, render the bitmap with empty translated
+    // text (so only the cyan outline is drawn), and verify pixels on
+    // the outline have non-zero alpha while pixels far away don't.
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let anchor_id = engine.acquire_now(&gray, 1_000).expect("acquire");
+
+    let canonical_quad = [
+        (100.0_f32, 100.0_f32),
+        (200.0_f32, 100.0_f32),
+        (200.0_f32, 150.0_f32),
+        (100.0_f32, 150.0_f32),
+    ];
+    let overlay = CanonicalOverlay {
+        id: 42,
+        quad: canonical_quad,
+        payload: String::new(),
+    };
+    assert!(engine.set_overlays(anchor_id, vec![overlay]));
+
+    let w = gray.width();
+    let h = gray.height();
+    let items = vec![translator::planar_engine::TextRenderItem {
+        id: 42,
+        quad: canonical_quad,
+        translated_text: String::new(),
+        source_text: String::new(),
+        language: String::new(),
+        bg_argb: 0,
+        fg_argb: 0,
+        suggested_font_px: 16.0,
+    }];
+    let bitmap = engine
+        .render_text_overlay_bitmap(w, h, &items, &translator::font_provider::NoFontProvider)
+        .expect("bitmap rendered");
+    assert_eq!(bitmap.len(), (w as usize) * (h as usize) * 4);
+
+    let alpha_at = |x: u32, y: u32| -> u8 { bitmap[((y * w + x) * 4 + 3) as usize] };
+
+    // TL corner of the quad — outline pixel, should be opaque.
+    assert!(alpha_at(100, 100) > 0, "expected non-zero alpha at quad TL");
+    // Far outside the quad — should be untouched (alpha 0).
+    assert_eq!(alpha_at(10, 10), 0, "expected alpha=0 outside quad");
+    assert_eq!(alpha_at(300, 300), 0, "expected alpha=0 outside quad");
+}
+
+#[test]
+fn bitmap_pipeline_round_trip_under_translation() {
+    // End-to-end check that the bitmap pipeline aligns with the rest
+    // of the system: apply a known H to a real photo, track, recover
+    // H', then verify that projecting overlay corners through H'
+    // matches projecting through the known H within a small pixel
+    // budget. This is the canonical pixel-correctness check for the
+    // bitmap+coord stack.
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let anchor_id = engine.acquire_now(&gray, 1_000).expect("acquire");
+
+    let canonical_quad = [
+        (140.0_f32, 220.0_f32),
+        (260.0_f32, 220.0_f32),
+        (260.0_f32, 270.0_f32),
+        (140.0_f32, 270.0_f32),
+    ];
+    let overlay = CanonicalOverlay {
+        id: 7,
+        quad: canonical_quad,
+        payload: String::new(),
+    };
+    assert!(engine.set_overlays(anchor_id, vec![overlay]));
+
+    let known = [1.0, 0.0, 11.0, 0.0, 1.0, -7.0, 0.0, 0.0, 1.0];
+    let warped = warp_with_h(&gray, &known);
+    let cmd = engine.process_frame(&warped, true, 2_000);
+    let recovered = match cmd {
+        TrackerCommand::Locked { homography, .. } => homography,
+        other => panic!("expected Locked, got {:?}", other),
+    };
+
+    let projected = engine.project_overlays(anchor_id, &recovered);
+    assert_eq!(projected.len(), 1);
+    let p = &projected[0];
+    for i in 0..4 {
+        let (cx, cy) = canonical_quad[i];
+        let (ex, ey) =
+            translator::homography::project(&known, cx, cy).expect("known projection valid");
+        let (rx, ry) = p.quad[i];
+        let err = ((rx - ex).powi(2) + (ry - ey).powi(2)).sqrt();
+        assert!(
+            err < 2.0,
+            "overlay corner {} drift: recovered=({}, {}) expected=({}, {}) err={}",
+            i,
+            rx,
+            ry,
+            ex,
+            ey,
+            err
+        );
+    }
+}
+
+fn h_rotate_about(cx: f32, cy: f32, theta: f32) -> [f32; 9] {
+    let (s, c) = theta.sin_cos();
+    let t_pos = [1.0, 0.0, cx, 0.0, 1.0, cy, 0.0, 0.0, 1.0];
+    let t_neg = [1.0, 0.0, -cx, 0.0, 1.0, -cy, 0.0, 0.0, 1.0];
+    let r = [c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0];
+    let m = mat3_mul_test(&r, &t_neg);
+    mat3_mul_test(&t_pos, &m)
+}
+
+fn mat3_mul_test(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
+    let mut out = [0.0_f32; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s = 0.0_f32;
+            for k in 0..3 {
+                s += a[i * 3 + k] * b[k * 3 + j];
+            }
+            out[i * 3 + j] = s;
+        }
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn assert_anchor_id_nonzero(_id: AnchorId) {}
