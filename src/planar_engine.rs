@@ -1012,13 +1012,21 @@ fn homography_is_sane(h: &[f32; 9], canonical_w: u32, canonical_h: u32) -> bool 
     let h_right = edge(p[1], p[2]);
     let max_edge = w_top.max(w_bot).max(h_left).max(h_right);
     let orig_diag = (cw * cw + ch * ch).sqrt();
-    if !max_edge.is_finite() || max_edge > orig_diag * 4.0 {
+    // Tightened from 4.0× to 2.0× canonical diagonal: catches more of
+    // the moderately-bad fits that pass the looser bound but still
+    // produce visible warp. A genuinely-tilted surface at 45° has
+    // edges ~√2 × canonical, so 2.0 leaves headroom; anything beyond
+    // that is the perspective-DoF-noise regime, not a real view.
+    if !max_edge.is_finite() || max_edge > orig_diag * 2.0 {
         return false;
     }
     let safe_min = |a: f32, b: f32| (a.min(b)).max(1.0);
     let w_ratio = w_top.max(w_bot) / safe_min(w_top, w_bot);
     let h_ratio = h_left.max(h_right) / safe_min(h_left, h_right);
-    if w_ratio > 6.0 || h_ratio > 6.0 {
+    // Tightened from 6.0× to 3.0×: catches lopsided trapezoids that
+    // are mathematically valid homographies but indicate a fit
+    // driven by an under-spread inlier cluster.
+    if w_ratio > 3.0 || h_ratio > 3.0 {
         return false;
     }
     true

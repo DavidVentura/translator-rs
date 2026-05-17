@@ -12,7 +12,7 @@
 
 use image::GrayImage;
 
-use crate::homography::{fit_homography, invert, mat3_mul, project};
+use crate::homography::{fit_affine, fit_homography, fit_similarity, invert, mat3_mul, project};
 
 /// BRIEF descriptor length in bits. 256 is the original BRIEF default;
 /// 32 bytes per keypoint, Hamming distance fits in a u32.
@@ -128,11 +128,12 @@ impl Default for TrackerConfig {
             ransac_residual_px: 4.0,
             ransac_iters: 200,
             min_inliers: 12,
-            // Hysteresis floor for keeping a Locked track. 8 is the
-            // minimum that empirically avoids "9-inlier degenerate
-            // homography" cases — below ~8 the RANSAC fit can be
-            // near-singular and the per-pixel projection sends some
-            // bitmap corners to infinity, drawing huge skewed streaks.
+            // Hysteresis floor for keeping a Locked track. 8 is well
+            // above the 2-point minimum for the similarity fit; at the
+            // sparse end the RANSAC final-refit drops to similarity
+            // (4 DoF) so a fit with 8-14 inliers no longer produces
+            // degenerate homographies. See the adaptive-model branch
+            // in `ransac_homography_with_prior`.
             min_inliers_keep_locked: 8,
             nms_radius: 3,
         }
@@ -452,7 +453,22 @@ pub fn ransac_homography_with_prior(
     let _ = best_h?;
     let inlier_pairs: Vec<(f32, f32, f32, f32)> =
         best_inliers_idx.iter().map(|&i| pairs[i]).collect();
-    let refined = fit_homography(&inlier_pairs)?;
+    // Adaptive model: pick fitter complexity by inlier count. At sparse
+    // inlier counts the 8-DoF homography fit is under-constrained — the
+    // perspective entries (h6/h7) and the implicit rotation get driven
+    // by noise, producing frame-to-frame jitter (sub-30 inliers) or
+    // sudden 30°+ rotation jumps (<20 inliers). Affine drops to 6 DoF
+    // (no perspective); similarity drops to 4 DoF (uniform scale +
+    // explicit rotation parameter), both stable at the sparse end.
+    // Above ~30 inliers the full homography wins back its real
+    // perspective expressiveness on actually-tilted surfaces.
+    let refined = if inlier_pairs.len() >= 30 {
+        fit_homography(&inlier_pairs)?
+    } else if inlier_pairs.len() >= 15 {
+        fit_affine(&inlier_pairs)?
+    } else {
+        fit_similarity(&inlier_pairs)?
+    };
     let mut residuals: Vec<f32> = Vec::with_capacity(inlier_pairs.len());
     for &(px, py, qx, qy) in &inlier_pairs {
         if let Some((px2, py2)) = project(&refined, px, py) {
