@@ -72,6 +72,12 @@ fn test_engine_config() -> EngineConfig {
         give_up_after_frames: 5,
         stable_required_ns: 100_000_000,
         anchor_refresh_age_ns: 5_000_000_000,
+        // Disable handoff by default in lifecycle tests so the
+        // single-anchor semantics keep matching expectations. The
+        // dedicated chain tests override these to force handoffs.
+        handoff_min_inliers: 0,
+        handoff_min_visible_ratio: 0.0,
+        handoff_cooldown_ns: u64::MAX / 2,
     }
 }
 
@@ -509,3 +515,117 @@ fn mat3_mul_test(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
 
 #[allow(dead_code)]
 fn assert_anchor_id_nonzero(_id: AnchorId) {}
+
+/// v0 chain test: force a sequence of handoffs by configuring the
+/// trigger to fire on virtually any motion, pan back to the original
+/// frame, and verify the engine re-locks onto the root anchor without
+/// a re-acquire. Also verifies that the externally-emitted homography
+/// projects overlays correctly through the chain.
+#[test]
+fn anchor_chain_persists_overlays_across_handoffs() {
+    let mut cfg = test_engine_config();
+    // Force handoff on essentially any motion: any frame with <95%
+    // keypoint visibility OR <1000 inliers (always) triggers a spawn.
+    cfg.handoff_min_inliers = 1000;
+    cfg.handoff_min_visible_ratio = 0.95;
+    cfg.handoff_cooldown_ns = 0;
+    let mut engine = LivePlanarEngine::new(cfg);
+    let gray = load_gray("book.jpg", 480);
+    let root_id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    assert_eq!(engine.current_anchor(), Some(root_id));
+
+    // Attach an overlay to the root that we'll project through the
+    // chain to verify correctness at every hop.
+    let canonical_quad = [
+        (140.0_f32, 220.0),
+        (260.0, 220.0),
+        (260.0, 270.0),
+        (140.0, 270.0),
+    ];
+    let overlay = CanonicalOverlay {
+        id: 99,
+        quad: canonical_quad,
+        payload: "anchor".to_string(),
+    };
+    assert!(engine.set_overlays(root_id, vec![overlay]));
+
+    // Walk through 3 successive translations. Each frame's external
+    // homography should equal the applied translation (because overlays
+    // live in root coords and translations are exact).
+    let translations: [[f32; 9]; 3] = [
+        [1.0, 0.0, 6.0, 0.0, 1.0, -3.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 14.0, 0.0, 1.0, -8.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 22.0, 0.0, 1.0, -14.0, 0.0, 0.0, 1.0],
+    ];
+    let mut t_ns = 2_000_000_u64;
+    for (i, h_known) in translations.iter().enumerate() {
+        let warped = warp_with_h(&gray, h_known);
+        let cmd = engine.process_frame(&warped, true, t_ns);
+        let (anchor_id, homography) = match cmd {
+            TrackerCommand::Locked {
+                anchor_id,
+                homography,
+                ..
+            } => (anchor_id, homography),
+            other => panic!("hop {} expected Locked, got {:?}", i, other),
+        };
+        assert_eq!(
+            anchor_id, root_id,
+            "hop {}: externally-emitted anchor id should stay = root",
+            i
+        );
+        // Project the root overlay through the chain-composed H and
+        // compare against the known projection. Allow a few px of
+        // chain drift — RANSAC residual compounds per hop.
+        let projected = engine.project_overlays(root_id, &homography);
+        assert_eq!(projected.len(), 1);
+        for c in 0..4 {
+            let (cx, cy) = canonical_quad[c];
+            let (ex, ey) =
+                translator::homography::project(h_known, cx, cy).expect("known projection valid");
+            let (rx, ry) = projected[0].quad[c];
+            let err = ((rx - ex).powi(2) + (ry - ey).powi(2)).sqrt();
+            assert!(
+                err < 4.0,
+                "hop {}: overlay corner {} drift {} (recovered=({},{}) expected=({},{}))",
+                i,
+                c,
+                err,
+                rx,
+                ry,
+                ex,
+                ey
+            );
+        }
+        t_ns += 1_000_000;
+    }
+    // Cache should have grown: root + at least one handoff anchor.
+    assert!(
+        engine.cache_len() >= 2,
+        "expected chain growth, cache_len={}",
+        engine.cache_len()
+    );
+
+    // Now pan all the way back to the original frame. The engine
+    // should re-lock on the root anchor (potentially via fallback
+    // through cached anchors). No re-acquire.
+    let cmd = engine.process_frame(&gray, true, t_ns + 100_000_000);
+    match cmd {
+        TrackerCommand::Locked {
+            anchor_id,
+            homography,
+            ..
+        } => {
+            assert_eq!(anchor_id, root_id, "come-back should re-emit root id");
+            // Identity homography means we're back at root canonical coords.
+            let projected = engine.project_overlays(root_id, &homography);
+            for c in 0..4 {
+                let (cx, cy) = canonical_quad[c];
+                let (rx, ry) = projected[0].quad[c];
+                let err = ((rx - cx).powi(2) + (ry - cy).powi(2)).sqrt();
+                assert!(err < 4.0, "come-back: overlay corner {} drift {}", c, err);
+            }
+        }
+        other => panic!("expected Locked on come-back, got {:?}", other),
+    }
+}

@@ -11,6 +11,7 @@
 
 use image::GrayImage;
 
+use crate::homography::mat3_mul;
 use crate::imu_prior::{CameraIntrinsics, predict_canonical_to_current};
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
@@ -103,6 +104,17 @@ pub struct EngineConfig {
     /// scene is still locked, `should_refresh` will return true so
     /// Kotlin can re-run OCR to absorb new text.
     pub anchor_refresh_age_ns: u64,
+    /// Spawn a new (handoff) anchor when the active anchor's per-frame
+    /// RANSAC inlier count falls below this. Picked well above the
+    /// wobble floor so the handoff homography fit is also stable.
+    pub handoff_min_inliers: usize,
+    /// Spawn a new (handoff) anchor when this fraction of the active
+    /// anchor's keypoints fail to project inside the viewport — i.e.
+    /// most features are about to leave the frame.
+    pub handoff_min_visible_ratio: f32,
+    /// Cooldown between successive handoffs. Prevents churn when
+    /// inliers oscillate near the trigger threshold.
+    pub handoff_cooldown_ns: u64,
 }
 
 impl Default for EngineConfig {
@@ -115,7 +127,13 @@ impl Default for EngineConfig {
             // anchor matching a full-page view). The brief-loss
             // recovery within a single anchor still works because the
             // current anchor lives in the cache.
-            anchor_cache_size: 1,
+            // v0 surface-map persistence-on-pan: keep up to 5 anchors
+            // (1 root + up to 4 handoff anchors, or multiple distinct
+            // acquired roots in the page-flip case). Per-anchor cost is
+            // ~20 KB; the per-frame fallback (try other anchors when the
+            // active one fails) is bounded by cache size × ~5 ms/anchor
+            // = ~20 ms worst case at 5.
+            anchor_cache_size: 5,
             acquire_cooldown_ns: 250_000_000, // 250 ms — fast re-acquire after loss
             lost_after_frames: 15,            // ~0.5 s @ 30 fps
             // Recovery budget: 30 frames (~1 s) before we go Idle so a
@@ -125,6 +143,9 @@ impl Default for EngineConfig {
             give_up_after_frames: 30,
             stable_required_ns: 200_000_000,       // 200 ms
             anchor_refresh_age_ns: 30_000_000_000, // 30 s
+            handoff_min_inliers: 50,
+            handoff_min_visible_ratio: 0.6,
+            handoff_cooldown_ns: 500_000_000, // 500 ms
         }
     }
 }
@@ -143,6 +164,9 @@ pub struct LivePlanarEngine {
     /// with an IMU-predicted prior on the next frame. Cleared on
     /// anchor switch, acquire, or sustained loss.
     last_imu_lock: Option<ImuLockState>,
+    /// Timestamp of the last handoff (anchor spawn from an existing
+    /// chain). Used to throttle handoffs via `handoff_cooldown_ns`.
+    last_spawn_ns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +192,17 @@ enum EngineState {
 
 struct CachedAnchor {
     anchor: SceneAnchor,
+    /// Populated only on root anchors (those created by `acquire_now`).
+    /// Handoff anchors carry empty overlays — their root holds them.
     overlays: Vec<CanonicalOverlay>,
+    /// The root this anchor projects through. `root_id == self_id` for
+    /// roots; for handoff descendants, points at the root in whose
+    /// canonical frame overlays live.
+    root_id: AnchorId,
+    /// Homography mapping root canonical → this anchor's canonical
+    /// frame. Identity for roots. `H_root_to_canonical · root_point`
+    /// gives the equivalent point in this anchor's canonical coords.
+    h_root_to_canonical: [f32; 9],
     created_at_ns: u64,
     last_locked_ns: u64,
 }
@@ -245,6 +279,7 @@ impl LivePlanarEngine {
             last_acquire_ns: 0,
             stable_since_ns: None,
             last_imu_lock: None,
+            last_spawn_ns: 0,
         }
     }
 
@@ -277,9 +312,18 @@ impl LivePlanarEngine {
         let prior = self.compute_imu_prior(imu_rotation_dev, intrinsics);
         let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, prior);
         // Stash the new IMU + H for next frame's prior, if we ended up Locked.
-        if let TrackerCommand::Locked { homography, .. } = &cmd {
+        // The IMU prior predicts in the *active anchor's* canonical frame, not
+        // the root's, so we read H_active→view from the engine state rather
+        // than the externally-emitted H_root→view from the TrackerCommand.
+        let active_h = match self.state {
+            EngineState::Locked {
+                last_homography, ..
+            } => Some(last_homography),
+            _ => None,
+        };
+        if let (TrackerCommand::Locked { .. }, Some(h)) = (&cmd, active_h) {
             self.last_imu_lock = Some(ImuLockState {
-                canonical_to_frame: *homography,
+                canonical_to_frame: h,
                 rotation_dev: *imu_rotation_dev,
                 timestamp_ns,
             });
@@ -320,9 +364,11 @@ impl LivePlanarEngine {
                 if !self.cache.is_empty() {
                     if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                         self.transition_to_locked(id, &result, timestamp_ns, false);
+                        let (root_id, h_root_to_view) =
+                            self.chain_homography(id, &result.homography);
                         return TrackerCommand::Locked {
-                            anchor_id: id,
-                            homography: result.homography,
+                            anchor_id: root_id,
+                            homography: h_root_to_view,
                             is_new: false,
                             inliers: result.inliers,
                         };
@@ -370,14 +416,53 @@ impl LivePlanarEngine {
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
                         entry.last_locked_ns = timestamp_ns;
                     }
+                    // External: emit the root id and the chain-composed
+                    // H_root→view. The handoff machinery is invisible
+                    // to Kotlin.
+                    let (root_id, h_root_to_view) = self.chain_homography(anchor_id, &r.homography);
+                    // Handoff trigger: spawn a new anchor while the
+                    // current one still has enough overlap to fit a
+                    // stable H_active→new. Inlier and visibility checks
+                    // both matter — see EngineConfig docs.
+                    let cooldown_elapsed = timestamp_ns.saturating_sub(self.last_spawn_ns)
+                        >= self.config.handoff_cooldown_ns;
+                    let visible_ratio = self
+                        .cache
+                        .get(anchor_id)
+                        .map(|a| {
+                            visible_keypoint_ratio(
+                                &a.anchor.positions,
+                                &r.homography,
+                                gray.width(),
+                                gray.height(),
+                            )
+                        })
+                        .unwrap_or(1.0);
+                    let needs_handoff = r.inliers < self.config.handoff_min_inliers
+                        || visible_ratio < self.config.handoff_min_visible_ratio;
+                    let new_active = if cooldown_elapsed && needs_handoff {
+                        self.spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
+                            .unwrap_or(anchor_id)
+                    } else {
+                        anchor_id
+                    };
+                    // If we handed off, the new anchor's canonical frame
+                    // IS this view, so its `last_homography` is identity.
+                    // Otherwise we stay on the old anchor with its
+                    // tracked H.
+                    let (new_state_h, new_state_id) = if new_active == anchor_id {
+                        (r.homography, anchor_id)
+                    } else {
+                        (IDENTITY, new_active)
+                    };
                     self.state = EngineState::Locked {
-                        anchor_id,
+                        anchor_id: new_state_id,
                         frames_lost: 0,
-                        last_homography: r.homography,
+                        last_homography: new_state_h,
                     };
                     return TrackerCommand::Locked {
-                        anchor_id,
-                        homography: r.homography,
+                        anchor_id: root_id,
+                        homography: h_root_to_view,
                         is_new: false,
                         inliers: r.inliers,
                     };
@@ -385,21 +470,23 @@ impl LivePlanarEngine {
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
                     self.transition_to_locked(id, &alt, timestamp_ns, false);
+                    let (root_id, h_root_to_view) = self.chain_homography(id, &alt.homography);
                     return TrackerCommand::Locked {
-                        anchor_id: id,
-                        homography: alt.homography,
+                        anchor_id: root_id,
+                        homography: h_root_to_view,
                         is_new: false,
                         inliers: alt.inliers,
                     };
                 }
                 let new_frames_lost = frames_lost + 1;
+                let root = self.root_of(anchor_id);
                 if new_frames_lost >= self.config.lost_after_frames {
                     self.state = EngineState::Lost {
                         last_anchor_id: anchor_id,
                         frames_lost: 0,
                     };
                     TrackerCommand::Lost {
-                        last_anchor_id: anchor_id,
+                        last_anchor_id: root,
                     }
                 } else {
                     self.state = EngineState::Locked {
@@ -413,7 +500,7 @@ impl LivePlanarEngine {
                         },
                     };
                     TrackerCommand::Lost {
-                        last_anchor_id: anchor_id,
+                        last_anchor_id: root,
                     }
                 }
             }
@@ -423,14 +510,16 @@ impl LivePlanarEngine {
             } => {
                 if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                     self.transition_to_locked(id, &result, timestamp_ns, false);
+                    let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
                     return TrackerCommand::Locked {
-                        anchor_id: id,
-                        homography: result.homography,
+                        anchor_id: root_id,
+                        homography: h_root_to_view,
                         is_new: false,
                         inliers: result.inliers,
                     };
                 }
                 let new_frames_lost = frames_lost + 1;
+                let root = self.root_of(last_anchor_id);
                 if new_frames_lost >= self.config.give_up_after_frames {
                     self.state = EngineState::Idle;
                     TrackerCommand::Idle
@@ -439,7 +528,9 @@ impl LivePlanarEngine {
                         last_anchor_id,
                         frames_lost: new_frames_lost,
                     };
-                    TrackerCommand::Lost { last_anchor_id }
+                    TrackerCommand::Lost {
+                        last_anchor_id: root,
+                    }
                 }
             }
         }
@@ -497,6 +588,10 @@ impl LivePlanarEngine {
             CachedAnchor {
                 anchor,
                 overlays: Vec::new(),
+                // `acquire_now` always creates a fresh root: this anchor
+                // owns its own overlays and starts a new chain.
+                root_id: id,
+                h_root_to_canonical: IDENTITY,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
             },
@@ -510,6 +605,9 @@ impl LivePlanarEngine {
         // New canonical frame: drop any IMU lock state — composing it
         // with the new H would be meaningless.
         self.last_imu_lock = None;
+        // Reset spawn cooldown — a fresh root means there's no chain
+        // yet to throttle.
+        self.last_spawn_ns = timestamp_ns;
         Some(id)
     }
 
@@ -596,8 +694,8 @@ impl LivePlanarEngine {
 
     pub fn current_anchor(&self) -> Option<AnchorId> {
         match self.state {
-            EngineState::Locked { anchor_id, .. } => Some(anchor_id),
-            EngineState::Lost { last_anchor_id, .. } => Some(last_anchor_id),
+            EngineState::Locked { anchor_id, .. } => Some(self.root_of(anchor_id)),
+            EngineState::Lost { last_anchor_id, .. } => Some(self.root_of(last_anchor_id)),
             EngineState::Idle => None,
         }
     }
@@ -617,9 +715,80 @@ impl LivePlanarEngine {
         self.last_acquire_ns = 0;
         self.stable_since_ns = None;
         self.last_imu_lock = None;
+        self.last_spawn_ns = 0;
     }
 
     // -- internal helpers --------------------------------------------------
+
+    /// Map an active-anchor id to its chain root. External APIs (the
+    /// `TrackerCommand` enum, `current_anchor`, etc.) speak in root
+    /// ids so Kotlin doesn't see the handoff machinery.
+    fn root_of(&self, active_id: AnchorId) -> AnchorId {
+        self.cache
+            .get(active_id)
+            .map(|a| a.root_id)
+            .unwrap_or(active_id)
+    }
+
+    /// Given a successful track of `active_id` with `h_active_to_view`,
+    /// return `(root_id, H_root→view)` — the pair the engine should
+    /// emit externally. The chain compose lets Kotlin keep treating
+    /// the engine as single-anchor: it sees the root id and a single
+    /// homography per frame, never the handoff anchors in between.
+    /// Falls back to `(active_id, h_active_to_view)` if the active
+    /// anchor isn't in the cache (shouldn't happen during normal flow).
+    fn chain_homography(
+        &self,
+        active_id: AnchorId,
+        h_active_to_view: &[f32; 9],
+    ) -> (AnchorId, [f32; 9]) {
+        match self.cache.get(active_id) {
+            Some(a) => {
+                let h_root_to_view = mat3_mul(h_active_to_view, &a.h_root_to_canonical);
+                (a.root_id, h_root_to_view)
+            }
+            None => (active_id, *h_active_to_view),
+        }
+    }
+
+    /// Spawn a handoff anchor from the current frame as a descendant
+    /// of the currently-active chain. Returns the new anchor id on
+    /// success, `None` if the new anchor doesn't carry enough features
+    /// to be useful. The new anchor's canonical frame *is* this view,
+    /// so `H_active→newCanonical = h_active_to_view`, and
+    /// `H_root→newCanonical = h_active_to_view · h_root_to_active`.
+    fn spawn_handoff(
+        &mut self,
+        gray: &GrayImage,
+        active_id: AnchorId,
+        h_active_to_view: &[f32; 9],
+        timestamp_ns: u64,
+    ) -> Option<AnchorId> {
+        let (root_id, h_root_to_active) = {
+            let active = self.cache.get(active_id)?;
+            (active.root_id, active.h_root_to_canonical)
+        };
+        let new_anchor = build_anchor(gray, &self.config.tracker, timestamp_ns)?;
+        if new_anchor.len() < self.config.tracker.min_inliers {
+            return None;
+        }
+        let h_root_to_new = mat3_mul(h_active_to_view, &h_root_to_active);
+        let new_id = self.next_anchor_id;
+        self.next_anchor_id += 1;
+        self.cache.insert(
+            new_id,
+            CachedAnchor {
+                anchor: new_anchor,
+                overlays: Vec::new(),
+                root_id,
+                h_root_to_canonical: h_root_to_new,
+                created_at_ns: timestamp_ns,
+                last_locked_ns: timestamp_ns,
+            },
+        );
+        self.last_spawn_ns = timestamp_ns;
+        Some(new_id)
+    }
 
     fn tick_stable(&mut self, imu_stable: bool, timestamp_ns: u64) {
         if imu_stable {
@@ -789,6 +958,30 @@ pub fn render_text_overlay_bitmap(
 /// with `pad` px of bg breathing room on the right of short lines.
 #[cfg(feature = "image-render")]
 pub const OVERLAY_TEXT_HORIZONTAL_INSET_PX: f32 = 8.0;
+
+/// Fraction of an anchor's canonical-frame keypoints that, projected
+/// through `h` (canonical → view), land inside `(0..view_w, 0..view_h)`.
+/// Returns 0.0 for empty anchors and saturates at 1.0. Used by the
+/// handoff trigger: when too few features will be visible next frame,
+/// we want a new anchor while the current one still has enough
+/// overlap to fit `H_active→new` cleanly.
+fn visible_keypoint_ratio(positions: &[(f32, f32)], h: &[f32; 9], view_w: u32, view_h: u32) -> f32 {
+    if positions.is_empty() {
+        return 0.0;
+    }
+    let w = view_w as f32;
+    let h_ = view_h as f32;
+    let mut visible = 0usize;
+    for &(x, y) in positions {
+        let Some((vx, vy)) = crate::homography::project(h, x, y) else {
+            continue;
+        };
+        if vx >= 0.0 && vx < w && vy >= 0.0 && vy < h_ {
+            visible += 1;
+        }
+    }
+    visible as f32 / positions.len() as f32
+}
 
 /// Reject a homography if it would produce a visually-degenerate
 /// projection of the canonical frame's four corners. A "valid" matrix
