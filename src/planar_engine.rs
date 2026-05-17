@@ -533,16 +533,14 @@ impl LivePlanarEngine {
         }
     }
 
-    /// Phase 2: rasterize an overlay bitmap containing the *translated
-    /// text* for each item. Stateless — callers pass canonical-frame
-    /// dimensions plus a list of items (quad + text + colours + font
-    /// size) and get back RGBA8888 bytes ready to be wrapped in an
-    /// Android Bitmap.
-    ///
-    /// Hooks `image_render::render_overlay` (the same rasterizer the
-    /// PDF / image-translate path uses), so glyph shaping, font
-    /// fallback, fit-to-bbox sizing, and bg/fg compositing all match
-    /// what the PDF translation produces.
+    /// Backwards-compatible shim — delegates to the free
+    /// [`render_text_overlay_bitmap`] function so existing callers that
+    /// already hold an `&LivePlanarEngine` keep working. New callers
+    /// (uniffi `prepare_overlay_for_composite`) should call the free
+    /// function directly so they don't need to lock the engine mutex
+    /// for the duration of the raster — which is what was blocking the
+    /// detector thread (and therefore the display pipeline) during the
+    /// 50–100 ms it takes to rasterize a dense page.
     #[cfg(feature = "image-render")]
     pub fn render_text_overlay_bitmap(
         &self,
@@ -551,100 +549,7 @@ impl LivePlanarEngine {
         items: &[TextRenderItem],
         fonts: &dyn FontProvider,
     ) -> Option<Vec<u8>> {
-        if frame_width == 0 || frame_height == 0 {
-            return None;
-        }
-        let pixels = (frame_width as usize) * (frame_height as usize);
-        // Start from a transparent canvas with a translucent fill behind
-        // every item — including ones with no text yet. Gives the user
-        // immediate "we've detected something here" feedback while
-        // recognise streams in, and the rendered text sits on this fill
-        // for legibility. Failed-rec items will still be there after all
-        // batches complete; the Kotlin side filters those out by simply
-        // not including them in the next render call. (The detector
-        // contour outline overlay is rendered separately by the Kotlin
-        // debug layer; no need to draw it here.)
-        let mut rgba = vec![0u8; pixels * 4];
-        for it in items {
-            let oriented = oriented_rect_from_corners(&it.quad);
-            fill_oriented_rect_blended(
-                &mut rgba,
-                frame_width,
-                frame_height,
-                &oriented,
-                argb_u32_to_rgba8(it.bg_argb),
-            );
-        }
-        let blocks: Vec<PreparedTextBlock> = items
-            .iter()
-            .filter(|it| !it.translated_text.trim().is_empty())
-            .map(|it| {
-                let bg_box = oriented_rect_from_corners(&it.quad);
-                // Inset the *text* box horizontally so the left-aligned
-                // text starts inside the bg's rounded edge instead of
-                // flush against it. Must match the Kotlin-side
-                // `HORIZONTAL_PAD_PX` added when building `visualBox`.
-                // image_render's per-line formula puts the text origin
-                // at `oriented.cx - half_w` (line-local u=−half_w); since
-                // text_box is centred on bg_box, that becomes
-                // `bg_box.left + pad` — the desired left-with-padding
-                // placement.
-                let text_box = OrientedRect {
-                    cx: bg_box.cx,
-                    cy: bg_box.cy,
-                    width: (bg_box.width - 2.0 * OVERLAY_TEXT_HORIZONTAL_INSET_PX).max(1.0),
-                    height: bg_box.height,
-                    angle_radians: bg_box.angle_radians,
-                };
-                let aabb = text_box.to_aabb();
-                let bbox = Rect {
-                    left: aabb.left.min(frame_width.saturating_sub(1)),
-                    top: aabb.top.min(frame_height.saturating_sub(1)),
-                    right: aabb.right.min(frame_width),
-                    bottom: aabb.bottom.min(frame_height),
-                };
-                let line = PreparedTextLine {
-                    text: it.translated_text.clone(),
-                    bounding_box: bbox.clone(),
-                    oriented_box: text_box,
-                    word_rects: vec![bbox.clone()],
-                    background_argb: it.bg_argb,
-                    foreground_argb: it.fg_argb,
-                };
-                PreparedTextBlock {
-                    source_text: it.source_text.clone(),
-                    translated_text: it.translated_text.clone(),
-                    bounding_box: bbox,
-                    lines: vec![line],
-                    layout_hints: OverlayLayoutHints {
-                        layout_mode: OverlayLayoutMode::PerLine,
-                        suggested_font_size_px: it.suggested_font_px.max(6.0),
-                    },
-                    background_argb: it.bg_argb,
-                    foreground_argb: it.fg_argb,
-                }
-            })
-            .collect();
-        if blocks.is_empty() {
-            // No text yet — just the outlines we drew above.
-            return Some(rgba);
-        }
-        let prepared = PreparedImageOverlay {
-            rgba_bytes: rgba,
-            width: frame_width,
-            height: frame_height,
-            extracted_text: String::new(),
-            translated_text: String::new(),
-            blocks,
-        };
-        let opts = RenderOptions {
-            language: items
-                .first()
-                .map(|i| i.language.clone())
-                .unwrap_or_default(),
-            min_font_size_px: 6.0,
-        };
-        render_overlay(&prepared, fonts, &opts).ok()
+        render_text_overlay_bitmap(frame_width, frame_height, items, fonts)
     }
 
     /// Project all overlays of `anchor_id` through `homography` into
@@ -781,6 +686,101 @@ impl LivePlanarEngine {
 }
 
 const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+/// Free-function form of the overlay rasterizer (extracted from
+/// `LivePlanarEngine::render_text_overlay_bitmap`). Doesn't touch any
+/// engine state — pure on `items` + `fonts`. Pulled out so the uniffi
+/// `prepare_overlay_for_composite` call can rasterize without locking
+/// the engine mutex; otherwise the rec-batch worker's raster (50–100
+/// ms on a dense page) starves the detector thread that's trying to
+/// run `process_frame_with_imu`, which freezes the SurfaceView at the
+/// rec-batch rate instead of the camera rate.
+#[cfg(feature = "image-render")]
+pub fn render_text_overlay_bitmap(
+    frame_width: u32,
+    frame_height: u32,
+    items: &[TextRenderItem],
+    fonts: &dyn FontProvider,
+) -> Option<Vec<u8>> {
+    if frame_width == 0 || frame_height == 0 {
+        return None;
+    }
+    let pixels = (frame_width as usize) * (frame_height as usize);
+    let mut rgba = vec![0u8; pixels * 4];
+    for it in items {
+        let oriented = oriented_rect_from_corners(&it.quad);
+        fill_oriented_rect_blended(
+            &mut rgba,
+            frame_width,
+            frame_height,
+            &oriented,
+            argb_u32_to_rgba8(it.bg_argb),
+        );
+    }
+    let blocks: Vec<PreparedTextBlock> = items
+        .iter()
+        .filter(|it| !it.translated_text.trim().is_empty())
+        .map(|it| {
+            let bg_box = oriented_rect_from_corners(&it.quad);
+            // Inset the text box horizontally so the left-aligned text
+            // starts inside the bg's rounded edge instead of flush
+            // against it. Matches the Kotlin `HORIZONTAL_PAD_PX`.
+            let text_box = OrientedRect {
+                cx: bg_box.cx,
+                cy: bg_box.cy,
+                width: (bg_box.width - 2.0 * OVERLAY_TEXT_HORIZONTAL_INSET_PX).max(1.0),
+                height: bg_box.height,
+                angle_radians: bg_box.angle_radians,
+            };
+            let aabb = text_box.to_aabb();
+            let bbox = Rect {
+                left: aabb.left.min(frame_width.saturating_sub(1)),
+                top: aabb.top.min(frame_height.saturating_sub(1)),
+                right: aabb.right.min(frame_width),
+                bottom: aabb.bottom.min(frame_height),
+            };
+            let line = PreparedTextLine {
+                text: it.translated_text.clone(),
+                bounding_box: bbox.clone(),
+                oriented_box: text_box,
+                word_rects: vec![bbox.clone()],
+                background_argb: it.bg_argb,
+                foreground_argb: it.fg_argb,
+            };
+            PreparedTextBlock {
+                source_text: it.source_text.clone(),
+                translated_text: it.translated_text.clone(),
+                bounding_box: bbox,
+                lines: vec![line],
+                layout_hints: OverlayLayoutHints {
+                    layout_mode: OverlayLayoutMode::PerLine,
+                    suggested_font_size_px: it.suggested_font_px.max(6.0),
+                },
+                background_argb: it.bg_argb,
+                foreground_argb: it.fg_argb,
+            }
+        })
+        .collect();
+    if blocks.is_empty() {
+        return Some(rgba);
+    }
+    let prepared = PreparedImageOverlay {
+        rgba_bytes: rgba,
+        width: frame_width,
+        height: frame_height,
+        extracted_text: String::new(),
+        translated_text: String::new(),
+        blocks,
+    };
+    let opts = RenderOptions {
+        language: items
+            .first()
+            .map(|i| i.language.clone())
+            .unwrap_or_default(),
+        min_font_size_px: 6.0,
+    };
+    render_overlay(&prepared, fonts, &opts).ok()
+}
 
 /// Horizontal text inset (canonical pixels) within the live-overlay
 /// rounded-rect background. Must equal the Kotlin-side

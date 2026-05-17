@@ -24,6 +24,8 @@ pub mod imu_prior;
 mod inference;
 pub mod language;
 pub mod language_detect;
+#[cfg(feature = "planar-tracker")]
+pub mod live_compositor;
 #[cfg(feature = "ppocr")]
 pub mod live_frame;
 #[cfg(feature = "ppocr")]

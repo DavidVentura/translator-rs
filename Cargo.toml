@@ -132,6 +132,11 @@ path = "tests/ppocr_tilt_dump.rs"
 required-features = ["ppocr"]
 
 [[test]]
+name = "ppocr_color_matting"
+path = "tests/ppocr_color_matting.rs"
+required-features = ["ppocr"]
+
+[[test]]
 name = "planar_tracker_synthetic"
 path = "tests/planar_tracker_synthetic.rs"
 required-features = ["planar-tracker"]
@@ -146,4 +151,3 @@ required-features = ["planar-tracker"]
 
 # [patch."https://github.com/DavidVentura/mupdf-rs"]
 # piper-rs = { path = "../mupdf-rs" }
-
