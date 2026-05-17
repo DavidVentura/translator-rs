@@ -641,17 +641,21 @@ fn render_per_line(
             continue;
         }
         // Origin in image space at line-local cursor=0 along the baseline. In line-local
-        // coords this point is at u=-width/2 (left edge), v=-height/2 + ascent_px (baseline
-        // measured from the rect's top). For an axis-aligned rect, the formulas collapse to
-        // the previous (bbox.left, bbox.top + ascent_px).
+        // coords this point is at u=-width/2 (left edge); the v coord is chosen so the
+        // glyph mass (ascent + descent) is centered on the rect's centre. For a rect
+        // whose height matches the font size this collapses to the previous
+        // "baseline at rect.top + ascent_px" placement (since
+        // (ascent - descent) / 2 == -half_h + ascent when half_h == (ascent+descent)/2),
+        // so the PDF erase-replace path is unchanged. For oversized rects (the live
+        // overlay path inflates `oriented.height` to leave halo room) the glyph is
+        // centred instead of top-aligned.
         let oriented = prepared_line.oriented_box;
         let cos = oriented.angle_radians.cos();
         let sin = oriented.angle_radians.sin();
         let half_w = oriented.width * 0.5;
-        let half_h = oriented.height * 0.5;
         let ascent_px = line_shape.ascent_px(size);
-        // Vertical offset from the rect's centre to the baseline, in line-local v.
-        let v_from_center = -half_h + ascent_px;
+        let descent_px = (line_shape.line_height_px(size) - ascent_px).max(0.0);
+        let v_from_center = (ascent_px - descent_px) * 0.5;
         // perp_down direction (line-local +v) in image space is (-sin, cos).
         let origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
         let origin_y = oriented.cy - half_w * sin + v_from_center * cos;

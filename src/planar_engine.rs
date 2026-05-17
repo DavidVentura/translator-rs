@@ -579,8 +579,24 @@ impl LivePlanarEngine {
             .iter()
             .filter(|it| !it.translated_text.trim().is_empty())
             .map(|it| {
-                let oriented = oriented_rect_from_corners(&it.quad);
-                let aabb = oriented.to_aabb();
+                let bg_box = oriented_rect_from_corners(&it.quad);
+                // Inset the *text* box horizontally so the left-aligned
+                // text starts inside the bg's rounded edge instead of
+                // flush against it. Must match the Kotlin-side
+                // `HORIZONTAL_PAD_PX` added when building `visualBox`.
+                // image_render's per-line formula puts the text origin
+                // at `oriented.cx - half_w` (line-local u=−half_w); since
+                // text_box is centred on bg_box, that becomes
+                // `bg_box.left + pad` — the desired left-with-padding
+                // placement.
+                let text_box = OrientedRect {
+                    cx: bg_box.cx,
+                    cy: bg_box.cy,
+                    width: (bg_box.width - 2.0 * OVERLAY_TEXT_HORIZONTAL_INSET_PX).max(1.0),
+                    height: bg_box.height,
+                    angle_radians: bg_box.angle_radians,
+                };
+                let aabb = text_box.to_aabb();
                 let bbox = Rect {
                     left: aabb.left.min(frame_width.saturating_sub(1)),
                     top: aabb.top.min(frame_height.saturating_sub(1)),
@@ -590,7 +606,7 @@ impl LivePlanarEngine {
                 let line = PreparedTextLine {
                     text: it.translated_text.clone(),
                     bounding_box: bbox.clone(),
-                    oriented_box: oriented,
+                    oriented_box: text_box,
                     word_rects: vec![bbox.clone()],
                     background_argb: it.bg_argb,
                     foreground_argb: it.fg_argb,
@@ -766,6 +782,14 @@ impl LivePlanarEngine {
 
 const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
+/// Horizontal text inset (canonical pixels) within the live-overlay
+/// rounded-rect background. Must equal the Kotlin-side
+/// `HORIZONTAL_PAD_PX` used to inflate `visualBox`; together they yield
+/// left-aligned text starting `pad` px inside the bg's rounded edge,
+/// with `pad` px of bg breathing room on the right of short lines.
+#[cfg(feature = "image-render")]
+const OVERLAY_TEXT_HORIZONTAL_INSET_PX: f32 = 8.0;
+
 /// Reject a homography if it would produce a visually-degenerate
 /// projection of the canonical frame's four corners. A "valid" matrix
 /// from RANSAC can still send some bitmap pixels to infinity (when the
@@ -862,10 +886,14 @@ fn argb_u32_to_rgba8(argb: u32) -> [u8; 4] {
     [r, g, b, a]
 }
 
-/// Alpha-blend a flat colour into the canvas across the oriented rect.
-/// Pixels outside the rect (or canvas) are left untouched. Mirrors
-/// `image_render`'s blending semantics so the rendered text composites
-/// cleanly on top.
+/// Stamp a flat colour into the canvas across the oriented rect, with
+/// rounded corners and a 1-pixel anti-aliased edge. Uses *max alpha*
+/// rather than alpha-blending so overlapping boxes (adjacent lines that
+/// share an edge) take the louder coverage instead of summing — without
+/// this, every overlap would visibly darken.
+///
+/// All bg fills are expected to use the same RGB; callers paint into a
+/// freshly-zeroed canvas before the text rasterizer runs.
 fn fill_oriented_rect_blended(
     rgba: &mut [u8],
     w: u32,
@@ -880,7 +908,12 @@ fn fill_oriented_rect_blended(
     let sin = rect.angle_radians.sin();
     let hw = rect.width * 0.5;
     let hh = rect.height * 0.5;
-    // AABB of the rect, clipped to the canvas.
+    // Corner radius: 50 % of the short half-extent, capped at 12 px.
+    // Visible softness without eating into glyph space on short boxes.
+    let radius = (hw.min(hh) * 0.5).min(12.0).max(0.0);
+    // AABB of the rect, clipped to the canvas. Rotation can make the
+    // AABB bigger than width × height, so use the half-diagonal as the
+    // scan window radius.
     let half_diag = (hw * hw + hh * hh).sqrt();
     let min_x = ((rect.cx - half_diag).floor() as i32).max(0) as u32;
     let min_y = ((rect.cy - half_diag).floor() as i32).max(0) as u32;
@@ -892,9 +925,30 @@ fn fill_oriented_rect_blended(
             let dy = y as f32 + 0.5 - rect.cy;
             let lx = dx * cos + dy * sin;
             let ly = -dx * sin + dy * cos;
-            if lx.abs() <= hw && ly.abs() <= hh {
-                let idx = ((y * w + x) * 4) as usize;
-                blend_pixel(&mut rgba[idx..idx + 4], color);
+            // Signed distance to a rounded rect centred at the origin
+            // with half-extents (hw, hh) and corner radius `radius`.
+            // < 0 inside, > 0 outside.
+            let qx = lx.abs() - (hw - radius);
+            let qy = ly.abs() - (hh - radius);
+            let outside = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
+            let inside = qx.max(qy).min(0.0);
+            let sdf = outside + inside - radius;
+            // 1-px feathered edge: full coverage at sdf ≤ -0.5, zero at
+            // sdf ≥ 0.5, linear in between.
+            let coverage = (0.5 - sdf).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let new_alpha = (color[3] as f32 * coverage).round() as u8;
+            if new_alpha == 0 {
+                continue;
+            }
+            let idx = ((y * w + x) * 4) as usize;
+            if new_alpha > rgba[idx + 3] {
+                rgba[idx] = color[0];
+                rgba[idx + 1] = color[1];
+                rgba[idx + 2] = color[2];
+                rgba[idx + 3] = new_alpha;
             }
         }
     }
