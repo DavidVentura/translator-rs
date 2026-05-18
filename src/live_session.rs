@@ -890,7 +890,17 @@ impl LiveSession {
                 input.font_provider,
             );
         }
-        self.retain_blocks(input.anchor_id, &block_ids);
+        // NB: don't `retain_blocks(&block_ids)` here. That would
+        // drop overlay items whose stable_block_id isn't in *this
+        // run's* set — i.e. lines the detector happened to miss in
+        // this single frame. PaddleOCR is non-deterministic on
+        // borderline glyphs; on a held camera, missing 19 of 25
+        // lines for one frame is normal and the lines still exist
+        // in the surface map. Dropping their overlays makes pills
+        // visibly evaporate. The only blocks we should drop are
+        // those that were *re-observed and rec-failed* this run —
+        // see the failed-block cleanup below the rec/translate
+        // loop.
 
         if cancel() {
             return PostDetectOutcome {
@@ -1102,7 +1112,27 @@ impl LiveSession {
             .enumerate()
             .filter_map(|(bi, &id)| if block_translated[bi] { Some(id) } else { None })
             .collect();
-        self.retain_blocks(input.anchor_id, &surviving_block_ids);
+        // Drop *only* the blocks that were observed AND failed
+        // (placeholder upserted, rec returned empty). Blocks not in
+        // this run's set are untouched — see the comment up top
+        // explaining why "blocks the detector missed this frame
+        // shouldn't get evicted." `failed_block_ids` is the
+        // complement of `surviving_block_ids` restricted to
+        // `block_ids` from this run.
+        let failed_block_ids: Vec<u64> = block_ids
+            .iter()
+            .filter(|id| !surviving_block_ids.contains(id))
+            .copied()
+            .collect();
+        if !failed_block_ids.is_empty() {
+            let failed_set: std::collections::HashSet<u64> =
+                failed_block_ids.iter().copied().collect();
+            if let Ok(mut items) = self.overlay_items.lock() {
+                items.retain(|it| {
+                    it.anchor_id != input.anchor_id || !failed_set.contains(&it.id)
+                });
+            }
+        }
 
         // Mark the viewport's surface AABB as covered for this
         // anchor. Subsequent refresh triggers compare their viewport

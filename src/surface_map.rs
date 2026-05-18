@@ -142,11 +142,16 @@ impl AddResult {
 /// Threshold on u-extent growth, expressed as a fraction of line
 /// height, that promotes a `MergedUnchanged` to `MergedAndExtended`.
 /// Per FUTURE_SURFACE_MAP.md: "if D.surface_bbox extends
-/// L.observed_extent (by ≥ ½ x-height)…". We use line height as a
-/// proxy for x-height — it's a bit more permissive (line height
-/// includes ascenders/descenders), but the same threshold tunes
-/// equivalently in practice.
-const EXTENT_GROWTH_TRIGGER_FRACTION: f32 = 0.5;
+/// L.observed_extent (by ≥ ½ x-height)…".
+///
+/// The doc proposed 0.5, but at typical phone zoom PaddleOCR's
+/// frame-to-frame contour fluctuation can clear 0.5 × height on a
+/// held camera (a 40 px line tolerates 20 px boundary jitter
+/// trivially). With 0.5, refresh on a still hand still triggers
+/// `MergedAndExtended` → bbox grows → re-raster. 1.0 × height ≈ a
+/// short word's width — well above detector noise, below "an
+/// actually new word visible at the edge."
+const EXTENT_GROWTH_TRIGGER_FRACTION: f32 = 1.0;
 
 /// Collection of lines on one surface, keyed by physical line
 /// identity. Built up across observations; queried by the renderer
@@ -596,11 +601,11 @@ mod tests {
         let a = rect(100.0, 50.0, 200.0, 30.0, 0.0); // u in [0, 200]
         let r0 = map.add_or_merge(obs(a, "", ""));
         map.get_mut(r0.id()).unwrap().record_rec_extent();
-        // Threshold is 0.5 * height = 15 px. Extend right by 20 px.
-        let b = rect(120.0, 50.0, 200.0, 30.0, 0.0); // u in [20, 220]
+        // Threshold is 1.0 * height = 30 px. Extend right by 40 px.
+        let b = rect(140.0, 50.0, 200.0, 30.0, 0.0); // u in [40, 240]
         let r1 = map.add_or_merge(obs(b, "", ""));
         assert!(matches!(r1, AddResult::MergedAndExtended(_)));
-        assert!(r1.needs_rec(), "20px > 15px threshold → re-rec");
+        assert!(r1.needs_rec(), "40px > 30px threshold → re-rec");
     }
 
     #[test]
@@ -609,11 +614,11 @@ mod tests {
         let a = rect(100.0, 50.0, 200.0, 30.0, 0.0);
         let r0 = map.add_or_merge(obs(a, "", ""));
         map.get_mut(r0.id()).unwrap().record_rec_extent();
-        // 0.5 * height = 15 px threshold. Extend right by only 10 px.
-        let b = rect(105.0, 50.0, 200.0, 30.0, 0.0); // u in [5, 205]
+        // 1.0 * height = 30 px threshold. Extend right by only 20 px.
+        let b = rect(110.0, 50.0, 200.0, 30.0, 0.0); // u in [10, 210]
         let r1 = map.add_or_merge(obs(b, "", ""));
         assert!(matches!(r1, AddResult::MergedUnchanged(_)));
-        assert!(!r1.needs_rec(), "10px < 15px threshold → skip re-rec");
+        assert!(!r1.needs_rec(), "20px < 30px threshold → skip re-rec");
     }
 
     #[test]
