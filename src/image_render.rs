@@ -284,6 +284,12 @@ struct ShapedRun {
     font_bytes: Arc<Vec<u8>>,
     ttc_index: u32,
     rtl: bool,
+    /// Byte offset of this run's first character in the source string
+    /// passed to `shape_line`. Each glyph's `cluster` is relative to
+    /// the run's slice; adding this gives the glyph's global byte
+    /// position in the source — needed for the per-line breaker to
+    /// compute exact prefix widths across an arbitrary source span.
+    byte_start_in_text: usize,
 }
 
 fn shape_run(
@@ -329,6 +335,7 @@ fn shape_run(
         font_bytes: bytes,
         ttc_index: handle.ttc_index,
         rtl: run.rtl,
+        byte_start_in_text: run.start,
     })
 }
 
@@ -517,6 +524,15 @@ struct LineShape {
     max_ascent_em: f32,
     /// Maximum (-descent / units_per_em) across runs.
     max_descent_em: f32,
+    /// Cumulative em-advance indexed by source byte position. Length
+    /// `source_text.len() + 1`; entry `i` is the total em-advance of
+    /// every glyph whose source byte position is `< i`. Lets the
+    /// line breaker compute exact widths of any source-text prefix
+    /// without re-shaping. Mirrors what `FontMetrics::measure` does
+    /// on the PDF path; the difference is we have the harfbuzz-
+    /// shaped output here (with kerning, ligatures, complex script
+    /// shaping) so the widths match what gets drawn pixel-for-pixel.
+    cum_em_at_byte: Vec<f32>,
 }
 
 fn shape_line(
@@ -538,13 +554,35 @@ fn shape_line(
     let mut max_ascent_em: f32 = 0.0;
     let mut max_descent_em: f32 = 0.0;
     let mut runs_only = Vec::with_capacity(shaped.len());
+    // Source-byte-ordered (byte_offset, em_advance) for every glyph
+    // across every run. Used below to fold into a per-byte prefix sum.
+    let mut glyph_advances: Vec<(usize, f32)> = Vec::new();
     for (_, run) in shaped {
         let upem = run.units_per_em as f32;
         let total_units: i64 = run.glyphs.iter().map(|g| g.advance_x as i64).sum();
         total_widths.push(total_units as f32 / upem);
         max_ascent_em = max_ascent_em.max(run.ascent as f32 / upem);
         max_descent_em = max_descent_em.max(-(run.descent as f32) / upem);
+        let run_start = run.byte_start_in_text;
+        for g in &run.glyphs {
+            let global_byte = run_start + g.cluster as usize;
+            glyph_advances.push((global_byte, g.advance_x as f32 / upem));
+        }
         runs_only.push(run);
+    }
+    // Source order. For LTR latin text glyphs already arrive in source
+    // order; this also makes the table correct for BiDi mixed runs
+    // (visual order ≠ source order). Sort key is the source byte.
+    glyph_advances.sort_by_key(|&(b, _)| b);
+    let mut cum_em_at_byte = vec![0.0_f32; text.len() + 1];
+    let mut acc = 0.0_f32;
+    let mut g_idx = 0usize;
+    for byte in 0..=text.len() {
+        while g_idx < glyph_advances.len() && glyph_advances[g_idx].0 < byte {
+            acc += glyph_advances[g_idx].1;
+            g_idx += 1;
+        }
+        cum_em_at_byte[byte] = acc;
     }
 
     LineShape {
@@ -552,6 +590,7 @@ fn shape_line(
         total_widths,
         max_ascent_em,
         max_descent_em,
+        cum_em_at_byte,
     }
 }
 
@@ -677,6 +716,17 @@ fn render_per_line(
 /// Split `text` into per-line slices that fit within `target_widths` at the
 /// chosen `font_size`. Returns `None` if the text doesn't fit even greedily
 /// at the given size.
+///
+/// Width measurement uses the shaped per-glyph advances (via
+/// `LineShape::cum_em_at_byte`) rather than an average-char-em
+/// approximation. This is what the PDF text-erase path
+/// (`wrap_lines_to_widths` in `pdf_overlay.rs`) does via
+/// `FontMetrics::measure`. The previous approximation
+/// underestimated prefixes dominated by wider-than-average glyphs —
+/// e.g. capitalised first words on book / sign translations — which
+/// made the breaker assign a prefix that "fit" the estimate but
+/// overflowed the rect when actually drawn, clipping the trailing
+/// glyph off-bitmap ("Ontwerpen Van" rendered as "Ontwerpen Va").
 fn break_into_lines_by_words(
     text: &str,
     shaped: &LineShape,
@@ -700,22 +750,14 @@ fn break_into_lines_by_words(
         return None;
     }
 
-    // Per-character pixel-width lookup using the shaped result. Fall back
-    // proportionally if shape didn't cover (shouldn't happen for our text).
-    let upem_widths: f32 = shaped.total_widths.iter().sum();
-    let chars: Vec<char> = text.chars().collect();
-    let total_chars = chars.len() as f32;
-    let avg_char_em = if total_chars > 0.0 {
-        upem_widths / total_chars
-    } else {
-        0.0
-    };
-    let measure = |slice: &str| -> f32 {
-        // Crude but consistent with shaped totals: count chars * average em
-        // width * font_size. Good enough for whitespace-driven greedy break;
-        // exact widths come back when we re-shape the assigned slice for
-        // drawing.
-        slice.chars().count() as f32 * avg_char_em * font_size
+    // Width of `text[start_byte..end_byte]` at `font_size` using the
+    // shaped per-glyph advances. Clamp byte indices to the table's
+    // valid range — defensive, the breaker only passes positions
+    // within bounds.
+    let measure_bytes = |start_byte: usize, end_byte: usize| -> f32 {
+        let lo = start_byte.min(shaped.cum_em_at_byte.len() - 1);
+        let hi = end_byte.min(shaped.cum_em_at_byte.len() - 1);
+        (shaped.cum_em_at_byte[hi] - shaped.cum_em_at_byte[lo]) * font_size
     };
 
     let mut out: Vec<String> = Vec::with_capacity(target_widths.len());
@@ -727,9 +769,8 @@ fn break_into_lines_by_words(
             out.push(String::new());
             continue;
         }
-        let remainder = &bytes_text[cursor..];
-        if measure(remainder) <= target_w {
-            out.push(remainder.to_string());
+        if measure_bytes(cursor, bytes_text.len()) <= target_w {
+            out.push(bytes_text[cursor..].to_string());
             cursor = bytes_text.len();
             continue;
         }
@@ -738,28 +779,26 @@ fn break_into_lines_by_words(
         }
 
         // Walk word boundaries (spaces) to find the largest prefix that fits.
+        let remainder = &bytes_text[cursor..];
         let mut last_good_end: Option<usize> = None;
-        let mut byte_idx = 0;
         for (off, ch) in remainder.char_indices() {
             if ch == ' ' {
-                let candidate_end = off; // exclusive
-                let candidate = &remainder[..candidate_end];
-                if measure(candidate) <= target_w {
-                    last_good_end = Some(candidate_end);
+                // Width of cursor..(cursor + off) — i.e. up to but not
+                // including this space. The trailing space gets eaten by
+                // the cursor advance below.
+                if measure_bytes(cursor, cursor + off) <= target_w {
+                    last_good_end = Some(off);
                 } else {
                     break;
                 }
             }
-            byte_idx = off + ch.len_utf8();
         }
-        let _ = byte_idx;
 
         let Some(end) = last_good_end else {
             return None;
         };
         let assigned = &remainder[..end];
         out.push(assigned.to_string());
-        // Skip the space we broke at.
         cursor += end;
         while cursor < bytes_text.len() && bytes_text.as_bytes()[cursor] == b' ' {
             cursor += 1;

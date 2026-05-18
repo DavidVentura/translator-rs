@@ -4,6 +4,8 @@ uniffi::setup_scaffolding!();
 pub mod api;
 pub mod bergamot;
 pub mod catalog;
+#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+pub mod color_matting;
 #[cfg(feature = "doc-align")]
 pub mod doc_align;
 #[cfg(feature = "doc-align")]
