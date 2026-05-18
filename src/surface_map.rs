@@ -207,7 +207,25 @@ impl SurfaceMap {
                 .iter_mut()
                 .find(|l| l.id == id)
                 .expect("find_matching returned an id not in the map");
-            line.bbox = merge_bbox(&line.bbox, &obs.bbox, line.observation_count);
+            // Tentatively compute the merged bbox so we can ask
+            // `needs_rec_after_merge` whether it extends past
+            // `last_rec_extent`. We only commit the merge in the
+            // **extended** case. Without this guard, noisy detections
+            // and tracker drift creep the bbox forward observation by
+            // observation: u-extent unions monotonically, cx slides
+            // toward the union centre, and the overlay visibly shifts
+            // on every refresh even when the camera is held still.
+            let candidate = merge_bbox(&line.bbox, &obs.bbox, line.observation_count);
+            let extended = {
+                let probe = SurfaceLine {
+                    bbox: candidate.clone(),
+                    ..line.clone()
+                };
+                needs_rec_after_merge(&probe)
+            };
+            if extended {
+                line.bbox = candidate;
+            }
             line.observation_count = line.observation_count.saturating_add(1);
             // Note: observation's source_text / translated_text are
             // *not* written through here. Acquire-time observations
@@ -216,7 +234,6 @@ impl SurfaceMap {
             if !obs.source_language.is_empty() {
                 line.source_language = obs.source_language;
             }
-            let extended = needs_rec_after_merge(line);
             return if extended {
                 AddResult::MergedAndExtended(id)
             } else {

@@ -13,10 +13,113 @@
 //! overlay store, matting cache, and the orchestration methods
 //! themselves. See FUTURE_SURFACE_MAP.md for the bigger plan.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::ocr::OrientedRect;
+use crate::api::LanguageCode;
+use crate::color_matting::MattedStrip;
+use crate::homography::{invert, project};
+use crate::live_frame::OrientedImage;
+use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine};
+use crate::routing::MixedTextTranslationResult;
 use crate::surface_map::{AddResult, SurfaceLineId, SurfaceLineObservation, SurfaceMap};
+
+/// Anchor identifier as the engine emits it. Mirrors
+/// `planar_engine::AnchorId` (u64) but kept here as a plain alias to
+/// avoid pulling the engine module into `live_session`'s public
+/// surface — the session doesn't care how anchors are produced.
+pub type AnchorId = u64;
+
+/// Axis-aligned bounding box in surface coords. Used by the refresh
+/// trigger to track which surface region has already been run
+/// through the detector and skip refreshes whose viewport is
+/// entirely contained in that region (no new info to gain).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Aabb {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+}
+
+impl Aabb {
+    /// Smallest AABB enclosing the given points. Returns `None` on an
+    /// empty iterator or a non-finite coordinate.
+    pub fn from_points(points: impl IntoIterator<Item = (f32, f32)>) -> Option<Self> {
+        let mut iter = points.into_iter();
+        let (x0, y0) = iter.next()?;
+        if !x0.is_finite() || !y0.is_finite() {
+            return None;
+        }
+        let mut aabb = Self {
+            min_x: x0,
+            min_y: y0,
+            max_x: x0,
+            max_y: y0,
+        };
+        for (x, y) in iter {
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            if x < aabb.min_x {
+                aabb.min_x = x;
+            }
+            if y < aabb.min_y {
+                aabb.min_y = y;
+            }
+            if x > aabb.max_x {
+                aabb.max_x = x;
+            }
+            if y > aabb.max_y {
+                aabb.max_y = y;
+            }
+        }
+        Some(aabb)
+    }
+
+    pub fn union_inplace(&mut self, other: &Aabb) {
+        self.min_x = self.min_x.min(other.min_x);
+        self.min_y = self.min_y.min(other.min_y);
+        self.max_x = self.max_x.max(other.max_x);
+        self.max_y = self.max_y.max(other.max_y);
+    }
+
+    /// True when `inner` fits entirely inside `self` after inflating
+    /// `self` by `pad` on each side. The padding absorbs RANSAC
+    /// residual / detector noise so a viewport that's *practically*
+    /// covered doesn't trip the predicate via sub-pixel jitter.
+    pub fn contains_inflated(&self, inner: &Aabb, pad: f32) -> bool {
+        inner.min_x >= self.min_x - pad
+            && inner.min_y >= self.min_y - pad
+            && inner.max_x <= self.max_x + pad
+            && inner.max_y <= self.max_y + pad
+    }
+}
+
+/// Project the viewport's four corners through `H_view→surface` and
+/// return the surface-coord AABB they enclose. `None` when any
+/// corner failed to project (degenerate homography).
+pub fn viewport_surface_aabb(
+    h_view_to_surface: &[f32; 9],
+    frame_w: f32,
+    frame_h: f32,
+) -> Option<Aabb> {
+    let corners = [
+        (0.0, 0.0),
+        (frame_w, 0.0),
+        (frame_w, frame_h),
+        (0.0, frame_h),
+    ];
+    let projected: Vec<(f32, f32)> = corners
+        .into_iter()
+        .filter_map(|(x, y)| project(h_view_to_surface, x, y))
+        .collect();
+    if projected.len() != 4 {
+        return None;
+    }
+    Aabb::from_points(projected)
+}
 
 /// One rasterized overlay item resident across composite calls. The
 /// caller hashes the source content (strips + texts + language) and
@@ -25,6 +128,12 @@ use crate::surface_map::{AddResult, SurfaceLineId, SurfaceLineObservation, Surfa
 #[derive(Clone)]
 pub struct OverlayItem {
     pub id: u64,
+    /// Anchor whose canonical frame this overlay lives in. The
+    /// compositor warps the bitmap by *that anchor's*
+    /// `H_root→view`; items for inactive anchors are skipped at
+    /// compose time so cached state for a cached anchor doesn't
+    /// render at the wrong place under the current anchor's H.
+    pub anchor_id: AnchorId,
     /// RGBA bitmap in canonical (surface) coords.
     pub bitmap: Vec<u8>,
     pub width: u32,
@@ -38,36 +147,160 @@ pub struct OverlayItem {
     pub content_hash: u64,
 }
 
+/// Per-anchor live state. Each acquired anchor (engine
+/// `AnchorId`) gets its own slot so two physical surfaces — sign A
+/// and sign B — never share coord frames, line ids, or "what's been
+/// detected" state. The session holds a `HashMap<AnchorId,
+/// AnchorState>`; anchor-bound methods (`observe_detections`,
+/// `ingest_rec`, ...) look up the right state by id.
+pub struct AnchorState {
+    /// Lines on this anchor's canonical frame.
+    pub map: SurfaceMap,
+    /// Surface region we've already run detection over. The refresh
+    /// trigger compares the current viewport's surface AABB against
+    /// this: viewport ⊆ covered → no new pixels → skip detection.
+    /// Grows monotonically as detection runs over new viewport
+    /// areas; reset only when the anchor is evicted (LRU) or the
+    /// session is cleared.
+    pub covered_region: Option<Aabb>,
+}
+
+impl AnchorState {
+    fn new() -> Self {
+        Self {
+            map: SurfaceMap::new(),
+            covered_region: None,
+        }
+    }
+}
+
+/// Surface-coord padding when testing viewport ⊆ covered_region. A
+/// few px of slack absorbs RANSAC residual + projection noise so a
+/// "practically covered" viewport doesn't fail containment via
+/// sub-pixel jitter.
+pub const COVERAGE_PADDING_SURFACE_PX: f32 = 8.0;
+
 /// Lifetime-bound state shared between platform wrappers (Android
 /// `LivePlanarTracker`, desktop `surface_sim`). One instance per
 /// active session; cleared on reset (tap-to-focus, language change).
 pub struct LiveSession {
-    /// Per-physical-line storage across acquires. The `same_line`
-    /// predicate's geometric matching makes this safe across
-    /// scene changes — stale entries from a different scene stay
-    /// inert (no false merges) until `clear()` is called.
-    pub surface_map: Mutex<SurfaceMap>,
-    /// Resident rasterized overlays, keyed by block id. Populated
-    /// by `upsert_overlay_item` and consumed by the compositor.
+    /// Per-root-anchor state. Each entry is independent — different
+    /// roots (= different physical surfaces) have different coord
+    /// frames, line ids, and covered regions. No session-side LRU:
+    /// the engine's `AnchorCache` is the source of truth for which
+    /// roots exist, and bindings call
+    /// [`Self::retain_anchors`] after each pipeline run with
+    /// `engine.cached_root_ids()` to drop state for roots the
+    /// engine has evicted.
+    pub anchor_states: Mutex<HashMap<AnchorId, AnchorState>>,
+    /// Resident rasterized overlays. Each item carries the
+    /// `anchor_id` it belongs to; the compositor filters to only the
+    /// currently-active anchor so cached anchors' overlays don't
+    /// render at wrong positions under another anchor's H.
     pub overlay_items: Mutex<Vec<OverlayItem>>,
+    /// Frame counter that ticks on every Locked frame the caller
+    /// observes after the most recent acquire. Drives the
+    /// detect-on-tracking-frame trigger ([`Self::should_refresh_now`]).
+    locked_frames_since_acquire: AtomicU64,
+    /// Tick value at which the last refresh fired. The refresh
+    /// predicate compares the current tick against this + the
+    /// configured interval.
+    last_refresh_locked_frame: AtomicU64,
+    /// How many Locked frames must elapse between detect-on-track
+    /// refresh fires. ~15 frames is ~0.5s at 30fps. Configurable so
+    /// the sim can run tighter cadence than production.
+    refresh_every_n_locked_frames: AtomicU32,
 }
+
+/// Default refresh cadence: fire `run_post_detect` every N tracked
+/// frames while Locked. ~333 ms at 30 fps. The covered-region gate
+/// makes the per-check cost essentially free (an AABB containment
+/// test) on a held camera, so cadence here is the cadence we want
+/// while actively panning — not the wall-clock interval between
+/// detector runs. While panning, the gate flips to "not contained"
+/// the moment the viewport edges past the covered region, and
+/// detection fires; while still, almost every check is a cheap skip.
+/// Going much below ~10 frames adds nothing because detection
+/// itself is ~80–120 ms; we'd just be sampling the predicate more
+/// often than detection can keep up with.
+const DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES: u32 = 10;
 
 impl LiveSession {
     pub fn new() -> Self {
         Self {
-            surface_map: Mutex::new(SurfaceMap::new()),
+            anchor_states: Mutex::new(HashMap::new()),
             overlay_items: Mutex::new(Vec::new()),
+            locked_frames_since_acquire: AtomicU64::new(0),
+            last_refresh_locked_frame: AtomicU64::new(0),
+            refresh_every_n_locked_frames: AtomicU32::new(DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES),
         }
     }
 
     /// Drop all session state. Caller invokes on tap-to-focus,
     /// language change, or any other coarse-grained reset signal.
     pub fn clear(&self) {
-        if let Ok(mut map) = self.surface_map.lock() {
-            map.clear();
+        if let Ok(mut states) = self.anchor_states.lock() {
+            states.clear();
         }
         if let Ok(mut items) = self.overlay_items.lock() {
             items.clear();
+        }
+        self.locked_frames_since_acquire.store(0, Ordering::SeqCst);
+        self.last_refresh_locked_frame.store(0, Ordering::SeqCst);
+    }
+
+    /// Drop per-anchor state and overlays whose `anchor_id` isn't in
+    /// `keep`. Bindings call this after each acquire/refresh with the
+    /// engine's currently-cached anchor set so our state stays
+    /// aligned with what the engine can still track. Anchors evicted
+    /// from the engine's LRU lose their session state on the next
+    /// call.
+    pub fn retain_anchors(&self, keep: &[AnchorId]) {
+        let keep_set: std::collections::HashSet<AnchorId> = keep.iter().copied().collect();
+        if let Ok(mut states) = self.anchor_states.lock() {
+            states.retain(|id, _| keep_set.contains(id));
+        }
+        if let Ok(mut items) = self.overlay_items.lock() {
+            items.retain(|it| keep_set.contains(&it.anchor_id));
+        }
+    }
+
+    /// Per-anchor coverage query. True when the viewport AABB is
+    /// already inside the anchor's `covered_region` (padded by `pad`
+    /// surface-coord units for noise). Refresh trigger uses this as
+    /// its motion gate: contained → nothing new visible → skip.
+    /// Returns false when no state exists for the anchor (first
+    /// refresh after acquire) so the caller fires detection at least
+    /// once.
+    pub fn viewport_contained_in_coverage(
+        &self,
+        anchor_id: AnchorId,
+        viewport: &Aabb,
+        pad: f32,
+    ) -> bool {
+        let states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        match states.get(&anchor_id).and_then(|s| s.covered_region) {
+            Some(covered) => covered.contains_inflated(viewport, pad),
+            None => false,
+        }
+    }
+
+    /// Union the viewport AABB into this anchor's `covered_region`.
+    /// Called after `run_post_detect` completes so subsequent
+    /// refreshes can gate themselves out when they'd cover the same
+    /// surface area.
+    pub fn note_coverage(&self, anchor_id: AnchorId, viewport: Aabb) {
+        let mut states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let state = states.entry(anchor_id).or_insert_with(AnchorState::new);
+        match &mut state.covered_region {
+            Some(c) => c.union_inplace(&viewport),
+            None => state.covered_region = Some(viewport),
         }
     }
 
@@ -77,26 +310,85 @@ impl LiveSession {
         }
     }
 
+    /// Reset the refresh counter. Call after each fresh acquire so
+    /// `should_refresh_now` doesn't immediately fire again on the
+    /// next Locked frame.
+    pub fn on_acquire(&self) {
+        self.locked_frames_since_acquire.store(0, Ordering::SeqCst);
+        self.last_refresh_locked_frame.store(0, Ordering::SeqCst);
+    }
+
+    /// Bump the Locked-frame counter. Call once per per-frame tracker
+    /// tick that reports `Locked`. Returns the new tick value so the
+    /// caller can log it if desired.
+    pub fn on_locked_frame(&self) -> u64 {
+        self.locked_frames_since_acquire
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Configure the refresh interval. Callers tweak this for tests /
+    /// sim cadence; production uses the [default][DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES].
+    pub fn set_refresh_every_n_locked_frames(&self, n: u32) {
+        self.refresh_every_n_locked_frames
+            .store(n.max(1), Ordering::SeqCst);
+    }
+
+    /// True when enough Locked frames have elapsed since the last
+    /// refresh that the caller is *eligible* to fire one. Does **not**
+    /// advance any internal state — pair with [`Self::mark_refresh_fired`]
+    /// when the caller actually decides to fire. The split lets the
+    /// caller add additional gates (e.g. a motion gate on H_root→view)
+    /// without advancing the cadence on every frame.
+    pub fn refresh_cadence_elapsed(&self) -> bool {
+        let n = self.refresh_every_n_locked_frames.load(Ordering::SeqCst) as u64;
+        let tick = self.locked_frames_since_acquire.load(Ordering::SeqCst);
+        let last = self.last_refresh_locked_frame.load(Ordering::SeqCst);
+        tick > 0 && tick >= last + n
+    }
+
+    /// Snapshot the current Locked-frame tick as the new "last
+    /// refresh fired" baseline. Call when actually firing a refresh
+    /// after [`Self::refresh_cadence_elapsed`] + any caller-side
+    /// gates pass.
+    pub fn mark_refresh_fired(&self) {
+        let tick = self.locked_frames_since_acquire.load(Ordering::SeqCst);
+        self.last_refresh_locked_frame.store(tick, Ordering::SeqCst);
+    }
+
+    /// Combined check+mark: true when the cadence has elapsed (in
+    /// which case the tick is advanced). Convenience for callers that
+    /// don't apply additional gates — production uses the split
+    /// `refresh_cadence_elapsed` / `mark_refresh_fired` pair to layer
+    /// the motion gate in between.
+    pub fn should_refresh_now(&self) -> bool {
+        if !self.refresh_cadence_elapsed() {
+            return false;
+        }
+        self.mark_refresh_fired();
+        true
+    }
+
     /// Feed a batch of detections (in surface coords) into the
-    /// surface map and return per-detection outcomes the caller
-    /// uses to (a) decide which detections need recognition, and
-    /// (b) push rec results back via [`Self::ingest_rec`].
+    /// **active anchor's** surface map and return per-detection
+    /// outcomes the caller uses to (a) decide which detections need
+    /// recognition, and (b) push rec results back via
+    /// [`Self::ingest_rec`].
     ///
-    /// `source_language` is used as the default for newly-created
-    /// lines; existing lines keep their previously-recorded
-    /// language unless the observation carries a non-empty value.
-    ///
-    /// Replaces the open-coded `for entry in entries: map.add_or_merge`
-    /// loops in `uniffi_catalog::run_acquire_pipeline` and the
-    /// simulator's `run_detection_cycle`.
+    /// Creates the `AnchorState` on first call for a new
+    /// `anchor_id`. `source_language` is used as the default for
+    /// newly-created lines; existing lines keep their
+    /// previously-recorded language unless the observation carries a
+    /// non-empty value.
     pub fn observe_detections(
         &self,
+        anchor_id: AnchorId,
         detections: &[OrientedRect],
         source_language: &str,
     ) -> Vec<DetectionOutcome> {
         let mut out = Vec::with_capacity(detections.len());
-        let mut map = match self.surface_map.lock() {
-            Ok(m) => m,
+        let mut states = match self.anchor_states.lock() {
+            Ok(s) => s,
             Err(_) => {
                 return detections
                     .iter()
@@ -104,6 +396,7 @@ impl LiveSession {
                     .collect();
             }
         };
+        let state = states.entry(anchor_id).or_insert_with(AnchorState::new);
         for d in detections {
             let obs = SurfaceLineObservation {
                 bbox: d.clone(),
@@ -111,19 +404,23 @@ impl LiveSession {
                 translated_text: String::new(),
                 source_language: source_language.to_string(),
             };
-            let res = map.add_or_merge(obs);
+            let res = state.map.add_or_merge(obs);
             let needs_rec = res.needs_rec();
             let line_id = res.id();
             let kind = AddResultKind::from(&res);
             let cached_source_text = if !needs_rec {
-                map.get(line_id)
+                state
+                    .map
+                    .get(line_id)
                     .map(|l| l.source_text.clone())
                     .unwrap_or_default()
             } else {
                 String::new()
             };
             let cached_source_language = if !needs_rec {
-                map.get(line_id)
+                state
+                    .map
+                    .get(line_id)
                     .map(|l| l.source_language.clone())
                     .unwrap_or_default()
             } else {
@@ -140,35 +437,806 @@ impl LiveSession {
         out
     }
 
-    /// Push a single recognized line back into the map: store the
-    /// text and language, and snapshot the line's current u-extent
-    /// as "rec just saw up to here" so future observations that
-    /// extend past it trigger re-recognition.
-    pub fn ingest_rec(&self, line_id: SurfaceLineId, source_text: &str, source_language: &str) {
-        if let Ok(mut map) = self.surface_map.lock() {
-            if let Some(line) = map.get_mut(line_id) {
-                line.source_text = source_text.to_string();
-                if !source_language.is_empty() {
-                    line.source_language = source_language.to_string();
+    /// Push a single recognized line back into the active anchor's
+    /// map: store the text and language, and snapshot the line's
+    /// current u-extent as "rec just saw up to here" so future
+    /// observations that extend past it trigger re-recognition.
+    pub fn ingest_rec(
+        &self,
+        anchor_id: AnchorId,
+        line_id: SurfaceLineId,
+        source_text: &str,
+        source_language: &str,
+    ) {
+        if let Ok(mut states) = self.anchor_states.lock() {
+            if let Some(state) = states.get_mut(&anchor_id) {
+                if let Some(line) = state.map.get_mut(line_id) {
+                    line.source_text = source_text.to_string();
+                    if !source_language.is_empty() {
+                        line.source_language = source_language.to_string();
+                    }
+                    line.record_rec_extent();
                 }
-                line.record_rec_extent();
             }
         }
     }
 
-    /// Push translated text back into a set of lines (all
-    /// recipients receive the same string — caller has already
-    /// performed block-level translation across the joined source
-    /// strings).
-    pub fn ingest_translation(&self, line_ids: &[SurfaceLineId], translated: &str) {
-        if let Ok(mut map) = self.surface_map.lock() {
-            for &id in line_ids {
-                if let Some(line) = map.get_mut(id) {
-                    line.translated_text = translated.to_string();
+    /// Push translated text back into a set of lines on the active
+    /// anchor (all recipients receive the same string — caller has
+    /// already performed block-level translation across the joined
+    /// source strings).
+    pub fn ingest_translation(
+        &self,
+        anchor_id: AnchorId,
+        line_ids: &[SurfaceLineId],
+        translated: &str,
+    ) {
+        if let Ok(mut states) = self.anchor_states.lock() {
+            if let Some(state) = states.get_mut(&anchor_id) {
+                for &id in line_ids {
+                    if let Some(line) = state.map.get_mut(id) {
+                        line.translated_text = translated.to_string();
+                    }
                 }
             }
         }
     }
+
+    /// Upsert one resident overlay item. Re-rasters only when the
+    /// content hash (strips + display text + language) changed since
+    /// the previous upsert for `id`; otherwise this is a no-op and
+    /// the cached bitmap survives. `matted_strips` is indexed parallel
+    /// to `strips` and may be empty to fall back to the legacy pill
+    /// rendering for every strip.
+    pub fn upsert_block(
+        &self,
+        anchor_id: AnchorId,
+        id: u64,
+        strips: Vec<OrientedRect>,
+        matted_strips: Vec<Option<MattedStrip>>,
+        source_text: String,
+        translated_text: String,
+        language: String,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) {
+        if strips.is_empty() {
+            return;
+        }
+        let display_text = pick_display_text(&source_text, &translated_text);
+        let hash = block_content_hash(&strips, &display_text, &language);
+        // Fast path: same content → keep the cached bitmap.
+        if let Ok(items) = self.overlay_items.lock() {
+            if let Some(existing) = items.iter().find(|it| it.id == id) {
+                if existing.content_hash == hash {
+                    return;
+                }
+            }
+        }
+        let raster = match render_block_bitmap(
+            &strips,
+            &matted_strips,
+            &display_text,
+            &language,
+            font_provider,
+        ) {
+            Some(r) => r,
+            None => return,
+        };
+        if let Ok(mut items) = self.overlay_items.lock() {
+            let new_item = OverlayItem {
+                id,
+                anchor_id,
+                bitmap: raster.bitmap,
+                width: raster.width,
+                height: raster.height,
+                surface_origin_x: raster.surface_origin_x,
+                surface_origin_y: raster.surface_origin_y,
+                content_hash: hash,
+            };
+            if let Some(slot) = items.iter_mut().find(|it| it.id == id) {
+                *slot = new_item;
+            } else {
+                items.push(new_item);
+            }
+        }
+    }
+
+    /// Drop overlay items for `anchor_id` whose id isn't in `ids`.
+    /// Used when an acquire / refresh finishes (final block id set
+    /// known) so stale overlays from a prior pipeline run on the
+    /// same anchor don't linger. Items for *other* anchors are
+    /// untouched.
+    pub fn retain_blocks(&self, anchor_id: AnchorId, ids: &[u64]) {
+        let keep: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        if let Ok(mut items) = self.overlay_items.lock() {
+            items.retain(|it| it.anchor_id != anchor_id || keep.contains(&it.id));
+        }
+    }
+}
+
+/// Adapter implementing the live recognition interface. The bindings
+/// implements this on `&TranslatorSession`; the desktop sim wraps a
+/// `&PpocrEngine`. Errors are stringified — the orchestrator only
+/// logs them and continues, so a typed error tree pulls its weight.
+pub trait LiveRecognizer {
+    fn recognize(
+        &self,
+        oriented: &OrientedImage,
+        boxes: &[DetectedTextBox],
+        source_selection: &OcrSourceSelection,
+    ) -> Result<Vec<RecognizedTextLine>, String>;
+}
+
+/// Adapter implementing the live translation interface. Mirrors
+/// `TranslatorSession::translate_mixed_texts`'s signature. The sim
+/// passes [`NoopTranslator`] (no translation models loaded).
+pub trait LiveTranslator {
+    fn translate_mixed_texts(
+        &self,
+        inputs: &[String],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[LanguageCode],
+    ) -> Result<MixedTextTranslationResult, String>;
+}
+
+#[cfg(feature = "ppocr")]
+impl LiveRecognizer for &crate::session::TranslatorSession {
+    fn recognize(
+        &self,
+        oriented: &OrientedImage,
+        boxes: &[DetectedTextBox],
+        source_selection: &OcrSourceSelection,
+    ) -> Result<Vec<RecognizedTextLine>, String> {
+        (*self)
+            .recognize_in_oriented_image(oriented, boxes, source_selection.clone())
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+impl LiveTranslator for &crate::session::TranslatorSession {
+    fn translate_mixed_texts(
+        &self,
+        inputs: &[String],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[LanguageCode],
+    ) -> Result<MixedTextTranslationResult, String> {
+        (*self)
+            .translate_mixed_texts(
+                inputs,
+                forced_source_code,
+                target_code,
+                available_language_codes,
+            )
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// Stub translator: returns the source as the "translation". Suitable
+/// for the desktop simulator (no translation models loaded) where the
+/// pipeline still wants to exercise the translate → upsert path.
+pub struct NoopTranslator;
+
+impl LiveTranslator for NoopTranslator {
+    fn translate_mixed_texts(
+        &self,
+        inputs: &[String],
+        _forced: Option<&str>,
+        _target: &str,
+        _available: &[LanguageCode],
+    ) -> Result<MixedTextTranslationResult, String> {
+        let translations = inputs
+            .iter()
+            .map(|s| crate::routing::TextTranslation {
+                source_text: s.clone(),
+                translated_text: s.clone(),
+            })
+            .collect();
+        Ok(MixedTextTranslationResult {
+            translations,
+            nothing_reason: None,
+        })
+    }
+}
+
+/// Inputs to [`LiveSession::run_post_detect`]. The orchestrator owns
+/// per-line state internally; callers only thread inputs and pull a
+/// summary out.
+pub struct PostDetectInput<'a> {
+    /// Detections in *camera/full-crop* coords. `tight_box` is what
+    /// the surface map gets after projecting through `h_view_to_surface`;
+    /// the whole struct is what the recognizer crops from.
+    pub detections: &'a [DetectedTextBox],
+    /// The same `OrientedImage` detection was just run on. Used to
+    /// crop strips for recognition.
+    pub oriented: &'a OrientedImage,
+    /// View → surface homography. `None` means identity (initial
+    /// acquire: canonical == camera). For mid-tracking refreshes
+    /// caller passes `invert(H_root_to_view)`.
+    pub h_view_to_surface: Option<[f32; 9]>,
+    /// Anchor id that "owns" these detections. Threaded through to
+    /// logging only; the overlay store is keyed by block id, not
+    /// anchor.
+    pub anchor_id: u64,
+    pub from_lang: &'a str,
+    pub to_lang: &'a str,
+    pub is_auto_source: bool,
+    pub available_codes: &'a [LanguageCode],
+    pub font_provider: &'a dyn crate::font_provider::FontProvider,
+    /// Per-detection matted strip (indexed parallel to `detections`).
+    /// Empty falls back to the legacy pill for every strip.
+    pub matted_strips: &'a [Option<MattedStrip>],
+    /// Translate-block batch size. Production uses 4; sim may pick a
+    /// smaller value to keep per-frame work bounded.
+    pub rec_batch_size: usize,
+}
+
+/// Result of [`LiveSession::run_post_detect`].
+#[derive(Clone, Debug, Default)]
+pub struct PostDetectOutcome {
+    pub anchor_id: u64,
+    pub detected_count: u32,
+    pub rec_ok_count: u32,
+    pub rec_empty_count: u32,
+    /// Number of detections that hit the surface-map cache (text was
+    /// already known; no ppocr rec call ran for them). Combined with
+    /// `rec_ok_count` to tell whether a refresh did real work or
+    /// just confirmed existing state.
+    pub cache_hits: u32,
+    /// Number of detections that actually went through the
+    /// recognizer this run (i.e. `detected_count - cache_hits` minus
+    /// any cancelled batches).
+    pub rec_called_count: u32,
+    /// Stable block ids that survived this run (got a non-empty rec
+    /// result and were upserted with their final translation). Caller
+    /// uses this for the post-pipeline `retain_blocks` so pending
+    /// placeholders for rec-failed blocks get dropped.
+    pub surviving_block_ids: Vec<u64>,
+    pub canceled: bool,
+}
+
+impl LiveSession {
+    /// One-shot post-detect orchestration: project bboxes into
+    /// surface coords, fold into the surface map, run rec on the
+    /// `needs_rec` boxes, translate per block, upsert the resident
+    /// overlay items, drop the placeholders for rec-failed blocks.
+    /// Returns a summary the caller uses for its outcome reporting.
+    ///
+    /// Cancellation: `cancel` is checked before each potentially-slow
+    /// stage (rec batch, translate batch). On `true`, the function
+    /// returns early with `canceled = true`. Outputs already pushed
+    /// into the surface map / overlay store are kept (so a cancelled
+    /// run doesn't undo any partial progress).
+    pub fn run_post_detect(
+        &self,
+        input: PostDetectInput<'_>,
+        recognizer: &dyn LiveRecognizer,
+        translator: &dyn LiveTranslator,
+        cancel: &dyn Fn() -> bool,
+    ) -> PostDetectOutcome {
+        let total = input.detections.len();
+        if total == 0 {
+            return PostDetectOutcome {
+                anchor_id: input.anchor_id,
+                ..Default::default()
+            };
+        }
+
+        // Project tight_boxes into surface coords (identity when
+        // h_view_to_surface is None).
+        let surface_boxes: Vec<OrientedRect> = match input.h_view_to_surface {
+            None => input
+                .detections
+                .iter()
+                .map(|d| d.tight_box.clone())
+                .collect(),
+            Some(h) => input
+                .detections
+                .iter()
+                .map(|d| {
+                    project_oriented_rect(&d.tight_box, &h).unwrap_or_else(|| d.tight_box.clone())
+                })
+                .collect(),
+        };
+
+        let outcomes = self.observe_detections(input.anchor_id, &surface_boxes, input.from_lang);
+
+        // Per-entry rec state: text + whether rec already filled it
+        // from cache. `rec_box` keeps the *camera-coord* DetectedTextBox
+        // so the recognizer can crop the strip; `line_id` ties back to
+        // the surface map for ingest.
+        struct Entry {
+            tight_surface: OrientedRect,
+            rec_box: DetectedTextBox,
+            line_id: SurfaceLineId,
+            source_text: String,
+            source_code: String,
+            rec_attempted: bool,
+        }
+        let mut entries: Vec<Entry> = input
+            .detections
+            .iter()
+            .zip(surface_boxes.iter())
+            .zip(outcomes.iter())
+            .map(|((d, surf), outcome)| {
+                let mut e = Entry {
+                    tight_surface: surf.clone(),
+                    rec_box: d.clone(),
+                    line_id: outcome.line_id,
+                    source_text: String::new(),
+                    source_code: input.from_lang.to_string(),
+                    rec_attempted: false,
+                };
+                if !outcome.needs_rec && !outcome.cached_source_text.is_empty() {
+                    e.source_text = outcome.cached_source_text.clone();
+                    e.source_code = if outcome.cached_source_language.is_empty() {
+                        input.from_lang.to_string()
+                    } else {
+                        outcome.cached_source_language.clone()
+                    };
+                    e.rec_attempted = true;
+                }
+                e
+            })
+            .collect();
+
+        let new_lines = outcomes
+            .iter()
+            .filter(|o| matches!(o.kind, AddResultKind::Created))
+            .count();
+        let extended_lines = outcomes
+            .iter()
+            .filter(|o| matches!(o.kind, AddResultKind::MergedAndExtended))
+            .count();
+        let unchanged_lines = outcomes
+            .iter()
+            .filter(|o| matches!(o.kind, AddResultKind::MergedUnchanged))
+            .count();
+        let cache_hits = entries.iter().filter(|e| e.rec_attempted).count();
+        log::debug!(
+            "[post_detect] anchor={} +new={} extended={} unchanged={} cache_hits={} total={}",
+            input.anchor_id,
+            new_lines,
+            extended_lines,
+            unchanged_lines,
+            cache_hits,
+            total,
+        );
+
+        // Group lines into blocks using the *anchor's* surface map
+        // bbox per line (may be wider than this run's projected tight
+        // rect when prior observations extended it).
+        let block_strip_indices: Vec<Vec<usize>>;
+        let block_strips: Vec<Vec<OrientedRect>>;
+        let block_ids: Vec<u64>;
+        {
+            let states_guard = self.anchor_states.lock();
+            let snapshot_lines: Vec<crate::surface_map::SurfaceLine> = match states_guard {
+                Ok(ref s) => match s.get(&input.anchor_id) {
+                    Some(state) => entries
+                        .iter()
+                        .filter_map(|e| state.map.get(e.line_id).cloned())
+                        .collect(),
+                    None => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+            let groups = group_surface_lines_into_blocks(&snapshot_lines);
+            block_strip_indices = groups
+                .iter()
+                .map(|g| {
+                    g.iter()
+                        .filter_map(|&snap_idx| {
+                            let line_id = snapshot_lines[snap_idx].id;
+                            entries.iter().position(|e| e.line_id == line_id)
+                        })
+                        .collect::<Vec<usize>>()
+                })
+                .filter(|v| !v.is_empty())
+                .collect();
+            block_strips = block_strip_indices
+                .iter()
+                .map(|idxs| {
+                    idxs.iter()
+                        .map(|&i| {
+                            states_guard
+                                .as_ref()
+                                .ok()
+                                .and_then(|s| s.get(&input.anchor_id))
+                                .and_then(|state| state.map.get(entries[i].line_id))
+                                .map(|line| line.bbox.clone())
+                                .unwrap_or_else(|| entries[i].tight_surface.clone())
+                        })
+                        .collect()
+                })
+                .collect();
+            block_ids = block_strip_indices
+                .iter()
+                .map(|idxs| {
+                    let mut ids: Vec<SurfaceLineId> =
+                        idxs.iter().map(|&i| entries[i].line_id).collect();
+                    ids.sort_unstable();
+                    stable_block_id(input.anchor_id, &ids)
+                })
+                .collect();
+        }
+
+        // Pending placeholders: per-strip bg rects, no text. Only
+        // upsert for blocks that don't already have a resident
+        // overlay (i.e. first time we see this set of lines). For a
+        // refresh on a known block, blanking the overlay back to an
+        // empty pill and then re-rendering the translation ~300 ms
+        // later is a visible flash; the translated overlay from a
+        // prior acquire is the right thing to keep on screen until
+        // the new translation arrives.
+        let existing_ids: std::collections::HashSet<u64> = match self.overlay_items.lock() {
+            Ok(items) => items.iter().map(|it| it.id).collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+        for (i, &id) in block_ids.iter().enumerate() {
+            if existing_ids.contains(&id) {
+                continue;
+            }
+            let block_mats = pick_matted_for_block(input.matted_strips, &block_strip_indices[i]);
+            self.upsert_block(
+                input.anchor_id,
+                id,
+                block_strips[i].clone(),
+                block_mats,
+                String::new(),
+                String::new(),
+                input.to_lang.to_string(),
+                input.font_provider,
+            );
+        }
+        self.retain_blocks(input.anchor_id, &block_ids);
+
+        if cancel() {
+            return PostDetectOutcome {
+                anchor_id: input.anchor_id,
+                detected_count: total as u32,
+                canceled: true,
+                ..Default::default()
+            };
+        }
+
+        let source_selection = if input.is_auto_source {
+            OcrSourceSelection::Auto
+        } else {
+            OcrSourceSelection::Specific {
+                language_code: LanguageCode::from(input.from_lang),
+            }
+        };
+
+        let rec_batch_size = input.rec_batch_size.max(1);
+        let mut block_of_entry = vec![0usize; total];
+        for (bi, idxs) in block_strip_indices.iter().enumerate() {
+            for &ei in idxs {
+                block_of_entry[ei] = bi;
+            }
+        }
+        let mut block_rec_remaining: Vec<usize> = block_strip_indices
+            .iter()
+            .map(|idxs| idxs.iter().filter(|&&i| !entries[i].rec_attempted).count())
+            .collect();
+        let mut block_translated = vec![false; block_ids.len()];
+
+        let mut start = 0;
+        while start < total {
+            if cancel() {
+                return PostDetectOutcome {
+                    anchor_id: input.anchor_id,
+                    detected_count: total as u32,
+                    canceled: true,
+                    ..Default::default()
+                };
+            }
+            let end = (start + rec_batch_size).min(total);
+
+            let original_indices: Vec<usize> = (start..end)
+                .filter(|&i| !entries[i].rec_attempted)
+                .collect();
+            let batch_boxes: Vec<DetectedTextBox> = original_indices
+                .iter()
+                .map(|&i| entries[i].rec_box.clone())
+                .collect();
+            let lines = if batch_boxes.is_empty() {
+                Vec::new()
+            } else {
+                match recognizer.recognize(input.oriented, &batch_boxes, &source_selection) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        log::warn!("[post_detect] recognize failed: {e}");
+                        break;
+                    }
+                }
+            };
+
+            for (i, line) in lines.iter().enumerate() {
+                let idx = match original_indices.get(i) {
+                    Some(&v) => v,
+                    None => break,
+                };
+                entries[idx].source_text = line.text.trim().to_string();
+                entries[idx].rec_attempted = true;
+                if input.is_auto_source {
+                    if let Some(code) = &line.source_code {
+                        entries[idx].source_code = code.clone();
+                    }
+                }
+                let bi = block_of_entry[idx];
+                if block_rec_remaining[bi] > 0 {
+                    block_rec_remaining[bi] -= 1;
+                }
+                self.ingest_rec(
+                    input.anchor_id,
+                    entries[idx].line_id,
+                    &entries[idx].source_text,
+                    &entries[idx].source_code,
+                );
+            }
+
+            if cancel() {
+                return PostDetectOutcome {
+                    anchor_id: input.anchor_id,
+                    detected_count: total as u32,
+                    canceled: true,
+                    ..Default::default()
+                };
+            }
+
+            // Which blocks just finished rec'ing all their strips?
+            let mut ready_blocks: Vec<usize> = (0..block_ids.len())
+                .filter(|&bi| block_rec_remaining[bi] == 0 && !block_translated[bi])
+                .collect();
+
+            if !ready_blocks.is_empty() {
+                let block_sources: Vec<String> = ready_blocks
+                    .iter()
+                    .map(|&bi| {
+                        block_strip_indices[bi]
+                            .iter()
+                            .map(|&i| entries[i].source_text.as_str())
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                let kept: Vec<(usize, String)> = ready_blocks
+                    .drain(..)
+                    .zip(block_sources)
+                    .filter(|(_, s)| !s.trim().is_empty())
+                    .collect();
+                if !kept.is_empty() {
+                    let inputs: Vec<String> = kept.iter().map(|(_, s)| s.clone()).collect();
+                    let forced = if input.is_auto_source {
+                        None
+                    } else {
+                        Some(input.from_lang)
+                    };
+                    let result = translator.translate_mixed_texts(
+                        &inputs,
+                        forced,
+                        input.to_lang,
+                        input.available_codes,
+                    );
+                    let by_src: std::collections::HashMap<String, String> = match result {
+                        Ok(res) => res
+                            .translations
+                            .into_iter()
+                            .map(|t| (t.source_text, t.translated_text))
+                            .collect(),
+                        Err(e) => {
+                            log::warn!("[post_detect] translate batch failed: {e}");
+                            std::collections::HashMap::new()
+                        }
+                    };
+                    for (bi, src) in kept {
+                        if cancel() {
+                            return PostDetectOutcome {
+                                anchor_id: input.anchor_id,
+                                detected_count: total as u32,
+                                canceled: true,
+                                ..Default::default()
+                            };
+                        }
+                        let translated = by_src.get(&src).cloned().unwrap_or_default();
+                        let kept_indices: Vec<usize> = block_strip_indices[bi]
+                            .iter()
+                            .copied()
+                            .filter(|&i| !entries[i].source_text.is_empty())
+                            .collect();
+                        if kept_indices.is_empty() {
+                            continue;
+                        }
+                        // Pull each strip's geometry from the **surface
+                        // map**, not from the per-detection
+                        // `entries[i].tight_surface`. The per-detection
+                        // projection carries detector + RANSAC noise
+                        // (1–3 px) every refresh; the map's stored
+                        // `line.bbox` only mutates on
+                        // `MergedAndExtended`, so for a held camera
+                        // every kept strip's geometry stays bit-for-bit
+                        // identical to the previous upsert → content
+                        // hash matches → no re-raster, no overlay shift.
+                        let line_ids: Vec<SurfaceLineId> =
+                            kept_indices.iter().map(|&i| entries[i].line_id).collect();
+                        let kept_strips: Vec<OrientedRect> = {
+                            let states = match self.anchor_states.lock() {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let map = states.get(&input.anchor_id).map(|s| &s.map);
+                            line_ids
+                                .iter()
+                                .zip(kept_indices.iter())
+                                .map(|(&id, &i)| match map.and_then(|m| m.get(id)) {
+                                    Some(line) => line.bbox.clone(),
+                                    None => entries[i].tight_surface.clone(),
+                                })
+                                .collect()
+                        };
+                        let kept_mats = pick_matted_for_block(input.matted_strips, &kept_indices);
+                        self.ingest_translation(input.anchor_id, &line_ids, &translated);
+                        self.upsert_block(
+                            input.anchor_id,
+                            block_ids[bi],
+                            kept_strips,
+                            kept_mats,
+                            src,
+                            translated,
+                            input.to_lang.to_string(),
+                            input.font_provider,
+                        );
+                        block_translated[bi] = true;
+                    }
+                }
+            }
+
+            start = end;
+        }
+
+        let surviving_block_ids: Vec<u64> = block_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(bi, &id)| if block_translated[bi] { Some(id) } else { None })
+            .collect();
+        self.retain_blocks(input.anchor_id, &surviving_block_ids);
+
+        // Mark the viewport's surface AABB as covered for this
+        // anchor. Subsequent refresh triggers compare their viewport
+        // AABB against this region and gate themselves out when
+        // there's nothing new visible. For the initial-acquire case
+        // (h_view_to_surface = None / identity), the viewport in
+        // surface coords is `(0, 0)..(rgb.W, rgb.H)`.
+        let frame_w = input.oriented.rgb.width() as f32;
+        let frame_h = input.oriented.rgb.height() as f32;
+        let viewport_aabb = match input.h_view_to_surface {
+            None => Aabb::from_points([
+                (0.0, 0.0),
+                (frame_w, 0.0),
+                (frame_w, frame_h),
+                (0.0, frame_h),
+            ]),
+            Some(h) => viewport_surface_aabb(&h, frame_w, frame_h),
+        };
+        if let Some(aabb) = viewport_aabb {
+            self.note_coverage(input.anchor_id, aabb);
+        }
+
+        let rec_ok = entries
+            .iter()
+            .filter(|e| e.rec_attempted && !e.source_text.is_empty())
+            .count();
+        let rec_empty = entries
+            .iter()
+            .filter(|e| e.rec_attempted && e.source_text.is_empty())
+            .count();
+        let rec_called_count = total.saturating_sub(cache_hits) as u32;
+
+        PostDetectOutcome {
+            anchor_id: input.anchor_id,
+            detected_count: total as u32,
+            rec_ok_count: rec_ok as u32,
+            rec_empty_count: rec_empty as u32,
+            cache_hits: cache_hits as u32,
+            rec_called_count,
+            surviving_block_ids,
+            canceled: false,
+        }
+    }
+}
+
+fn pick_matted_for_block(
+    mats: &[Option<MattedStrip>],
+    entry_indices: &[usize],
+) -> Vec<Option<MattedStrip>> {
+    if mats.is_empty() {
+        return entry_indices.iter().map(|_| None).collect();
+    }
+    entry_indices
+        .iter()
+        .map(|&i| mats.get(i).and_then(|m| m.clone()))
+        .collect()
+}
+
+/// Project an `OrientedRect` through the homography `h` by projecting
+/// each corner and re-fitting an `OrientedRect` from the resulting
+/// quad. For mild homographies (pan/zoom/in-plane rotation) the
+/// projected quad is near-rectangular; we approximate with the
+/// centroid + averaged edge direction + averaged side lengths. Returns
+/// `None` if any corner failed to project (e.g. h is non-invertible
+/// or quad collapses past the projective horizon).
+pub fn project_oriented_rect(rect: &OrientedRect, h: &[f32; 9]) -> Option<OrientedRect> {
+    let mut projected: [(f32, f32); 4] = [(0.0, 0.0); 4];
+    for (i, (x, y)) in rect.corners().into_iter().enumerate() {
+        let p = project(h, x, y)?;
+        projected[i] = p;
+    }
+    let cx = 0.25 * (projected[0].0 + projected[1].0 + projected[2].0 + projected[3].0);
+    let cy = 0.25 * (projected[0].1 + projected[1].1 + projected[2].1 + projected[3].1);
+    let top_dx = projected[1].0 - projected[0].0;
+    let top_dy = projected[1].1 - projected[0].1;
+    let bot_dx = projected[2].0 - projected[3].0;
+    let bot_dy = projected[2].1 - projected[3].1;
+    let angle = (top_dy + bot_dy).atan2(top_dx + bot_dx);
+    let width =
+        0.5 * ((top_dx.powi(2) + top_dy.powi(2)).sqrt() + (bot_dx.powi(2) + bot_dy.powi(2)).sqrt());
+    let left_dx = projected[3].0 - projected[0].0;
+    let left_dy = projected[3].1 - projected[0].1;
+    let right_dx = projected[2].0 - projected[1].0;
+    let right_dy = projected[2].1 - projected[1].1;
+    let height = 0.5
+        * ((left_dx.powi(2) + left_dy.powi(2)).sqrt()
+            + (right_dx.powi(2) + right_dy.powi(2)).sqrt());
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return None;
+    }
+    Some(OrientedRect {
+        cx,
+        cy,
+        width,
+        height,
+        angle_radians: angle,
+    })
+}
+
+/// `invert(h)` convenience that maps `H_root→view` into `H_view→surface`
+/// for the detect-on-tracking-frame trigger. Caller passes the
+/// homography it just got from the planar engine.
+pub fn h_view_to_surface_from(h_root_to_view: &[f32; 9]) -> Option<[f32; 9]> {
+    invert(h_root_to_view)
+}
+
+/// Decide which string to render for an item. Translation wins when
+/// non-empty; otherwise empty (pending placeholder). Mirrors the
+/// bindings-side `pick_display_text` for the run_acquire_pipeline-era
+/// pill renderer.
+fn pick_display_text(_source_text: &str, translated_text: &str) -> String {
+    if !translated_text.trim().is_empty() {
+        translated_text.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Content hash for `upsert_block` change detection. Same hash → same
+/// rasterized bitmap, no need to re-render.
+fn block_content_hash(strips: &[OrientedRect], display_text: &str, language: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (strips.len() as u64).hash(&mut h);
+    for s in strips {
+        s.cx.to_bits().hash(&mut h);
+        s.cy.to_bits().hash(&mut h);
+        s.width.to_bits().hash(&mut h);
+        s.height.to_bits().hash(&mut h);
+        s.angle_radians.to_bits().hash(&mut h);
+    }
+    display_text.hash(&mut h);
+    language.hash(&mut h);
+    h.finish()
 }
 
 /// Per-detection result from [`LiveSession::observe_detections`].
@@ -418,7 +1486,11 @@ pub fn render_block_bitmap(
             .map(argb_to_rgba_bytes)
             .unwrap_or(default_bg);
         crate::planar_engine::fill_oriented_rect_blended(
-            &mut rgba, bitmap_w, bitmap_h, v, strip_color,
+            &mut rgba,
+            bitmap_w,
+            bitmap_h,
+            v,
+            strip_color,
         );
     }
     let foreground_argb: u32 = matted_strips
@@ -513,7 +1585,9 @@ pub fn render_block_bitmap(
 
 /// Group `SurfaceLine`s into translation blocks (paragraphs) via the
 /// shared OCR grouping. Returns indices into the input slice.
-pub fn group_surface_lines_into_blocks(lines: &[crate::surface_map::SurfaceLine]) -> Vec<Vec<usize>> {
+pub fn group_surface_lines_into_blocks(
+    lines: &[crate::surface_map::SurfaceLine],
+) -> Vec<Vec<usize>> {
     use crate::ocr::TextLine;
     if lines.is_empty() {
         return Vec::new();
@@ -546,8 +1620,15 @@ pub fn group_surface_lines_into_blocks(lines: &[crate::surface_map::SurfaceLine]
 /// content-hash cache skips re-raster for unchanged blocks. The
 /// high bit is set so block ids generated this way are distinct
 /// from any legacy `next_entry_id`-derived ids.
-pub fn stable_block_id(sorted_line_ids: &[crate::surface_map::SurfaceLineId]) -> u64 {
+pub fn stable_block_id(
+    anchor_id: AnchorId,
+    sorted_line_ids: &[crate::surface_map::SurfaceLineId],
+) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in anchor_id.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
     for &id in sorted_line_ids {
         for byte in id.to_le_bytes() {
             hash ^= byte as u64;

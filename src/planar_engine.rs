@@ -730,8 +730,40 @@ impl LivePlanarEngine {
         }
     }
 
-    pub fn cached_anchor_ids(&self) -> Vec<AnchorId> {
+    /// Internal cache handles, MRU-first. **These name specific cache
+    /// entries, not root coordinate frames.** A single root (one
+    /// physical surface) may have several handles after handoffs.
+    /// `pub(crate)` so the handle id space never escapes
+    /// `planar_engine` — confusing it with the root id space (the
+    /// id externally-emitted by `TrackerCommand::Locked`,
+    /// `acquire_now`, etc.) was the source of "surface-map state
+    /// evaporates after panning" bugs. External callers want
+    /// [`Self::cached_root_ids`].
+    #[allow(dead_code)]
+    pub(crate) fn cached_handle_ids(&self) -> Vec<AnchorId> {
         self.cache.ids_mru()
+    }
+
+    /// Unique root anchor ids currently represented in the cache, in
+    /// MRU-of-any-descendant order. One root per physical surface;
+    /// the right id space for session-state retention because the
+    /// emitted `TrackerCommand::Locked.anchor_id` is always a root.
+    ///
+    /// A root survives in this list as long as **any** of its
+    /// descendants is still cached — handoff chains preserve the
+    /// root's coord frame even when the original root anchor itself
+    /// gets LRU-evicted from `AnchorCache`.
+    pub fn cached_root_ids(&self) -> Vec<AnchorId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut roots = Vec::new();
+        for id in self.cache.ids_mru() {
+            if let Some(entry) = self.cache.get(id) {
+                if seen.insert(entry.root_id) {
+                    roots.push(entry.root_id);
+                }
+            }
+        }
+        roots
     }
 
     pub fn cache_len(&self) -> usize {

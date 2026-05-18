@@ -245,7 +245,12 @@ fn lru_eviction_at_capacity() {
     let id2 = engine.acquire_now(&scene, 2_000).expect("a2");
     let id3 = engine.acquire_now(&scene, 3_000).expect("a3");
 
-    let ids = engine.cached_anchor_ids();
+    // Each `acquire_now` makes its own root (no chaining across calls),
+    // so root ids == handle ids here. `cached_root_ids` is the right
+    // accessor for tests asserting cache content from outside the
+    // engine module — `cached_handle_ids` exposes internal handle
+    // ids and is intentionally `pub(crate)`.
+    let ids = engine.cached_root_ids();
     assert_eq!(engine.cache_len(), 2);
     assert!(ids.contains(&id3), "newest must remain");
     assert!(ids.contains(&id2), "second-newest must remain");

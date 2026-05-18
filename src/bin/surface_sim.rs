@@ -46,7 +46,6 @@ const STATUS_H: u32 = 80;
 const WIN_W: usize = CAM_W as usize;
 const WIN_H: usize = (CAM_H + STATUS_H) as usize;
 const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-const DETECT_EVERY_N_FRAMES: u64 = 12; // ~2.5 Hz at 30fps
 const REC_BUDGET_PER_FRAME: usize = 4;
 
 // ---------------------------------------------------------------------
@@ -469,10 +468,14 @@ impl SimPipeline {
             cx: CAM_W as f32 / 2.0,
             cy: CAM_H as f32 / 2.0,
         };
+        let session = LiveSession::new();
+        // Match the sim's previous fixed ~2.5 Hz cadence (12 frames @
+        // 30 fps) instead of the production default (15).
+        session.set_refresh_every_n_locked_frames(12);
         Self {
             engine: LivePlanarEngine::new(cfg),
             ppocr,
-            session: LiveSession::new(),
+            session,
             intrinsics,
             active_anchor: None,
             frame_idx: 0,
@@ -521,15 +524,21 @@ impl SimPipeline {
                 self.last_inliers = inliers;
                 if self.active_anchor != Some(anchor_id) {
                     self.active_anchor = Some(anchor_id);
+                    // New anchor → reset refresh cadence so we don't
+                    // immediately re-detect on the next frame.
+                    self.session.on_acquire();
                 }
+                self.session.on_locked_frame();
             }
             TrackerCommand::Lost { .. } => self.last_cmd = TrackerCommandSummary::Lost,
         }
 
-        // Run detection periodically. Detection is in CAMERA coords;
-        // we project bboxes back through H⁻¹ into the anchor's
-        // canonical/surface coords before feeding the surface map.
-        if self.frame_idx % DETECT_EVERY_N_FRAMES == 0 && self.active_anchor.is_some() {
+        // Run detection on a `should_refresh_now`-paced cadence (same
+        // mechanism Android uses for the detect-on-tracking-frame
+        // trigger). Detection is in CAMERA coords; we project bboxes
+        // back through H⁻¹ into the anchor's canonical/surface coords
+        // before feeding the surface map.
+        if self.active_anchor.is_some() && self.session.should_refresh_now() {
             self.run_detection_cycle(rgba, gray);
         }
 
@@ -609,7 +618,8 @@ impl SimPipeline {
         // Feed each surface-coord bbox into the shared session.
         self.last_detection = camera_boxes;
         self.last_states.clear();
-        let outcomes = self.session.observe_detections(&surface_boxes, "");
+        let active = self.active_anchor.unwrap_or(0);
+        let outcomes = self.session.observe_detections(active, &surface_boxes, "");
         let mut needing_rec: Vec<(usize, SurfaceLineId)> = Vec::new();
         for (i, outcome) in outcomes.iter().enumerate() {
             self.last_states.push((outcome.line_id, outcome.kind));
@@ -657,9 +667,12 @@ impl SimPipeline {
                 self.cumulative_rec_calls += lines.len() as u64;
                 for (k, line) in lines.iter().enumerate() {
                     let (_idx, line_id) = needing_rec[k];
-                    let lang = line.source_code.clone().unwrap_or_else(|| "und".to_string());
+                    let lang = line
+                        .source_code
+                        .clone()
+                        .unwrap_or_else(|| "und".to_string());
                     self.session
-                        .ingest_rec(line_id, line.text.trim(), &lang);
+                        .ingest_rec(active, line_id, line.text.trim(), &lang);
                 }
             }
             Err(e) => log::warn!("rec failed: {e:?}"),
@@ -795,15 +808,17 @@ fn render(buf: &mut [u32], rgba: &RgbaImage, p: &SimPipeline) {
 
     // Surface map lines projected through the current H into camera
     // coords, color-coded by their last AddResult state.
+    let active = p.active_anchor.unwrap_or(0);
     for (id, kind) in &p.last_states {
-        let map_guard = match p.session.surface_map.lock() {
-            Ok(m) => m,
+        let states_guard = match p.session.anchor_states.lock() {
+            Ok(s) => s,
             Err(_) => continue,
         };
-        let line = match map_guard.get(*id) {
-            Some(l) => l,
+        let line = match states_guard.get(&active).and_then(|s| s.map.get(*id)) {
+            Some(l) => l.clone(),
             None => continue,
         };
+        drop(states_guard);
         let surf_quad = oriented_quad(&line.bbox);
         let cam_quad = match project_quad(&p.last_homography, &surf_quad) {
             Some(q) => q,
@@ -830,16 +845,15 @@ fn render(buf: &mut [u32], rgba: &RgbaImage, p: &SimPipeline) {
         TrackerCommandSummary::Locked => "LOCKED",
         TrackerCommandSummary::Lost => "LOST",
     };
+    let line_count = p
+        .session
+        .anchor_states
+        .lock()
+        .map(|s| s.values().map(|st| st.map.len()).sum::<usize>())
+        .unwrap_or(0);
     let line1 = format!(
         "FRAME {} {} INLIERS {} LINES {}",
-        p.frame_idx,
-        state_str,
-        p.last_inliers,
-        p.session
-            .surface_map
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0)
+        p.frame_idx, state_str, p.last_inliers, line_count
     );
     let line2 = format!(
         "DETECTED {} REC {} CACHE {}",
