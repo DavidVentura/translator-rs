@@ -67,6 +67,8 @@ pub mod planar_engine;
 pub mod planar_tracker;
 #[cfg(feature = "ppocr")]
 pub mod ppocr;
+#[cfg(feature = "planar-tracker")]
+pub mod rectification;
 mod routing;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod script;
