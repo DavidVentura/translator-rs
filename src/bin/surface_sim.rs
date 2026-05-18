@@ -34,10 +34,11 @@ use minifb::{Key, Window, WindowOptions};
 use translator::PpocrScript;
 use translator::homography::{fit_homography, invert, project};
 use translator::imu_prior::CameraIntrinsics;
+use translator::live_session::{AddResultKind, LiveSession};
 use translator::ocr::OrientedRect;
 use translator::planar_engine::{EngineConfig, LivePlanarEngine, TrackerCommand};
 use translator::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
-use translator::surface_map::{AddResult, SurfaceLineObservation, SurfaceMap};
+use translator::surface_map::SurfaceLineId;
 
 const CAM_W: u32 = 720;
 const CAM_H: u32 = 540;
@@ -431,7 +432,9 @@ fn draw_text(buf: &mut [u32], s: &str, x0: usize, y0: usize, color: u32) {
 struct SimPipeline {
     engine: LivePlanarEngine,
     ppocr: PpocrEngine,
-    map: SurfaceMap,
+    /// Shared cross-platform session state. Owns the surface map +
+    /// overlay store (currently only the map matters here).
+    session: LiveSession,
     intrinsics: CameraIntrinsics,
     active_anchor: Option<u64>,
     frame_idx: u64,
@@ -439,16 +442,9 @@ struct SimPipeline {
     last_inliers: usize,
     last_cmd: TrackerCommandSummary,
     last_detection: Vec<OrientedRect>,
-    last_states: Vec<(u64, AddResultKind)>, // (line_id, kind) for last detection
+    last_states: Vec<(SurfaceLineId, AddResultKind)>, // (line_id, kind) for last detection
     cumulative_rec_calls: u64,
     cumulative_cache_hits: u64,
-}
-
-#[derive(Clone, Copy)]
-enum AddResultKind {
-    Created,
-    MergedExtended,
-    MergedUnchanged,
 }
 
 #[derive(Clone, Copy)]
@@ -476,7 +472,7 @@ impl SimPipeline {
         Self {
             engine: LivePlanarEngine::new(cfg),
             ppocr,
-            map: SurfaceMap::new(),
+            session: LiveSession::new(),
             intrinsics,
             active_anchor: None,
             frame_idx: 0,
@@ -610,27 +606,15 @@ impl SimPipeline {
             camera_boxes.push(d.tight_box);
         }
 
-        // Feed each surface-coord bbox into the map. Track AddResult
-        // per detection for visualization.
+        // Feed each surface-coord bbox into the shared session.
         self.last_detection = camera_boxes;
         self.last_states.clear();
-        let mut needing_rec: Vec<(usize, u64)> = Vec::new(); // (idx in detected, line_id)
-        for (i, sbbox) in surface_boxes.iter().enumerate() {
-            let obs = SurfaceLineObservation {
-                bbox: sbbox.clone(),
-                source_text: String::new(),
-                translated_text: String::new(),
-                source_language: String::new(),
-            };
-            let res = self.map.add_or_merge(obs);
-            let kind = match res {
-                AddResult::Created(_) => AddResultKind::Created,
-                AddResult::MergedAndExtended(_) => AddResultKind::MergedExtended,
-                AddResult::MergedUnchanged(_) => AddResultKind::MergedUnchanged,
-            };
-            self.last_states.push((res.id(), kind));
-            if res.needs_rec() {
-                needing_rec.push((i, res.id()));
+        let outcomes = self.session.observe_detections(&surface_boxes, "");
+        let mut needing_rec: Vec<(usize, SurfaceLineId)> = Vec::new();
+        for (i, outcome) in outcomes.iter().enumerate() {
+            self.last_states.push((outcome.line_id, outcome.kind));
+            if outcome.needs_rec {
+                needing_rec.push((i, outcome.line_id));
             } else {
                 self.cumulative_cache_hits += 1;
             }
@@ -673,14 +657,9 @@ impl SimPipeline {
                 self.cumulative_rec_calls += lines.len() as u64;
                 for (k, line) in lines.iter().enumerate() {
                     let (_idx, line_id) = needing_rec[k];
-                    if let Some(line_ref) = self.map.get_mut(line_id) {
-                        line_ref.source_text = line.text.trim().to_string();
-                        line_ref.source_language = line
-                            .source_code
-                            .clone()
-                            .unwrap_or_else(|| "und".to_string());
-                        line_ref.record_rec_extent();
-                    }
+                    let lang = line.source_code.clone().unwrap_or_else(|| "und".to_string());
+                    self.session
+                        .ingest_rec(line_id, line.text.trim(), &lang);
                 }
             }
             Err(e) => log::warn!("rec failed: {e:?}"),
@@ -689,7 +668,7 @@ impl SimPipeline {
 
     fn reset(&mut self) {
         self.engine.clear();
-        self.map.clear();
+        self.session.clear();
         self.active_anchor = None;
         self.frame_idx = 0;
         self.last_homography = IDENTITY;
@@ -817,7 +796,11 @@ fn render(buf: &mut [u32], rgba: &RgbaImage, p: &SimPipeline) {
     // Surface map lines projected through the current H into camera
     // coords, color-coded by their last AddResult state.
     for (id, kind) in &p.last_states {
-        let line = match p.map.get(*id) {
+        let map_guard = match p.session.surface_map.lock() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let line = match map_guard.get(*id) {
             Some(l) => l,
             None => continue,
         };
@@ -828,7 +811,7 @@ fn render(buf: &mut [u32], rgba: &RgbaImage, p: &SimPipeline) {
         };
         let color = match kind {
             AddResultKind::Created => 0x40FF40,
-            AddResultKind::MergedExtended => 0xFFFF40,
+            AddResultKind::MergedAndExtended => 0xFFFF40,
             AddResultKind::MergedUnchanged => 0x4080FF,
         };
         draw_quad(buf, &cam_quad, color, 0, 0);
@@ -852,7 +835,11 @@ fn render(buf: &mut [u32], rgba: &RgbaImage, p: &SimPipeline) {
         p.frame_idx,
         state_str,
         p.last_inliers,
-        p.map.len()
+        p.session
+            .surface_map
+            .lock()
+            .map(|m| m.len())
+            .unwrap_or(0)
     );
     let line2 = format!(
         "DETECTED {} REC {} CACHE {}",
