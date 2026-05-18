@@ -157,6 +157,97 @@ pub fn decomposition_residual(h: &[f32; 9], pose: &PlanePose, k: &CameraIntrinsi
     acc.sqrt() / h_scale
 }
 
+/// Build the image-space homography that resamples the source camera
+/// image into a fronto-parallel canonical view of the plane defined
+/// by `pose.normal`. Apply this to a source pixel via `project(H_rect,
+/// x, y)` to find the rectified-frame pixel where it should land.
+///
+/// The construction:
+/// 1. The source camera sees a 3D point on the plane at depth
+///    `d / (n · ray_dir)`, where `ray_dir = K⁻¹·[u,v,1]ᵀ`. So source
+///    pixel `(u,v)` corresponds to the plane point
+///    `d · ray_dir / (n · ray_dir)`.
+/// 2. A virtual fronto-parallel camera looking along `-n` sees the
+///    plane axis-aligned. Choose its in-plane basis `(b1, b2)` and
+///    project the 3D point onto that basis to get rectified pixel
+///    coords.
+///
+/// The resulting H_rect is `K_virtual · [b1, b2, -n]ᵀ · K⁻¹` (up
+/// to scale). `out_scale_px` sets the pixel density of the rectified
+/// image (pixels per unit at the source's depth).
+///
+/// `out_centre_px` places the rectified-frame origin in output
+/// pixel coords; typically set this to half the desired output
+/// width/height so the centre of the source's text region lands
+/// near the rectified-frame centre.
+///
+/// Returns `None` if `pose.normal` is degenerate (zero, or aligned
+/// with the world-up basis we use to construct the in-plane axes).
+pub fn rectification_matrix(
+    pose: &PlanePose,
+    k: &CameraIntrinsics,
+    out_scale_px: f32,
+    out_centre_px: (f32, f32),
+) -> Option<[f32; 9]> {
+    let n = normalize3(&pose.normal);
+    if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).abs() < 0.5 {
+        return None;
+    }
+    // Pick an in-plane basis. The two basis vectors `b1`, `b2` span
+    // the plane (both perpendicular to n) and define which way is
+    // "up" / "right" in the rectified image. Use a stable
+    // construction that doesn't collapse for typical normals.
+    //
+    // Anchor "up" against world-Y (camera's +y, image-down) projected
+    // onto the plane. If `n` is nearly parallel to +y (the plane is
+    // viewed edge-on, near-degenerate), fall back to anchoring
+    // against world-X.
+    let reference = if n[1].abs() < 0.9 {
+        [0.0_f32, 1.0, 0.0]
+    } else {
+        [1.0_f32, 0.0, 0.0]
+    };
+    let b2_raw = [
+        reference[0] - reference[0] * 0.0 - n[0] * dot3(&reference, &n),
+        reference[1] - n[1] * dot3(&reference, &n),
+        reference[2] - n[2] * dot3(&reference, &n),
+    ];
+    let b2 = normalize3(&b2_raw);
+    if dot3(&b2, &b2) < 0.5 {
+        return None;
+    }
+    let b1 = cross(&b2, &n);
+
+    // Build [b1, b2, -n] as rows of the world→plane-frame rotation.
+    // Source pixel (u,v) → ray d = K⁻¹·[u,v,1].
+    // Plane point P = d / (n·d) (set plane at depth 1).
+    // Rectified coords (X, Y) = (b1·P, b2·P) · out_scale_px + centre.
+    // Equivalently, build H so that H · [u,v,1]ᵀ ~ [X, Y, 1] up to
+    // scale. The trick: substitute P = d/(n·d), so
+    //   X = (b1·d) / (n·d) · scale + cx
+    //   Y = (b2·d) / (n·d) · scale + cy
+    //   1 = (n·d) / (n·d)
+    // which means H_rect = M · K⁻¹, with M's rows:
+    //   [scale·b1ᵀ + cx·nᵀ;  scale·b2ᵀ + cy·nᵀ;  nᵀ].
+    let (cx, cy) = out_centre_px;
+    let m = [
+        out_scale_px * b1[0] - cx * n[0],
+        out_scale_px * b1[1] - cx * n[1],
+        out_scale_px * b1[2] - cx * n[2],
+        out_scale_px * b2[0] - cy * n[0],
+        out_scale_px * b2[1] - cy * n[1],
+        out_scale_px * b2[2] - cy * n[2],
+        -n[0],
+        -n[1],
+        -n[2],
+    ];
+    Some(mat3_mul(&m, &k.k_inv()))
+}
+
+fn dot3(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
 /// True if the candidate pose passes basic physical-validity checks.
 pub fn is_pose_plausible(pose: &PlanePose, h: &[f32; 9], k: &CameraIntrinsics) -> bool {
     if pose.normal[2] >= 0.0 {
@@ -172,6 +263,19 @@ pub fn is_pose_plausible(pose: &PlanePose, h: &[f32; 9], k: &CameraIntrinsics) -
 // Disambiguation.
 // ---------------------------------------------------------------------
 
+/// Result of multi-frame disambiguation: the picked pose plus the
+/// **mean per-frame disagreement** of the chosen normal with the
+/// closest matching normal in every other frame (in radians, ≥ 0).
+/// A small value means cross-frame consistency was good; a large
+/// value means the frames disagreed and the rectification is
+/// suspect. Sanity-check this against a threshold before committing
+/// to a rectification.
+#[derive(Clone, Copy, Debug)]
+pub struct DisambiguationResult {
+    pub pose: PlanePose,
+    pub mean_disagreement_radians: f32,
+}
+
 /// Multi-frame disambiguation: pick the candidate whose normal is
 /// most consistent across multiple frames' decompositions of the
 /// same plane. The plane normal in the anchor's coordinate system is
@@ -183,13 +287,14 @@ pub fn is_pose_plausible(pose: &PlanePose, h: &[f32; 9], k: &CameraIntrinsics) -
 /// `per_frame` is `[frame_candidates_0, frame_candidates_1, ...]`,
 /// each typically with 2 entries. Returns the frame-0 candidate
 /// (i.e. caller's reference frame) whose normal best matches a
-/// candidate in every other frame. `None` if any frame produced no
+/// candidate in every other frame, plus the mean disagreement angle
+/// to the matched normals. `None` if any frame produced no
 /// candidates.
 ///
 /// This is the **primary** disambiguator; the single-frame
 /// `disambiguate_with_priors` below is a fallback for when only one
 /// frame is available, and is best-effort.
-pub fn disambiguate_across_frames(per_frame: &[Vec<PlanePose>]) -> Option<PlanePose> {
+pub fn disambiguate_across_frames(per_frame: &[Vec<PlanePose>]) -> Option<DisambiguationResult> {
     if per_frame.is_empty() {
         return None;
     }
@@ -200,6 +305,7 @@ pub fn disambiguate_across_frames(per_frame: &[Vec<PlanePose>]) -> Option<PlaneP
     if per_frame.iter().any(|f| f.is_empty()) {
         return None;
     }
+    let other_count = per_frame.len() - 1;
     let mut best: Option<(PlanePose, f32)> = None;
     for c0 in frame0 {
         let mut total_disagreement = 0.0_f32;
@@ -222,7 +328,14 @@ pub fn disambiguate_across_frames(per_frame: &[Vec<PlanePose>]) -> Option<PlaneP
             _ => {}
         }
     }
-    best.map(|(p, _)| p)
+    best.map(|(pose, total)| DisambiguationResult {
+        pose,
+        mean_disagreement_radians: if other_count == 0 {
+            0.0
+        } else {
+            total / other_count as f32
+        },
+    })
 }
 
 /// Single-frame fallback. Uses a weighted combination of rotation
@@ -744,8 +857,8 @@ mod tests {
             }
             let picked = disambiguate_across_frames(&[c0, c1]);
             match picked {
-                Some(p) => {
-                    let err = angle_between(&p.normal, &pose_f0.normal);
+                Some(r) => {
+                    let err = angle_between(&r.pose.normal, &pose_f0.normal);
                     if err > max_err {
                         max_err = err;
                     }
@@ -783,8 +896,8 @@ mod tests {
             }
             let picked = disambiguate_across_frames(&[c0, c1]);
             match picked {
-                Some(p) => {
-                    let err = angle_between(&p.normal, &pose_f0.normal);
+                Some(r) => {
+                    let err = angle_between(&r.pose.normal, &pose_f0.normal);
                     if err > max_err {
                         max_err = err;
                     }
@@ -878,8 +991,8 @@ mod tests {
                 if c0.is_empty() || c1.is_empty() {
                     continue;
                 }
-                if let Some(p) = disambiguate_across_frames(&[c0, c1]) {
-                    let err = angle_between(&p.normal, &pose_f0.normal);
+                if let Some(r) = disambiguate_across_frames(&[c0, c1]) {
+                    let err = angle_between(&r.pose.normal, &pose_f0.normal);
                     sum_err += err;
                     if err > max_err {
                         max_err = err;
@@ -908,6 +1021,104 @@ mod tests {
             "zero-noise mean error {} ° is not near zero",
             mean0
         );
+    }
+
+    /// A rectangular patch on a tilted plane, projected through the
+    /// source camera, then through `H_rect`, should land on an
+    /// axis-aligned rectangle in the rectified image.
+    #[test]
+    fn rectification_axis_aligns_plane_rectangle() {
+        use crate::homography::project;
+        let k = k_test();
+        let alpha = 30.0_f32.to_radians();
+        let n = normalize3(&[0.0, alpha.sin(), -alpha.cos()]);
+        let pose = PlanePose {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            t_over_d: [0.0, 0.0, 0.0],
+            normal: n,
+        };
+        let b1 = normalize3(&cross(&[0.0, 1.0, 0.0], &n));
+        let b2 = normalize3(&cross(&n, &b1));
+        let plane_centre = scale_vec3(&n, -1.0);
+        let size = 0.25;
+        let corners_3d: Vec<[f32; 3]> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .iter()
+            .map(|&(u, v)| {
+                [
+                    plane_centre[0] + size * u * b1[0] + size * v * b2[0],
+                    plane_centre[1] + size * u * b1[1] + size * v * b2[1],
+                    plane_centre[2] + size * u * b1[2] + size * v * b2[2],
+                ]
+            })
+            .collect();
+        let source_pixels: Vec<(f32, f32)> = corners_3d
+            .iter()
+            .map(|p| {
+                let x = k.fx * p[0] / p[2] + k.cx;
+                let y = k.fy * p[1] / p[2] + k.cy;
+                (x, y)
+            })
+            .collect();
+        let h_rect = rectification_matrix(&pose, &k, 200.0, (320.0, 240.0)).unwrap();
+        let rectified: Vec<(f32, f32)> = source_pixels
+            .iter()
+            .map(|&(x, y)| project(&h_rect, x, y).unwrap())
+            .collect();
+        let mut by_y = rectified.clone();
+        by_y.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let tol = 0.5;
+        assert!(
+            (by_y[0].1 - by_y[1].1).abs() < tol,
+            "top y mismatch: {:?}",
+            by_y
+        );
+        assert!(
+            (by_y[2].1 - by_y[3].1).abs() < tol,
+            "bottom y mismatch: {:?}",
+            by_y
+        );
+        let mut by_x = rectified.clone();
+        by_x.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(
+            (by_x[0].0 - by_x[1].0).abs() < tol,
+            "left x mismatch: {:?}",
+            by_x
+        );
+        assert!(
+            (by_x[2].0 - by_x[3].0).abs() < tol,
+            "right x mismatch: {:?}",
+            by_x
+        );
+    }
+
+    /// Rectifying a fronto-parallel plane should produce a pure
+    /// similarity (no perspective skew, just scale + translation).
+    #[test]
+    fn rectification_of_fronto_parallel_is_similarity() {
+        use crate::homography::project;
+        let k = k_test();
+        let pose = PlanePose {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            t_over_d: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, -1.0],
+        };
+        let h_rect = rectification_matrix(&pose, &k, 200.0, (320.0, 240.0)).unwrap();
+        let pixels = [
+            (160.0, 120.0),
+            (480.0, 120.0),
+            (480.0, 360.0),
+            (160.0, 360.0),
+        ];
+        let mapped: Vec<(f32, f32)> = pixels
+            .iter()
+            .map(|&(x, y)| project(&h_rect, x, y).unwrap())
+            .collect();
+        let top_dy = (mapped[0].1 - mapped[1].1).abs();
+        let bot_dy = (mapped[2].1 - mapped[3].1).abs();
+        let left_dx = (mapped[0].0 - mapped[3].0).abs();
+        let right_dx = (mapped[1].0 - mapped[2].0).abs();
+        assert!(top_dy < 0.5 && bot_dy < 0.5, "y not preserved");
+        assert!(left_dx < 0.5 && right_dx < 0.5, "x not preserved");
     }
 
     #[test]

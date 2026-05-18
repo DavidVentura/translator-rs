@@ -205,7 +205,20 @@ struct CachedAnchor {
     h_root_to_canonical: [f32; 9],
     created_at_ns: u64,
     last_locked_ns: u64,
+    /// First few `H_anchor→view` samples collected after acquire.
+    /// Used by the caller to recover the plane's pose for
+    /// rectification (see `rectification::disambiguate_across_frames`).
+    /// Capped at `RECTIFICATION_BURST_SIZE`; subsequent frames are
+    /// dropped silently.
+    h_burst: Vec<[f32; 9]>,
 }
+
+/// Number of post-acquire `H_anchor→view` samples we collect per
+/// anchor before the caller runs plane-pose recovery. Three gives a
+/// strong cross-frame consistency signal (see noise-tolerance table
+/// in `rectification::tests`); raising it costs nothing per-frame
+/// but delays the rectification commit.
+pub const RECTIFICATION_BURST_SIZE: usize = 3;
 
 /// Hand-rolled LRU. Capacity is small (≤5 in production) so a Vec keyed
 /// in MRU-first order is fine; not worth pulling in a crate. Insertions
@@ -415,6 +428,9 @@ impl LivePlanarEngine {
                     self.cache.touch(anchor_id);
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
                         entry.last_locked_ns = timestamp_ns;
+                        if entry.h_burst.len() < RECTIFICATION_BURST_SIZE {
+                            entry.h_burst.push(r.homography);
+                        }
                     }
                     // External: emit the root id and the chain-composed
                     // H_root→view. The handoff machinery is invisible
@@ -594,6 +610,7 @@ impl LivePlanarEngine {
                 h_root_to_canonical: IDENTITY,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
+                h_burst: Vec::with_capacity(RECTIFICATION_BURST_SIZE),
             },
         );
         self.state = EngineState::Locked {
@@ -692,6 +709,19 @@ impl LivePlanarEngine {
         }
     }
 
+    /// The `H_anchor→view` samples collected for `anchor_id` since
+    /// acquire, up to `RECTIFICATION_BURST_SIZE`. Empty until the
+    /// anchor sees its first Locked frame; full once it has seen
+    /// `RECTIFICATION_BURST_SIZE` Locked frames. Caller can feed
+    /// these into `rectification::decompose_homography` +
+    /// `disambiguate_across_frames` to recover the plane pose.
+    pub fn h_burst_of(&self, anchor_id: AnchorId) -> &[[f32; 9]] {
+        match self.cache.get(anchor_id) {
+            Some(entry) => entry.h_burst.as_slice(),
+            None => &[],
+        }
+    }
+
     pub fn current_anchor(&self) -> Option<AnchorId> {
         match self.state {
             EngineState::Locked { anchor_id, .. } => Some(self.root_of(anchor_id)),
@@ -784,6 +814,7 @@ impl LivePlanarEngine {
                 h_root_to_canonical: h_root_to_new,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
+                h_burst: Vec::with_capacity(RECTIFICATION_BURST_SIZE),
             },
         );
         self.last_spawn_ns = timestamp_ns;
