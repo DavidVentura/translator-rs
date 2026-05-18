@@ -23,6 +23,11 @@ name = "translate"
 path = "src/bin/translate.rs"
 required-features = ["translate-cli"]
 
+[[bin]]
+name = "surface_sim"
+path = "src/bin/surface_sim.rs"
+required-features = ["surface-sim"]
+
 [features]
 default = []
 translate-cli = ["dep:toml"]
@@ -53,6 +58,7 @@ pdf-image-translate = [
 doc-align = ["dep:ort", "dep:ndarray"]
 ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon"]
 planar-tracker = ["dep:image", "dep:imageproc", "image-render"]
+surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
@@ -85,6 +91,9 @@ ndarray = { version = "0.16", optional = true }
 imageproc = { version = "0.25", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
 log = "0.4"
+minifb = { version = "0.27", optional = true }
+ab_glyph = { version = "0.2", optional = true }
+env_logger = { version = "0.11", optional = true }
 
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 html5ever = { version = "0.38", optional = true }

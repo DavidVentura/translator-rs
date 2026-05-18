@@ -30,6 +30,8 @@ pub mod language_detect;
 pub mod live_compositor;
 #[cfg(feature = "ppocr")]
 pub mod live_frame;
+#[cfg(feature = "planar-tracker")]
+pub mod live_session;
 #[cfg(feature = "ppocr")]
 mod mnn_inference;
 #[cfg(feature = "mucab")]
@@ -78,6 +80,8 @@ pub mod settings;
 #[cfg(feature = "tts")]
 mod speech;
 mod styled;
+#[cfg(feature = "planar-tracker")]
+pub mod surface_map;
 #[cfg(feature = "dictionary")]
 pub mod tarkka;
 #[cfg(feature = "tesseract")]
