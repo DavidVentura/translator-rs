@@ -25,6 +25,7 @@ use crate::live_frame::OrientedImage;
 use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine};
 use crate::rectification::{
     PlanePose, SurfaceKind, decompose_homography, disambiguate_across_frames, is_pose_plausible,
+    resample_rgba_through,
 };
 use crate::routing::MixedTextTranslationResult;
 use crate::surface_map::{AddResult, SurfaceLineId, SurfaceLineObservation, SurfaceMap};
@@ -175,6 +176,15 @@ pub struct AnchorState {
     /// `Committed` or `Refused` exactly once per anchor (no
     /// re-attempts).
     pub rectification: RectificationAttempt,
+    /// `H_rect` (raw-display → rectified-display) committed for this
+    /// anchor's acquire. `None` when rectification refused (or hasn't
+    /// run yet) — surface coords for those anchors are sensor coords
+    /// (today's path). When `Some`, surface coords for the anchor are
+    /// rectified-display coords, and the per-frame compositor must
+    /// post-compose `engine_H × h_disp_to_sensor × invert(h_rect)` to
+    /// get a surface→view homography that applies the page's
+    /// perspective at draw time.
+    pub h_rect: Option<[f32; 9]>,
 }
 
 impl AnchorState {
@@ -183,6 +193,7 @@ impl AnchorState {
             map: SurfaceMap::new(),
             covered_region: None,
             rectification: RectificationAttempt::Pending,
+            h_rect: None,
         }
     }
 }
@@ -226,6 +237,15 @@ pub enum RectificationRefusal {
     /// Recovered pose fails the sanity check
     /// (`is_pose_plausible`).
     PoseImplausible,
+    /// Recovered normal is too close to the camera's optical
+    /// axis — the surface is nearly fronto-parallel and
+    /// rectifying it would be a no-op (`h_rect ≈ identity`)
+    /// while costing us the per-line angle variation that the
+    /// un-rectified path captures naturally in
+    /// `normalize_block_visuals_rotated_basis`. Below this tilt
+    /// threshold the un-rectified path is strictly better for
+    /// overlay layout.
+    TooFrontoParallel { tilt_radians: f32 },
 }
 
 /// Minimum frames required before we'll attempt commit. Mirrors
@@ -240,6 +260,199 @@ pub const RECTIFICATION_MIN_FRAMES: usize = 2;
 /// while still rejecting cases where the per-frame candidates
 /// disagree wildly (decomposition isn't stable on this geometry).
 pub const RECTIFICATION_MAX_DISAGREEMENT_RAD: f32 = 0.0873; // 5°
+
+/// Minimum surface tilt below which we refuse to commit.
+/// Computed as `acos(|n.z|)` — the angle between the recovered
+/// plane normal and the camera's optical axis (+z). Near-zero
+/// tilt means `h_rect ≈ identity`, so the rectification would do
+/// nothing at the OCR stage (rec quality is fine on near-flat
+/// surfaces anyway) but would destroy per-line angle variation
+/// at the overlay stage (block normalization in rectified coords
+/// collapses all lines to 0°; the composite H can't re-add the
+/// page tilt because there's no tilt in `h_rect` to invert). The
+/// un-rectified path is strictly better below this threshold.
+pub const RECTIFICATION_MIN_TILT_RAD: f32 = 0.175; // ~10°
+
+/// Project an `OrientedRect` through a homography, returning the
+/// oriented rect that approximately bounds the warped quad. Used at
+/// acquire time to map detection bboxes from raw camera coords into
+/// rectified canonical coords (or any other change-of-basis).
+///
+/// The fit uses the 4 corners' projected positions: the center is
+/// their centroid, the angle is the direction from new-TL to new-TR
+/// (reading direction), and width/height are the average lengths of
+/// the parallel edges. Under perfect homography of a rigid rectangle
+/// this is exact; under perspective foreshortening the source
+/// rectangle warps to a non-rectangular quad and this is a
+/// least-error rectangular fit. For the OCR pipeline's purposes —
+/// "where does the text region land after rectification" — that's
+/// good enough; PP-OCR rec then operates on the cropped strip.
+pub fn warp_oriented_box(b: &OrientedRect, h: &[f32; 9]) -> Option<OrientedRect> {
+    let mut projected = [(0.0_f32, 0.0_f32); 4];
+    for (i, (x, y)) in b.corners().iter().enumerate() {
+        match project(h, *x, *y) {
+            Some(p) => projected[i] = p,
+            None => return None,
+        }
+    }
+    let cx =
+        0.25 * (projected[0].0 + projected[1].0 + projected[2].0 + projected[3].0);
+    let cy =
+        0.25 * (projected[0].1 + projected[1].1 + projected[2].1 + projected[3].1);
+    let top_dx = projected[1].0 - projected[0].0;
+    let top_dy = projected[1].1 - projected[0].1;
+    let bot_dx = projected[2].0 - projected[3].0;
+    let bot_dy = projected[2].1 - projected[3].1;
+    let left_dx = projected[3].0 - projected[0].0;
+    let left_dy = projected[3].1 - projected[0].1;
+    let right_dx = projected[2].0 - projected[1].0;
+    let right_dy = projected[2].1 - projected[1].1;
+    let top_len = (top_dx * top_dx + top_dy * top_dy).sqrt();
+    let bot_len = (bot_dx * bot_dx + bot_dy * bot_dy).sqrt();
+    let left_len = (left_dx * left_dx + left_dy * left_dy).sqrt();
+    let right_len = (right_dx * right_dx + right_dy * right_dy).sqrt();
+    let width = 0.5 * (top_len + bot_len);
+    let height = 0.5 * (left_len + right_len);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let angle_radians = top_dy.atan2(top_dx);
+    Some(OrientedRect {
+        cx,
+        cy,
+        width,
+        height,
+        angle_radians,
+    })
+}
+
+/// Build a rectified `OrientedImage` from `orig` by resampling its
+/// `rgb` field through `h_rect`. `gray` is carried through
+/// un-rectified — current consumers (PP-OCR rec on contour-empty
+/// boxes) only read `rgb` once contour is cleared by the caller, so
+/// rectifying gray would be wasted work. `rgb_det` is dropped
+/// because the rectification fires post-detect, so no further detect
+/// is run on the rectified image.
+///
+/// Returns `None` if `orig.rgb` is missing or the homography
+/// inversion fails.
+pub fn rectified_oriented_image(
+    orig: &OrientedImage,
+    h_rect: &[f32; 9],
+    out_w: u32,
+    out_h: u32,
+) -> Option<OrientedImage> {
+    use image::{DynamicImage, RgbaImage};
+    let rgb = orig.rgb.as_ref()?;
+    let rgba = rgb.to_rgba8();
+    let src_w = rgba.width();
+    let src_h = rgba.height();
+    let h_inv = invert(h_rect)?;
+    let dst_bytes =
+        resample_rgba_through(rgba.as_raw(), src_w, src_h, out_w, out_h, &h_inv);
+    let buf = RgbaImage::from_raw(out_w, out_h, dst_bytes)?;
+    Some(OrientedImage {
+        gray: orig.gray.clone(),
+        display_crop: orig.display_crop,
+        rgb: Some(DynamicImage::ImageRgba8(buf)),
+        rgb_det: None,
+        det_to_full_scale: 1.0,
+    })
+}
+
+/// Warp a full `DetectedTextBox` through `h`: warps `rect`,
+/// `oriented_box`, `tight_box`, and the contour points. Used to
+/// map detections from raw camera coords into rectified canonical
+/// coords at acquire time before feeding them to rec.
+///
+/// Returns `None` if any of the geometry components fail to warp
+/// (degenerate output or projective division blowing up). Caller
+/// should fall back to the un-warped box rather than dropping the
+/// detection.
+pub fn warp_detection_through(
+    b: &DetectedTextBox,
+    h: &[f32; 9],
+) -> Option<DetectedTextBox> {
+    let oriented_box = warp_oriented_box(&b.oriented_box, h)?;
+    let tight_box = warp_oriented_box(&b.tight_box, h)?;
+    let rect_corners = [
+        (b.rect.left as f32, b.rect.top as f32),
+        (b.rect.right as f32, b.rect.top as f32),
+        (b.rect.right as f32, b.rect.bottom as f32),
+        (b.rect.left as f32, b.rect.bottom as f32),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in rect_corners {
+        let (px, py) = project(h, x, y)?;
+        min_x = min_x.min(px);
+        min_y = min_y.min(py);
+        max_x = max_x.max(px);
+        max_y = max_y.max(py);
+    }
+    let rect = crate::ocr::Rect {
+        left: min_x.max(0.0).round() as u32,
+        top: min_y.max(0.0).round() as u32,
+        right: max_x.max(0.0).round() as u32,
+        bottom: max_y.max(0.0).round() as u32,
+    };
+    let mut contour: Vec<f32> = Vec::with_capacity(b.contour.len());
+    let mut pairs = b.contour.chunks_exact(2);
+    let mut all_ok = true;
+    for pair in &mut pairs {
+        match project(h, pair[0], pair[1]) {
+            Some((x, y)) => {
+                contour.push(x);
+                contour.push(y);
+            }
+            None => {
+                all_ok = false;
+                break;
+            }
+        }
+    }
+    if !all_ok {
+        contour.clear();
+    }
+    Some(DetectedTextBox {
+        rect,
+        oriented_box,
+        tight_box,
+        contour,
+        score: b.score,
+    })
+}
+
+/// Max corner displacement between two H matrices, evaluated on a
+/// reference 1000×1000 unit square in anchor coords. A scale-free
+/// "how different are these H's" metric used by the rectification
+/// transition diagnostic to disambiguate "burst has no parallax"
+/// (spread ≈ 0) from "burst spans real motion" (spread > a few px).
+fn burst_corner_spread(h_a: &[f32; 9], h_b: &[f32; 9]) -> f32 {
+    let ref_px = 1000.0_f32;
+    let corners = [
+        (0.0_f32, 0.0_f32),
+        (ref_px, 0.0),
+        (ref_px, ref_px),
+        (0.0, ref_px),
+    ];
+    let mut max_d = 0.0_f32;
+    for (cx, cy) in corners {
+        let pa = project(h_a, cx, cy);
+        let pb = project(h_b, cx, cy);
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            let dx = pa.0 - pb.0;
+            let dy = pa.1 - pb.1;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d > max_d {
+                max_d = d;
+            }
+        }
+    }
+    max_d
+}
 
 /// Pure orchestration: take a burst of `H_anchor→view` samples and
 /// camera intrinsics, return the committed plane pose or a
@@ -292,6 +505,13 @@ pub fn commit_rectification_from_burst(
     if !is_pose_plausible(&result.pose, &h_burst[0], intrinsics) {
         return RectificationAttempt::Refused {
             reason: RectificationRefusal::PoseImplausible,
+        };
+    }
+    let nz_abs = result.pose.normal[2].abs().clamp(0.0, 1.0);
+    let tilt_radians = nz_abs.acos();
+    if tilt_radians < RECTIFICATION_MIN_TILT_RAD {
+        return RectificationAttempt::Refused {
+            reason: RectificationRefusal::TooFrontoParallel { tilt_radians },
         };
     }
     RectificationAttempt::Committed {
@@ -482,6 +702,41 @@ impl LiveSession {
         }
         let outcome = commit_rectification_from_burst(h_burst, intrinsics, gravity_camera, kind);
         state.rectification = outcome;
+        // Diagnostic dump on transition (Pending → terminal). Runs
+        // once per anchor; tells us whether a Refusal is degenerate-
+        // by-jitter (H's nearly identical, candidates wildly
+        // different) vs noisy-but-distinct (H's differ enough, per-
+        // frame candidates roughly agree, just mismatched).
+        for (i, h) in h_burst.iter().enumerate() {
+            log::info!(
+                "rectification anchor {}: H[{}] = [{:+.4} {:+.4} {:+.4}; {:+.4} {:+.4} {:+.4}; {:+.4} {:+.4} {:+.4}]",
+                anchor_id, i,
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
+            );
+        }
+        for i in 1..h_burst.len() {
+            let spread = burst_corner_spread(&h_burst[i - 1], &h_burst[i]);
+            log::info!(
+                "rectification anchor {}: spread H[{}]↔H[{}] = {:.2} px (over 1000px reference frame)",
+                anchor_id, i - 1, i, spread,
+            );
+        }
+        for (fi, h) in h_burst.iter().enumerate() {
+            let cands = decompose_homography(h, intrinsics);
+            if cands.is_empty() {
+                log::info!(
+                    "rectification anchor {}: frame {} candidates: <none> (degenerate)",
+                    anchor_id, fi,
+                );
+            } else {
+                for (ci, c) in cands.iter().enumerate() {
+                    log::info!(
+                        "rectification anchor {}: frame {} cand {}: n=[{:+.3}, {:+.3}, {:+.3}]",
+                        anchor_id, fi, ci, c.normal[0], c.normal[1], c.normal[2],
+                    );
+                }
+            }
+        }
         match outcome {
             RectificationAttempt::Committed {
                 pose,
@@ -507,6 +762,26 @@ impl LiveSession {
             RectificationAttempt::Pending => {}
         }
         outcome
+    }
+
+    /// Stash the committed `H_rect` for an anchor so the per-frame
+    /// compositor can re-apply the inverse at draw time. Called by
+    /// the bindings' acquire path right after
+    /// [`Self::try_commit_rectification`] returns `Committed`. Idempotent.
+    pub fn set_anchor_h_rect(&self, anchor_id: AnchorId, h_rect: [f32; 9]) {
+        if let Ok(mut states) = self.anchor_states.lock() {
+            let state = states.entry(anchor_id).or_insert_with(AnchorState::new);
+            state.h_rect = Some(h_rect);
+        }
+    }
+
+    /// Read the committed `H_rect` for an anchor (or `None` if
+    /// rectification refused / hasn't run yet). Per-frame compositor
+    /// looks this up to decide whether to post-compose the perspective
+    /// re-skew.
+    pub fn anchor_h_rect(&self, anchor_id: AnchorId) -> Option<[f32; 9]> {
+        let states = self.anchor_states.lock().ok()?;
+        states.get(&anchor_id).and_then(|s| s.h_rect)
     }
 
     /// Inspect (without mutating) the current rectification state
@@ -2045,13 +2320,22 @@ mod rectification_tests {
     #[test]
     fn try_commit_is_idempotent_per_anchor() {
         let k = k_test();
-        let n = [0.0_f32, 0.0, -1.0];
+        // Tilted normal so it clears the min-tilt threshold (10°).
+        let n = {
+            let raw = [0.4_f32, -0.1, -0.9];
+            let m = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+            [raw[0] / m, raw[1] / m, raw[2] / m]
+        };
         let burst = synthetic_two_frame_burst(n);
         let session = LiveSession::new();
         let anchor_id = 42u64;
         let first =
             session.try_commit_rectification(anchor_id, &burst, &k, None, SurfaceKind::Unknown);
-        assert!(matches!(first, RectificationAttempt::Committed { .. }));
+        assert!(
+            matches!(first, RectificationAttempt::Committed { .. }),
+            "expected Committed, got {:?}",
+            first
+        );
         // Second call with a *different* burst should NOT overwrite —
         // sticky per anchor.
         let bogus = vec![[1.0_f32; 9], [1.0_f32; 9]];
@@ -2061,9 +2345,50 @@ mod rectification_tests {
     }
 
     #[test]
+    fn warp_oriented_box_identity_round_trip() {
+        let b = OrientedRect {
+            cx: 100.0,
+            cy: 200.0,
+            width: 50.0,
+            height: 20.0,
+            angle_radians: 0.1,
+        };
+        let identity = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let w = warp_oriented_box(&b, &identity).expect("identity warp");
+        assert!((w.cx - b.cx).abs() < 1e-3);
+        assert!((w.cy - b.cy).abs() < 1e-3);
+        assert!((w.width - b.width).abs() < 1e-3);
+        assert!((w.height - b.height).abs() < 1e-3);
+        assert!((w.angle_radians - b.angle_radians).abs() < 1e-3);
+    }
+
+    #[test]
+    fn warp_oriented_box_translation_shifts_center() {
+        let b = OrientedRect {
+            cx: 50.0,
+            cy: 50.0,
+            width: 30.0,
+            height: 10.0,
+            angle_radians: 0.0,
+        };
+        let translate = [1.0_f32, 0.0, 17.0, 0.0, 1.0, -23.0, 0.0, 0.0, 1.0];
+        let w = warp_oriented_box(&b, &translate).expect("translate warp");
+        assert!((w.cx - (b.cx + 17.0)).abs() < 1e-3);
+        assert!((w.cy - (b.cy - 23.0)).abs() < 1e-3);
+        assert!((w.width - b.width).abs() < 1e-3);
+        assert!((w.height - b.height).abs() < 1e-3);
+        assert!((w.angle_radians - b.angle_radians).abs() < 1e-3);
+    }
+
+    #[test]
     fn try_commit_stays_pending_until_burst_full() {
         let k = k_test();
-        let burst = synthetic_two_frame_burst([0.0, 0.0, -1.0]);
+        let n = {
+            let raw = [0.4_f32, -0.1, -0.9];
+            let m = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+            [raw[0] / m, raw[1] / m, raw[2] / m]
+        };
+        let burst = synthetic_two_frame_burst(n);
         let session = LiveSession::new();
         let anchor_id = 7u64;
         let outcome = session.try_commit_rectification(
@@ -2076,6 +2401,31 @@ mod rectification_tests {
         assert_eq!(outcome, RectificationAttempt::Pending);
         let outcome2 =
             session.try_commit_rectification(anchor_id, &burst, &k, None, SurfaceKind::Unknown);
-        assert!(matches!(outcome2, RectificationAttempt::Committed { .. }));
+        assert!(
+            matches!(outcome2, RectificationAttempt::Committed { .. }),
+            "expected Committed, got {:?}",
+            outcome2
+        );
+    }
+
+    #[test]
+    fn commit_refuses_too_fronto_parallel() {
+        let k = k_test();
+        let n = [0.0_f32, 0.0, -1.0];
+        let burst = synthetic_two_frame_burst(n);
+        let outcome =
+            commit_rectification_from_burst(&burst, &k, None, SurfaceKind::Unknown);
+        match outcome {
+            RectificationAttempt::Refused {
+                reason: RectificationRefusal::TooFrontoParallel { tilt_radians },
+            } => {
+                assert!(
+                    tilt_radians < RECTIFICATION_MIN_TILT_RAD,
+                    "tilt {} should be below threshold",
+                    tilt_radians
+                );
+            }
+            other => panic!("expected TooFrontoParallel, got {:?}", other),
+        }
     }
 }

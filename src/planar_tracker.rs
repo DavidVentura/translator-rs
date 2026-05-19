@@ -20,7 +20,7 @@ use crate::homography::{fit_affine, fit_homography, fit_similarity, invert, mat3
 /// than the planar pipeline is being investigated and the timing
 /// chatter is in the way. The bindings crate has its own equivalent
 /// gate on the `process_and_composite` outer line.
-pub const PER_FRAME_TIMING_LOG: bool = true;
+pub const PER_FRAME_TIMING_LOG: bool = false;
 
 /// BRIEF descriptor length in bits. 256 is the original BRIEF default;
 /// 32 bytes per keypoint, Hamming distance fits in a u32.

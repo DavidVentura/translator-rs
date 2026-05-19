@@ -248,6 +248,74 @@ fn dot3(a: &[f32; 3], b: &[f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// Inverse-sample `src` (an RGBA buffer, row-major, 4 bytes per pixel)
+/// into a `dst_w × dst_h` rectified RGBA. For each destination pixel,
+/// projects through `h_dst_to_src` to find the source pixel and
+/// bilinear-samples. Pixels whose source coords land outside the
+/// source bounds are written as transparent black.
+///
+/// Caller computes `h_dst_to_src = invert(H_rect)` where `H_rect`
+/// is the forward "source pixel → rectified pixel" homography from
+/// [`rectification_matrix`]. Doing the inverse caller-side keeps
+/// this function pure pixel math, decoupled from the homography
+/// builder.
+pub fn resample_rgba_through(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    h_dst_to_src: &[f32; 9],
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    if src.len() < (src_w as usize) * (src_h as usize) * 4 || dst_w == 0 || dst_h == 0 {
+        return dst;
+    }
+    let src_stride = (src_w as usize) * 4;
+    let src_w_max = src_w as f32 - 1.0;
+    let src_h_max = src_h as f32 - 1.0;
+    for dy in 0..dst_h {
+        for dx in 0..dst_w {
+            let u = dx as f32 + 0.5;
+            let v = dy as f32 + 0.5;
+            let denom = h_dst_to_src[6] * u + h_dst_to_src[7] * v + h_dst_to_src[8];
+            if denom.abs() < 1e-6 {
+                continue;
+            }
+            let sx = (h_dst_to_src[0] * u + h_dst_to_src[1] * v + h_dst_to_src[2]) / denom;
+            let sy = (h_dst_to_src[3] * u + h_dst_to_src[4] * v + h_dst_to_src[5]) / denom;
+            let sxc = sx - 0.5;
+            let syc = sy - 0.5;
+            if sxc < 0.0 || syc < 0.0 || sxc > src_w_max || syc > src_h_max {
+                continue;
+            }
+            let x0 = sxc.floor() as i32;
+            let y0 = syc.floor() as i32;
+            let x1 = (x0 + 1).min(src_w as i32 - 1);
+            let y1 = (y0 + 1).min(src_h as i32 - 1);
+            let fx = sxc - x0 as f32;
+            let fy = syc - y0 as f32;
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w01 = fx * (1.0 - fy);
+            let w10 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+            let i00 = (y0 as usize) * src_stride + (x0 as usize) * 4;
+            let i01 = (y0 as usize) * src_stride + (x1 as usize) * 4;
+            let i10 = (y1 as usize) * src_stride + (x0 as usize) * 4;
+            let i11 = (y1 as usize) * src_stride + (x1 as usize) * 4;
+            let dst_idx = ((dy as usize) * (dst_w as usize) + (dx as usize)) * 4;
+            for c in 0..4 {
+                let v = w00 * src[i00 + c] as f32
+                    + w01 * src[i01 + c] as f32
+                    + w10 * src[i10 + c] as f32
+                    + w11 * src[i11 + c] as f32;
+                dst[dst_idx + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    dst
+}
+
 /// True if the candidate pose passes basic physical-validity checks.
 pub fn is_pose_plausible(pose: &PlanePose, h: &[f32; 9], k: &CameraIntrinsics) -> bool {
     if pose.normal[2] >= 0.0 {
@@ -1134,5 +1202,84 @@ mod tests {
         let h = compose_homography(&pose, &k);
         let res = decomposition_residual(&h, &pose, &k);
         assert!(res < 1e-4, "residual too large: {}", res);
+    }
+
+    fn synthetic_rgba(w: u32, h: u32) -> Vec<u8> {
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                out[i] = (x % 256) as u8;
+                out[i + 1] = (y % 256) as u8;
+                out[i + 2] = ((x ^ y) % 256) as u8;
+                out[i + 3] = 0xFF;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn resample_identity_recovers_source() {
+        let w = 32u32;
+        let h = 24u32;
+        let src = synthetic_rgba(w, h);
+        let identity = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let dst = resample_rgba_through(&src, w, h, w, h, &identity);
+        assert_eq!(dst.len(), src.len());
+        // Bilinear at half-pixel centres reproduces the input exactly
+        // when the map is identity.
+        for i in 0..src.len() {
+            assert!(
+                (dst[i] as i32 - src[i] as i32).abs() <= 1,
+                "pixel {} differs: dst={} src={}",
+                i,
+                dst[i],
+                src[i],
+            );
+        }
+    }
+
+    #[test]
+    fn resample_outside_bounds_is_zero() {
+        let src = synthetic_rgba(16, 16);
+        // h_dst_to_src that maps every destination pixel to (-1000, -1000) → outside.
+        // Translate the destination origin far off the source.
+        let translate = [
+            1.0_f32, 0.0, -1000.0,
+            0.0, 1.0, -1000.0,
+            0.0, 0.0, 1.0,
+        ];
+        let dst = resample_rgba_through(&src, 16, 16, 16, 16, &translate);
+        assert!(dst.iter().all(|&b| b == 0), "expected all-zero output");
+    }
+
+    #[test]
+    fn resample_horizontal_flip_swaps_columns() {
+        let w = 8u32;
+        let h = 4u32;
+        let src = synthetic_rgba(w, h);
+        // Inverse map dst→src that horizontally flips: dst pixel x
+        // samples src pixel (w - x).
+        let flip = [
+            -1.0_f32, 0.0, w as f32,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        let dst = resample_rgba_through(&src, w, h, w, h, &flip);
+        // dst column x should equal src column (w-1-x), modulo
+        // half-pixel-centre bilinear rounding (≤ 1 byte off).
+        for y in 0..h {
+            for x in 0..w {
+                let di = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                let si = ((y as usize) * (w as usize) + ((w - 1 - x) as usize)) * 4;
+                for c in 0..3 {
+                    assert!(
+                        (dst[di + c] as i32 - src[si + c] as i32).abs() <= 1,
+                        "flip mismatch at ({}, {}) channel {}: dst={} src={}",
+                        x, y, c, dst[di + c], src[si + c],
+                    );
+                }
+            }
+        }
     }
 }

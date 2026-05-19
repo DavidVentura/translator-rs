@@ -78,6 +78,63 @@ pub fn composite_frame_into(
     Ok(())
 }
 
+/// Cropped variant of [`composite_frame_into`]: reads a sub-rect of
+/// the full-sensor `camera_rgba` (starting at `src_offset_x/y`, sized
+/// `dst_w × dst_h`) instead of the whole frame, and writes into `dst`
+/// which is sized to that sub-rect. Used by the live pipeline when
+/// the user's preview is FILL_CENTER-cropped: the OCR and overlay
+/// surface map both live in visible-region-sensor coords, so the
+/// composite output bitmap is sized to match.
+///
+/// `h_surface_to_viewport` is in the *visible-region* coord system,
+/// not the full-sensor one — engine's H_anchor→view is already in
+/// that space because the gray frame is built from the same crop.
+pub fn composite_frame_into_cropped(
+    dst_rgba: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    camera_rgba: &[u8],
+    src_full_w: u32,
+    src_full_h: u32,
+    src_offset_x: u32,
+    src_offset_y: u32,
+    h_surface_to_viewport: &[f32; 9],
+    items: &[OverlayItem<'_>],
+) -> Result<(), CompositeError> {
+    let dst_bytes = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(CompositeError::DstBufferSize)?;
+    if dst_rgba.len() != dst_bytes {
+        return Err(CompositeError::DstBufferSize);
+    }
+    let src_full_bytes = (src_full_w as usize)
+        .checked_mul(src_full_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(CompositeError::SrcBufferSize)?;
+    if camera_rgba.len() != src_full_bytes {
+        return Err(CompositeError::SrcBufferSize);
+    }
+    if src_offset_x.saturating_add(dst_w) > src_full_w
+        || src_offset_y.saturating_add(dst_h) > src_full_h
+    {
+        return Err(CompositeError::SrcBufferSize);
+    }
+    let src_stride = (src_full_w as usize) * 4;
+    let dst_stride = (dst_w as usize) * 4;
+    for y in 0..dst_h {
+        let src_row = ((src_offset_y + y) as usize) * src_stride
+            + (src_offset_x as usize) * 4;
+        let dst_row = (y as usize) * dst_stride;
+        dst_rgba[dst_row..dst_row + dst_stride]
+            .copy_from_slice(&camera_rgba[src_row..src_row + dst_stride]);
+    }
+    for item in items {
+        warp_item_onto_display(dst_rgba, dst_w, dst_h, item, h_surface_to_viewport);
+    }
+    Ok(())
+}
+
 /// Perspective-warp an item's bitmap onto the display buffer with
 /// bilinear sampling and source-over alpha compositing.
 ///
