@@ -14,8 +14,9 @@ use image::GrayImage;
 use crate::homography::mat3_mul;
 use crate::imu_prior::{CameraIntrinsics, predict_canonical_to_current};
 use crate::planar_tracker::{
-    SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
-    track_against_anchor, track_against_anchor_with_min, track_against_anchor_with_prior,
+    GuidedMatchPrior, SceneAnchor, TrackResult, TrackerConfig, build_anchor,
+    build_anchor_in_regions, track_against_anchor, track_against_anchor_guided,
+    track_against_anchor_with_min, track_against_anchor_with_prior,
 };
 
 #[cfg(feature = "image-render")]
@@ -167,6 +168,11 @@ pub struct LivePlanarEngine {
     /// Timestamp of the last handoff (anchor spawn from an existing
     /// chain). Used to throttle handoffs via `handoff_cooldown_ns`.
     last_spawn_ns: u64,
+    /// Velocity + depth estimate used by the accel-aware translation
+    /// prior for guided descriptor matching. Reset on acquire / clear /
+    /// sustained loss; refined frame-by-frame from observed inlier
+    /// flow vs accel integration.
+    motion: MotionState,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +181,75 @@ struct ImuLockState {
     rotation_dev: [f32; 9],
     timestamp_ns: u64,
 }
+
+/// Self-calibrating short-horizon translation predictor. The "tactical"
+/// half of the planar tracker's IMU pipeline (the strategic half is
+/// the rotation prior in `imu_prior.rs`).
+///
+/// We track camera-frame velocity in m/s by integrating
+/// gravity-subtracted linear accel between frames, then correct it from
+/// observed inlier flow each time RANSAC succeeds. This is a
+/// complementary filter: short-term responsiveness from accel,
+/// long-term truth from observation.
+///
+/// `pixels_per_meter` converts metric translation predictions into the
+/// view-pixel offsets the matcher actually consumes. Defaults to a
+/// page-distance assumption (`fx / DEFAULT_DEPTH_M`); refining it from
+/// observation is a future improvement.
+#[derive(Clone, Debug)]
+struct MotionState {
+    velocity_cam_mps: [f32; 3],
+    pixels_per_meter: f32,
+    last_frame_ns: Option<u64>,
+    /// Number of velocity corrections absorbed since the last reset.
+    /// We disable the guided matcher's translation offset until this
+    /// passes a small threshold — without a couple of observations,
+    /// integrating an arbitrary accel reading produces wildly wrong
+    /// predictions that would mis-centre every window.
+    n_corrections: u32,
+    /// Side channel from `process_frame_inner`'s guided-Locked branch:
+    /// the observed mean inlier translation in view pixels for the
+    /// frame that just ran. `process_frame_with_imu` reads + clears
+    /// this after each call and uses it to correct velocity for the
+    /// next frame's prediction.
+    last_observed_translation_px: Option<(f32, f32)>,
+}
+
+impl MotionState {
+    fn new() -> Self {
+        Self {
+            velocity_cam_mps: [0.0; 3],
+            pixels_per_meter: 0.0,
+            last_frame_ns: None,
+            n_corrections: 0,
+            last_observed_translation_px: None,
+        }
+    }
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Page-distance assumption used to initialise `pixels_per_meter` from
+/// the camera's `fx`. 25 cm matches a typical reading distance; if the
+/// user is at 3 m, the depth-misestimate falls back to "translation
+/// prior is over-magnified" — caught by `LONG_AXIS_SLACK_PX` widening
+/// the search window in the predicted-translation direction (still
+/// much smaller than full-frame brute force).
+const DEFAULT_DEPTH_M: f32 = 0.25;
+
+/// Extra pixels of slack added to the long axis of the guided-match
+/// window beyond the predicted translation magnitude. Covers
+/// accel-integration error, depth-misestimate, and the inevitable
+/// transient lag between a real motion onset and the velocity
+/// correction catching up.
+const LONG_AXIS_SLACK_PX: f32 = 12.0;
+
+/// Radius of the short (perpendicular) axis of the guided-match
+/// window. Covers descriptor noise and small unmodelled motion
+/// perpendicular to the predicted translation direction. Also used as
+/// the circular-window radius in the no-translation regime.
+const SHORT_AXIS_RADIUS_PX: f32 = 10.0;
 
 #[derive(Clone, Debug)]
 enum EngineState {
@@ -293,6 +368,7 @@ impl LivePlanarEngine {
             stable_since_ns: None,
             last_imu_lock: None,
             last_spawn_ns: 0,
+            motion: MotionState::new(),
         }
     }
 
@@ -305,25 +381,116 @@ impl LivePlanarEngine {
         imu_stable: bool,
         timestamp_ns: u64,
     ) -> TrackerCommand {
-        self.process_frame_inner(gray, imu_stable, timestamp_ns, None)
+        self.process_frame_inner(gray, imu_stable, timestamp_ns, None, None)
     }
 
     /// Like [`process_frame`] but with an IMU-derived RANSAC prior.
     /// `imu_rotation_dev` is the device-frame rotation matrix at this
-    /// camera frame. `intrinsics` are the camera intrinsics in the
-    /// same pixel space as `gray`. The engine remembers these and the
-    /// per-anchor canonical→frame homography from the previous Locked
-    /// frame; the difference becomes a predicted H seeded into RANSAC.
+    /// camera frame. `linear_accel_dev` is the device-frame
+    /// gravity-subtracted accel (from Android's TYPE_LINEAR_ACCELERATION
+    /// sensor); when present, the engine maintains a short-horizon
+    /// velocity estimate that powers the elongated guided-matching
+    /// window in the Locked-state matcher. `intrinsics` are the camera
+    /// intrinsics in the same pixel space as `gray`.
     pub fn process_frame_with_imu(
         &mut self,
         gray: &GrayImage,
         imu_stable: bool,
         timestamp_ns: u64,
         imu_rotation_dev: &[f32; 9],
+        linear_accel_dev: Option<&[f32; 3]>,
         intrinsics: &CameraIntrinsics,
     ) -> TrackerCommand {
-        let prior = self.compute_imu_prior(imu_rotation_dev, intrinsics);
-        let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, prior);
+        if self.motion.pixels_per_meter == 0.0 && intrinsics.fx > 0.0 {
+            self.motion.pixels_per_meter = intrinsics.fx / DEFAULT_DEPTH_M;
+        }
+        let rotation_prior = self.compute_imu_prior(imu_rotation_dev, intrinsics);
+        // Compute the dt for the *prediction* this frame consumes — i.e.
+        // the time since the previous frame the engine ran on. Clamped
+        // to a sane range so a long pause (app backgrounded) doesn't
+        // integrate a huge velocity step.
+        let dt = self
+            .motion
+            .last_frame_ns
+            .map(|prev| ((timestamp_ns.saturating_sub(prev)) as f32 / 1e9).clamp(0.0, 0.1))
+            .unwrap_or(0.0);
+        // Convert the device-frame accel reading to camera-frame using
+        // the same M = diag(1, -1, -1) basis transform the rotation
+        // path uses (see `imu_prior::device_to_camera`).
+        let accel_cam: Option<[f32; 3]> = linear_accel_dev.map(|a| [a[0], -a[1], -a[2]]);
+        // Build the guided-matching prior when *all* of:
+        //  - a rotation prior is available (need a Locked anchor)
+        //  - linear-accel is being fed in
+        //  - dt is sensible (skip when we don't have a previous frame yet)
+        //
+        // Earlier versions gated this on a velocity-warm-up counter
+        // (`n_corrections >= 2`), but that was a chicken-and-egg: the
+        // counter only ticks when the guided path *succeeds*, and the
+        // guided path never ran while the counter was zero, so we sat
+        // forever in brute-force fallback. The first-frame case is
+        // fine without warm-up because velocity defaults to zero,
+        // which produces a sub-pixel translation prediction and a
+        // (correctly-centred) circular search window.
+        let guided_prior = if let (Some(h_prior), Some(a_cam)) = (rotation_prior, accel_cam) {
+            if dt > 0.0 {
+                let v = self.motion.velocity_cam_mps;
+                // Predicted camera translation over this frame in metres.
+                let dp_cam = [
+                    v[0] * dt + 0.5 * a_cam[0] * dt * dt,
+                    v[1] * dt + 0.5 * a_cam[1] * dt * dt,
+                    v[2] * dt + 0.5 * a_cam[2] * dt * dt,
+                ];
+                let ppm = self.motion.pixels_per_meter;
+                // Image motion is opposite the camera translation
+                // direction (when the camera moves right, features
+                // appear to move left in the image).
+                let translation_offset_px = (-ppm * dp_cam[0], -ppm * dp_cam[1]);
+                let mag = translation_offset_px.0.hypot(translation_offset_px.1);
+                Some(GuidedMatchPrior {
+                    h_prior,
+                    translation_offset_px,
+                    long_radius_px: mag + LONG_AXIS_SLACK_PX,
+                    short_radius_px: SHORT_AXIS_RADIUS_PX,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.motion.last_observed_translation_px = None;
+        let cmd =
+            self.process_frame_inner(gray, imu_stable, timestamp_ns, rotation_prior, guided_prior);
+        // Correct velocity from observed flow if the guided matcher
+        // produced one this frame. We don't blindly integrate accel
+        // across many frames without a correction — bias drift would
+        // run the velocity estimate off the rails. When no observation
+        // landed, hold the previous velocity; next frame's prediction
+        // simply absorbs the dt-worth of accel on top of it.
+        if let (Some(obs_px), Some(a_cam)) = (self.motion.last_observed_translation_px, accel_cam) {
+            if dt > 0.0 {
+                let ppm = self.motion.pixels_per_meter.max(1.0);
+                let obs_dp_cam = [-obs_px.0 / ppm, -obs_px.1 / ppm, 0.0];
+                let v_observed = [obs_dp_cam[0] / dt, obs_dp_cam[1] / dt, obs_dp_cam[2] / dt];
+                let v_integrated = [
+                    self.motion.velocity_cam_mps[0] + a_cam[0] * dt,
+                    self.motion.velocity_cam_mps[1] + a_cam[1] * dt,
+                    self.motion.velocity_cam_mps[2] + a_cam[2] * dt,
+                ];
+                // Complementary blend: lean on observation (which is
+                // ground truth modulo the depth assumption) but keep
+                // a bit of accel-integrated mass so the prediction
+                // doesn't lag a sudden onset.
+                const ALPHA: f32 = 0.7;
+                self.motion.velocity_cam_mps = [
+                    ALPHA * v_observed[0] + (1.0 - ALPHA) * v_integrated[0],
+                    ALPHA * v_observed[1] + (1.0 - ALPHA) * v_integrated[1],
+                    ALPHA * v_observed[2] + (1.0 - ALPHA) * v_integrated[2],
+                ];
+                self.motion.n_corrections = self.motion.n_corrections.saturating_add(1);
+            }
+        }
+        self.motion.last_frame_ns = Some(timestamp_ns);
         // Stash the new IMU + H for next frame's prior, if we ended up Locked.
         // The IMU prior predicts in the *active anchor's* canonical frame, not
         // the root's, so we read H_active→view from the engine state rather
@@ -341,8 +508,10 @@ impl LivePlanarEngine {
                 timestamp_ns,
             });
         } else if matches!(cmd, TrackerCommand::Idle) {
-            // True Idle: clear stale IMU state.
+            // True Idle: clear stale IMU state and motion estimate;
+            // velocity has no meaning without an anchor to project onto.
             self.last_imu_lock = None;
+            self.motion.reset();
         }
         cmd
     }
@@ -367,6 +536,7 @@ impl LivePlanarEngine {
         imu_stable: bool,
         timestamp_ns: u64,
         prior: Option<[f32; 9]>,
+        guided: Option<GuidedMatchPrior>,
     ) -> TrackerCommand {
         self.tick_stable(imu_stable, timestamp_ns);
         match self.state.clone() {
@@ -404,14 +574,32 @@ impl LivePlanarEngine {
                 // around the acquire threshold. Pair with the
                 // IMU-derived prior (if any) to short-circuit RANSAC.
                 let keep_min = self.config.tracker.min_inliers_keep_locked;
+                let mut observed_translation_px: Option<(f32, f32)> = None;
                 let result = self.cache.get(anchor_id).and_then(|a| {
-                    let candidate = track_against_anchor_with_prior(
-                        &a.anchor,
-                        gray,
-                        &self.config.tracker,
-                        keep_min,
-                        prior,
-                    )?;
+                    let candidate = if let Some(gp) = guided.as_ref() {
+                        // Guided path: rotation prior centres the
+                        // search window per canonical keypoint;
+                        // accel-derived translation elongates it. The
+                        // observed mean translation comes back out so
+                        // we can refresh velocity for next frame.
+                        let g = track_against_anchor_guided(
+                            &a.anchor,
+                            gray,
+                            &self.config.tracker,
+                            keep_min,
+                            gp,
+                        )?;
+                        observed_translation_px = Some(g.observed_translation_px);
+                        Some(g.track)
+                    } else {
+                        track_against_anchor_with_prior(
+                            &a.anchor,
+                            gray,
+                            &self.config.tracker,
+                            keep_min,
+                            prior,
+                        )
+                    }?;
                     // Reject visibly-degenerate homographies even if
                     // RANSAC accepted them. A low-inlier fit can be
                     // mathematically valid but project some bitmap
@@ -424,6 +612,9 @@ impl LivePlanarEngine {
                         None
                     }
                 });
+                if result.is_some() {
+                    self.motion.last_observed_translation_px = observed_translation_px;
+                }
                 if let Some(r) = result {
                     self.cache.touch(anchor_id);
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
@@ -622,6 +813,10 @@ impl LivePlanarEngine {
         // New canonical frame: drop any IMU lock state — composing it
         // with the new H would be meaningless.
         self.last_imu_lock = None;
+        // Velocity calibration is per-scene; a new anchor means the
+        // depth assumption and the observed flow ratio both need to
+        // re-converge from observation.
+        self.motion.reset();
         // Reset spawn cooldown — a fresh root means there's no chain
         // yet to throttle.
         self.last_spawn_ns = timestamp_ns;
@@ -778,6 +973,7 @@ impl LivePlanarEngine {
         self.stable_since_ns = None;
         self.last_imu_lock = None;
         self.last_spawn_ns = 0;
+        self.motion.reset();
     }
 
     // -- internal helpers --------------------------------------------------

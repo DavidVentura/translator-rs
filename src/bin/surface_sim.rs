@@ -496,6 +496,7 @@ impl SimPipeline {
             true, // imu_stable
             timestamp_ns,
             &IDENTITY,
+            None,
             &self.intrinsics,
         );
         match cmd {

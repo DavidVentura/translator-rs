@@ -1128,9 +1128,7 @@ impl LiveSession {
             let failed_set: std::collections::HashSet<u64> =
                 failed_block_ids.iter().copied().collect();
             if let Ok(mut items) = self.overlay_items.lock() {
-                items.retain(|it| {
-                    it.anchor_id != input.anchor_id || !failed_set.contains(&it.id)
-                });
+                items.retain(|it| it.anchor_id != input.anchor_id || !failed_set.contains(&it.id));
             }
         }
 
@@ -1140,8 +1138,8 @@ impl LiveSession {
         // there's nothing new visible. For the initial-acquire case
         // (h_view_to_surface = None / identity), the viewport in
         // surface coords is `(0, 0)..(rgb.W, rgb.H)`.
-        let frame_w = input.oriented.rgb.width() as f32;
-        let frame_h = input.oriented.rgb.height() as f32;
+        let frame_w = input.oriented.gray.width() as f32;
+        let frame_h = input.oriented.gray.height() as f32;
         let viewport_aabb = match input.h_view_to_surface {
             None => Aabb::from_points([
                 (0.0, 0.0),

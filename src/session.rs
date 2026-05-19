@@ -453,7 +453,11 @@ impl TranslatorSession {
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
         let snap = self.snapshot();
         let ppocr = self.ppocr_engine(&snap)?;
-        ppocr.detect_only_image(&oriented.rgb_det, crate::ppocr::PpocrProfile::Live)
+        let rgb_det = oriented
+            .rgb_det
+            .as_ref()
+            .expect("detect path requires build_with_rgb");
+        ppocr.detect_only_image(rgb_det, crate::ppocr::PpocrProfile::Live)
     }
 
     /// Live-OCR recognize: takes the same `OrientedImage` (full-resolution crop +
@@ -470,13 +474,16 @@ impl TranslatorSession {
 
         let snap = self.snapshot();
         let ppocr = self.ppocr_engine(&snap)?;
+        let rgb = oriented
+            .rgb
+            .as_ref()
+            .expect("recognize path requires build_with_rgb");
         match source_selection {
             OcrSourceSelection::Auto => {
-                let predictions =
-                    ppocr.classify_text_boxes_image(&oriented.rgb, &oriented.gray, boxes)?;
+                let predictions = ppocr.classify_text_boxes_image(rgb, &oriented.gray, boxes)?;
                 let scripts = route_ppocr_predictions(&ppocr, &predictions, boxes)?;
                 let mut lines = ppocr.recognize_text_in_boxes_image(
-                    &oriented.rgb,
+                    rgb,
                     &oriented.gray,
                     boxes,
                     &scripts,
@@ -497,7 +504,7 @@ impl TranslatorSession {
                 let script = recognizer_script_for_language(&snap, &language_code)?;
                 let scripts = vec![script; boxes.len()];
                 ppocr.recognize_text_in_boxes_image(
-                    &oriented.rgb,
+                    rgb,
                     &oriented.gray,
                     boxes,
                     &scripts,

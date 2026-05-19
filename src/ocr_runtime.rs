@@ -160,11 +160,14 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         bottom: height,
     };
     let det_max_pixels = saturating_square(max_image_size);
-    let oriented = OrientedImage::build(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
-        .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
+    let oriented =
+        OrientedImage::build_with_rgb(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
+            .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
+    let rgb = oriented.rgb.as_ref().expect("with_rgb path");
+    let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
 
     let det_raw = ppocr
-        .detect_only_image(&oriented.rgb_det, PpocrProfile::Still)
+        .detect_only_image(rgb_det, PpocrProfile::Still)
         .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?;
     let det_boxes: Vec<DetectedTextBox> = det_raw
         .into_iter()
@@ -174,7 +177,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let scripts = match source_selection {
         OcrSourceSelection::Auto => {
             let predictions = ppocr
-                .classify_text_boxes_image(&oriented.rgb, &oriented.gray, &det_boxes)
+                .classify_text_boxes_image(rgb, &oriented.gray, &det_boxes)
                 .map_err(|e| {
                     TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
                 })?;
@@ -188,7 +191,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
 
     let lines = ppocr
         .recognize_text_in_boxes_image(
-            &oriented.rgb,
+            rgb,
             &oriented.gray,
             &det_boxes,
             &scripts,
