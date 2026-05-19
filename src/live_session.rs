@@ -100,6 +100,23 @@ impl Aabb {
             && inner.max_x <= self.max_x + pad
             && inner.max_y <= self.max_y + pad
     }
+
+    pub fn area(&self) -> f32 {
+        (self.max_x - self.min_x).max(0.0) * (self.max_y - self.min_y).max(0.0)
+    }
+
+    /// AABB of the intersection. Returns a zero-area `Aabb` (with
+    /// degenerate min ≥ max) when the boxes don't overlap; callers
+    /// should use [`Self::area`] to distinguish "no intersection"
+    /// from a real overlap.
+    pub fn intersect(&self, other: &Aabb) -> Aabb {
+        Aabb {
+            min_x: self.min_x.max(other.min_x),
+            min_y: self.min_y.max(other.min_y),
+            max_x: self.max_x.min(other.max_x),
+            max_y: self.max_y.min(other.max_y),
+        }
+    }
 }
 
 /// Project the viewport's four corners through `H_view→surface` and
@@ -168,6 +185,15 @@ pub struct AnchorState {
     /// areas; reset only when the anchor is evicted (LRU) or the
     /// session is cleared.
     pub covered_region: Option<Aabb>,
+    /// Engine's `H_anchor→view` at the time of the most recent
+    /// successful detect+OCR+translate pass. The re-lock trigger
+    /// uses this as the reference pose: it projects the current
+    /// view corners through `inv(last_lock_h)` and through
+    /// `inv(current_h)`, then compares the resulting AABBs in
+    /// anchor coords. When the camera hasn't moved, both AABBs
+    /// coincide and overlap = 1.0. Replaced (not unioned) on
+    /// every successful pass.
+    pub last_lock_h: Option<[f32; 9]>,
     /// Result of the post-acquire rectification attempt for this
     /// anchor. See [`RectificationAttempt`] and
     /// [`LiveSession::try_commit_rectification`]. Stays
@@ -192,6 +218,7 @@ impl AnchorState {
         Self {
             map: SurfaceMap::new(),
             covered_region: None,
+            last_lock_h: None,
             rectification: RectificationAttempt::Pending,
             h_rect: None,
         }
@@ -295,10 +322,8 @@ pub fn warp_oriented_box(b: &OrientedRect, h: &[f32; 9]) -> Option<OrientedRect>
             None => return None,
         }
     }
-    let cx =
-        0.25 * (projected[0].0 + projected[1].0 + projected[2].0 + projected[3].0);
-    let cy =
-        0.25 * (projected[0].1 + projected[1].1 + projected[2].1 + projected[3].1);
+    let cx = 0.25 * (projected[0].0 + projected[1].0 + projected[2].0 + projected[3].0);
+    let cy = 0.25 * (projected[0].1 + projected[1].1 + projected[2].1 + projected[3].1);
     let top_dx = projected[1].0 - projected[0].0;
     let top_dy = projected[1].1 - projected[0].1;
     let bot_dx = projected[2].0 - projected[3].0;
@@ -348,8 +373,7 @@ pub fn rectified_oriented_image(
     let src_w = rgba.width();
     let src_h = rgba.height();
     let h_inv = invert(h_rect)?;
-    let dst_bytes =
-        resample_rgba_through(rgba.as_raw(), src_w, src_h, out_w, out_h, &h_inv);
+    let dst_bytes = resample_rgba_through(rgba.as_raw(), src_w, src_h, out_w, out_h, &h_inv);
     let buf = RgbaImage::from_raw(out_w, out_h, dst_bytes)?;
     Some(OrientedImage {
         gray: orig.gray.clone(),
@@ -369,10 +393,7 @@ pub fn rectified_oriented_image(
 /// (degenerate output or projective division blowing up). Caller
 /// should fall back to the un-warped box rather than dropping the
 /// detection.
-pub fn warp_detection_through(
-    b: &DetectedTextBox,
-    h: &[f32; 9],
-) -> Option<DetectedTextBox> {
+pub fn warp_detection_through(b: &DetectedTextBox, h: &[f32; 9]) -> Option<DetectedTextBox> {
     let oriented_box = warp_oriented_box(&b.oriented_box, h)?;
     let tight_box = warp_oriented_box(&b.tight_box, h)?;
     let rect_corners = [
@@ -595,6 +616,25 @@ impl LiveSession {
         self.last_refresh_locked_frame.store(0, Ordering::SeqCst);
     }
 
+    /// Wipe per-anchor session state for `anchor_id` — drops the
+    /// surface map, covered region, committed `h_rect`, and any
+    /// resident overlay items belonging to it. Use this when the
+    /// engine has *re-created* an anchor with the same id (which
+    /// can happen when `engine.clear()` resets the id counter and
+    /// the next acquire claims id=1 again): without this wipe the
+    /// stale surface map's overlays render through the NEW anchor's
+    /// per-frame H at *old* surface coords, producing the "overlay
+    /// stuck to an arbitrary offset" symptom right after a fast pan
+    /// → loss → re-lock cycle.
+    pub fn reset_anchor_state(&self, anchor_id: AnchorId) {
+        if let Ok(mut states) = self.anchor_states.lock() {
+            states.remove(&anchor_id);
+        }
+        if let Ok(mut items) = self.overlay_items.lock() {
+            items.retain(|it| it.anchor_id != anchor_id);
+        }
+    }
+
     /// Drop per-anchor state and overlays whose `anchor_id` isn't in
     /// `keep`. Bindings call this after each acquire/refresh with the
     /// engine's currently-cached anchor set so our state stays
@@ -647,6 +687,88 @@ impl LiveSession {
         match &mut state.covered_region {
             Some(c) => c.union_inplace(&viewport),
             None => state.covered_region = Some(viewport),
+        }
+    }
+
+    /// Replace (not union) the anchor's `last_lock_h` with the
+    /// engine's `H_anchor→view` at the time of a successful pass.
+    /// The re-lock trigger uses this as the reference pose.
+    pub fn set_last_lock_h(&self, anchor_id: AnchorId, h: [f32; 9]) {
+        let mut states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let state = states.entry(anchor_id).or_insert_with(AnchorState::new);
+        state.last_lock_h = Some(h);
+    }
+
+    /// Re-lock trigger: project the view corners
+    /// `(0,0)..(view_w, view_h)` through both `inv(last_lock_h)` and
+    /// `inv(current_h)` into anchor coords, then compare AABBs:
+    ///   `area(intersect) / max(area(curr), area(lock)) < threshold`
+    /// Symmetric in zoom direction (zoom-in shrinks the projected
+    /// AABB; zoom-out grows it; pure rotation about the optical axis
+    /// rotates corners around the same centre and overlap stays ≈ 1).
+    ///
+    /// Returns false when the anchor has no stored `last_lock_h`
+    /// yet — that means we haven't completed a successful pass for
+    /// this anchor, so there's nothing to compare against.
+    pub fn should_relock_by_view(
+        &self,
+        anchor_id: AnchorId,
+        current_h: &[f32; 9],
+        view_w: f32,
+        view_h: f32,
+        threshold: f32,
+    ) -> bool {
+        let states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let lock_h = match states.get(&anchor_id).and_then(|s| s.last_lock_h.as_ref()) {
+            Some(h) => *h,
+            None => return false,
+        };
+        drop(states);
+        let curr_inv = match crate::homography::invert(current_h) {
+            Some(h) => h,
+            None => return false,
+        };
+        let lock_inv = match crate::homography::invert(&lock_h) {
+            Some(h) => h,
+            None => return false,
+        };
+        let curr_vp = match viewport_surface_aabb(&curr_inv, view_w, view_h) {
+            Some(a) => a,
+            None => return false,
+        };
+        let lock_vp = match viewport_surface_aabb(&lock_inv, view_w, view_h) {
+            Some(a) => a,
+            None => return false,
+        };
+        let i_area = curr_vp.intersect(&lock_vp).area();
+        let max_area = curr_vp.area().max(lock_vp.area());
+        if max_area <= 0.0 {
+            return true;
+        }
+        (i_area / max_area) < threshold
+    }
+
+    /// Wipe the surface map + overlay items for `anchor_id` so the
+    /// next `run_post_detect` starts from empty state. Used by the
+    /// re-lock pipeline to convert the existing merge semantics into
+    /// an atomic replace: clear → detect → OCR → translate → insert
+    /// into the empty map. `covered_region` and `lock_viewport` are
+    /// preserved here; the caller updates `lock_viewport` after the
+    /// fresh pass succeeds (via `set_lock_viewport`).
+    pub fn clear_anchor_state_for_relock(&self, anchor_id: AnchorId) {
+        if let Ok(mut states) = self.anchor_states.lock() {
+            if let Some(state) = states.get_mut(&anchor_id) {
+                state.map = SurfaceMap::new();
+            }
+        }
+        if let Ok(mut items) = self.overlay_items.lock() {
+            items.retain(|it| it.anchor_id != anchor_id);
         }
     }
 
@@ -710,15 +832,27 @@ impl LiveSession {
         for (i, h) in h_burst.iter().enumerate() {
             log::info!(
                 "rectification anchor {}: H[{}] = [{:+.4} {:+.4} {:+.4}; {:+.4} {:+.4} {:+.4}; {:+.4} {:+.4} {:+.4}]",
-                anchor_id, i,
-                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
+                anchor_id,
+                i,
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4],
+                h[5],
+                h[6],
+                h[7],
+                h[8],
             );
         }
         for i in 1..h_burst.len() {
             let spread = burst_corner_spread(&h_burst[i - 1], &h_burst[i]);
             log::info!(
                 "rectification anchor {}: spread H[{}]↔H[{}] = {:.2} px (over 1000px reference frame)",
-                anchor_id, i - 1, i, spread,
+                anchor_id,
+                i - 1,
+                i,
+                spread,
             );
         }
         for (fi, h) in h_burst.iter().enumerate() {
@@ -726,13 +860,19 @@ impl LiveSession {
             if cands.is_empty() {
                 log::info!(
                     "rectification anchor {}: frame {} candidates: <none> (degenerate)",
-                    anchor_id, fi,
+                    anchor_id,
+                    fi,
                 );
             } else {
                 for (ci, c) in cands.iter().enumerate() {
                     log::info!(
                         "rectification anchor {}: frame {} cand {}: n=[{:+.3}, {:+.3}, {:+.3}]",
-                        anchor_id, fi, ci, c.normal[0], c.normal[1], c.normal[2],
+                        anchor_id,
+                        fi,
+                        ci,
+                        c.normal[0],
+                        c.normal[1],
+                        c.normal[2],
                     );
                 }
             }
@@ -1632,6 +1772,11 @@ impl LiveSession {
         if let Some(aabb) = viewport_aabb {
             self.note_coverage(input.anchor_id, aabb);
         }
+        // `last_lock_h` is set by the *caller* (uniffi_catalog) once
+        // `run_post_detect` returns, because the engine's H is the
+        // authoritative reference and only the bindings layer knows
+        // which H to pin (identity for acquire, the pending-target H
+        // for refresh).
 
         let rec_ok = entries
             .iter()
@@ -2413,8 +2558,7 @@ mod rectification_tests {
         let k = k_test();
         let n = [0.0_f32, 0.0, -1.0];
         let burst = synthetic_two_frame_burst(n);
-        let outcome =
-            commit_rectification_from_burst(&burst, &k, None, SurfaceKind::Unknown);
+        let outcome = commit_rectification_from_burst(&burst, &k, None, SurfaceKind::Unknown);
         match outcome {
             RectificationAttempt::Refused {
                 reason: RectificationRefusal::TooFrontoParallel { tilt_radians },

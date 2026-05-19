@@ -113,6 +113,15 @@ pub struct EngineConfig {
     /// anchor's keypoints fail to project inside the viewport — i.e.
     /// most features are about to leave the frame.
     pub handoff_min_visible_ratio: f32,
+    /// Spawn a new (handoff) anchor when `|ln(approx_scale(H_anchor→view))|`
+    /// exceeds this threshold. BRIEF descriptors are scale-variant; once
+    /// the view's effective scale diverges past ~1.35× from acquire
+    /// (`ln(1.35) ≈ 0.30`) per-keypoint Hamming matching starts losing
+    /// inliers from descriptor drift before the inlier-count or
+    /// visible-ratio gates trip. Catching the scale change earlier lets
+    /// the handoff fit on still-co-visible features rather than at the
+    /// bottom of an inlier cliff.
+    pub handoff_scale_log_threshold: f32,
     /// Cooldown between successive handoffs. Prevents churn when
     /// inliers oscillate near the trigger threshold.
     pub handoff_cooldown_ns: u64,
@@ -146,6 +155,10 @@ impl Default for EngineConfig {
             anchor_refresh_age_ns: 30_000_000_000, // 30 s
             handoff_min_inliers: 50,
             handoff_min_visible_ratio: 0.6,
+            // ln(1.35) ≈ 0.30 — fire when accumulated scale change
+            // since acquire would push BRIEF descriptors into the
+            // "silently mis-matching" regime.
+            handoff_scale_log_threshold: 0.30,
             handoff_cooldown_ns: 500_000_000, // 500 ms
         }
     }
@@ -645,8 +658,24 @@ impl LivePlanarEngine {
                             )
                         })
                         .unwrap_or(1.0);
+                    // Scale-change trigger: H_anchor→view's local linear
+                    // scale captures cumulative zoom since acquire. The
+                    // anchor's canonical frame is by construction
+                    // identity-mapped to itself, so the current H *is*
+                    // the change. BRIEF is not scale-invariant; fire a
+                    // handoff once we're past ~1.35× to rebuild
+                    // descriptors at the current scale before matching
+                    // collapses.
+                    let scale = crate::coords::Homography::<
+                        crate::coords::AnchorSpace,
+                        crate::coords::TrackerSpace,
+                    >::from_raw(r.homography)
+                    .approx_scale();
+                    let scale_log = if scale > 0.0 { scale.ln().abs() } else { 0.0 };
+                    let scale_changed = scale_log > self.config.handoff_scale_log_threshold;
                     let needs_handoff = r.inliers < self.config.handoff_min_inliers
-                        || visible_ratio < self.config.handoff_min_visible_ratio;
+                        || visible_ratio < self.config.handoff_min_visible_ratio
+                        || scale_changed;
                     let new_active = if cooldown_elapsed && needs_handoff {
                         self.spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
                             .unwrap_or(anchor_id)

@@ -123,8 +123,7 @@ pub fn composite_frame_into_cropped(
     let src_stride = (src_full_w as usize) * 4;
     let dst_stride = (dst_w as usize) * 4;
     for y in 0..dst_h {
-        let src_row = ((src_offset_y + y) as usize) * src_stride
-            + (src_offset_x as usize) * 4;
+        let src_row = ((src_offset_y + y) as usize) * src_stride + (src_offset_x as usize) * 4;
         let dst_row = (y as usize) * dst_stride;
         dst_rgba[dst_row..dst_row + dst_stride]
             .copy_from_slice(&camera_rgba[src_row..src_row + dst_stride]);

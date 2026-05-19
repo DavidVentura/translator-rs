@@ -1244,11 +1244,7 @@ mod tests {
         let src = synthetic_rgba(16, 16);
         // h_dst_to_src that maps every destination pixel to (-1000, -1000) → outside.
         // Translate the destination origin far off the source.
-        let translate = [
-            1.0_f32, 0.0, -1000.0,
-            0.0, 1.0, -1000.0,
-            0.0, 0.0, 1.0,
-        ];
+        let translate = [1.0_f32, 0.0, -1000.0, 0.0, 1.0, -1000.0, 0.0, 0.0, 1.0];
         let dst = resample_rgba_through(&src, 16, 16, 16, 16, &translate);
         assert!(dst.iter().all(|&b| b == 0), "expected all-zero output");
     }
@@ -1260,11 +1256,7 @@ mod tests {
         let src = synthetic_rgba(w, h);
         // Inverse map dst→src that horizontally flips: dst pixel x
         // samples src pixel (w - x).
-        let flip = [
-            -1.0_f32, 0.0, w as f32,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-        ];
+        let flip = [-1.0_f32, 0.0, w as f32, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let dst = resample_rgba_through(&src, w, h, w, h, &flip);
         // dst column x should equal src column (w-1-x), modulo
         // half-pixel-centre bilinear rounding (≤ 1 byte off).
@@ -1276,7 +1268,11 @@ mod tests {
                     assert!(
                         (dst[di + c] as i32 - src[si + c] as i32).abs() <= 1,
                         "flip mismatch at ({}, {}) channel {}: dst={} src={}",
-                        x, y, c, dst[di + c], src[si + c],
+                        x,
+                        y,
+                        c,
+                        dst[di + c],
+                        src[si + c],
                     );
                 }
             }
