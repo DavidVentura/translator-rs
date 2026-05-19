@@ -165,6 +165,11 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
             .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
     let rgb = oriented.rgb.as_ref().expect("with_rgb path");
     let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
+    // PPOCR needs display-orient gray (same coord frame as `rgb` and
+    // detected boxes). `oriented.gray` is sensor-orient for the
+    // tracker; we don't reuse it here.
+    let rgb8 = rgb.to_rgb8();
+    let gray_display = image::imageops::grayscale(&rgb8);
 
     let det_raw = ppocr
         .detect_only_image(rgb_det, PpocrProfile::Still)
@@ -177,7 +182,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let scripts = match source_selection {
         OcrSourceSelection::Auto => {
             let predictions = ppocr
-                .classify_text_boxes_image(rgb, &oriented.gray, &det_boxes)
+                .classify_text_boxes_image(rgb, &gray_display, &det_boxes)
                 .map_err(|e| {
                     TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
                 })?;
@@ -192,7 +197,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let lines = ppocr
         .recognize_text_in_boxes_image(
             rgb,
-            &oriented.gray,
+            &gray_display,
             &det_boxes,
             &scripts,
             PpocrProfile::Still,

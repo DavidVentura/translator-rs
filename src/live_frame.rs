@@ -156,16 +156,21 @@ fn validate_rgba_len(
     Ok(())
 }
 
-/// Single-pass fused crop+rotate+RGBA→luma. Walks the destination
-/// gray buffer in row-major display orientation and derives the
-/// source RGBA byte address per output pixel from the rotation.
-/// Integer Rec.601 luma `(77·R + 150·G + 29·B + 128) >> 8`.
+/// Single-pass crop + RGBA→luma in **sensor orientation**. Walks the
+/// sensor-orient crop sequentially row-by-row — no rotation, purely
+/// stride-1 source reads, prefetcher-friendly. Integer BT.709 luma
+/// `(13933·R + 46871·G + 4732·B) >> 16` (matches
+/// `image::imageops::grayscale` to ±1 LSB so downstream FAST+BRIEF
+/// sees bit-identical input to the old path).
 ///
-/// Replaces the legacy four-pass chain (crop RGBA→RGB, rotate90,
-/// grayscale, resize_exact for the gray case): ~33 ms → ~5–8 ms at
-/// 1.2 MP on a phone CPU, scalar. NEON acceleration is possible
-/// later but the source read traffic dominates so a SIMD luma op
-/// alone won't help much.
+/// `display_crop` is in display-orient coords; we convert to the
+/// equivalent sensor-orient rect via `display_crop_to_sensor` so the
+/// caller's existing crop semantics work without rewiring (and crop
+/// is currently full-frame anyway). The output gray buffer's
+/// dimensions are the *sensor-orient* crop size — i.e. width/height
+/// swap relative to the legacy display-orient gray under R90/R270.
+/// The tracker now operates on this sensor-orient gray; the
+/// per-frame rotation pass is gone (saves ~3 ms at 1.2 MP).
 fn build_gray_fused(
     rgba: &[u8],
     sensor_width: u32,
@@ -173,66 +178,27 @@ fn build_gray_fused(
     rotation_degrees: i32,
     display_crop: Rect,
 ) -> Result<GrayImage, TranslatorError> {
-    let r = ((rotation_degrees % 360) + 360) % 360;
-    if !matches!(r, 0 | 90 | 180 | 270) {
-        return Err(TranslatorError::new(
-            TranslatorErrorKind::InvalidInput,
-            format!("unsupported rotation_degrees: {}", rotation_degrees),
-        ));
-    }
-    let (display_w, display_h) = if r == 90 || r == 270 {
-        (sensor_height, sensor_width)
-    } else {
-        (sensor_width, sensor_height)
-    };
-    let right = display_crop.right.min(display_w);
-    let bottom = display_crop.bottom.min(display_h);
-    if right <= display_crop.left || bottom <= display_crop.top {
-        return Err(TranslatorError::new(
-            TranslatorErrorKind::InvalidInput,
-            "crop region is empty after clamp",
-        ));
-    }
-    let crop_w = right - display_crop.left;
-    let crop_h = bottom - display_crop.top;
+    let sensor_crop =
+        display_crop_to_sensor(display_crop, sensor_width, sensor_height, rotation_degrees)?;
+    let crop_w = sensor_crop.right - sensor_crop.left;
+    let crop_h = sensor_crop.bottom - sensor_crop.top;
     let total = (crop_w as usize) * (crop_h as usize);
     let mut gray = vec![0u8; total];
 
-    let sw = sensor_width as i32;
-    let sh = sensor_height as i32;
-    let crop_left = display_crop.left as i32;
-    let crop_top = display_crop.top as i32;
-    let crop_w_i = crop_w as i32;
     let stride = (sensor_width as usize) * 4;
+    let crop_left = sensor_crop.left as usize;
+    let crop_w_usize = crop_w as usize;
 
-    // For each rotation, compute the (sx0, sy0) source coord for
-    // dst (dx=0, dy=current row) and the (sdx_x, sdx_y) step taken
-    // per inner-loop column. Pulls the rotation branch out of the
-    // per-pixel hot path.
-    for dy in 0..crop_h as i32 {
-        let display_y = crop_top + dy;
-        let dst_row_off = (dy as usize) * (crop_w as usize);
-        let (sx0, sy0, sdx_x, sdx_y) = match r {
-            0 => (crop_left, display_y, 1i32, 0i32),
-            90 => (display_y, sh - 1 - crop_left, 0i32, -1i32),
-            180 => (sw - 1 - crop_left, sh - 1 - display_y, -1i32, 0i32),
-            _ /* 270 */ => (sw - 1 - display_y, crop_left, 0i32, 1i32),
-        };
-        let mut sx = sx0;
-        let mut sy = sy0;
-        for dx in 0..crop_w_i {
-            let src_idx = (sy as usize) * stride + (sx as usize) * 4;
-            let rr = rgba[src_idx] as u32;
-            let gg = rgba[src_idx + 1] as u32;
-            let bb = rgba[src_idx + 2] as u32;
-            // sRGB luma per BT.709 (matches `image::imageops::grayscale`'s
-            // coefficients exactly so the tracker's downstream FAST+BRIEF
-            // sees bit-identical input to the old path). 16-bit fixed
-            // point: `0.2126 ≈ 13933 / 65536`, etc.
+    for sy in sensor_crop.top..sensor_crop.bottom {
+        let src_row = (sy as usize) * stride;
+        let dst_row = ((sy - sensor_crop.top) as usize) * crop_w_usize;
+        for dx in 0..crop_w_usize {
+            let p = src_row + (crop_left + dx) * 4;
+            let rr = rgba[p] as u32;
+            let gg = rgba[p + 1] as u32;
+            let bb = rgba[p + 2] as u32;
             let luma = ((13933 * rr + 46871 * gg + 4732 * bb) >> 16) as u8;
-            gray[dst_row_off + dx as usize] = luma;
-            sx += sdx_x;
-            sy += sdx_y;
+            gray[dst_row + dx] = luma;
         }
     }
 
@@ -269,9 +235,43 @@ fn build_rgb_full(
     Ok(DynamicImage::ImageRgb8(rotated))
 }
 
+/// 3×3 homography mapping display-orient pixel coords to sensor-orient
+/// pixel coords under the given camera rotation. Composed into the
+/// `h_view_to_surface` matrix at the PPOCR boundary so detected text
+/// boxes (in display coords, since PPOCR runs on display-orient RGB)
+/// project correctly into the tracker's sensor-orient surface frame
+/// via one matrix multiply.
+///
+/// Row-major. `rotation_degrees` is the CameraX
+/// `ImageInfo.rotationDegrees` (the sensor→display rotation).
+pub fn display_to_sensor_homography(
+    sensor_w: u32,
+    sensor_h: u32,
+    rotation_degrees: i32,
+) -> [f32; 9] {
+    let r = ((rotation_degrees % 360) + 360) % 360;
+    let sw = sensor_w as f32;
+    let sh = sensor_h as f32;
+    match r {
+        0 => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        // display(dx, dy) → sensor(dy, sh - dx)
+        90 => [0.0, 1.0, 0.0, -1.0, 0.0, sh, 0.0, 0.0, 1.0],
+        // display(dx, dy) → sensor(sw - dx, sh - dy)
+        180 => [-1.0, 0.0, sw, 0.0, -1.0, sh, 0.0, 0.0, 1.0],
+        // display(dx, dy) → sensor(sw - dy, dx)
+        270 => [0.0, -1.0, sw, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    }
+}
+
 /// Apply the inverse of a sensor→display rotation to a display-orient rect to
 /// recover the corresponding sensor-orient rect. Both rects are in pixel coords.
-fn display_crop_to_sensor(
+///
+/// Public so the bindings layer can use it to convert PPOCR-detected
+/// boxes (display-orient, since PPOCR runs on display-orient RGB) into
+/// sensor-orient regions for the tracker's anchor builder (which works
+/// on sensor-orient gray).
+pub fn display_crop_to_sensor(
     crop: Rect,
     sensor_w: u32,
     sensor_h: u32,
@@ -386,8 +386,12 @@ mod tests {
         }
     }
 
+    /// Gray is in **sensor orientation** now (no per-frame rotation).
+    /// For an (8×4) sensor under R90, a display crop of (4×8) covers
+    /// the whole sensor → gray comes out at sensor dims (8×4), not
+    /// the display dims (4×8) the legacy code produced.
     #[test]
-    fn gray_dims_swap_under_90_rotation() {
+    fn gray_is_sensor_orient_under_90_rotation() {
         let rgba = make_solid_rgba(8, 4, 0, 0, 0);
         let crop = Rect {
             left: 0,
@@ -396,14 +400,14 @@ mod tests {
             bottom: 8,
         };
         let oi = OrientedImage::build(&rgba, 8, 4, 90, crop, 1_000_000).unwrap();
-        assert_eq!(oi.gray.dimensions(), (4, 8));
+        assert_eq!(oi.gray.dimensions(), (8, 4));
     }
 
-    /// The fused fast path produces the same bytes (±1 LSB rounding)
-    /// as the legacy rotate-then-grayscale chain, for every rotation.
-    /// Catches sign/offset mistakes in the source-pointer arithmetic.
+    /// Gray luma matches `image::imageops::grayscale` of the
+    /// sensor-orient RGB (no rotation) to ±1 LSB. Catches
+    /// coefficient mistakes in the BT.709 fixed-point math.
     #[test]
-    fn fused_matches_legacy_for_all_rotations() {
+    fn fused_gray_matches_legacy_no_rotation() {
         let sensor_w = 6u32;
         let sensor_h = 4u32;
         let mut rgba = Vec::with_capacity((sensor_w * sensor_h * 4) as usize);
@@ -418,6 +422,8 @@ mod tests {
             }
         }
         for rot in [0, 90, 180, 270] {
+            // Display crop covering the whole display-orient frame
+            // (which is sensor swapped under R90/R270).
             let (dw, dh) = if rot == 90 || rot == 270 {
                 (sensor_h, sensor_w)
             } else {
@@ -429,11 +435,19 @@ mod tests {
                 right: dw,
                 bottom: dh,
             };
-            let legacy_rgb = build_rgb_full(&rgba, sensor_w, sensor_h, rot, crop).unwrap();
-            let legacy_gray = image::imageops::grayscale(&legacy_rgb.to_rgb8());
-
             let oi = OrientedImage::build(&rgba, sensor_w, sensor_h, rot, crop, 1_000_000).unwrap();
-            for (got, want) in oi.gray.as_raw().iter().zip(legacy_gray.as_raw().iter()) {
+            // Expected: sensor-orient gray of the whole RGBA, no rotation.
+            let mut expected_rgb = Vec::with_capacity((sensor_w * sensor_h * 3) as usize);
+            for chunk in rgba.chunks_exact(4) {
+                expected_rgb.push(chunk[0]);
+                expected_rgb.push(chunk[1]);
+                expected_rgb.push(chunk[2]);
+            }
+            let expected_gray = image::imageops::grayscale(
+                &RgbImage::from_raw(sensor_w, sensor_h, expected_rgb).unwrap(),
+            );
+            assert_eq!(oi.gray.dimensions(), expected_gray.dimensions());
+            for (got, want) in oi.gray.as_raw().iter().zip(expected_gray.as_raw().iter()) {
                 let diff = (*got as i32 - *want as i32).abs();
                 assert!(
                     diff <= 1,

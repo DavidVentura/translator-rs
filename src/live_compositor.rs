@@ -38,121 +38,42 @@ pub struct OverlayItem<'a> {
 pub enum CompositeError {
     DstBufferSize,
     SrcBufferSize,
-    UnsupportedRotation,
-    DimensionMismatch,
 }
 
-/// Build the per-frame display image: rotate the sensor RGBA into the
-/// display orientation, then warp+blend each overlay item on top.
+/// Build the per-frame display image: blit the sensor RGBA + warp +
+/// alpha-blend each overlay item on top. Both source and destination
+/// are sensor-orient; the SurfaceView rotates for display at scanout.
 ///
 /// `dst_rgba` must be sized `display_w * display_h * 4`. On success
 /// it's fully overwritten with the composited result and can be blitted
 /// to a `SurfaceView` directly.
 pub fn composite_frame_into(
     dst_rgba: &mut [u8],
-    display_w: u32,
-    display_h: u32,
-    camera_rgba: &[u8],
     sensor_w: u32,
     sensor_h: u32,
-    rotation_degrees: i32,
+    camera_rgba: &[u8],
     h_surface_to_viewport: &[f32; 9],
     items: &[OverlayItem<'_>],
 ) -> Result<(), CompositeError> {
-    let dst_bytes = (display_w as usize)
-        .checked_mul(display_h as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or(CompositeError::DstBufferSize)?;
-    if dst_rgba.len() != dst_bytes {
-        return Err(CompositeError::DstBufferSize);
-    }
-    let src_bytes = (sensor_w as usize)
+    // Dst and src share dims now — no per-frame rotation. The Kotlin
+    // side hands the sensor-orient bitmap straight to the SurfaceView,
+    // which rotates it for display via its drawMatrix (GPU-composited
+    // for free at scanout).
+    let frame_bytes = (sensor_w as usize)
         .checked_mul(sensor_h as usize)
         .and_then(|n| n.checked_mul(4))
-        .ok_or(CompositeError::SrcBufferSize)?;
-    if camera_rgba.len() != src_bytes {
+        .ok_or(CompositeError::DstBufferSize)?;
+    if dst_rgba.len() != frame_bytes {
+        return Err(CompositeError::DstBufferSize);
+    }
+    if camera_rgba.len() != frame_bytes {
         return Err(CompositeError::SrcBufferSize);
     }
-    rotate_camera_into_display(
-        dst_rgba,
-        display_w,
-        display_h,
-        camera_rgba,
-        sensor_w,
-        sensor_h,
-        rotation_degrees,
-    )?;
+    // Camera blit: sensor-orient → sensor-orient sequential copy.
+    // LLVM should turn this into a memcpy.
+    dst_rgba.copy_from_slice(camera_rgba);
     for item in items {
-        warp_item_onto_display(dst_rgba, display_w, display_h, item, h_surface_to_viewport);
-    }
-    Ok(())
-}
-
-/// Sensor-to-display rotation using the CameraX convention for
-/// `imageInfo.rotationDegrees`: the rotation that, when applied to the
-/// sensor image, yields the natural display orientation.
-fn rotate_camera_into_display(
-    dst: &mut [u8],
-    dst_w: u32,
-    dst_h: u32,
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    rotation_degrees: i32,
-) -> Result<(), CompositeError> {
-    let r = ((rotation_degrees % 360) + 360) % 360;
-    match r {
-        0 => {
-            if (dst_w, dst_h) != (src_w, src_h) {
-                return Err(CompositeError::DimensionMismatch);
-            }
-            dst.copy_from_slice(src);
-        }
-        90 => {
-            if (dst_w, dst_h) != (src_h, src_w) {
-                return Err(CompositeError::DimensionMismatch);
-            }
-            // Rotate 90° clockwise: dst[y][x] = src[src_h - 1 - x][y].
-            for y in 0..dst_h {
-                for x in 0..dst_w {
-                    let src_x = y;
-                    let src_y = src_h - 1 - x;
-                    let s = ((src_y * src_w + src_x) * 4) as usize;
-                    let d = ((y * dst_w + x) * 4) as usize;
-                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-        }
-        180 => {
-            if (dst_w, dst_h) != (src_w, src_h) {
-                return Err(CompositeError::DimensionMismatch);
-            }
-            for y in 0..dst_h {
-                for x in 0..dst_w {
-                    let src_x = src_w - 1 - x;
-                    let src_y = src_h - 1 - y;
-                    let s = ((src_y * src_w + src_x) * 4) as usize;
-                    let d = ((y * dst_w + x) * 4) as usize;
-                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-        }
-        270 => {
-            if (dst_w, dst_h) != (src_h, src_w) {
-                return Err(CompositeError::DimensionMismatch);
-            }
-            // Rotate 270° clockwise (= 90° CCW): dst[y][x] = src[x][src_w - 1 - y].
-            for y in 0..dst_h {
-                for x in 0..dst_w {
-                    let src_x = src_w - 1 - y;
-                    let src_y = x;
-                    let s = ((src_y * src_w + src_x) * 4) as usize;
-                    let d = ((y * dst_w + x) * 4) as usize;
-                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-        }
-        _ => return Err(CompositeError::UnsupportedRotation),
+        warp_item_onto_display(dst_rgba, sensor_w, sensor_h, item, h_surface_to_viewport);
     }
     Ok(())
 }
@@ -327,29 +248,11 @@ mod tests {
     }
 
     #[test]
-    fn rotation_zero_copies_camera_through() {
+    fn camera_blit_copies_through() {
         let cam = solid_rgba(2, 3, 10, 20, 30);
         let mut dst = vec![0u8; 24];
-        composite_frame_into(&mut dst, 2, 3, &cam, 2, 3, 0, &IDENTITY_H, &[]).unwrap();
+        composite_frame_into(&mut dst, 2, 3, &cam, &IDENTITY_H, &[]).unwrap();
         assert_eq!(dst, cam);
-    }
-
-    #[test]
-    fn rotation_90_rotates_pixel_layout() {
-        // 2x1 source: (red, green) → 1x2 destination after 90° CW: (red at bottom, green at top).
-        let mut cam = Vec::new();
-        cam.extend_from_slice(&[255, 0, 0, 255]); // (0,0)
-        cam.extend_from_slice(&[0, 255, 0, 255]); // (1,0)
-        let mut dst = vec![0u8; 8];
-        composite_frame_into(&mut dst, 1, 2, &cam, 2, 1, 90, &IDENTITY_H, &[]).unwrap();
-        // dst[0][0] = src[1 - 0 - 0][0] = src[0,0] is wrong — with our mapping
-        // dst[y][x] = src[src_h - 1 - x][y]. For dst[0][0]: src[0][0] = red.
-        // For dst[1][0]: src[0][1] = src[0,1] = green.
-        // Wait: src_h = 1 so src_h - 1 - x = 0 - x = -x, always 0 for x=0.
-        // dst[0][0] = src[src_h-1-0][0] = src[0,0] = (255,0,0,255). ✓
-        // dst[1][0] = src[src_h-1-0][1] = src[0,1] = (0,255,0,255). ✓
-        assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
-        assert_eq!(&dst[4..8], &[0, 255, 0, 255]);
     }
 
     #[test]
@@ -373,9 +276,6 @@ mod tests {
             6,
             6,
             &cam,
-            6,
-            6,
-            0,
             &IDENTITY_H,
             std::slice::from_ref(&item),
         )
