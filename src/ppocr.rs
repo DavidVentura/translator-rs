@@ -523,7 +523,13 @@ impl PpocrEngine {
                 low_score_count += 1;
                 (String::new(), 0.0, "low_score")
             } else {
-                (r.text, r.confidence, "accepted")
+                let accepted = match scripts[idx] {
+                    PpocrScript::Cyrillic | PpocrScript::Eslav => {
+                        crate::script_normalize::repair_cyrillic_word_mixing(&r.text)
+                    }
+                    _ => r.text,
+                };
+                (accepted, r.confidence, "accepted")
             };
             log::debug!(
                 "ppocr rec strip={} script={} det_score={:.3} width={} height={} area={} conf={:.3} status={} text=\"{}\"",

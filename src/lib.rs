@@ -74,6 +74,8 @@ pub mod rectification;
 mod routing;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod script;
+#[cfg(feature = "ppocr")]
+mod script_normalize;
 mod sentence_split;
 pub mod session;
 pub mod settings;
