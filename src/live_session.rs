@@ -20,8 +20,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::api::LanguageCode;
 use crate::color_matting::MattedStrip;
 use crate::homography::{invert, project};
+use crate::imu_prior::CameraIntrinsics;
 use crate::live_frame::OrientedImage;
 use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine};
+use crate::rectification::{
+    PlanePose, SurfaceKind, decompose_homography, disambiguate_across_frames, is_pose_plausible,
+};
 use crate::routing::MixedTextTranslationResult;
 use crate::surface_map::{AddResult, SurfaceLineId, SurfaceLineObservation, SurfaceMap};
 
@@ -163,6 +167,14 @@ pub struct AnchorState {
     /// areas; reset only when the anchor is evicted (LRU) or the
     /// session is cleared.
     pub covered_region: Option<Aabb>,
+    /// Result of the post-acquire rectification attempt for this
+    /// anchor. See [`RectificationAttempt`] and
+    /// [`LiveSession::try_commit_rectification`]. Stays
+    /// [`RectificationAttempt::Pending`] until the engine's H-burst
+    /// is full and the orchestration is called; transitions to
+    /// `Committed` or `Refused` exactly once per anchor (no
+    /// re-attempts).
+    pub rectification: RectificationAttempt,
 }
 
 impl AnchorState {
@@ -170,7 +182,121 @@ impl AnchorState {
         Self {
             map: SurfaceMap::new(),
             covered_region: None,
+            rectification: RectificationAttempt::Pending,
         }
+    }
+}
+
+/// Lifecycle of the post-acquire rectification analysis for an
+/// anchor. Phase 2B "orchestration only" stage: the attempt runs
+/// once per anchor, records the recovered plane pose (or the
+/// reason for refusal), and stops. Downstream resample / anchor
+/// swap is a later stage and consumes `Committed { .. }`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RectificationAttempt {
+    /// Burst not yet full, or call site hasn't fired yet.
+    Pending,
+    /// Decomposition + cross-frame disambiguation succeeded and
+    /// the disagreement angle is within tolerance. The pose's
+    /// `normal` is the recovered plane normal in the acquire
+    /// frame's coords; downstream resample uses this with the
+    /// `rectification_matrix` library helper.
+    Committed {
+        pose: PlanePose,
+        mean_disagreement_radians: f32,
+    },
+    /// The attempt ran but was rejected. Refused state is sticky
+    /// for the anchor's lifetime — we don't keep retrying on
+    /// every locked frame.
+    Refused { reason: RectificationRefusal },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RectificationRefusal {
+    /// `h_burst.len() < min_frames_required`.
+    BurstTooSmall { have: usize, need: usize },
+    /// Faugeras decomposition returned no candidates on at least
+    /// one frame — degenerate H (pure rotation, singular).
+    DecompositionDegenerate,
+    /// `disambiguate_across_frames` returned None.
+    DisambiguationFailed,
+    /// Mean cross-frame normal disagreement exceeds the
+    /// threshold; rectification would be unstable.
+    HighDisagreement { angle_radians: f32 },
+    /// Recovered pose fails the sanity check
+    /// (`is_pose_plausible`).
+    PoseImplausible,
+}
+
+/// Minimum frames required before we'll attempt commit. Mirrors
+/// the engine-side `RECTIFICATION_BURST_SIZE` so an anchor that's
+/// reached burst-full automatically has enough material.
+pub const RECTIFICATION_MIN_FRAMES: usize = 2;
+
+/// Mean disagreement threshold above which we refuse to commit.
+/// From FUTURE_ANCHOR_RECTIFICATION.md Phase 1 noise table:
+/// 3 px correspondence noise → ~3.6° normal error; we accept up
+/// to 5° to keep the bar reachable on real handheld captures
+/// while still rejecting cases where the per-frame candidates
+/// disagree wildly (decomposition isn't stable on this geometry).
+pub const RECTIFICATION_MAX_DISAGREEMENT_RAD: f32 = 0.0873; // 5°
+
+/// Pure orchestration: take a burst of `H_anchor→view` samples and
+/// camera intrinsics, return the committed plane pose or a
+/// refusal reason. Stateless — exposed for tests and for the
+/// LiveSession method to wrap.
+///
+/// `gravity_camera` and `kind` are forwarded to
+/// `disambiguate_with_priors` *only* as a fallback when the
+/// primary cross-frame disambiguator returns ambiguous-looking
+/// results; the cross-frame path is the primary mechanism
+/// (FUTURE_ANCHOR_RECTIFICATION.md → "Pose recovery").
+pub fn commit_rectification_from_burst(
+    h_burst: &[[f32; 9]],
+    intrinsics: &CameraIntrinsics,
+    _gravity_camera: Option<[f32; 3]>,
+    _kind: SurfaceKind,
+) -> RectificationAttempt {
+    if h_burst.len() < RECTIFICATION_MIN_FRAMES {
+        return RectificationAttempt::Refused {
+            reason: RectificationRefusal::BurstTooSmall {
+                have: h_burst.len(),
+                need: RECTIFICATION_MIN_FRAMES,
+            },
+        };
+    }
+    let per_frame: Vec<Vec<PlanePose>> = h_burst
+        .iter()
+        .map(|h| decompose_homography(h, intrinsics))
+        .collect();
+    if per_frame.iter().any(|c| c.is_empty()) {
+        return RectificationAttempt::Refused {
+            reason: RectificationRefusal::DecompositionDegenerate,
+        };
+    }
+    let result = match disambiguate_across_frames(&per_frame) {
+        Some(r) => r,
+        None => {
+            return RectificationAttempt::Refused {
+                reason: RectificationRefusal::DisambiguationFailed,
+            };
+        }
+    };
+    if result.mean_disagreement_radians > RECTIFICATION_MAX_DISAGREEMENT_RAD {
+        return RectificationAttempt::Refused {
+            reason: RectificationRefusal::HighDisagreement {
+                angle_radians: result.mean_disagreement_radians,
+            },
+        };
+    }
+    if !is_pose_plausible(&result.pose, &h_burst[0], intrinsics) {
+        return RectificationAttempt::Refused {
+            reason: RectificationRefusal::PoseImplausible,
+        };
+    }
+    RectificationAttempt::Committed {
+        pose: result.pose,
+        mean_disagreement_radians: result.mean_disagreement_radians,
     }
 }
 
@@ -316,6 +442,84 @@ impl LiveSession {
     pub fn on_acquire(&self) {
         self.locked_frames_since_acquire.store(0, Ordering::SeqCst);
         self.last_refresh_locked_frame.store(0, Ordering::SeqCst);
+    }
+
+    /// Try to commit a rectification analysis for `anchor_id` from
+    /// the engine's H-burst. Idempotent per anchor: if the state is
+    /// already `Committed` or `Refused`, this call is a no-op and
+    /// returns the existing state. On `Pending` it runs the
+    /// decompose + cross-frame disambiguation pipeline and
+    /// transitions the state.
+    ///
+    /// Caller (bindings) gets the burst from
+    /// `engine.h_burst_of(anchor_id)` after each Locked frame.
+    /// Calling this with a still-filling burst (`< RECTIFICATION_MIN_FRAMES`)
+    /// leaves the state at `Pending` — we don't refuse early, we
+    /// just wait for more frames. Once the burst is full and an
+    /// attempt has been made, the state is sticky.
+    ///
+    /// Phase 2B orchestration only: no resample, no anchor swap.
+    /// Downstream consumers read `state.rectification` and use the
+    /// recovered pose to build `H_rect` at resample time.
+    pub fn try_commit_rectification(
+        &self,
+        anchor_id: AnchorId,
+        h_burst: &[[f32; 9]],
+        intrinsics: &CameraIntrinsics,
+        gravity_camera: Option<[f32; 3]>,
+        kind: SurfaceKind,
+    ) -> RectificationAttempt {
+        let mut states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return RectificationAttempt::Pending,
+        };
+        let state = states.entry(anchor_id).or_insert_with(AnchorState::new);
+        if !matches!(state.rectification, RectificationAttempt::Pending) {
+            return state.rectification;
+        }
+        if h_burst.len() < RECTIFICATION_MIN_FRAMES {
+            return RectificationAttempt::Pending;
+        }
+        let outcome = commit_rectification_from_burst(h_burst, intrinsics, gravity_camera, kind);
+        state.rectification = outcome;
+        match outcome {
+            RectificationAttempt::Committed {
+                pose,
+                mean_disagreement_radians,
+            } => {
+                log::info!(
+                    "rectification anchor {}: COMMIT  n=[{:+.3}, {:+.3}, {:+.3}]  disagreement={:.2}°  rot_axis_z_dot={:+.3}",
+                    anchor_id,
+                    pose.normal[0],
+                    pose.normal[1],
+                    pose.normal[2],
+                    mean_disagreement_radians.to_degrees(),
+                    pose.rotation[8],
+                );
+            }
+            RectificationAttempt::Refused { reason } => {
+                log::info!(
+                    "rectification anchor {}: REFUSE  reason={:?}",
+                    anchor_id,
+                    reason,
+                );
+            }
+            RectificationAttempt::Pending => {}
+        }
+        outcome
+    }
+
+    /// Inspect (without mutating) the current rectification state
+    /// for an anchor. Returns `Pending` for unknown anchors.
+    pub fn rectification_state(&self, anchor_id: AnchorId) -> RectificationAttempt {
+        let states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return RectificationAttempt::Pending,
+        };
+        states
+            .get(&anchor_id)
+            .map(|s| s.rectification)
+            .unwrap_or(RectificationAttempt::Pending)
     }
 
     /// Bump the Locked-frame counter. Call once per per-frame tracker
@@ -1695,4 +1899,183 @@ pub fn stable_block_id(
         }
     }
     hash | (1u64 << 63)
+}
+
+#[cfg(test)]
+mod rectification_tests {
+    use super::*;
+    use crate::rectification::compose_homography;
+
+    fn k_test() -> CameraIntrinsics {
+        CameraIntrinsics {
+            fx: 600.0,
+            fy: 600.0,
+            cx: 320.0,
+            cy: 240.0,
+        }
+    }
+
+    fn axis_angle_rotation(axis: [f32; 3], angle_rad: f32) -> [f32; 9] {
+        let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        let a = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+        let c = angle_rad.cos();
+        let s = angle_rad.sin();
+        let one_minus_c = 1.0 - c;
+        [
+            c + a[0] * a[0] * one_minus_c,
+            a[0] * a[1] * one_minus_c - a[2] * s,
+            a[0] * a[2] * one_minus_c + a[1] * s,
+            a[1] * a[0] * one_minus_c + a[2] * s,
+            c + a[1] * a[1] * one_minus_c,
+            a[1] * a[2] * one_minus_c - a[0] * s,
+            a[2] * a[0] * one_minus_c - a[1] * s,
+            a[2] * a[1] * one_minus_c + a[0] * s,
+            c + a[2] * a[2] * one_minus_c,
+        ]
+    }
+
+    fn angle_between_normals(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+        let na = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        let nb = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
+        let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (na * nb);
+        dot.clamp(-1.0, 1.0).acos()
+    }
+
+    /// Two synthetic frames observing the same plane (`normal`)
+    /// from two different camera poses. Mirrors the
+    /// `rectification.rs` test pattern.
+    fn synthetic_two_frame_burst(normal: [f32; 3]) -> Vec<[f32; 9]> {
+        let k = k_test();
+        let pose_f0 = PlanePose {
+            rotation: axis_angle_rotation([0.0, 1.0, 0.0], 8.0_f32.to_radians()),
+            t_over_d: [0.05, 0.02, 0.06],
+            normal,
+        };
+        let pose_f1 = PlanePose {
+            rotation: axis_angle_rotation([1.0, 0.5, 0.0], 12.0_f32.to_radians()),
+            t_over_d: [-0.04, 0.03, 0.08],
+            normal,
+        };
+        vec![
+            compose_homography(&pose_f0, &k),
+            compose_homography(&pose_f1, &k),
+        ]
+    }
+
+    #[test]
+    fn commit_succeeds_on_clean_two_frame_burst() {
+        let k = k_test();
+        let n_truth = [0.10_f32, 0.20, -1.0];
+        let n_truth_unit = {
+            let m = (n_truth[0] * n_truth[0] + n_truth[1] * n_truth[1] + n_truth[2] * n_truth[2])
+                .sqrt();
+            [n_truth[0] / m, n_truth[1] / m, n_truth[2] / m]
+        };
+        let burst = synthetic_two_frame_burst(n_truth_unit);
+        let outcome = commit_rectification_from_burst(&burst, &k, None, SurfaceKind::Unknown);
+        match outcome {
+            RectificationAttempt::Committed {
+                pose,
+                mean_disagreement_radians,
+            } => {
+                let err = angle_between_normals(&pose.normal, &n_truth_unit);
+                assert!(
+                    err < 1.0_f32.to_radians(),
+                    "normal err {} deg",
+                    err.to_degrees()
+                );
+                assert!(mean_disagreement_radians < 1.0_f32.to_radians());
+            }
+            other => panic!("expected Committed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn commit_refuses_undersized_burst() {
+        let k = k_test();
+        let outcome = commit_rectification_from_burst(&[], &k, None, SurfaceKind::Unknown);
+        assert!(matches!(
+            outcome,
+            RectificationAttempt::Refused {
+                reason: RectificationRefusal::BurstTooSmall { have: 0, need: _ }
+            }
+        ));
+        let single = synthetic_two_frame_burst([0.0, 0.0, -1.0]);
+        let outcome = commit_rectification_from_burst(&single[..1], &k, None, SurfaceKind::Unknown);
+        assert!(matches!(
+            outcome,
+            RectificationAttempt::Refused {
+                reason: RectificationRefusal::BurstTooSmall { have: 1, need: _ }
+            }
+        ));
+    }
+
+    #[test]
+    fn commit_refuses_pure_rotation_burst() {
+        // Two frames where the only motion is a small rotation
+        // around the optical axis with zero translation — the
+        // plane normal is unobservable. Decomposition should
+        // return no candidates (degenerate).
+        let k = k_test();
+        let r0 = axis_angle_rotation([0.0, 0.0, 1.0], 3.0_f32.to_radians());
+        let r1 = axis_angle_rotation([0.0, 0.0, 1.0], 6.0_f32.to_radians());
+        let pose_f0 = PlanePose {
+            rotation: r0,
+            t_over_d: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, -1.0],
+        };
+        let pose_f1 = PlanePose {
+            rotation: r1,
+            t_over_d: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, -1.0],
+        };
+        let burst = vec![
+            compose_homography(&pose_f0, &k),
+            compose_homography(&pose_f1, &k),
+        ];
+        let outcome = commit_rectification_from_burst(&burst, &k, None, SurfaceKind::Unknown);
+        assert!(matches!(
+            outcome,
+            RectificationAttempt::Refused {
+                reason: RectificationRefusal::DecompositionDegenerate
+            }
+        ));
+    }
+
+    #[test]
+    fn try_commit_is_idempotent_per_anchor() {
+        let k = k_test();
+        let n = [0.0_f32, 0.0, -1.0];
+        let burst = synthetic_two_frame_burst(n);
+        let session = LiveSession::new();
+        let anchor_id = 42u64;
+        let first =
+            session.try_commit_rectification(anchor_id, &burst, &k, None, SurfaceKind::Unknown);
+        assert!(matches!(first, RectificationAttempt::Committed { .. }));
+        // Second call with a *different* burst should NOT overwrite —
+        // sticky per anchor.
+        let bogus = vec![[1.0_f32; 9], [1.0_f32; 9]];
+        let second =
+            session.try_commit_rectification(anchor_id, &bogus, &k, None, SurfaceKind::Unknown);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn try_commit_stays_pending_until_burst_full() {
+        let k = k_test();
+        let burst = synthetic_two_frame_burst([0.0, 0.0, -1.0]);
+        let session = LiveSession::new();
+        let anchor_id = 7u64;
+        let outcome = session.try_commit_rectification(
+            anchor_id,
+            &burst[..1],
+            &k,
+            None,
+            SurfaceKind::Unknown,
+        );
+        assert_eq!(outcome, RectificationAttempt::Pending);
+        let outcome2 =
+            session.try_commit_rectification(anchor_id, &burst, &k, None, SurfaceKind::Unknown);
+        assert!(matches!(outcome2, RectificationAttempt::Committed { .. }));
+    }
 }
