@@ -513,6 +513,7 @@ impl LiveSession {
             }
         }
         let raster = match render_block_bitmap(
+            id,
             &strips,
             &matted_strips,
             &display_text,
@@ -1332,6 +1333,31 @@ impl Default for LiveSession {
 /// ascenders/descenders so the pill looks like it covers the line.
 pub const TIGHT_VERTICAL_INFLATE: f32 = 2.4;
 
+/// Diagnostic: tint each block's bg with a deterministic palette
+/// colour (selected by `block_id % 8`) so we can see at a glance
+/// which pixels belong to which block. Useful for spotting
+/// inter-block overlap (different colours intermixing) vs
+/// intra-block double-fill artefacts (same colour appearing
+/// darker — should never happen due to cap-by-max in
+/// `fill_oriented_rect_blended`, but worth eyeballing). Flip off
+/// for production.
+pub const DEBUG_PER_BLOCK_BG_COLOR: bool = true;
+
+/// 8-color palette for [`DEBUG_PER_BLOCK_BG_COLOR`]. All entries
+/// share the same alpha as the default bg (0xC8 = 200/255) and
+/// similar luma so text legibility doesn't change wildly between
+/// blocks — only the hue.
+pub const DEBUG_BG_PALETTE: [[u8; 4]; 8] = [
+    [0x50, 0x10, 0x10, 0xC8], // crimson
+    [0x10, 0x40, 0x10, 0xC8], // forest
+    [0x10, 0x20, 0x50, 0xC8], // navy
+    [0x50, 0x40, 0x10, 0xC8], // olive
+    [0x50, 0x10, 0x50, 0xC8], // magenta
+    [0x10, 0x40, 0x40, 0xC8], // teal
+    [0x60, 0x30, 0x10, 0xC8], // rust
+    [0x30, 0x10, 0x50, 0xC8], // indigo
+];
+
 /// Horizontal padding (per side) on the visible pill vs the
 /// detector's tight rect. Keeps glyph edges off the rounded corner.
 pub const HORIZONTAL_PAD_PX: f32 = 8.0;
@@ -1441,6 +1467,7 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
 /// simulator can pass any `FontProvider` impl (or a stub if it
 /// doesn't need text rendering yet).
 pub fn render_block_bitmap(
+    block_id: u64,
     strips: &[OrientedRect],
     matted_strips: &[Option<crate::color_matting::MattedStrip>],
     display_text: &str,
@@ -1495,7 +1522,11 @@ pub fn render_block_bitmap(
 
     let pixels = (bitmap_w as usize) * (bitmap_h as usize);
     let mut rgba = vec![0u8; pixels * 4];
-    let default_bg = [0x10, 0x10, 0x10, 0xC8];
+    let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
+        DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
+    } else {
+        [0x10, 0x10, 0x10, 0xC8]
+    };
     let visuals_local: Vec<OrientedRect> = visuals
         .iter()
         .map(|v| OrientedRect {

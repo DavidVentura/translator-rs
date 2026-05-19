@@ -912,22 +912,57 @@ pub fn group_live_lines_into_blocks(lines: Vec<TextLine>) -> Vec<TextBlock> {
             })
     });
 
-    let mut groups: Vec<TextBlock> = Vec::new();
-    for line in ordered {
-        let target = groups
-            .iter_mut()
-            .rev()
-            .find(|group| live_lines_should_merge(group.lines.last().unwrap(), &line));
-        if let Some(group) = target {
-            group.lines.push(line);
-        } else {
-            groups.push(TextBlock { lines: vec![line] });
+    // Union-find over all-pairs mergeability. Sequential-pairwise
+    // chain-walking breaks the body paragraph any time a small
+    // detection (line-trailing fragment, marginal note, footnote
+    // ref) sits at an intermediate y between two body lines: the
+    // body→fragment and fragment→body checks both fail, so the
+    // body line below the fragment starts its own block. Switching
+    // to connected components lets body lines connect directly to
+    // each other across interleaved short content.
+    let n = ordered.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if live_lines_should_merge(&ordered[i], &ordered[j]) {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
         }
     }
-    groups
+
+    let roots: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
+    let mut ordered_opt: Vec<Option<TextLine>> = ordered.into_iter().map(Some).collect();
+    let mut by_root: std::collections::HashMap<usize, Vec<TextLine>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let line = ordered_opt[i].take().unwrap();
+        by_root.entry(roots[i]).or_default().push(line);
+    }
+
+    let mut blocks: Vec<TextBlock> = by_root
+        .into_values()
+        .map(|lines| TextBlock { lines })
+        .collect();
+    blocks.sort_by(|a, b| {
+        let ta = a.lines.iter().map(tight_top).fold(f32::INFINITY, f32::min);
+        let tb = b.lines.iter().map(tight_top).fold(f32::INFINITY, f32::min);
+        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    blocks
 }
 
-fn live_lines_should_merge(prev: &TextLine, next: &TextLine) -> bool {
+pub fn live_lines_should_merge(prev: &TextLine, next: &TextLine) -> bool {
     if is_live_measurement_token(prev.text.trim()) || is_live_measurement_token(next.text.trim()) {
         return false;
     }
