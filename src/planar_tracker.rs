@@ -114,6 +114,16 @@ pub struct LivePlanarTracker {
 pub struct TrackerConfig {
     /// FAST corner threshold (0..255). Higher → fewer, stronger corners.
     pub fast_threshold: u8,
+    /// Fallback FAST threshold for the Locked-state matcher: if a
+    /// first-pass detect at `fast_threshold` returns fewer than
+    /// `fast_min_keypoints`, we redetect at this looser threshold to
+    /// catch corners that motion blur has softened below the strict
+    /// score cutoff. Used only on the per-frame match path; acquire and
+    /// re-lock keep `fast_threshold` so anchor quality stays high.
+    pub fast_threshold_fallback: u8,
+    /// Minimum first-pass keypoint count below which the Locked matcher
+    /// triggers the `fast_threshold_fallback` redetect.
+    pub fast_min_keypoints: usize,
     /// Cap on keypoints returned by detection — strongest survive.
     pub max_features: usize,
     /// Lowe ratio test cutoff (best/second-best Hamming) used by
@@ -150,22 +160,28 @@ impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
             fast_threshold: 15,
+            fast_threshold_fallback: 7,
+            fast_min_keypoints: 200,
             max_features: 500,
             lowe_ratio: 0.8,
             lowe_ratio_locked: 0.85,
             ransac_residual_px: 4.0,
-            ransac_iters: 1000,
+            ransac_iters: 400,
             min_inliers: 25,
-            // Hysteresis floor for keeping a Locked track. Raised
-            // to 18 to land us inside the affine model band (15-29
-            // inliers = 6-DoF affine fit) and force a Lost
-            // transition before the matcher drops into the 4-DoF
-            // similarity regime where overlays warp into the wrong
-            // plane on perspective scenes. Paired with the
-            // per-frame H-delta cap and `lost_after_frames=5`,
-            // this gives the Google-Translate-style
-            // shake → overlay-hides → re-acquire-on-stability UX.
-            min_inliers_keep_locked: 18,
+            // Hysteresis floor for keeping a Locked track. Set to 10
+            // so the cascading-model refinement in
+            // `ransac_homography_with_prior` can fall through to the
+            // 4-DoF similarity fit at low inlier counts — earlier we
+            // pinned this at 18 (mid-affine band), which cut RANSAC
+            // off before the similarity path ever engaged. Similarity
+            // is over-flat on tilted planes (no perspective), but at
+            // sub-15-inlier counts the 8-DoF homography is so under-
+            // constrained that it produces worse drift than the flat
+            // similarity does; better a stable 4-DoF lock through a
+            // brief blur than a wild 8-DoF wrong-basin fit. The
+            // per-frame H-delta cap + sanity gate spread-coverage
+            // check still catch egregiously bad similarity fits.
+            min_inliers_keep_locked: 10,
             nms_radius: 3,
         }
     }
@@ -325,7 +341,23 @@ pub fn track_against_anchor_with_prior(
     prior: Option<[f32; 9]>,
 ) -> Option<TrackResult> {
     let t0 = std::time::Instant::now();
-    let kps = detect_fast(gray, cfg.fast_threshold, cfg.max_features, cfg.nms_radius);
+    let mut kps = detect_fast(gray, cfg.fast_threshold, cfg.max_features, cfg.nms_radius);
+    if kps.len() < cfg.fast_min_keypoints && cfg.fast_threshold_fallback < cfg.fast_threshold {
+        // Blur survival: the strict threshold returned too few corners,
+        // suggesting the frame is blurred or low-contrast. Redetect at
+        // the looser threshold to pick up the soft, sub-strict corners
+        // that blur created. RANSAC + the previous-frame H seed will
+        // filter the inevitable noise; the alternative is going Lost.
+        let retry = detect_fast(
+            gray,
+            cfg.fast_threshold_fallback,
+            cfg.max_features,
+            cfg.nms_radius,
+        );
+        if retry.len() > kps.len() {
+            kps = retry;
+        }
+    }
     let n_raw_kps = kps.len();
     let t_detect = t0.elapsed();
     if kps.is_empty() {
@@ -345,7 +377,15 @@ pub fn track_against_anchor_with_prior(
         return None;
     }
     let t2 = std::time::Instant::now();
-    let matches = match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio_locked);
+    let mut matches = match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio_locked);
+    // Sort by Hamming distance ascending — pairs[i] now corresponds
+    // to the i-th best match. RANSAC samples from a progressively
+    // growing prefix of this list (PROSAC), so early iterations draw
+    // from the high-likelihood-inlier top matches and find the
+    // correct model in fewer tries. If those top matches are
+    // misleading (degenerate / repetitive features), later phases
+    // widen the pool to the full match set.
+    matches.sort_unstable_by_key(|m| m.distance);
     let t_match = t2.elapsed();
     let n_matches = matches.len();
     if matches.len() < 4 {
@@ -493,12 +533,27 @@ pub fn ransac_homography_with_prior(
             best_h = Some(h);
         }
     }
-    for _ in 0..cfg.ransac_iters {
+    // PROSAC schedule: assumes `pairs` is pre-sorted by match quality
+    // (best first). Early iters sample from a small top-quality
+    // prefix; the prefix grows in four phases over the iteration
+    // budget so that bad-prior tops get a chance to lose to broader
+    // samples later. Quarters were picked over a smooth curve for
+    // implementation simplicity — the gain over uniform random is
+    // primarily from phase 0, not the exact growth law.
+    let quarter = (cfg.ransac_iters / 4).max(1);
+    for t in 0..cfg.ransac_iters {
+        let phase = (t / quarter).min(3);
+        let growth_cap = match phase {
+            0 => (n / 4).max(8).min(n),
+            1 => (n / 2).max(8).min(n),
+            2 => (n * 3 / 4).max(8).min(n),
+            _ => n,
+        };
         let mut sample = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
         let mut idxs = [0usize; 4];
         for k in 0..4 {
             loop {
-                let candidate = (rng.next_u32() as usize) % n;
+                let candidate = (rng.next_u32() as usize) % growth_cap;
                 if idxs[..k].iter().all(|&p| p != candidate) {
                     idxs[k] = candidate;
                     sample[k] = pairs[candidate];

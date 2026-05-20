@@ -57,6 +57,8 @@ fn test_engine_config() -> EngineConfig {
     EngineConfig {
         tracker: TrackerConfig {
             fast_threshold: 20,
+            fast_threshold_fallback: 10,
+            fast_min_keypoints: 100,
             max_features: 800,
             lowe_ratio: 0.8,
             lowe_ratio_locked: 0.9,

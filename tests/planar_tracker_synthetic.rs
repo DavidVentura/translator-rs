@@ -100,6 +100,8 @@ fn max_point_error(h_a: &[f32; 9], h_b: &[f32; 9], pts: &[(f32, f32)]) -> f32 {
 fn test_config() -> TrackerConfig {
     TrackerConfig {
         fast_threshold: 20,
+        fast_threshold_fallback: 10,
+        fast_min_keypoints: 100,
         max_features: 800,
         lowe_ratio: 0.8,
         lowe_ratio_locked: 0.9,
