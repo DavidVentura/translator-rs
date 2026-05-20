@@ -59,6 +59,7 @@ fn test_engine_config() -> EngineConfig {
             fast_threshold: 20,
             max_features: 800,
             lowe_ratio: 0.8,
+            lowe_ratio_locked: 0.9,
             ransac_residual_px: 3.0,
             ransac_iters: 400,
             min_inliers: 20,

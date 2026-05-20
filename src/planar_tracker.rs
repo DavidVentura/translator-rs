@@ -116,8 +116,19 @@ pub struct TrackerConfig {
     pub fast_threshold: u8,
     /// Cap on keypoints returned by detection — strongest survive.
     pub max_features: usize,
-    /// Lowe ratio test cutoff (best/second-best Hamming).
+    /// Lowe ratio test cutoff (best/second-best Hamming) used by
+    /// fresh-acquire and re-lock paths. Lower = stricter, fewer false
+    /// matches, fewer total matches; safe default for cold starts where
+    /// we have no geometric prior to filter the surviving pool.
     pub lowe_ratio: f32,
+    /// Lowe ratio used when the tracker is *already* Locked. Relaxed
+    /// (default 0.9) so that descriptors degraded by motion blur — best
+    /// vs second-best ratio creeps from 0.7 toward 1.0 as the patch
+    /// smears — still get through to RANSAC. The previous-frame H seed
+    /// and the engine's sanity gate (corner-jump cap, inlier-bbox
+    /// coverage) filter the resulting false matches; the safety net
+    /// only triggers when guess-quality has actually collapsed.
+    pub lowe_ratio_locked: f32,
     /// RANSAC inlier residual threshold in pixels.
     pub ransac_residual_px: f32,
     /// RANSAC iterations.
@@ -141,8 +152,9 @@ impl Default for TrackerConfig {
             fast_threshold: 15,
             max_features: 500,
             lowe_ratio: 0.8,
+            lowe_ratio_locked: 0.85,
             ransac_residual_px: 4.0,
-            ransac_iters: 200,
+            ransac_iters: 1000,
             min_inliers: 25,
             // Hysteresis floor for keeping a Locked track. Raised
             // to 18 to land us inside the affine model band (15-29
@@ -333,7 +345,7 @@ pub fn track_against_anchor_with_prior(
         return None;
     }
     let t2 = std::time::Instant::now();
-    let matches = match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio);
+    let matches = match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio_locked);
     let t_match = t2.elapsed();
     let n_matches = matches.len();
     if matches.len() < 4 {
