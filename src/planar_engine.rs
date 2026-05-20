@@ -12,11 +12,10 @@
 use image::GrayImage;
 
 use crate::homography::mat3_mul;
-use crate::imu_prior::{CameraIntrinsics, device_to_camera_vec, predict_canonical_to_current};
+use crate::imu_prior::{CameraIntrinsics, predict_canonical_to_current};
 use crate::planar_tracker::{
-    GuidedMatchPrior, SceneAnchor, TrackResult, TrackerConfig, build_anchor,
-    build_anchor_in_regions, track_against_anchor, track_against_anchor_guided,
-    track_against_anchor_with_prior,
+    SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
+    track_against_anchor, track_against_anchor_with_prior,
 };
 
 #[cfg(feature = "image-render")]
@@ -125,6 +124,29 @@ pub struct EngineConfig {
     /// Cooldown between successive handoffs. Prevents churn when
     /// inliers oscillate near the trigger threshold.
     pub handoff_cooldown_ns: u64,
+    /// Inlier-discontinuity sanity gate: reject a new RANSAC fit when
+    /// its inlier count drops below `sanity_gate_drop_ratio * EMA`. A
+    /// drop this severe in one frame is almost always a wrong-basin
+    /// fit or a descriptor-collapse event, not a real world change.
+    pub sanity_gate_drop_ratio: f32,
+    /// Only apply the sanity gate when the running EMA is at least
+    /// this high. Below this, the lock is already marginal and a
+    /// "discontinuity" carries less signal than noise.
+    pub sanity_gate_min_ema: f32,
+    /// Maximum number of consecutive frames for which the sanity gate
+    /// will substitute a predicted H. After this, fall through and
+    /// let the bad fit advance `frames_lost` so we can transition to
+    /// Lost on sustained failure.
+    pub sanity_gate_max_consecutive: u32,
+    /// EMA smoothing factor for accepted inlier counts. Higher = more
+    /// responsive to recent inlier counts; lower = more stable.
+    pub inlier_ema_alpha: f32,
+    /// Spatial-spread sanity check: minimum fraction of the anchor's
+    /// keypoint bbox area that the inlier set must cover for the fit
+    /// to be trusted. Catches the "lots of inliers, all clustered in
+    /// one region" failure mode that produces overlay wobble even at
+    /// inlier counts the count-based gate would accept.
+    pub sanity_gate_min_bbox_coverage: f32,
 }
 
 impl Default for EngineConfig {
@@ -175,6 +197,21 @@ impl Default for EngineConfig {
             // value of the upper-left 2×2 + bounds on max).
             handoff_scale_log_threshold: f32::INFINITY,
             handoff_cooldown_ns: 500_000_000, // 500 ms
+            sanity_gate_drop_ratio: 0.3,
+            sanity_gate_min_ema: 60.0,
+            sanity_gate_max_consecutive: 3,
+            inlier_ema_alpha: 0.2,
+            // Minimum fraction of the anchor's keypoint bbox area
+            // that the inlier set's bbox must cover for the fit to
+            // be considered spatially well-constrained. Below this
+            // the inliers are clustered (typically on the
+            // feature-dense top half of the subject), the H is
+            // over-fit to that region, and the overlay projection
+            // outside the cluster wobbles toward the cluster —
+            // visible as the "snap up" you observe at sub-30 inlier
+            // counts. Defaults to 25% (i.e. 50% × 50% of anchor
+            // bbox dimensions).
+            sanity_gate_min_bbox_coverage: 0.25,
         }
     }
 }
@@ -196,11 +233,9 @@ pub struct LivePlanarEngine {
     /// Timestamp of the last handoff (anchor spawn from an existing
     /// chain). Used to throttle handoffs via `handoff_cooldown_ns`.
     last_spawn_ns: u64,
-    /// Velocity + depth estimate used by the accel-aware translation
-    /// prior for guided descriptor matching. Reset on acquire / clear /
-    /// sustained loss; refined frame-by-frame from observed inlier
-    /// flow vs accel integration.
-    motion: MotionState,
+    /// History of accepted H + inlier EMA for the active anchor.
+    /// Drives the inlier-discontinuity sanity gate.
+    track_quality: TrackQualityState,
 }
 
 #[derive(Clone, Debug)]
@@ -209,74 +244,62 @@ struct ImuLockState {
     rotation_dev: [f32; 9],
 }
 
-/// Self-calibrating short-horizon translation predictor. The "tactical"
-/// half of the planar tracker's IMU pipeline (the strategic half is
-/// the rotation prior in `imu_prior.rs`).
-///
-/// We track camera-frame velocity in m/s by integrating
-/// gravity-subtracted linear accel between frames, then correct it from
-/// observed inlier flow each time RANSAC succeeds. This is a
-/// complementary filter: short-term responsiveness from accel,
-/// long-term truth from observation.
-///
-/// `pixels_per_meter` converts metric translation predictions into the
-/// view-pixel offsets the matcher actually consumes. Defaults to a
-/// page-distance assumption (`fx / DEFAULT_DEPTH_M`); refining it from
-/// observation is a future improvement.
+/// Single-step history of accepted `H_anchor→view` for the active anchor,
+/// plus a running EMA of accepted inlier counts. Drives the inlier-
+/// discontinuity sanity gate (rejects catastrophic single-frame drops
+/// that are usually wrong-basin fits or descriptor collapse) and
+/// supplies the "freeze" baseline (`h_prev`) the gate substitutes when
+/// it suppresses a suspicious fit.
 #[derive(Clone, Debug)]
-struct MotionState {
-    velocity_cam_mps: [f32; 3],
-    pixels_per_meter: f32,
-    last_frame_ns: Option<u64>,
-    /// Number of velocity corrections absorbed since the last reset.
-    /// We disable the guided matcher's translation offset until this
-    /// passes a small threshold — without a couple of observations,
-    /// integrating an arbitrary accel reading produces wildly wrong
-    /// predictions that would mis-centre every window.
-    n_corrections: u32,
-    /// Side channel from `process_frame_inner`'s guided-Locked branch:
-    /// the observed mean inlier translation in view pixels for the
-    /// frame that just ran. `process_frame_with_imu` reads + clears
-    /// this after each call and uses it to correct velocity for the
-    /// next frame's prediction.
-    last_observed_translation_px: Option<(f32, f32)>,
+struct TrackQualityState {
+    h_prev: Option<[f32; 9]>,
+    anchor_id: Option<AnchorId>,
+    inlier_ema: Option<f32>,
+    suspicious_frames: u32,
 }
 
-impl MotionState {
+impl TrackQualityState {
     fn new() -> Self {
         Self {
-            velocity_cam_mps: [0.0; 3],
-            pixels_per_meter: 0.0,
-            last_frame_ns: None,
-            n_corrections: 0,
-            last_observed_translation_px: None,
+            h_prev: None,
+            anchor_id: None,
+            inlier_ema: None,
+            suspicious_frames: 0,
         }
     }
     fn reset(&mut self) {
         *self = Self::new();
     }
+    /// Drops history when the anchor changes — the H coordinate system
+    /// is anchor-relative.
+    fn ensure_anchor(&mut self, anchor_id: AnchorId) {
+        if self.anchor_id != Some(anchor_id) {
+            *self = Self {
+                anchor_id: Some(anchor_id),
+                ..Self::new()
+            };
+        }
+    }
+    fn push_h(&mut self, h: [f32; 9]) {
+        self.h_prev = Some(h);
+    }
+    fn update_ema(&mut self, inliers: f32, alpha: f32) {
+        self.inlier_ema = Some(match self.inlier_ema {
+            Some(prev) => prev * (1.0 - alpha) + inliers * alpha,
+            None => inliers,
+        });
+    }
+    /// Reset the EMA and substitution budget after the sanity gate
+    /// rejects a suspicious fit, but **keep `h_prev`** so the next
+    /// suspicious frame can still freeze to the last accepted H.
+    /// Clearing EMA prevents a stale high baseline from making every
+    /// subsequent fit look suspicious (which produced multi-frame
+    /// reject cascades).
+    fn reset_ema_and_budget(&mut self) {
+        self.inlier_ema = None;
+        self.suspicious_frames = 0;
+    }
 }
-
-/// Page-distance assumption used to initialise `pixels_per_meter` from
-/// the camera's `fx`. 25 cm matches a typical reading distance; if the
-/// user is at 3 m, the depth-misestimate falls back to "translation
-/// prior is over-magnified" — caught by `LONG_AXIS_SLACK_PX` widening
-/// the search window in the predicted-translation direction (still
-/// much smaller than full-frame brute force).
-const DEFAULT_DEPTH_M: f32 = 0.25;
-
-/// Extra pixels of slack added to the long axis of the guided-match
-/// window beyond the predicted translation magnitude. Covers
-/// accel-integration error, depth-misestimate, and the inevitable
-/// transient lag between a real motion onset and the velocity
-/// correction catching up.
-const LONG_AXIS_SLACK_PX: f32 = 12.0;
-
-/// Radius of the short (perpendicular) axis of the guided-match
-/// window. Covers descriptor noise and small unmodelled motion
-/// perpendicular to the predicted translation direction. Also used as
-/// the circular-window radius in the no-translation regime.
-const SHORT_AXIS_RADIUS_PX: f32 = 10.0;
 
 #[derive(Clone, Debug)]
 enum EngineState {
@@ -395,7 +418,7 @@ impl LivePlanarEngine {
             stable_since_ns: None,
             last_imu_lock: None,
             last_spawn_ns: 0,
-            motion: MotionState::new(),
+            track_quality: TrackQualityState::new(),
         }
     }
 
@@ -408,138 +431,25 @@ impl LivePlanarEngine {
         imu_stable: bool,
         timestamp_ns: u64,
     ) -> TrackerCommand {
-        self.process_frame_inner(gray, imu_stable, timestamp_ns, None, None)
+        self.process_frame_inner(gray, imu_stable, timestamp_ns, None)
     }
 
     /// Like [`process_frame`] but with an IMU-derived RANSAC prior.
     /// `imu_rotation_dev` is the device-frame rotation matrix at this
-    /// camera frame. `linear_accel_dev` is the device-frame
-    /// gravity-subtracted accel (from Android's TYPE_LINEAR_ACCELERATION
-    /// sensor); when present, the engine maintains a short-horizon
-    /// velocity estimate that powers the elongated guided-matching
-    /// window in the Locked-state matcher. `intrinsics` are the camera
-    /// intrinsics in the same pixel space as `gray`.
+    /// camera frame. `intrinsics` are the camera intrinsics in the same
+    /// pixel space as `gray`.
     pub fn process_frame_with_imu(
         &mut self,
         gray: &GrayImage,
         imu_stable: bool,
         timestamp_ns: u64,
-        capture_timestamp_ns: u64,
         imu_rotation_dev: &[f32; 9],
-        linear_accel_dev: Option<&[f32; 3]>,
         intrinsics: &CameraIntrinsics,
         sensor_orientation_degrees: i32,
     ) -> TrackerCommand {
-        if self.motion.pixels_per_meter == 0.0 && intrinsics.fx > 0.0 {
-            self.motion.pixels_per_meter = intrinsics.fx / DEFAULT_DEPTH_M;
-        }
         let rotation_prior =
             self.compute_imu_prior(imu_rotation_dev, intrinsics, sensor_orientation_degrees);
-        // Compute dt for the *prediction* this frame consumes — i.e.
-        // the time between the two CAPTURE timestamps the IMU samples
-        // were drawn from. Critical: the IMU samples are taken at
-        // `captureTs` (sensor exposure, CLOCK_BOOTTIME), so the
-        // integration interval must use the same clock — otherwise
-        // processing-pipeline jitter (analyzer queue backing up under
-        // load) inflates dt while the actual exposure spacing stays
-        // ~33 ms at 30 fps, and the acceleration term `0.5·a·dt²`
-        // over-predicts translation by the ratio of clocks. On real
-        // devices that's the difference between ~130 px and ~400 px
-        // of predicted feature shift — guided window lands off-target
-        // → matcher collapses to ~zero inliers while the camera is
-        // already steady again.
-        //
-        // Clamped to a sane range so a long pause (app backgrounded,
-        // sensor stalled) doesn't integrate a huge velocity step.
-        let dt = self
-            .motion
-            .last_frame_ns
-            .map(|prev| ((capture_timestamp_ns.saturating_sub(prev)) as f32 / 1e9).clamp(0.0, 0.1))
-            .unwrap_or(0.0);
-        // Convert the device-frame accel reading to camera-frame using
-        // the same M as the rotation path (see
-        // `imu_prior::device_to_camera_matrix`). At sensor_orientation=0
-        // this is the legacy `[a[0], -a[1], -a[2]]`; at 90° (typical
-        // back-camera portrait) the X/Y axes also swap to match the
-        // sensor's actual mount orientation.
-        let accel_cam: Option<[f32; 3]> =
-            linear_accel_dev.map(|a| device_to_camera_vec(*a, sensor_orientation_degrees));
-        // Build the guided-matching prior when *all* of:
-        //  - a rotation prior is available (need a Locked anchor)
-        //  - linear-accel is being fed in
-        //  - dt is sensible (skip when we don't have a previous frame yet)
-        //
-        // Earlier versions gated this on a velocity-warm-up counter
-        // (`n_corrections >= 2`), but that was a chicken-and-egg: the
-        // counter only ticks when the guided path *succeeds*, and the
-        // guided path never ran while the counter was zero, so we sat
-        // forever in brute-force fallback. The first-frame case is
-        // fine without warm-up because velocity defaults to zero,
-        // which produces a sub-pixel translation prediction and a
-        // (correctly-centred) circular search window.
-        let guided_prior = if let (Some(h_prior), Some(_a_cam)) = (rotation_prior, accel_cam) {
-            if dt > 0.0 {
-                // Translation prior disabled: previous version
-                // computed `dp = v · dt + 0.5 · a · dt²` from the
-                // motion state, but the velocity estimate (updated
-                // only when guided tracking *succeeded*) persisted
-                // across frames where tracking failed — so one bad
-                // fit could leave a spike velocity that poisoned
-                // predictions for the next several frames, even on
-                // a steady camera. The result was that "no camera
-                // movement" frames still lost inliers because the
-                // window was centred off-target by the stale
-                // velocity. Until we have a robust velocity-decay
-                // policy on track failure (or move to gyro-only
-                // window centring permanently), keep the
-                // rotation-centred window with slack only.
-                Some(GuidedMatchPrior {
-                    h_prior,
-                    translation_offset_px: (0.0, 0.0),
-                    long_radius_px: LONG_AXIS_SLACK_PX,
-                    short_radius_px: SHORT_AXIS_RADIUS_PX,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        self.motion.last_observed_translation_px = None;
-        let cmd =
-            self.process_frame_inner(gray, imu_stable, timestamp_ns, rotation_prior, guided_prior);
-        // Correct velocity from observed flow if the guided matcher
-        // produced one this frame. We don't blindly integrate accel
-        // across many frames without a correction — bias drift would
-        // run the velocity estimate off the rails. When no observation
-        // landed, hold the previous velocity; next frame's prediction
-        // simply absorbs the dt-worth of accel on top of it.
-        if let (Some(obs_px), Some(a_cam)) = (self.motion.last_observed_translation_px, accel_cam) {
-            if dt > 0.0 {
-                let ppm = self.motion.pixels_per_meter.max(1.0);
-                let obs_dp_cam = [-obs_px.0 / ppm, -obs_px.1 / ppm, 0.0];
-                let v_observed = [obs_dp_cam[0] / dt, obs_dp_cam[1] / dt, obs_dp_cam[2] / dt];
-                let v_integrated = [
-                    self.motion.velocity_cam_mps[0] + a_cam[0] * dt,
-                    self.motion.velocity_cam_mps[1] + a_cam[1] * dt,
-                    self.motion.velocity_cam_mps[2] + a_cam[2] * dt,
-                ];
-                // Complementary blend: lean on observation (which is
-                // ground truth modulo the depth assumption) but keep
-                // a bit of accel-integrated mass so the prediction
-                // doesn't lag a sudden onset.
-                const ALPHA: f32 = 0.7;
-                self.motion.velocity_cam_mps = [
-                    ALPHA * v_observed[0] + (1.0 - ALPHA) * v_integrated[0],
-                    ALPHA * v_observed[1] + (1.0 - ALPHA) * v_integrated[1],
-                    ALPHA * v_observed[2] + (1.0 - ALPHA) * v_integrated[2],
-                ];
-                self.motion.n_corrections = self.motion.n_corrections.saturating_add(1);
-            }
-        }
-        // Store the *capture* timestamp so the next frame's dt is
-        // computed in the same clock domain as the IMU sampling.
-        self.motion.last_frame_ns = Some(capture_timestamp_ns);
+        let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, rotation_prior);
         // Stash the new IMU + H for next frame's prior, if we ended up Locked.
         // The IMU prior predicts in the *active anchor's* canonical frame, not
         // the root's, so we read H_active→view from the engine state rather
@@ -556,10 +466,8 @@ impl LivePlanarEngine {
                 rotation_dev: *imu_rotation_dev,
             });
         } else if matches!(cmd, TrackerCommand::Idle) {
-            // True Idle: clear stale IMU state and motion estimate;
-            // velocity has no meaning without an anchor to project onto.
             self.last_imu_lock = None;
-            self.motion.reset();
+            self.track_quality.reset();
         }
         cmd
     }
@@ -586,7 +494,6 @@ impl LivePlanarEngine {
         imu_stable: bool,
         timestamp_ns: u64,
         prior: Option<[f32; 9]>,
-        guided: Option<GuidedMatchPrior>,
     ) -> TrackerCommand {
         self.tick_stable(imu_stable, timestamp_ns);
         match self.state.clone() {
@@ -618,6 +525,7 @@ impl LivePlanarEngine {
                 frames_lost,
                 last_homography,
             } => {
+                self.track_quality.ensure_anchor(anchor_id);
                 // In Locked state we apply hysteresis: a lower inlier
                 // bar to *keep* the lock than to acquire it. Avoids
                 // per-frame Locked↔Lost flicker when inliers wander
@@ -639,65 +547,48 @@ impl LivePlanarEngine {
                 // essentially what the IMU prior reduces to when
                 // rotation is small.
                 let keep_min = self.config.tracker.min_inliers_keep_locked;
-                let mut observed_translation_px: Option<(f32, f32)> = None;
                 let seed_prior = prior.or(Some(last_homography));
                 let result = self.cache.get(anchor_id).and_then(|a| {
-                    let candidate = if let Some(gp) = guided.as_ref() {
-                        // Guided path: rotation prior centres the
-                        // search window per canonical keypoint;
-                        // accel-derived translation elongates it. The
-                        // observed mean translation comes back out so
-                        // we can refresh velocity for next frame.
-                        let g = track_against_anchor_guided(
-                            &a.anchor,
-                            gray,
-                            &self.config.tracker,
-                            keep_min,
-                            gp,
-                        )?;
-                        observed_translation_px = Some(g.observed_translation_px);
-                        Some(g.track)
-                    } else {
-                        track_against_anchor_with_prior(
-                            &a.anchor,
-                            gray,
-                            &self.config.tracker,
-                            keep_min,
-                            seed_prior,
-                        )
-                    }?;
-                    // Reject visibly-degenerate homographies even if
-                    // RANSAC accepted them. A low-inlier fit can be
-                    // mathematically valid but project some bitmap
-                    // corners to infinity, producing the
-                    // "huge diagonal streaks" rendering glitch.
                     let dims = a.anchor.image_dims;
-                    if !homography_is_sane(&candidate.homography, dims.0, dims.1) {
-                        return None;
+                    let brute = track_against_anchor_with_prior(
+                        &a.anchor,
+                        gray,
+                        &self.config.tracker,
+                        keep_min,
+                        seed_prior,
+                    );
+                    match brute {
+                        None => {
+                            log::debug!("[engine] brute force returned None (matcher failed)");
+                            None
+                        }
+                        Some(t) => {
+                            let raw_inliers = t.inliers;
+                            if !homography_is_sane(&t.homography, dims.0, dims.1)
+                                || !homography_delta_is_sane(
+                                    &t.homography,
+                                    &last_homography,
+                                    dims.0,
+                                    dims.1,
+                                )
+                            {
+                                log::debug!(
+                                    "[engine] brute force fit rejected by validate() (insane H or large delta vs last_homography); raw inliers={}",
+                                    raw_inliers
+                                );
+                                None
+                            } else {
+                                Some(t)
+                            }
+                        }
                     }
-                    // Reject fits that jump the canonical corners
-                    // farther than physically plausible between two
-                    // adjacent Locked frames. Catches the
-                    // "self-consistent wrong basin" case where
-                    // RANSAC on repetitive content settles on a fit
-                    // that has plenty of inliers but is offset /
-                    // flipped relative to the previous frame —
-                    // visible as "overlay attached itself to the
-                    // wrong place in space" with healthy inlier
-                    // counts (89, 107, etc).
-                    if !homography_delta_is_sane(
-                        &candidate.homography,
-                        &last_homography,
-                        dims.0,
-                        dims.1,
-                    ) {
-                        return None;
-                    }
-                    Some(candidate)
                 });
-                if result.is_some() {
-                    self.motion.last_observed_translation_px = observed_translation_px;
-                }
+                let anchor_bbox = self
+                    .cache
+                    .get(anchor_id)
+                    .map(|a| Self::keypoint_bbox(&a.anchor.positions))
+                    .unwrap_or((0.0, 0.0, 1.0, 1.0));
+                let result = result.and_then(|r| self.apply_sanity_gate(r, anchor_bbox));
                 if let Some(r) = result {
                     self.cache.touch(anchor_id);
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
@@ -786,6 +677,13 @@ impl LivePlanarEngine {
                 }
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(anchor_id);
+                log::info!(
+                    "[engine] Locked frame produced no usable fit; frames_lost {} -> {} (gate ema={:?} susp={})",
+                    frames_lost,
+                    new_frames_lost,
+                    self.track_quality.inlier_ema,
+                    self.track_quality.suspicious_frames,
+                );
                 if new_frames_lost >= self.config.lost_after_frames {
                     self.state = EngineState::Lost {
                         last_anchor_id: anchor_id,
@@ -912,10 +810,7 @@ impl LivePlanarEngine {
         // New canonical frame: drop any IMU lock state — composing it
         // with the new H would be meaningless.
         self.last_imu_lock = None;
-        // Velocity calibration is per-scene; a new anchor means the
-        // depth assumption and the observed flow ratio both need to
-        // re-converge from observation.
-        self.motion.reset();
+        self.track_quality.reset();
         // Reset spawn cooldown — a fresh root means there's no chain
         // yet to throttle.
         self.last_spawn_ns = timestamp_ns;
@@ -1072,7 +967,7 @@ impl LivePlanarEngine {
         self.stable_since_ns = None;
         self.last_imu_lock = None;
         self.last_spawn_ns = 0;
-        self.motion.reset();
+        self.track_quality.reset();
     }
 
     // -- internal helpers --------------------------------------------------
@@ -1087,7 +982,109 @@ impl LivePlanarEngine {
             .unwrap_or(active_id)
     }
 
-    /// Given a successful track of `active_id` with `h_active_to_view`,
+    /// Compute the bbox of a set of keypoint positions in canonical
+    /// (anchor) coords. Returns (min_x, min_y, max_x, max_y).
+    fn keypoint_bbox(positions: &[(f32, f32)]) -> (f32, f32, f32, f32) {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for &(x, y) in positions {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        (min_x, min_y, max_x, max_y)
+    }
+
+    /// Inlier-discontinuity sanity gate (fix A) + spatial-spread check.
+    ///
+    /// Three outcomes per call:
+    ///   - *Accept*: fit looks fine (not a catastrophic drop, inliers
+    ///     well-spread over the anchor bbox). Push to history, update
+    ///     EMA, return the fit.
+    ///   - *Freeze*: fit is suspicious (count drop OR spatial cluster)
+    ///     and we have a last-accepted H within budget. Substitute the
+    ///     *frozen* last-accepted H instead of the suspicious fit. We
+    ///     don't extrapolate forward (that was fix #1; in practice the
+    ///     extrapolation overshoots on non-linear motion and drifts the
+    ///     overlay off-target). Don't advance history or EMA — the
+    ///     freeze baseline stays anchored to last-known-good
+    ///     observations.
+    ///   - *Reject*: fit is suspicious and we either have no history to
+    ///     freeze on, or we've already burned the substitution budget.
+    ///     Return None so the caller treats this like a matcher miss;
+    ///     `frames_lost` advances toward Lost via the normal path. We
+    ///     don't push the bad H to history (avoids "split" artefacts on
+    ///     the next frame) and don't update EMA (a wrong fit shouldn't
+    ///     drag the running average down and weaken the gate).
+    fn apply_sanity_gate(
+        &mut self,
+        r: TrackResult,
+        anchor_bbox: (f32, f32, f32, f32),
+    ) -> Option<TrackResult> {
+        let cfg = &self.config;
+        let new_inliers_f = r.inliers as f32;
+        let ema = self.track_quality.inlier_ema.unwrap_or(new_inliers_f);
+        let freeze_h = self.track_quality.h_prev;
+        let count_suspicious =
+            ema >= cfg.sanity_gate_min_ema && new_inliers_f < cfg.sanity_gate_drop_ratio * ema;
+        let coverage = bbox_coverage(r.inlier_anchor_bbox, anchor_bbox);
+        let spread_suspicious = coverage < cfg.sanity_gate_min_bbox_coverage;
+        let suspicious = count_suspicious || spread_suspicious;
+        let can_freeze = self.track_quality.suspicious_frames < cfg.sanity_gate_max_consecutive
+            && freeze_h.is_some();
+        let trigger = if count_suspicious && spread_suspicious {
+            "count+spread"
+        } else if count_suspicious {
+            "count"
+        } else {
+            "spread"
+        };
+        if suspicious && can_freeze {
+            self.track_quality.suspicious_frames += 1;
+            let hf = freeze_h.expect("freeze_h is Some when can_freeze");
+            log::info!(
+                "[sanity_gate] freeze (substitute with last accepted H): inliers={} ema={:.1} coverage={:.2} trigger={} run={}",
+                r.inliers,
+                ema,
+                coverage,
+                trigger,
+                self.track_quality.suspicious_frames,
+            );
+            Some(TrackResult {
+                homography: hf,
+                ..r
+            })
+        } else if suspicious {
+            let reason = if freeze_h.is_none() {
+                "no_history(h_prev=false)".to_string()
+            } else {
+                format!(
+                    "budget_exhausted(run={})",
+                    self.track_quality.suspicious_frames
+                )
+            };
+            log::info!(
+                "[sanity_gate] reject suspicious fit: inliers={} ema={:.1} coverage={:.2} trigger={} reason={}",
+                r.inliers,
+                ema,
+                coverage,
+                trigger,
+                reason,
+            );
+            self.track_quality.reset_ema_and_budget();
+            None
+        } else {
+            self.track_quality.suspicious_frames = 0;
+            self.track_quality
+                .update_ema(new_inliers_f, cfg.inlier_ema_alpha);
+            self.track_quality.push_h(r.homography);
+            Some(r)
+        }
+    }
+
     /// return `(root_id, H_root→view)` — the pair the engine should
     /// emit externally. The chain compose lets Kotlin keep treating
     /// the engine as single-anchor: it sees the root id and a single
@@ -1204,6 +1201,9 @@ impl LivePlanarEngine {
         if let Some(entry) = self.cache.get_mut(anchor_id) {
             entry.last_locked_ns = timestamp_ns;
         }
+        // Stale velocity + EMA from before the Lost period would
+        // mislead the sanity gate.
+        self.track_quality.reset();
         self.state = EngineState::Locked {
             anchor_id,
             frames_lost: 0,
@@ -1363,6 +1363,22 @@ fn visible_keypoint_ratio(positions: &[(f32, f32)], h: &[f32; 9], view_w: u32, v
 /// `lost_after_frames` consecutive rejects, transition to Lost
 /// (overlay hides, scene re-acquires when matcher recovers).
 const MAX_CORNER_JUMP_PX: f32 = 300.0;
+
+/// Fraction of `anchor_bbox`'s area covered by `inlier_bbox`. Returns
+/// 0.0 if the anchor bbox is degenerate. Clamped to [0, 1].
+fn bbox_coverage(inlier_bbox: (f32, f32, f32, f32), anchor_bbox: (f32, f32, f32, f32)) -> f32 {
+    let (imin_x, imin_y, imax_x, imax_y) = inlier_bbox;
+    let (amin_x, amin_y, amax_x, amax_y) = anchor_bbox;
+    let aw = (amax_x - amin_x).max(0.0);
+    let ah = (amax_y - amin_y).max(0.0);
+    if aw <= 0.0 || ah <= 0.0 {
+        return 0.0;
+    }
+    let iw = (imax_x - imin_x).max(0.0);
+    let ih = (imax_y - imin_y).max(0.0);
+    let coverage = (iw * ih) / (aw * ah);
+    coverage.clamp(0.0, 1.0)
+}
 
 /// True when the corner displacement between `h_new` and `h_prev`
 /// projected over the canonical rect stays below

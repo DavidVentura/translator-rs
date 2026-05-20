@@ -28,6 +28,7 @@ const REC_PUNCT_MIN_SCORE: f32 = 0.3;
 /// per-pixel `DET_SCORE_THRESHOLD` and per-character `REC_MIN_SCORE` gates accept
 /// individually-weak signals; this rejects whole lines that never look strong on average).
 const REC_DROP_SCORE: f32 = 0.5;
+const REC_WHITESPACE_SPLIT_MAX_WIDTH: u32 = 960;
 /// One rec session per parallel worker, dispatched via rayon. Mirrors the demo's strategy:
 /// each session runs single-threaded (intra=1) on its own crop. Inter-session parallelism beats
 /// intra-session padding-and-batching on this workload because crop widths are heterogeneous
@@ -470,20 +471,52 @@ impl PpocrEngine {
 
         let t_crops = Instant::now();
         let (crops, dewarp_count) = crop_text_strips(image, gray, boxes);
-        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
         let mean_crop_w: f32 =
             crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32;
         let mean_crop_h: f32 =
             crops.iter().map(|c| c.height() as f32).sum::<f32>() / crops.len() as f32;
 
-        let mut results: Vec<Option<RecResult>> = (0..boxes.len()).map(|_| None).collect();
+        let mut rec_chunks = Vec::new();
+        let mut owner_chunks = (0..boxes.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut wide_count = 0usize;
+        let mut split_count = 0usize;
+        for (owner, crop) in crops.iter().enumerate() {
+            if resized_rec_width(crop) > REC_WHITESPACE_SPLIT_MAX_WIDTH {
+                wide_count += 1;
+            }
+            let chunks =
+                split_crop_on_whitespace_for_rec_width(crop, REC_WHITESPACE_SPLIT_MAX_WIDTH);
+            split_count += chunks.len().saturating_sub(1);
+            for chunk in chunks {
+                let idx = rec_chunks.len();
+                owner_chunks[owner].push(idx);
+                rec_chunks.push(RecChunk {
+                    owner,
+                    image: chunk.image,
+                    join_before: chunk.join_before,
+                });
+            }
+        }
+        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
+        let mean_chunk_w: f32 = rec_chunks
+            .iter()
+            .map(|c| c.image.width() as f32)
+            .sum::<f32>()
+            / rec_chunks.len().max(1) as f32;
+        let mean_chunk_h: f32 = rec_chunks
+            .iter()
+            .map(|c| c.image.height() as f32)
+            .sum::<f32>()
+            / rec_chunks.len().max(1) as f32;
+
+        let mut results: Vec<Option<RecResult>> = (0..rec_chunks.len()).map(|_| None).collect();
         let mut rec_wall_ms = 0.0;
         let mut rec_pre_ms = 0.0;
         let mut rec_infer_ms = 0.0;
         let mut rec_post_ms = 0.0;
         let mut grouped = HashMap::<PpocrScript, Vec<usize>>::new();
-        for (idx, script) in scripts.iter().enumerate() {
-            grouped.entry(*script).or_default().push(idx);
+        for (idx, chunk) in rec_chunks.iter().enumerate() {
+            grouped.entry(scripts[chunk.owner]).or_default().push(idx);
         }
         for (script, indices) in grouped {
             let recognizer = self.recognizer(script)?;
@@ -496,7 +529,11 @@ impl PpocrEngine {
                         .map(|&idx| {
                             let worker_idx = rayon::current_thread_index().unwrap_or(0)
                                 % recognizer.sessions.len();
-                            recognizer.recognize_one(&crops[idx], worker_idx, &timings_us)
+                            recognizer.recognize_one(
+                                &rec_chunks[idx].image,
+                                worker_idx,
+                                &timings_us,
+                            )
                         })
                         .collect()
                 });
@@ -512,27 +549,51 @@ impl PpocrEngine {
         let mut lines = Vec::with_capacity(boxes.len());
         let mut empty_count = 0usize;
         let mut low_score_count = 0usize;
-        for (idx, result) in results.into_iter().enumerate() {
-            let r = result.expect("all routed ppocr recognition results populated");
-            let raw_text = r.text.trim().to_owned();
-            let raw_confidence = r.confidence;
-            let (text, confidence, status) = if raw_text.is_empty() {
+        for (idx, chunk_indices) in owner_chunks.iter().enumerate() {
+            let mut text = String::new();
+            let mut raw_text = String::new();
+            let mut confidence_sum = 0.0f32;
+            let mut confidence_count = 0usize;
+            for &chunk_idx in chunk_indices {
+                let r = results[chunk_idx]
+                    .as_ref()
+                    .expect("all routed ppocr recognition results populated");
+                let chunk_raw = r.text.trim();
+                if chunk_raw.is_empty() {
+                    continue;
+                }
+                if !raw_text.is_empty() {
+                    raw_text.push_str(rec_chunks[chunk_idx].join_before);
+                }
+                raw_text.push_str(chunk_raw);
+
+                let chunk_text = normalize_rec_text_for_script(scripts[idx], chunk_raw.to_owned());
+                if chunk_text.is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push_str(rec_chunks[chunk_idx].join_before);
+                }
+                text.push_str(&chunk_text);
+                confidence_sum += r.confidence;
+                confidence_count += 1;
+            }
+            let raw_confidence = if confidence_count > 0 {
+                confidence_sum / confidence_count as f32
+            } else {
+                0.0
+            };
+            let (text, confidence, status) = if text.trim().is_empty() {
                 empty_count += 1;
                 (String::new(), 0.0, "empty")
             } else if raw_confidence < thresholds.rec_drop_score {
                 low_score_count += 1;
                 (String::new(), 0.0, "low_score")
             } else {
-                let accepted = match scripts[idx] {
-                    PpocrScript::Cyrillic | PpocrScript::Eslav => {
-                        crate::script_normalize::repair_cyrillic_word_mixing(&r.text)
-                    }
-                    _ => r.text,
-                };
-                (accepted, r.confidence, "accepted")
+                (text, raw_confidence, "accepted")
             };
             log::debug!(
-                "ppocr rec strip={} script={} det_score={:.3} width={} height={} area={} conf={:.3} status={} text=\"{}\"",
+                "ppocr rec strip={} script={} det_score={:.3} width={} height={} area={} chunks={} conf={:.3} status={} text=\"{}\"",
                 idx,
                 scripts[idx].as_slug(),
                 boxes[idx].score,
@@ -542,6 +603,7 @@ impl PpocrEngine {
                     .rect
                     .width()
                     .saturating_mul(boxes[idx].rect.height()),
+                chunk_indices.len(),
                 raw_confidence,
                 status,
                 log_text_preview(&raw_text),
@@ -556,6 +618,7 @@ impl PpocrEngine {
         }
         log::debug!(
             "ppocr rec: src={}x{} boxes={} dewarped={}/{} mean_crop={:.0}x{:.0} \
+             wide_boxes={} chunks={} splits={} mean_chunk={:.0}x{:.0} max_rec_w={} \
              accepted={} empty={} low_score={} (drop {:.2}) — \
              crops/dewarp={:.1}ms \
              rec_wall={:.1}ms (cpu pre={:.1}ms infer={:.1}ms post={:.1}ms)",
@@ -566,6 +629,12 @@ impl PpocrEngine {
             boxes.len(),
             mean_crop_w,
             mean_crop_h,
+            wide_count,
+            rec_chunks.len(),
+            split_count,
+            mean_chunk_w,
+            mean_chunk_h,
+            REC_WHITESPACE_SPLIT_MAX_WIDTH,
             lines.iter().filter(|l| !l.text.is_empty()).count(),
             empty_count,
             low_score_count,
@@ -586,6 +655,15 @@ fn log_text_preview(text: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+fn normalize_rec_text_for_script(script: PpocrScript, text: String) -> String {
+    match script {
+        PpocrScript::Cyrillic | PpocrScript::Eslav => {
+            crate::script_normalize::repair_cyrillic_word_mixing(&text)
+        }
+        _ => text,
+    }
 }
 
 fn pulc_strip_eligible(
@@ -645,6 +723,223 @@ fn crop_text_strips(
         })
         .collect();
     (crops, dewarp_count)
+}
+
+fn resized_rec_width(crop: &DynamicImage) -> u32 {
+    let (w, h) = crop.dimensions();
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    ((w as f32 * REC_TARGET_HEIGHT as f32) / h as f32).ceil() as u32
+}
+
+fn split_crop_on_whitespace_for_rec_width(
+    crop: &DynamicImage,
+    max_resized_width: u32,
+) -> Vec<SplitCrop> {
+    let (w, h) = crop.dimensions();
+    if w == 0 || h == 0 || max_resized_width == 0 {
+        return vec![SplitCrop {
+            image: crop.clone(),
+            join_before: "",
+        }];
+    }
+    let resized_w = resized_rec_width(crop);
+    if resized_w <= max_resized_width {
+        return vec![SplitCrop {
+            image: crop.clone(),
+            join_before: "",
+        }];
+    }
+
+    let max_crop_width = ((max_resized_width as f32 * h as f32) / REC_TARGET_HEIGHT as f32)
+        .floor()
+        .max(1.0) as usize;
+    if w as usize <= max_crop_width {
+        return vec![SplitCrop {
+            image: crop.clone(),
+            join_before: "",
+        }];
+    }
+
+    let gray = crop.to_luma8();
+    let valleys = whitespace_valleys(&gray);
+    if valleys.is_empty() {
+        return vec![SplitCrop {
+            image: crop.clone(),
+            join_before: "",
+        }];
+    }
+
+    let mut cuts = Vec::new();
+    collect_whitespace_cuts(0, w as usize, max_crop_width, &valleys, &mut cuts);
+    cuts.sort_unstable();
+    cuts.dedup();
+    if cuts.is_empty() {
+        return vec![SplitCrop {
+            image: crop.clone(),
+            join_before: "",
+        }];
+    }
+
+    let mut chunks = Vec::with_capacity(cuts.len() + 1);
+    let mut prev_x = 0u32;
+    let mut first = true;
+    for cut in cuts {
+        let x = (cut as u32).clamp(prev_x + 1, w.saturating_sub(1));
+        chunks.push(SplitCrop {
+            image: crop.crop_imm(prev_x, 0, x - prev_x, h),
+            join_before: if first { "" } else { " " },
+        });
+        first = false;
+        prev_x = x;
+    }
+    if prev_x < w {
+        chunks.push(SplitCrop {
+            image: crop.crop_imm(prev_x, 0, w - prev_x, h),
+            join_before: if first { "" } else { " " },
+        });
+    }
+    chunks
+}
+
+fn collect_whitespace_cuts(
+    start: usize,
+    end: usize,
+    max_width: usize,
+    valleys: &[(usize, usize)],
+    cuts: &mut Vec<usize>,
+) {
+    let width = end.saturating_sub(start);
+    if width <= max_width {
+        return;
+    }
+    let min_piece = (max_width / 4).max(24).min(max_width.saturating_sub(1));
+    if width < min_piece * 2 {
+        return;
+    }
+
+    let target = if width <= max_width * 2 {
+        start + width / 2
+    } else {
+        start + max_width
+    };
+    let search_limit = max_width / 2;
+    let search_end = (target + search_limit).min(end.saturating_sub(min_piece));
+    let search_start = (start + min_piece).max(target.saturating_sub(search_limit));
+
+    let right = find_valley_cut(valleys, target, search_end, target, end);
+    let left = find_valley_cut(valleys, search_start, target, target, end);
+    let cut = match (right, left) {
+        (Some(r), Some(l)) => {
+            if r.abs_diff(target) <= l.abs_diff(target) {
+                r
+            } else {
+                l
+            }
+        }
+        (Some(r), None) => r,
+        (None, Some(l)) => l,
+        (None, None) => return,
+    };
+    if cut <= start + min_piece || cut + min_piece >= end {
+        return;
+    }
+    cuts.push(cut);
+    collect_whitespace_cuts(start, cut, max_width, valleys, cuts);
+    collect_whitespace_cuts(cut, end, max_width, valleys, cuts);
+}
+
+fn find_valley_cut(
+    valleys: &[(usize, usize)],
+    lo: usize,
+    hi: usize,
+    target: usize,
+    segment_end: usize,
+) -> Option<usize> {
+    let mut best = None;
+    let mut best_dist = usize::MAX;
+    for &(a, b) in valleys {
+        if b <= lo || a >= hi {
+            continue;
+        }
+        let cut = (a + b) / 2;
+        if cut <= lo || cut >= hi || cut >= segment_end {
+            continue;
+        }
+        let dist = cut.abs_diff(target);
+        if dist < best_dist {
+            best = Some(cut);
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+fn whitespace_valleys(gray: &GrayImage) -> Vec<(usize, usize)> {
+    let (w, h) = gray.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let mut hist = [0usize; 256];
+    for pixel in gray.pixels() {
+        hist[pixel[0] as usize] += 1;
+    }
+    let total = (w * h) as usize;
+    let p10 = percentile_from_hist(&hist, total, 10);
+    let bg = percentile_from_hist(&hist, total, 50);
+    let p90 = percentile_from_hist(&hist, total, 90);
+    let contrast = p90.saturating_sub(p10).max(p10.saturating_sub(p90));
+    if contrast < 18 {
+        return Vec::new();
+    }
+    let threshold = (contrast / 4).max(12);
+    let mut ink = vec![0u16; w as usize];
+    for x in 0..w {
+        let mut count = 0u16;
+        for y in 0..h {
+            let v = gray.get_pixel(x, y)[0];
+            if v.abs_diff(bg) >= threshold {
+                count += 1;
+            }
+        }
+        ink[x as usize] = count;
+    }
+
+    let max_ink = ((h as f32) * 0.04).ceil().max(1.0) as u16;
+    let min_space_w = ((h as f32) * 0.22).ceil().max(2.0) as usize;
+    let mut valleys = Vec::new();
+    let mut start = None;
+    for x in 0..ink.len() {
+        let a = x.saturating_sub(1);
+        let b = (x + 2).min(ink.len());
+        let smoothed = ink[a..b].iter().copied().map(u32::from).sum::<u32>() / (b - a) as u32;
+        if smoothed <= u32::from(max_ink) {
+            start.get_or_insert(x);
+        } else if let Some(s) = start.take() {
+            if x.saturating_sub(s) >= min_space_w {
+                valleys.push((s, x));
+            }
+        }
+    }
+    if let Some(s) = start {
+        if ink.len().saturating_sub(s) >= min_space_w {
+            valleys.push((s, ink.len()));
+        }
+    }
+    valleys
+}
+
+fn percentile_from_hist(hist: &[usize; 256], total: usize, percentile: usize) -> u8 {
+    let target = total.saturating_mul(percentile).div_ceil(100);
+    let mut seen = 0usize;
+    for (value, count) in hist.iter().enumerate() {
+        seen += count;
+        if seen >= target {
+            return value as u8;
+        }
+    }
+    255
 }
 
 fn expand_box(rect: &PpocrRect, border: u32, max_w: u32, max_h: u32) -> PpocrRect {
@@ -1013,6 +1308,17 @@ fn extract_boxes(
 struct RecResult {
     text: String,
     confidence: f32,
+}
+
+struct RecChunk {
+    owner: usize,
+    image: DynamicImage,
+    join_before: &'static str,
+}
+
+struct SplitCrop {
+    image: DynamicImage,
+    join_before: &'static str,
 }
 
 impl PpocrRecognizer {

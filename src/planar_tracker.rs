@@ -20,7 +20,7 @@ use crate::homography::{fit_affine, fit_homography, fit_similarity, invert, mat3
 /// than the planar pipeline is being investigated and the timing
 /// chatter is in the way. The bindings crate has its own equivalent
 /// gate on the `process_and_composite` outer line.
-pub const PER_FRAME_TIMING_LOG: bool = false;
+pub const PER_FRAME_TIMING_LOG: bool = true;
 
 /// BRIEF descriptor length in bits. 256 is the original BRIEF default;
 /// 32 bytes per keypoint, Hamming distance fits in a u32.
@@ -93,6 +93,14 @@ pub struct TrackResult {
     pub matches: usize,
     /// Median re-projection residual in pixels (over inliers).
     pub median_residual_px: f32,
+    /// Bounding box (min_x, min_y, max_x, max_y) of the surviving
+    /// inliers' positions in **anchor (canonical) space**. The sanity
+    /// gate uses this to detect spatially-clustered inlier sets — a
+    /// fit constrained by inliers only in a fraction of the anchor
+    /// bbox extrapolates badly outside the cluster, producing the
+    /// "overlay snaps toward the feature-dense region" wobble even
+    /// when the count looks fine.
+    pub inlier_anchor_bbox: (f32, f32, f32, f32),
 }
 
 /// Public-facing tracker state. Wraps an optional anchor and the
@@ -369,133 +377,6 @@ pub fn track_against_anchor_with_prior(
     out
 }
 
-/// Output of a successful guided-matching tracking step. Carries the
-/// same fields as [`TrackResult`] plus the post-fit observed
-/// inlier-mean translation (in view pixels, after the rotation prior
-/// has been subtracted off) — the engine uses this to refresh its
-/// velocity estimate for next frame's translation prior.
-#[derive(Clone, Debug)]
-pub struct GuidedTrackResult {
-    pub track: TrackResult,
-    pub observed_translation_px: (f32, f32),
-}
-
-/// Like [`track_against_anchor_with_prior`] but uses guided descriptor
-/// matching (window-restricted Hamming + Lowe ratio) instead of
-/// brute force. The rotation-only prior centres the window per
-/// canonical keypoint; the accel-derived translation offset elongates
-/// it in the predicted motion direction.
-///
-/// Returns `None` if the inlier count falls below `min_inliers`. On
-/// success the caller gets the homography fit *plus* the observed mean
-/// inlier translation so the velocity estimate can be corrected from
-/// observation.
-pub fn track_against_anchor_guided(
-    anchor: &SceneAnchor,
-    gray: &GrayImage,
-    cfg: &TrackerConfig,
-    min_inliers: usize,
-    prior: &GuidedMatchPrior,
-) -> Option<GuidedTrackResult> {
-    let t0 = std::time::Instant::now();
-    let kps = detect_fast(gray, cfg.fast_threshold, cfg.max_features, cfg.nms_radius);
-    let n_raw_kps = kps.len();
-    let t_detect = t0.elapsed();
-    if kps.is_empty() {
-        if PER_FRAME_TIMING_LOG {
-            log::info!(
-                target: "planar_timing",
-                "guided: detect={:.1}ms (0 kps) → bail",
-                t_detect.as_secs_f64() * 1000.0,
-            );
-        }
-        return None;
-    }
-    let t1 = std::time::Instant::now();
-    let (frame_kps, frame_descs) = describe_brief(gray, &kps);
-    let t_describe = t1.elapsed();
-    if frame_kps.is_empty() {
-        return None;
-    }
-    let t2 = std::time::Instant::now();
-    let matches = match_descriptors_guided(anchor, &frame_kps, &frame_descs, cfg.lowe_ratio, prior);
-    let t_match = t2.elapsed();
-    let n_matches = matches.len();
-    if matches.len() < 4 {
-        if PER_FRAME_TIMING_LOG {
-            log::info!(
-                target: "planar_timing",
-                "guided: detect={:.1}ms describe={:.1}ms match={:.1}ms (kps={} matches={}) → bail",
-                t_detect.as_secs_f64() * 1000.0,
-                t_describe.as_secs_f64() * 1000.0,
-                t_match.as_secs_f64() * 1000.0,
-                n_raw_kps,
-                n_matches,
-            );
-        }
-        return None;
-    }
-    let pairs: Vec<(f32, f32, f32, f32)> = matches
-        .iter()
-        .map(|m| {
-            let (ax, ay) = anchor.positions[m.anchor_idx];
-            let fk = &frame_kps[m.frame_idx];
-            (ax, ay, fk.x, fk.y)
-        })
-        .collect();
-    let t3 = std::time::Instant::now();
-    let track_opt = ransac_homography_with_prior(&pairs, cfg, min_inliers, Some(prior.h_prior));
-    let t_ransac = t3.elapsed();
-    if PER_FRAME_TIMING_LOG {
-        log::info!(
-            target: "planar_timing",
-            "guided: detect={:.1}ms describe={:.1}ms match={:.1}ms ransac={:.1}ms (kps={} matches={} inliers={:?})",
-            t_detect.as_secs_f64() * 1000.0,
-            t_describe.as_secs_f64() * 1000.0,
-            t_match.as_secs_f64() * 1000.0,
-            t_ransac.as_secs_f64() * 1000.0,
-            n_raw_kps,
-            n_matches,
-            track_opt.as_ref().map(|r| r.inliers),
-        );
-    }
-    let track = track_opt?;
-    // After RANSAC, recompute the inlier set under the refined H using
-    // the same residual threshold; for each inlier, the observed
-    // translation vs the rotation-only prior projection is its
-    // contribution to mean translation. Median is more robust than
-    // mean against the remaining outliers near the threshold.
-    let mut dxs = Vec::with_capacity(pairs.len());
-    let mut dys = Vec::with_capacity(pairs.len());
-    let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
-    for &(ax, ay, fx, fy) in &pairs {
-        let Some((px, py)) = project(&track.homography, ax, ay) else {
-            continue;
-        };
-        let dx_fit = fx - px;
-        let dy_fit = fy - py;
-        if dx_fit * dx_fit + dy_fit * dy_fit > r_thresh_sq {
-            continue;
-        }
-        let Some((rx, ry)) = project(&prior.h_prior, ax, ay) else {
-            continue;
-        };
-        dxs.push(fx - rx);
-        dys.push(fy - ry);
-    }
-    let observed = if dxs.is_empty() {
-        (0.0, 0.0)
-    } else {
-        dxs.sort_by(|a, b| a.total_cmp(b));
-        dys.sort_by(|a, b| a.total_cmp(b));
-        (dxs[dxs.len() / 2], dys[dys.len() / 2])
-    };
-    Some(GuidedTrackResult {
-        track,
-        observed_translation_px: observed,
-    })
-}
-
 /// One match between an anchor descriptor and a current-frame descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct Match {
@@ -529,118 +410,6 @@ pub fn match_descriptors(
             } else if d < second {
                 second = d;
             }
-        }
-        if (best as f32) < lowe_ratio * (second as f32) {
-            out.push(Match {
-                anchor_idx: a_idx,
-                frame_idx: best_idx,
-                distance: best,
-            });
-        }
-    }
-    out
-}
-
-/// Per-frame predicted layout for guided matching. `h_prior` is the
-/// rotation-only canonical→view homography (an `imu_prior` output).
-/// `translation_offset_px` is the additional view-pixel shift the
-/// surface should undergo from camera translation this frame
-/// (accel-derived). The window around each predicted keypoint is an
-/// axis-aligned ellipse oriented along `translation_offset_px` —
-/// elongated in the predicted-motion direction (`long_radius_px`),
-/// tight perpendicular (`short_radius_px`).
-///
-/// Three properties make this the right shape for the typical handheld
-/// failure mode (off-axis rotation produces fast translation at the
-/// camera, blurring descriptors):
-/// 1. Centred on the rotation-prior projection, which is sub-pixel
-///    accurate without any depth assumption.
-/// 2. Elongated to absorb depth-misestimate in the translation
-///    magnitude (10× depth error → 10× off-target along the long axis;
-///    contained as long as the long radius covers the worst-case 25 cm
-///    page).
-/// 3. Restricting the candidate set to a small window means a blurred
-///    descriptor only has to beat a handful of wrong candidates, so it
-///    survives the Lowe ratio test under motion blur that would have
-///    killed full-frame brute force.
-pub struct GuidedMatchPrior {
-    pub h_prior: [f32; 9],
-    pub translation_offset_px: (f32, f32),
-    pub long_radius_px: f32,
-    pub short_radius_px: f32,
-}
-
-/// Guided variant of [`match_descriptors`]. For each anchor keypoint,
-/// project its canonical position through `prior.h_prior`, offset by
-/// `prior.translation_offset_px`, and restrict the Hamming search to
-/// frame keypoints inside the elongated window around that predicted
-/// position.
-///
-/// Falls back to a circular window of radius `short_radius_px` when
-/// the translation prediction is sub-pixel — in that regime the
-/// rotation prior alone is accurate enough.
-pub fn match_descriptors_guided(
-    anchor: &SceneAnchor,
-    frame_kps: &[KeyPoint],
-    frame_descs: &[Descriptor],
-    lowe_ratio: f32,
-    prior: &GuidedMatchPrior,
-) -> Vec<Match> {
-    let mut out = Vec::new();
-    if frame_kps.len() < 2 {
-        return out;
-    }
-    let (tx, ty) = prior.translation_offset_px;
-    let t_mag = (tx * tx + ty * ty).sqrt();
-    let elongated = t_mag > 1.0;
-    let (dir_x, dir_y) = if elongated {
-        (tx / t_mag, ty / t_mag)
-    } else {
-        (1.0, 0.0)
-    };
-    let long_r_sq = prior.long_radius_px * prior.long_radius_px;
-    let short_r_sq = prior.short_radius_px * prior.short_radius_px;
-
-    for (a_idx, (a_pos, a_desc)) in anchor
-        .positions
-        .iter()
-        .zip(anchor.descriptors.iter())
-        .enumerate()
-    {
-        let projected = match project(&prior.h_prior, a_pos.0, a_pos.1) {
-            Some(p) => p,
-            None => continue,
-        };
-        let predicted = (projected.0 + tx, projected.1 + ty);
-        let mut best = u32::MAX;
-        let mut best_idx = 0usize;
-        let mut second = u32::MAX;
-        let mut window_count = 0usize;
-        for (f_idx, fkp) in frame_kps.iter().enumerate() {
-            let dx = fkp.x - predicted.0;
-            let dy = fkp.y - predicted.1;
-            let inside = if elongated {
-                let along = dx * dir_x + dy * dir_y;
-                let across = -dx * dir_y + dy * dir_x;
-                (along * along) / long_r_sq + (across * across) / short_r_sq <= 1.0
-            } else {
-                dx * dx + dy * dy <= short_r_sq
-            };
-            if !inside {
-                continue;
-            }
-            let d = a_desc.hamming(&frame_descs[f_idx]);
-            if d < best {
-                second = best;
-                best = d;
-                best_idx = f_idx;
-            } else if d < second {
-                second = d;
-            }
-            window_count += 1;
-        }
-        if window_count < 2 {
-            continue;
         }
         if (best as f32) < lowe_ratio * (second as f32) {
             out.push(Match {
@@ -791,11 +560,23 @@ pub fn ransac_homography_with_prior(
     } else {
         residuals[residuals.len() / 2]
     };
+    let mut min_ax = f32::INFINITY;
+    let mut min_ay = f32::INFINITY;
+    let mut max_ax = f32::NEG_INFINITY;
+    let mut max_ay = f32::NEG_INFINITY;
+    for &(ax, ay, _, _) in &inlier_pairs {
+        min_ax = min_ax.min(ax);
+        min_ay = min_ay.min(ay);
+        max_ax = max_ax.max(ax);
+        max_ay = max_ay.max(ay);
+    }
+    let inlier_anchor_bbox = (min_ax, min_ay, max_ax, max_ay);
     Some(TrackResult {
         homography: refined,
         inliers: inlier_pairs.len(),
         matches: pairs.len(),
         median_residual_px: median,
+        inlier_anchor_bbox,
     })
 }
 

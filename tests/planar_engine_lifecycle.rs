@@ -79,6 +79,11 @@ fn test_engine_config() -> EngineConfig {
         handoff_min_visible_ratio: 0.0,
         handoff_scale_log_threshold: f32::INFINITY,
         handoff_cooldown_ns: u64::MAX / 2,
+        sanity_gate_drop_ratio: 0.3,
+        sanity_gate_min_ema: 60.0,
+        sanity_gate_max_consecutive: 3,
+        inlier_ema_alpha: 0.2,
+        sanity_gate_min_bbox_coverage: 0.25,
     }
 }
 
@@ -464,16 +469,7 @@ fn imu_prior_locks_under_known_rotation() {
     // Acquire anchor on the unrotated frame. First frame primes the
     // IMU lock state (identity rotation).
     let _id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
-    let cmd0 = engine.process_frame_with_imu(
-        &gray,
-        true,
-        1_001_000,
-        1_001_000,
-        &identity,
-        None,
-        &intrinsics,
-        0,
-    );
+    let cmd0 = engine.process_frame_with_imu(&gray, true, 1_001_000, &identity, &intrinsics, 0);
     assert!(
         matches!(cmd0, TrackerCommand::Locked { .. }),
         "first frame should lock; got {:?}",
@@ -492,16 +488,7 @@ fn imu_prior_locks_under_known_rotation() {
     // camera-frame matrix gives the device-frame equivalent).
     let r_curr_dev = device_to_camera(&r_cam, 0);
 
-    let cmd1 = engine.process_frame_with_imu(
-        &warped,
-        true,
-        2_000_000,
-        2_000_000,
-        &r_curr_dev,
-        None,
-        &intrinsics,
-        0,
-    );
+    let cmd1 = engine.process_frame_with_imu(&warped, true, 2_000_000, &r_curr_dev, &intrinsics, 0);
     match cmd1 {
         TrackerCommand::Locked { inliers, .. } => {
             assert!(

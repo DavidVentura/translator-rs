@@ -15,7 +15,6 @@ impl MnnSession {
             intra_threads,
             PrecisionMode::Low,
             MemoryMode::Low,
-            // MemoryMode::Normal, // EXPERIMENT SPEED
         )
     }
 
