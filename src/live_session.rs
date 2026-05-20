@@ -143,6 +143,35 @@ pub fn viewport_surface_aabb(
     Aabb::from_points(projected)
 }
 
+/// Area of the viewport quadrilateral after projection through
+/// `H_view->surface`. Unlike the AABB, the quadrilateral area is
+/// invariant under pure translation and in-plane rotation; it changes
+/// when the camera zoom/scale relative to the locked surface changes.
+fn viewport_surface_quad_area(
+    h_view_to_surface: &[f32; 9],
+    frame_w: f32,
+    frame_h: f32,
+) -> Option<f32> {
+    let corners = [
+        (0.0, 0.0),
+        (frame_w, 0.0),
+        (frame_w, frame_h),
+        (0.0, frame_h),
+    ];
+    let mut projected = [(0.0_f32, 0.0_f32); 4];
+    for (i, (x, y)) in corners.into_iter().enumerate() {
+        projected[i] = project(h_view_to_surface, x, y)?;
+    }
+    let mut twice_area = 0.0_f32;
+    for i in 0..4 {
+        let (x0, y0) = projected[i];
+        let (x1, y1) = projected[(i + 1) % 4];
+        twice_area += x0 * y1 - x1 * y0;
+    }
+    let area = 0.5 * twice_area.abs();
+    area.is_finite().then_some(area)
+}
+
 /// One rasterized overlay item resident across composite calls. The
 /// caller hashes the source content (strips + texts + language) and
 /// only re-rasterizes items whose hash changed, so dense pages with
@@ -702,13 +731,47 @@ impl LiveSession {
         state.last_lock_h = Some(h);
     }
 
-    /// Re-lock trigger: project the view corners
-    /// `(0,0)..(view_w, view_h)` through both `inv(last_lock_h)` and
-    /// `inv(current_h)` into anchor coords, then compare AABBs:
-    ///   `area(intersect) / max(area(curr), area(lock)) < threshold`
-    /// Symmetric in zoom direction (zoom-in shrinks the projected
-    /// AABB; zoom-out grows it; pure rotation about the optical axis
-    /// rotates corners around the same centre and overlap stays ≈ 1).
+    /// Drop the anchor's `last_lock_h`. Called by the trigger when
+    /// it fires so the next Locked frame re-initialises the
+    /// reference pose from the engine's *current* H. Without this,
+    /// the ~1-2 s pipeline window between trigger-fire and
+    /// refresh-completion leaves `last_lock_h` lagged behind the
+    /// real camera pose; subsequent comparisons then think the
+    /// camera has moved when it hasn't, and the trigger refires.
+    pub fn clear_last_lock_h(&self, anchor_id: AnchorId) {
+        let mut states = match self.anchor_states.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Some(state) = states.get_mut(&anchor_id) {
+            state.last_lock_h = None;
+        }
+    }
+
+    /// True when the anchor has a stored `last_lock_h`. The trigger
+    /// uses this to skip the overlap check on a freshly-initialised
+    /// (or freshly-invalidated) anchor and instead lazily seed
+    /// `last_lock_h` from the current engine H.
+    pub fn has_last_lock_h(&self, anchor_id: AnchorId) -> bool {
+        match self.anchor_states.lock() {
+            Ok(states) => states
+                .get(&anchor_id)
+                .and_then(|s| s.last_lock_h.as_ref())
+                .is_some(),
+            Err(_) => false,
+        }
+    }
+
+    /// Re-lock trigger for zoom/scale divergence. Project the view
+    /// corners `(0,0)..(view_w, view_h)` through both
+    /// `inv(last_lock_h)` and `inv(current_h)` into anchor coords,
+    /// compare the quadrilateral areas, and trigger when:
+    ///   `min(area(curr), area(lock)) / max(area(curr), area(lock)) < threshold`
+    ///
+    /// This is symmetric in zoom direction: zoom-in shrinks the
+    /// projected viewport area, zoom-out grows it. Pure pan/translation
+    /// leaves the area unchanged, so panning across the same locked
+    /// surface does not clear and re-seed the overlay map.
     ///
     /// Returns false when the anchor has no stored `last_lock_h`
     /// yet — that means we haven't completed a successful pass for
@@ -738,20 +801,19 @@ impl LiveSession {
             Some(h) => h,
             None => return false,
         };
-        let curr_vp = match viewport_surface_aabb(&curr_inv, view_w, view_h) {
+        let curr_area = match viewport_surface_quad_area(&curr_inv, view_w, view_h) {
             Some(a) => a,
             None => return false,
         };
-        let lock_vp = match viewport_surface_aabb(&lock_inv, view_w, view_h) {
+        let lock_area = match viewport_surface_quad_area(&lock_inv, view_w, view_h) {
             Some(a) => a,
             None => return false,
         };
-        let i_area = curr_vp.intersect(&lock_vp).area();
-        let max_area = curr_vp.area().max(lock_vp.area());
+        let max_area = curr_area.max(lock_area);
         if max_area <= 0.0 {
             return true;
         }
-        (i_area / max_area) < threshold
+        (curr_area.min(lock_area) / max_area) < threshold
     }
 
     /// Wipe the surface map + overlay items for `anchor_id` so the
@@ -2523,6 +2585,68 @@ mod rectification_tests {
         assert!((w.width - b.width).abs() < 1e-3);
         assert!((w.height - b.height).abs() < 1e-3);
         assert!((w.angle_radians - b.angle_radians).abs() < 1e-3);
+    }
+
+    #[test]
+    fn relock_by_view_ignores_pure_translation_pan() {
+        let session = LiveSession::new();
+        let anchor_id = 7;
+        let identity = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        session.set_last_lock_h(anchor_id, identity);
+
+        let pan = [1.0_f32, 0.0, 420.0, 0.0, 1.0, -130.0, 0.0, 0.0, 1.0];
+        assert!(
+            !session.should_relock_by_view(anchor_id, &pan, 1000.0, 800.0, 0.75),
+            "pure pan should keep using the existing surface map; coverage refresh handles newly visible areas"
+        );
+    }
+
+    #[test]
+    fn relock_by_view_triggers_on_zoom_change() {
+        let session = LiveSession::new();
+        let anchor_id = 7;
+        let identity = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        session.set_last_lock_h(anchor_id, identity);
+
+        let zoom_in = [2.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0];
+        assert!(
+            session.should_relock_by_view(anchor_id, &zoom_in, 1000.0, 800.0, 0.75),
+            "2x zoom shrinks the projected surface viewport area to 25%"
+        );
+
+        let zoom_out = [0.5_f32, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0];
+        assert!(
+            session.should_relock_by_view(anchor_id, &zoom_out, 1000.0, 800.0, 0.75),
+            "0.5x zoom grows the projected surface viewport area to 400%"
+        );
+    }
+
+    #[test]
+    fn relock_by_view_ignores_in_plane_rotation() {
+        let session = LiveSession::new();
+        let anchor_id = 7;
+        let identity = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        session.set_last_lock_h(anchor_id, identity);
+
+        let (cx, cy) = (500.0_f32, 400.0_f32);
+        let angle = 25.0_f32.to_radians();
+        let c = angle.cos();
+        let s = angle.sin();
+        let rotate_about_center = [
+            c,
+            -s,
+            cx - c * cx + s * cy,
+            s,
+            c,
+            cy - s * cx - c * cy,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        assert!(
+            !session.should_relock_by_view(anchor_id, &rotate_about_center, 1000.0, 800.0, 0.75),
+            "in-plane rotation preserves viewport area in surface coordinates"
+        );
     }
 
     #[test]

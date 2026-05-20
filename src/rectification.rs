@@ -19,7 +19,7 @@
 //!
 //! All matrices are row-major `[f32; 9]`, matching `homography.rs`.
 
-use crate::homography::{invert, mat3_mul};
+use crate::homography::mat3_mul;
 use crate::imu_prior::CameraIntrinsics;
 
 /// One decomposition candidate. The relationship is

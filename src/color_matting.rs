@@ -294,6 +294,7 @@ impl ContourMask {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct Detection {
     pub box_index: usize,
     pub contour_rect: Rect,
@@ -658,6 +659,7 @@ fn rgba_to_argb(c: Rgba<u8>) -> u32 {
 /// unused by `mat_detections` itself — the smoke test still calls it
 /// for diagnostics, and future "tint the inpainted strip with original
 /// ink colour" experiments would reuse it.
+#[allow(dead_code)]
 pub(crate) fn estimate_fg(
     image: &RgbaImage,
     inpainted: &RgbaImage,

@@ -135,14 +135,17 @@ impl Default for TrackerConfig {
             lowe_ratio: 0.8,
             ransac_residual_px: 4.0,
             ransac_iters: 200,
-            min_inliers: 12,
-            // Hysteresis floor for keeping a Locked track. 8 is well
-            // above the 2-point minimum for the similarity fit; at the
-            // sparse end the RANSAC final-refit drops to similarity
-            // (4 DoF) so a fit with 8-14 inliers no longer produces
-            // degenerate homographies. See the adaptive-model branch
-            // in `ransac_homography_with_prior`.
-            min_inliers_keep_locked: 8,
+            min_inliers: 25,
+            // Hysteresis floor for keeping a Locked track. Raised
+            // to 18 to land us inside the affine model band (15-29
+            // inliers = 6-DoF affine fit) and force a Lost
+            // transition before the matcher drops into the 4-DoF
+            // similarity regime where overlays warp into the wrong
+            // plane on perspective scenes. Paired with the
+            // per-frame H-delta cap and `lost_after_frames=5`,
+            // this gives the Google-Translate-style
+            // shake → overlay-hides → re-acquire-on-stability UX.
+            min_inliers_keep_locked: 18,
             nms_radius: 3,
         }
     }
@@ -683,10 +686,16 @@ pub fn ransac_homography_with_prior(
     let mut best_inliers_idx: Vec<usize> = Vec::new();
     let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
     let n = pairs.len();
-    // If we have a prior (IMU-derived prediction), evaluate it first
-    // as a hypothesis. RANSAC only beats it if random sampling finds
-    // a strictly larger inlier set; otherwise we converge to the
-    // prior immediately and the random iters become cheap no-ops.
+    // Only trust the prior if it's *still* well-supported by the
+    // current frame's correspondences. Threshold = half of min_inliers
+    // — if fewer than that many current matches fit the prior, the
+    // prior is stale (the scene has moved enough that it no longer
+    // explains the data) and biasing RANSAC toward it would be
+    // counter-productive. This prevents the "stuck prior" failure
+    // where a fast camera move makes the previous H useless but the
+    // prior's barely-passing inlier count blocks random samples from
+    // displacing it.
+    let prior_min_inliers = (min_inliers / 2).max(1);
     if let Some(h) = prior {
         let mut inliers_idx = Vec::with_capacity(n);
         for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
@@ -698,7 +707,7 @@ pub fn ransac_homography_with_prior(
                 }
             }
         }
-        if !inliers_idx.is_empty() {
+        if inliers_idx.len() >= prior_min_inliers {
             best_inliers_idx = inliers_idx;
             best_h = Some(h);
         }
@@ -731,7 +740,17 @@ pub fn ransac_homography_with_prior(
                 inliers_idx.push(i);
             }
         }
-        if inliers_idx.len() > best_inliers_idx.len() {
+        // `>=` rather than `>`: a random sample that *ties* the
+        // current best (often the prior) gets to replace it. Strict
+        // `>` made the prior sticky — once seeded, a fast camera
+        // move that produced equally-noisy correspondences for
+        // *every* random sample couldn't displace it, so the engine
+        // returned the same H frame after frame while the scene
+        // visibly moved underneath. Tie-replacement is slightly
+        // non-deterministic (last winning sample wins) but allows
+        // escape from a stale seed when random sampling finds an
+        // equally-good fresh fit.
+        if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
             best_inliers_idx = inliers_idx;
             best_h = Some(h);
         }

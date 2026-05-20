@@ -12,11 +12,11 @@
 use image::GrayImage;
 
 use crate::homography::mat3_mul;
-use crate::imu_prior::{CameraIntrinsics, predict_canonical_to_current};
+use crate::imu_prior::{CameraIntrinsics, device_to_camera_vec, predict_canonical_to_current};
 use crate::planar_tracker::{
     GuidedMatchPrior, SceneAnchor, TrackResult, TrackerConfig, build_anchor,
     build_anchor_in_regions, track_against_anchor, track_against_anchor_guided,
-    track_against_anchor_with_min, track_against_anchor_with_prior,
+    track_against_anchor_with_prior,
 };
 
 #[cfg(feature = "image-render")]
@@ -145,7 +145,15 @@ impl Default for EngineConfig {
             // = ~20 ms worst case at 5.
             anchor_cache_size: 5,
             acquire_cooldown_ns: 250_000_000, // 250 ms — fast re-acquire after loss
-            lost_after_frames: 15,            // ~0.5 s @ 30 fps
+            // Drop to Lost quickly under bad fits so the overlay
+            // hides as soon as the matcher loses confidence —
+            // matches Google Translate's "shake → overlay
+            // disappears → re-acquire when still" UX. Paired with
+            // the H-delta cap that converts wrong-basin fits into
+            // None returns, so violent shake reliably triggers a
+            // Lost transition in ~150 ms instead of riding a
+            // degenerate fit for half a second.
+            lost_after_frames: 5, // ~150 ms @ 30 fps
             // Recovery budget: 30 frames (~1 s) before we go Idle so a
             // fresh acquire can fire. Bigger values make stuck-Lost
             // feel glacial when the user has clearly aimed at something
@@ -155,10 +163,17 @@ impl Default for EngineConfig {
             anchor_refresh_age_ns: 30_000_000_000, // 30 s
             handoff_min_inliers: 50,
             handoff_min_visible_ratio: 0.6,
-            // ln(1.35) ≈ 0.30 — fire when accumulated scale change
-            // since acquire would push BRIEF descriptors into the
-            // "silently mis-matching" regime.
-            handoff_scale_log_threshold: 0.30,
+            // Disabled (A/B): set absurdly high so `scale_changed`
+            // never fires. Original 0.30 threshold (≈ 1.35× scale
+            // change) was theoretically perspective-invariant via
+            // `sqrt(|det|)`, but on real-world tilts where the
+            // camera isn't perfectly centred on the surface the
+            // affine det can still move 10-20% and spuriously fire
+            // a handoff that creates a new full-frame anchor with
+            // mismatched feature density. Bring back once we have a
+            // perspective-stable scale measure (e.g. min singular
+            // value of the upper-left 2×2 + bounds on max).
+            handoff_scale_log_threshold: f32::INFINITY,
             handoff_cooldown_ns: 500_000_000, // 500 ms
         }
     }
@@ -192,7 +207,6 @@ pub struct LivePlanarEngine {
 struct ImuLockState {
     canonical_to_frame: [f32; 9],
     rotation_dev: [f32; 9],
-    timestamp_ns: u64,
 }
 
 /// Self-calibrating short-horizon translation predictor. The "tactical"
@@ -410,27 +424,46 @@ impl LivePlanarEngine {
         gray: &GrayImage,
         imu_stable: bool,
         timestamp_ns: u64,
+        capture_timestamp_ns: u64,
         imu_rotation_dev: &[f32; 9],
         linear_accel_dev: Option<&[f32; 3]>,
         intrinsics: &CameraIntrinsics,
+        sensor_orientation_degrees: i32,
     ) -> TrackerCommand {
         if self.motion.pixels_per_meter == 0.0 && intrinsics.fx > 0.0 {
             self.motion.pixels_per_meter = intrinsics.fx / DEFAULT_DEPTH_M;
         }
-        let rotation_prior = self.compute_imu_prior(imu_rotation_dev, intrinsics);
-        // Compute the dt for the *prediction* this frame consumes — i.e.
-        // the time since the previous frame the engine ran on. Clamped
-        // to a sane range so a long pause (app backgrounded) doesn't
-        // integrate a huge velocity step.
+        let rotation_prior =
+            self.compute_imu_prior(imu_rotation_dev, intrinsics, sensor_orientation_degrees);
+        // Compute dt for the *prediction* this frame consumes — i.e.
+        // the time between the two CAPTURE timestamps the IMU samples
+        // were drawn from. Critical: the IMU samples are taken at
+        // `captureTs` (sensor exposure, CLOCK_BOOTTIME), so the
+        // integration interval must use the same clock — otherwise
+        // processing-pipeline jitter (analyzer queue backing up under
+        // load) inflates dt while the actual exposure spacing stays
+        // ~33 ms at 30 fps, and the acceleration term `0.5·a·dt²`
+        // over-predicts translation by the ratio of clocks. On real
+        // devices that's the difference between ~130 px and ~400 px
+        // of predicted feature shift — guided window lands off-target
+        // → matcher collapses to ~zero inliers while the camera is
+        // already steady again.
+        //
+        // Clamped to a sane range so a long pause (app backgrounded,
+        // sensor stalled) doesn't integrate a huge velocity step.
         let dt = self
             .motion
             .last_frame_ns
-            .map(|prev| ((timestamp_ns.saturating_sub(prev)) as f32 / 1e9).clamp(0.0, 0.1))
+            .map(|prev| ((capture_timestamp_ns.saturating_sub(prev)) as f32 / 1e9).clamp(0.0, 0.1))
             .unwrap_or(0.0);
         // Convert the device-frame accel reading to camera-frame using
-        // the same M = diag(1, -1, -1) basis transform the rotation
-        // path uses (see `imu_prior::device_to_camera`).
-        let accel_cam: Option<[f32; 3]> = linear_accel_dev.map(|a| [a[0], -a[1], -a[2]]);
+        // the same M as the rotation path (see
+        // `imu_prior::device_to_camera_matrix`). At sensor_orientation=0
+        // this is the legacy `[a[0], -a[1], -a[2]]`; at 90° (typical
+        // back-camera portrait) the X/Y axes also swap to match the
+        // sensor's actual mount orientation.
+        let accel_cam: Option<[f32; 3]> =
+            linear_accel_dev.map(|a| device_to_camera_vec(*a, sensor_orientation_degrees));
         // Build the guided-matching prior when *all* of:
         //  - a rotation prior is available (need a Locked anchor)
         //  - linear-accel is being fed in
@@ -444,25 +477,26 @@ impl LivePlanarEngine {
         // fine without warm-up because velocity defaults to zero,
         // which produces a sub-pixel translation prediction and a
         // (correctly-centred) circular search window.
-        let guided_prior = if let (Some(h_prior), Some(a_cam)) = (rotation_prior, accel_cam) {
+        let guided_prior = if let (Some(h_prior), Some(_a_cam)) = (rotation_prior, accel_cam) {
             if dt > 0.0 {
-                let v = self.motion.velocity_cam_mps;
-                // Predicted camera translation over this frame in metres.
-                let dp_cam = [
-                    v[0] * dt + 0.5 * a_cam[0] * dt * dt,
-                    v[1] * dt + 0.5 * a_cam[1] * dt * dt,
-                    v[2] * dt + 0.5 * a_cam[2] * dt * dt,
-                ];
-                let ppm = self.motion.pixels_per_meter;
-                // Image motion is opposite the camera translation
-                // direction (when the camera moves right, features
-                // appear to move left in the image).
-                let translation_offset_px = (-ppm * dp_cam[0], -ppm * dp_cam[1]);
-                let mag = translation_offset_px.0.hypot(translation_offset_px.1);
+                // Translation prior disabled: previous version
+                // computed `dp = v · dt + 0.5 · a · dt²` from the
+                // motion state, but the velocity estimate (updated
+                // only when guided tracking *succeeded*) persisted
+                // across frames where tracking failed — so one bad
+                // fit could leave a spike velocity that poisoned
+                // predictions for the next several frames, even on
+                // a steady camera. The result was that "no camera
+                // movement" frames still lost inliers because the
+                // window was centred off-target by the stale
+                // velocity. Until we have a robust velocity-decay
+                // policy on track failure (or move to gyro-only
+                // window centring permanently), keep the
+                // rotation-centred window with slack only.
                 Some(GuidedMatchPrior {
                     h_prior,
-                    translation_offset_px,
-                    long_radius_px: mag + LONG_AXIS_SLACK_PX,
+                    translation_offset_px: (0.0, 0.0),
+                    long_radius_px: LONG_AXIS_SLACK_PX,
                     short_radius_px: SHORT_AXIS_RADIUS_PX,
                 })
             } else {
@@ -503,7 +537,9 @@ impl LivePlanarEngine {
                 self.motion.n_corrections = self.motion.n_corrections.saturating_add(1);
             }
         }
-        self.motion.last_frame_ns = Some(timestamp_ns);
+        // Store the *capture* timestamp so the next frame's dt is
+        // computed in the same clock domain as the IMU sampling.
+        self.motion.last_frame_ns = Some(capture_timestamp_ns);
         // Stash the new IMU + H for next frame's prior, if we ended up Locked.
         // The IMU prior predicts in the *active anchor's* canonical frame, not
         // the root's, so we read H_active→view from the engine state rather
@@ -518,7 +554,6 @@ impl LivePlanarEngine {
             self.last_imu_lock = Some(ImuLockState {
                 canonical_to_frame: h,
                 rotation_dev: *imu_rotation_dev,
-                timestamp_ns,
             });
         } else if matches!(cmd, TrackerCommand::Idle) {
             // True Idle: clear stale IMU state and motion estimate;
@@ -533,6 +568,7 @@ impl LivePlanarEngine {
         &self,
         r_curr_dev: &[f32; 9],
         intrinsics: &CameraIntrinsics,
+        sensor_orientation_degrees: i32,
     ) -> Option<[f32; 9]> {
         let last = self.last_imu_lock.as_ref()?;
         Some(predict_canonical_to_current(
@@ -540,6 +576,7 @@ impl LivePlanarEngine {
             &last.rotation_dev,
             r_curr_dev,
             &last.canonical_to_frame,
+            sensor_orientation_degrees,
         ))
     }
 
@@ -579,15 +616,31 @@ impl LivePlanarEngine {
             EngineState::Locked {
                 anchor_id,
                 frames_lost,
-                ..
+                last_homography,
             } => {
                 // In Locked state we apply hysteresis: a lower inlier
                 // bar to *keep* the lock than to acquire it. Avoids
                 // per-frame Locked↔Lost flicker when inliers wander
                 // around the acquire threshold. Pair with the
                 // IMU-derived prior (if any) to short-circuit RANSAC.
+                //
+                // Fallback prior: when no external `prior` is provided
+                // (e.g. IMU bypassed), seed RANSAC with the previous
+                // frame's `H_anchor→view`. Without a seed, RANSAC
+                // starts from random 4-point samples; on scenes with
+                // repetitive features (e.g. pages of text), ~20% of
+                // those random seeds suggest a *flipped* homography
+                // and RANSAC can then confirm that flip from other
+                // wrong correspondences in the same basin — visible
+                // as "UI floating inverted in the middle of the air"
+                // with healthy inlier counts (107+) even on a static
+                // scene. The previous-frame H is the most informed
+                // seed we can give RANSAC at zero extra cost; it's
+                // essentially what the IMU prior reduces to when
+                // rotation is small.
                 let keep_min = self.config.tracker.min_inliers_keep_locked;
                 let mut observed_translation_px: Option<(f32, f32)> = None;
+                let seed_prior = prior.or(Some(last_homography));
                 let result = self.cache.get(anchor_id).and_then(|a| {
                     let candidate = if let Some(gp) = guided.as_ref() {
                         // Guided path: rotation prior centres the
@@ -610,7 +663,7 @@ impl LivePlanarEngine {
                             gray,
                             &self.config.tracker,
                             keep_min,
-                            prior,
+                            seed_prior,
                         )
                     }?;
                     // Reject visibly-degenerate homographies even if
@@ -619,11 +672,28 @@ impl LivePlanarEngine {
                     // corners to infinity, producing the
                     // "huge diagonal streaks" rendering glitch.
                     let dims = a.anchor.image_dims;
-                    if homography_is_sane(&candidate.homography, dims.0, dims.1) {
-                        Some(candidate)
-                    } else {
-                        None
+                    if !homography_is_sane(&candidate.homography, dims.0, dims.1) {
+                        return None;
                     }
+                    // Reject fits that jump the canonical corners
+                    // farther than physically plausible between two
+                    // adjacent Locked frames. Catches the
+                    // "self-consistent wrong basin" case where
+                    // RANSAC on repetitive content settles on a fit
+                    // that has plenty of inliers but is offset /
+                    // flipped relative to the previous frame —
+                    // visible as "overlay attached itself to the
+                    // wrong place in space" with healthy inlier
+                    // counts (89, 107, etc).
+                    if !homography_delta_is_sane(
+                        &candidate.homography,
+                        &last_homography,
+                        dims.0,
+                        dims.1,
+                    ) {
+                        return None;
+                    }
+                    Some(candidate)
                 });
                 if result.is_some() {
                     self.motion.last_observed_translation_px = observed_translation_px;
@@ -1280,6 +1350,51 @@ fn visible_keypoint_ratio(positions: &[(f32, f32)], h: &[f32; 9], view_w: u32, v
 ///   1. all 4 corner projections must succeed (finite, non-degenerate `w`)
 ///   2. no projected edge longer than 4× the canonical diagonal
 ///   3. opposite edges within a 6× length ratio of each other
+/// Maximum corner displacement (in canonical pixels) we'll accept
+/// between consecutive Locked frames' homographies. RANSAC on
+/// repetitive content occasionally settles into a wrong basin that
+/// is locally self-consistent (high inlier count, passes
+/// `homography_is_sane`) but is geometrically nonsense — projecting
+/// the canonical corners hundreds of pixels away from where the
+/// previous frame's H put them. Real hand motion at 30 fps doesn't
+/// move a corner ~150 px in one frame for typical zoom levels, so
+/// anything larger is rejected as a wrong-basin fit. The reject
+/// path returns None → `frames_lost++` → after
+/// `lost_after_frames` consecutive rejects, transition to Lost
+/// (overlay hides, scene re-acquires when matcher recovers).
+const MAX_CORNER_JUMP_PX: f32 = 300.0;
+
+/// True when the corner displacement between `h_new` and `h_prev`
+/// projected over the canonical rect stays below
+/// [`MAX_CORNER_JUMP_PX`]. Treats degenerate projections as a
+/// failure (= reject the fit).
+fn homography_delta_is_sane(
+    h_new: &[f32; 9],
+    h_prev: &[f32; 9],
+    canonical_w: u32,
+    canonical_h: u32,
+) -> bool {
+    let cw = canonical_w as f32;
+    let ch = canonical_h as f32;
+    let corners = [(0.0_f32, 0.0_f32), (cw, 0.0), (cw, ch), (0.0, ch)];
+    for &(x, y) in &corners {
+        let pn = crate::homography::project(h_new, x, y);
+        let pp = crate::homography::project(h_prev, x, y);
+        match (pn, pp) {
+            (Some(pn), Some(pp)) => {
+                let dx = pn.0 - pp.0;
+                let dy = pn.1 - pp.1;
+                let d = (dx * dx + dy * dy).sqrt();
+                if !d.is_finite() || d > MAX_CORNER_JUMP_PX {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn homography_is_sane(h: &[f32; 9], canonical_w: u32, canonical_h: u32) -> bool {
     let cw = canonical_w as f32;
     let ch = canonical_h as f32;
@@ -1443,6 +1558,7 @@ pub fn fill_oriented_rect_blended(
     }
 }
 
+#[allow(dead_code)]
 fn blend_pixel(dst: &mut [u8], src: [u8; 4]) {
     let sa = src[3] as u32;
     if sa == 0 {

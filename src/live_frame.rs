@@ -20,8 +20,6 @@ use image::{DynamicImage, GrayImage, RgbImage};
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::ocr::Rect;
-use crate::ppocr::rgba_to_dynamic;
-
 /// A frame's cropped, rotated, and detection-ready derivatives.
 ///
 /// `gray` is always populated. `rgb` and `rgb_det` are `Some` iff this
@@ -349,10 +347,18 @@ pub fn build_oriented_image(
     )
 }
 
-/// Forwards to `rgba_to_dynamic` so external callers (tests, bindings) can build
-/// a DynamicImage without going through the live-frame pipeline.
+/// Build a DynamicImage without going through the live-frame pipeline.
 pub fn rgba_bytes_to_dynamic(rgba: &[u8], width: u32, height: u32) -> DynamicImage {
-    rgba_to_dynamic(rgba, width, height)
+    let n_pixels = (width as usize) * (height as usize);
+    let mut rgb = Vec::with_capacity(n_pixels * 3);
+    for i in 0..n_pixels {
+        let base = i * 4;
+        rgb.push(rgba[base]);
+        rgb.push(rgba[base + 1]);
+        rgb.push(rgba[base + 2]);
+    }
+    let img = RgbImage::from_raw(width, height, rgb).expect("rgb buffer sized correctly");
+    DynamicImage::ImageRgb8(img)
 }
 
 #[cfg(test)]

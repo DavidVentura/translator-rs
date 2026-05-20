@@ -30,7 +30,7 @@ pub mod language;
 pub mod language_detect;
 #[cfg(feature = "planar-tracker")]
 pub mod live_compositor;
-#[cfg(feature = "ppocr")]
+#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod live_frame;
 #[cfg(feature = "planar-tracker")]
 pub mod live_session;

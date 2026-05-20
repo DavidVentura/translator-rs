@@ -155,6 +155,11 @@ name = "planar_engine_lifecycle"
 path = "tests/planar_engine_lifecycle.rs"
 required-features = ["planar-tracker"]
 
+[[test]]
+name = "live_video_overlay_smoke"
+path = "tests/live_video_overlay_smoke.rs"
+required-features = ["ppocr", "planar-tracker"]
+
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }
 

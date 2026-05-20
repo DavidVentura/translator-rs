@@ -495,9 +495,11 @@ impl SimPipeline {
             gray,
             true, // imu_stable
             timestamp_ns,
+            timestamp_ns,
             &IDENTITY,
             None,
             &self.intrinsics,
+            0,
         );
         match cmd {
             TrackerCommand::Idle => {

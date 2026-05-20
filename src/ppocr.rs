@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use image::{DynamicImage, GenericImageView, GrayImage, RgbImage, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, GrayImage, imageops::FilterType};
 use imageproc::contours::find_contours;
 use imageproc::point::Point;
 use rayon::ThreadPool;
@@ -603,19 +603,6 @@ fn pulc_strip_eligible(
         && crop.width() >= PULC_MIN_STRIP_WIDTH
         && crop.height() >= PULC_MIN_STRIP_HEIGHT
         && crop_area >= PULC_MIN_STRIP_AREA
-}
-
-pub(crate) fn rgba_to_dynamic(rgba: &[u8], width: u32, height: u32) -> DynamicImage {
-    let n_pixels = (width as usize) * (height as usize);
-    let mut rgb = Vec::with_capacity(n_pixels * 3);
-    for i in 0..n_pixels {
-        let base = i * 4;
-        rgb.push(rgba[base]);
-        rgb.push(rgba[base + 1]);
-        rgb.push(rgba[base + 2]);
-    }
-    let img = RgbImage::from_raw(width, height, rgb).expect("rgb buffer sized correctly");
-    DynamicImage::ImageRgb8(img)
 }
 
 fn crop_dynamic(image: &DynamicImage, rect: &PpocrRect) -> DynamicImage {

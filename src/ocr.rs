@@ -1212,6 +1212,7 @@ impl RasterImageMut {
         }
     }
 
+    #[allow(dead_code)]
     fn apply_fill_plan(&mut self, rect: Rect, plan: FillPlan) {
         match plan {
             FillPlan::Flat(color) => self.fill_rect(rect, color),
