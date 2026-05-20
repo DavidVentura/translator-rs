@@ -42,28 +42,51 @@ impl OrientedImage {
     /// tracker step which never reads `rgb` / `rgb_det`. Skips ~20–25
     /// ms of scalar rotate-RGB + grayscale-from-RGB + resize_exact at
     /// 1.2 MP compared to [`Self::build_with_rgb`].
+    ///
+    /// When the fused gray exceeds `det_max_pixels`, it's downsampled
+    /// with a triangle filter and `det_to_full_scale` is set to the
+    /// inverse of the applied scale (i.e. the multiplier that maps a
+    /// small-coord point back to full-display coords). Per-frame
+    /// tracker matching cost is linear in pixel count, and the planar
+    /// tracker doesn't need full-res to find robust correspondences,
+    /// so capping here is a direct ~2× perf win.
     pub fn build(
         rgba: &[u8],
         sensor_width: u32,
         sensor_height: u32,
         rotation_degrees: i32,
         display_crop: Rect,
-        _det_max_pixels: u32,
+        det_max_pixels: u32,
     ) -> Result<Self, TranslatorError> {
         validate_rgba_len(rgba, sensor_width, sensor_height)?;
-        let gray = build_gray_fused(
-            rgba,
-            sensor_width,
-            sensor_height,
-            rotation_degrees,
-            display_crop,
-        )?;
+        let sensor_crop =
+            display_crop_to_sensor(display_crop, sensor_width, sensor_height, rotation_degrees)?;
+        let crop_w = sensor_crop.right - sensor_crop.left;
+        let crop_h = sensor_crop.bottom - sensor_crop.top;
+        let full_pixels = (crop_w as u64) * (crop_h as u64);
+        let (gray, det_to_full_scale) = if full_pixels > det_max_pixels as u64 {
+            let scale = (det_max_pixels as f64 / full_pixels as f64).sqrt() as f32;
+            let target_w = ((crop_w as f32) * scale).max(1.0) as u32;
+            let target_h = ((crop_h as f32) * scale).max(1.0) as u32;
+            let gray =
+                build_gray_fused_downsampled(rgba, sensor_width, &sensor_crop, target_w, target_h)?;
+            (gray, 1.0 / scale)
+        } else {
+            let gray = build_gray_fused(
+                rgba,
+                sensor_width,
+                sensor_height,
+                rotation_degrees,
+                display_crop,
+            )?;
+            (gray, 1.0)
+        };
         Ok(OrientedImage {
             gray,
             display_crop,
             rgb: None,
             rgb_det: None,
-            det_to_full_scale: 1.0,
+            det_to_full_scale,
         })
     }
 
@@ -202,6 +225,58 @@ fn build_gray_fused(
 
     GrayImage::from_raw(crop_w, crop_h, gray).ok_or_else(|| {
         TranslatorError::new(TranslatorErrorKind::Internal, "gray buffer size mismatch")
+    })
+}
+
+/// Single-pass crop + nearest-neighbor-downsample + RGBA→luma in
+/// **sensor orientation**. One source RGBA read per output pixel — the
+/// total byte traffic is smaller than the full-res fused-luma path
+/// because we're producing fewer pixels, so this is a net per-frame win
+/// (not just a wash with the engine speedup). Nearest is fine for the
+/// tracker because BRIEF descriptors are binary pair-tests over a
+/// 31-pixel patch, robust to the mild aliasing nearest introduces at
+/// the ~1.33× ratio we use here.
+fn build_gray_fused_downsampled(
+    rgba: &[u8],
+    sensor_width: u32,
+    sensor_crop: &Rect,
+    target_w: u32,
+    target_h: u32,
+) -> Result<GrayImage, TranslatorError> {
+    let crop_w = sensor_crop.right - sensor_crop.left;
+    let crop_h = sensor_crop.bottom - sensor_crop.top;
+    let stride = (sensor_width as usize) * 4;
+    // Precompute source-x for every target column once (16-bit fixed
+    // point isn't worth the trouble at this size, but the precomputed
+    // table avoids a multiply+divide per output pixel and is cache-hot).
+    let mut sx_table = vec![0usize; target_w as usize];
+    for tx in 0..target_w {
+        let sx_crop = ((tx as u64) * (crop_w as u64) / (target_w as u64)) as u32;
+        sx_table[tx as usize] = (sensor_crop.left + sx_crop) as usize;
+    }
+    let total = (target_w as usize) * (target_h as usize);
+    let mut gray = vec![0u8; total];
+    for ty in 0..target_h {
+        let sy_crop = ((ty as u64) * (crop_h as u64) / (target_h as u64)) as u32;
+        let sy = (sensor_crop.top + sy_crop) as usize;
+        let src_row = sy * stride;
+        let dst_row = (ty as usize) * (target_w as usize);
+        for tx in 0..target_w as usize {
+            let p = src_row + sx_table[tx] * 4;
+            let rr = rgba[p] as u32;
+            let gg = rgba[p + 1] as u32;
+            let bb = rgba[p + 2] as u32;
+            // Same BT.709 coefficients as `build_gray_fused` so anchor
+            // and per-frame descriptors see consistent luma.
+            let luma = ((13933 * rr + 46871 * gg + 4732 * bb) >> 16) as u8;
+            gray[dst_row + tx] = luma;
+        }
+    }
+    GrayImage::from_raw(target_w, target_h, gray).ok_or_else(|| {
+        TranslatorError::new(
+            TranslatorErrorKind::Internal,
+            "downsampled gray buffer size mismatch",
+        )
     })
 }
 
