@@ -12,7 +12,6 @@
 use image::GrayImage;
 
 use crate::homography::mat3_mul;
-use crate::imu_prior::{CameraIntrinsics, predict_canonical_to_current};
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
     track_against_anchor, track_against_anchor_with_prior,
@@ -225,23 +224,12 @@ pub struct LivePlanarEngine {
     last_acquire_ns: u64,
     /// First timestamp at which IMU went quiet (None when moving).
     stable_since_ns: Option<u64>,
-    /// IMU state at the most recent Locked frame: (canonical→frame H,
-    /// device-frame rotation matrix, timestamp). Used to seed RANSAC
-    /// with an IMU-predicted prior on the next frame. Cleared on
-    /// anchor switch, acquire, or sustained loss.
-    last_imu_lock: Option<ImuLockState>,
     /// Timestamp of the last handoff (anchor spawn from an existing
     /// chain). Used to throttle handoffs via `handoff_cooldown_ns`.
     last_spawn_ns: u64,
     /// History of accepted H + inlier EMA for the active anchor.
     /// Drives the inlier-discontinuity sanity gate.
     track_quality: TrackQualityState,
-}
-
-#[derive(Clone, Debug)]
-struct ImuLockState {
-    canonical_to_frame: [f32; 9],
-    rotation_dev: [f32; 9],
 }
 
 /// Single-step history of accepted `H_anchor→view` for the active anchor,
@@ -330,20 +318,7 @@ struct CachedAnchor {
     h_root_to_canonical: [f32; 9],
     created_at_ns: u64,
     last_locked_ns: u64,
-    /// First few `H_anchor→view` samples collected after acquire.
-    /// Used by the caller to recover the plane's pose for
-    /// rectification (see `rectification::disambiguate_across_frames`).
-    /// Capped at `RECTIFICATION_BURST_SIZE`; subsequent frames are
-    /// dropped silently.
-    h_burst: Vec<[f32; 9]>,
 }
-
-/// Number of post-acquire `H_anchor→view` samples we collect per
-/// anchor before the caller runs plane-pose recovery. Three gives a
-/// strong cross-frame consistency signal (see noise-tolerance table
-/// in `rectification::tests`); raising it costs nothing per-frame
-/// but delays the rectification commit.
-pub const RECTIFICATION_BURST_SIZE: usize = 3;
 
 /// Hand-rolled LRU. Capacity is small (≤5 in production) so a Vec keyed
 /// in MRU-first order is fine; not worth pulling in a crate. Insertions
@@ -416,7 +391,6 @@ impl LivePlanarEngine {
             next_anchor_id: 1,
             last_acquire_ns: 0,
             stable_since_ns: None,
-            last_imu_lock: None,
             last_spawn_ns: 0,
             track_quality: TrackQualityState::new(),
         }
@@ -431,61 +405,11 @@ impl LivePlanarEngine {
         imu_stable: bool,
         timestamp_ns: u64,
     ) -> TrackerCommand {
-        self.process_frame_inner(gray, imu_stable, timestamp_ns, None)
-    }
-
-    /// Like [`process_frame`] but with an IMU-derived RANSAC prior.
-    /// `imu_rotation_dev` is the device-frame rotation matrix at this
-    /// camera frame. `intrinsics` are the camera intrinsics in the same
-    /// pixel space as `gray`.
-    pub fn process_frame_with_imu(
-        &mut self,
-        gray: &GrayImage,
-        imu_stable: bool,
-        timestamp_ns: u64,
-        imu_rotation_dev: &[f32; 9],
-        intrinsics: &CameraIntrinsics,
-        sensor_orientation_degrees: i32,
-    ) -> TrackerCommand {
-        let rotation_prior =
-            self.compute_imu_prior(imu_rotation_dev, intrinsics, sensor_orientation_degrees);
-        let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, rotation_prior);
-        // Stash the new IMU + H for next frame's prior, if we ended up Locked.
-        // The IMU prior predicts in the *active anchor's* canonical frame, not
-        // the root's, so we read H_active→view from the engine state rather
-        // than the externally-emitted H_root→view from the TrackerCommand.
-        let active_h = match self.state {
-            EngineState::Locked {
-                last_homography, ..
-            } => Some(last_homography),
-            _ => None,
-        };
-        if let (TrackerCommand::Locked { .. }, Some(h)) = (&cmd, active_h) {
-            self.last_imu_lock = Some(ImuLockState {
-                canonical_to_frame: h,
-                rotation_dev: *imu_rotation_dev,
-            });
-        } else if matches!(cmd, TrackerCommand::Idle) {
-            self.last_imu_lock = None;
+        let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, None);
+        if matches!(cmd, TrackerCommand::Idle) {
             self.track_quality.reset();
         }
         cmd
-    }
-
-    fn compute_imu_prior(
-        &self,
-        r_curr_dev: &[f32; 9],
-        intrinsics: &CameraIntrinsics,
-        sensor_orientation_degrees: i32,
-    ) -> Option<[f32; 9]> {
-        let last = self.last_imu_lock.as_ref()?;
-        Some(predict_canonical_to_current(
-            intrinsics,
-            &last.rotation_dev,
-            r_curr_dev,
-            &last.canonical_to_frame,
-            sensor_orientation_degrees,
-        ))
     }
 
     fn process_frame_inner(
@@ -593,9 +517,6 @@ impl LivePlanarEngine {
                     self.cache.touch(anchor_id);
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
                         entry.last_locked_ns = timestamp_ns;
-                        if entry.h_burst.len() < RECTIFICATION_BURST_SIZE {
-                            entry.h_burst.push(r.homography);
-                        }
                     }
                     // External: emit the root id and the chain-composed
                     // H_root→view. The handoff machinery is invisible
@@ -798,7 +719,6 @@ impl LivePlanarEngine {
                 h_root_to_canonical: IDENTITY,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
-                h_burst: Vec::with_capacity(RECTIFICATION_BURST_SIZE),
             },
         );
         self.state = EngineState::Locked {
@@ -807,9 +727,6 @@ impl LivePlanarEngine {
             last_homography: IDENTITY,
         };
         self.last_acquire_ns = timestamp_ns;
-        // New canonical frame: drop any IMU lock state — composing it
-        // with the new H would be meaningless.
-        self.last_imu_lock = None;
         self.track_quality.reset();
         // Reset spawn cooldown — a fresh root means there's no chain
         // yet to throttle.
@@ -898,19 +815,6 @@ impl LivePlanarEngine {
         }
     }
 
-    /// The `H_anchor→view` samples collected for `anchor_id` since
-    /// acquire, up to `RECTIFICATION_BURST_SIZE`. Empty until the
-    /// anchor sees its first Locked frame; full once it has seen
-    /// `RECTIFICATION_BURST_SIZE` Locked frames. Caller can feed
-    /// these into `rectification::decompose_homography` +
-    /// `disambiguate_across_frames` to recover the plane pose.
-    pub fn h_burst_of(&self, anchor_id: AnchorId) -> &[[f32; 9]] {
-        match self.cache.get(anchor_id) {
-            Some(entry) => entry.h_burst.as_slice(),
-            None => &[],
-        }
-    }
-
     pub fn current_anchor(&self) -> Option<AnchorId> {
         match self.state {
             EngineState::Locked { anchor_id, .. } => Some(self.root_of(anchor_id)),
@@ -965,7 +869,6 @@ impl LivePlanarEngine {
         self.next_anchor_id = 1;
         self.last_acquire_ns = 0;
         self.stable_since_ns = None;
-        self.last_imu_lock = None;
         self.last_spawn_ns = 0;
         self.track_quality.reset();
     }
@@ -1138,7 +1041,6 @@ impl LivePlanarEngine {
                 h_root_to_canonical: h_root_to_new,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
-                h_burst: Vec::with_capacity(RECTIFICATION_BURST_SIZE),
             },
         );
         self.last_spawn_ns = timestamp_ns;

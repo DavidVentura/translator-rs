@@ -33,7 +33,6 @@ use minifb::{Key, Window, WindowOptions};
 
 use translator::PpocrScript;
 use translator::homography::{fit_homography, invert, project};
-use translator::imu_prior::CameraIntrinsics;
 use translator::live_session::{AddResultKind, LiveSession};
 use translator::ocr::OrientedRect;
 use translator::planar_engine::{EngineConfig, LivePlanarEngine, TrackerCommand};
@@ -434,7 +433,6 @@ struct SimPipeline {
     /// Shared cross-platform session state. Owns the surface map +
     /// overlay store (currently only the map matters here).
     session: LiveSession,
-    intrinsics: CameraIntrinsics,
     active_anchor: Option<u64>,
     frame_idx: u64,
     last_homography: [f32; 9],
@@ -462,12 +460,6 @@ impl SimPipeline {
         // be permissive so the first frame transitions Idle→Locked when
         // we call acquire_now.
         cfg.stable_required_ns = 0;
-        let intrinsics = CameraIntrinsics {
-            fx: 600.0,
-            fy: 600.0,
-            cx: CAM_W as f32 / 2.0,
-            cy: CAM_H as f32 / 2.0,
-        };
         let session = LiveSession::new();
         // Match the sim's previous fixed ~2.5 Hz cadence (12 frames @
         // 30 fps) instead of the production default (15).
@@ -476,7 +468,6 @@ impl SimPipeline {
             engine: LivePlanarEngine::new(cfg),
             ppocr,
             session,
-            intrinsics,
             active_anchor: None,
             frame_idx: 0,
             last_homography: IDENTITY,
@@ -491,14 +482,7 @@ impl SimPipeline {
 
     fn step(&mut self, rgba: &RgbaImage, gray: &GrayImage) {
         let timestamp_ns = self.frame_idx * 33_333_333; // ~30 fps
-        let cmd = self.engine.process_frame_with_imu(
-            gray,
-            true, // imu_stable
-            timestamp_ns,
-            &IDENTITY,
-            &self.intrinsics,
-            0,
-        );
+        let cmd = self.engine.process_frame(gray, true, timestamp_ns);
         match cmd {
             TrackerCommand::Idle => {
                 self.last_cmd = TrackerCommandSummary::Idle;

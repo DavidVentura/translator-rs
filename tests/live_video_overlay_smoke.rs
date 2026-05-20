@@ -31,7 +31,6 @@ use image::{Rgba, RgbaImage, codecs::jpeg::JpegEncoder};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect as ImpRect;
 use translator::font_provider::{FontHandle, FontProvider, FontRequest};
-use translator::imu_prior::CameraIntrinsics;
 use translator::live_compositor::{OverlayItem as CompositeOverlayItem, composite_frame_into};
 use translator::live_frame::OrientedImage;
 use translator::live_session::{
@@ -150,26 +149,13 @@ fn video_frames_drive_live_overlay_pipeline() {
         };
         let oriented =
             OrientedImage::build_with_rgb(&rgba, w, h, 0, crop, det_max_pixels).expect("frame");
-        let intrinsics = CameraIntrinsics {
-            fx: w as f32,
-            fy: w as f32,
-            cx: w as f32 * 0.5,
-            cy: h as f32 * 0.5,
-        };
         let timestamp_ns = idx as u64 * 33_333_333;
 
         let mut detect_reason = DetectReason::None;
         let mut h_view_to_surface = None;
         let mut tracker_inliers: Option<usize> = None;
         let mut lost_anchor: Option<u64> = None;
-        let cmd = engine.process_frame_with_imu(
-            &oriented.gray,
-            true,
-            timestamp_ns,
-            &IDENTITY_H,
-            &intrinsics,
-            0,
-        );
+        let cmd = engine.process_frame(&oriented.gray, true, timestamp_ns);
         let tracker_state = match cmd {
             TrackerCommand::Idle | TrackerCommand::Acquiring => {
                 if let Some(anchor_id) = engine.acquire_now(&oriented.gray, timestamp_ns) {

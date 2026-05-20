@@ -641,33 +641,6 @@ pub fn ransac_homography_with_prior(
     // implementation simplicity — the gain over uniform random is
     // primarily from phase 0, not the exact growth law.
     let quarter = (cfg.ransac_iters / 4).max(1);
-    let count_inliers = |h: &[f32; 9]| -> Vec<usize> {
-        let mut out = Vec::with_capacity(n);
-        for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
-            let Some((px2, py2)) = project(h, px, py) else {
-                continue;
-            };
-            let dx = px2 - qx;
-            let dy = py2 - qy;
-            if dx * dx + dy * dy <= r_thresh_sq {
-                out.push(i);
-            }
-        }
-        out
-    };
-    let sample_unique = |k: usize, growth_cap: usize, rng: &mut SmallRng| -> [usize; 4] {
-        let mut idxs = [0usize; 4];
-        for j in 0..k {
-            loop {
-                let candidate = (rng.next_u32() as usize) % growth_cap;
-                if idxs[..j].iter().all(|&p| p != candidate) {
-                    idxs[j] = candidate;
-                    break;
-                }
-            }
-        }
-        idxs
-    };
     for t in 0..cfg.ransac_iters {
         let phase = (t / quarter).min(3);
         let growth_cap = match phase {
@@ -676,51 +649,46 @@ pub fn ransac_homography_with_prior(
             2 => (n * 3 / 4).max(8).min(n),
             _ => n,
         };
-        // 4-point homography hypothesis: 8-DoF, captures perspective.
-        let h_idxs = sample_unique(4, growth_cap, &mut rng);
-        let h_sample = [
-            pairs[h_idxs[0]],
-            pairs[h_idxs[1]],
-            pairs[h_idxs[2]],
-            pairs[h_idxs[3]],
-        ];
-        if let Some(h) = fit_homography(&h_sample) {
-            let inliers_idx = count_inliers(&h);
-            // `>=` rather than `>`: a random sample that *ties* the
-            // current best (often the prior) gets to replace it. Strict
-            // `>` made the prior sticky — once seeded, a fast camera
-            // move that produced equally-noisy correspondences for
-            // *every* random sample couldn't displace it, so the engine
-            // returned the same H frame after frame while the scene
-            // visibly moved underneath. Tie-replacement is slightly
-            // non-deterministic (last winning sample wins) but allows
-            // escape from a stale seed when random sampling finds an
-            // equally-good fresh fit.
-            if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
-                best_inliers_idx = inliers_idx;
-                best_h = Some(h);
+        let mut sample = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
+        let mut idxs = [0usize; 4];
+        for k in 0..4 {
+            loop {
+                let candidate = (rng.next_u32() as usize) % growth_cap;
+                if idxs[..k].iter().all(|&p| p != candidate) {
+                    idxs[k] = candidate;
+                    sample[k] = pairs[candidate];
+                    break;
+                }
             }
         }
-        // 2-point similarity hypothesis: 4-DoF (rotation + uniform scale
-        // + translation). Only 2 inlier correspondences needed to form
-        // the sample, vs 4 for homography. At low effective inlier
-        // ratios this dominates the homography branch on
-        // probability-of-clean-sample. The geometric constraint also
-        // makes it robust to *clustered* inliers — even when 100
-        // matches all land on the same text band, a similarity fit
-        // can't over-fit the periphery the way homography can. If a
-        // similarity sample produces more inliers than the current
-        // best 4-point fit, we use it instead and the refinement
-        // step below picks the right model order from the resulting
-        // inlier count.
-        let s_idxs = sample_unique(2, growth_cap, &mut rng);
-        let s_sample = [pairs[s_idxs[0]], pairs[s_idxs[1]]];
-        if let Some(h) = fit_similarity(&s_sample) {
-            let inliers_idx = count_inliers(&h);
-            if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
-                best_inliers_idx = inliers_idx;
-                best_h = Some(h);
+        let h = match fit_homography(&sample) {
+            Some(h) => h,
+            None => continue,
+        };
+        let mut inliers_idx = Vec::with_capacity(n);
+        for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
+            let Some((px2, py2)) = project(&h, px, py) else {
+                continue;
+            };
+            let dx = px2 - qx;
+            let dy = py2 - qy;
+            if dx * dx + dy * dy <= r_thresh_sq {
+                inliers_idx.push(i);
             }
+        }
+        // `>=` rather than `>`: a random sample that *ties* the
+        // current best (often the prior) gets to replace it. Strict
+        // `>` made the prior sticky — once seeded, a fast camera
+        // move that produced equally-noisy correspondences for
+        // *every* random sample couldn't displace it, so the engine
+        // returned the same H frame after frame while the scene
+        // visibly moved underneath. Tie-replacement is slightly
+        // non-deterministic (last winning sample wins) but allows
+        // escape from a stale seed when random sampling finds an
+        // equally-good fresh fit.
+        if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
+            best_inliers_idx = inliers_idx;
+            best_h = Some(h);
         }
     }
     if best_inliers_idx.len() < min_inliers {
