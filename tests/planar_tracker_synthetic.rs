@@ -110,6 +110,7 @@ fn test_config() -> TrackerConfig {
         min_inliers: 20,
         min_inliers_keep_locked: 6,
         nms_radius: 3,
+        guided_search_radius_px: 30.0,
     }
 }
 

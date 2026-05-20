@@ -67,6 +67,7 @@ fn test_engine_config() -> EngineConfig {
             min_inliers: 20,
             min_inliers_keep_locked: 6,
             nms_radius: 3,
+            guided_search_radius_px: 30.0,
         },
         anchor_cache_size: 5,
         // No cooldown for tests — they re-acquire intentionally.

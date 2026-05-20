@@ -154,6 +154,14 @@ pub struct TrackerConfig {
     pub min_inliers_keep_locked: usize,
     /// Non-max suppression radius for FAST corners (in pixels).
     pub nms_radius: i32,
+    /// Search-window radius for guided descriptor matching, in
+    /// pixel-coords of the gray the matcher operates on. The
+    /// per-frame Locked matcher uses this when an `H_anchor→view`
+    /// prior is provided (= we're tracking, not re-acquiring). Set to
+    /// roughly cover the worst-case feature displacement between two
+    /// adjacent frames: at 30 fps with handheld slow pan that's
+    /// ~10-20 px; we leave headroom for moderate motion.
+    pub guided_search_radius_px: f32,
 }
 
 impl Default for TrackerConfig {
@@ -183,6 +191,7 @@ impl Default for TrackerConfig {
             // check still catch egregiously bad similarity fits.
             min_inliers_keep_locked: 10,
             nms_radius: 3,
+            guided_search_radius_px: 30.0,
         }
     }
 }
@@ -377,7 +386,29 @@ pub fn track_against_anchor_with_prior(
         return None;
     }
     let t2 = std::time::Instant::now();
-    let mut matches = match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio_locked);
+    // Guided when we have a prior (= Locked, tracking through the
+    // scene): restrict each anchor's match candidates to a small
+    // window around its predicted view position. The narrow window
+    // lets blur-degraded descriptors pass Lowe ratio because they
+    // compete only against the ~handful of in-window candidates
+    // instead of the global pool, and the resulting inlier set is
+    // spread across the anchor (every anchor keypoint with a frame
+    // feature near its prediction can match), eliminating the
+    // clustered-inlier drift seen with brute matching. Brute path
+    // remains for re-acquire (no prior) where the previous-frame
+    // location is meaningless.
+    let mut matches = match prior {
+        Some(h_prior) => match_descriptors_guided(
+            &anchor.descriptors,
+            &anchor.positions,
+            &frame_kps,
+            &frame_descs,
+            cfg.lowe_ratio_locked,
+            &h_prior,
+            cfg.guided_search_radius_px,
+        ),
+        None => match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio_locked),
+    };
     // Sort by Hamming distance ascending — pairs[i] now corresponds
     // to the i-th best match. RANSAC samples from a progressively
     // growing prefix of this list (PROSAC), so early iterations draw
@@ -474,6 +505,75 @@ pub fn match_descriptors(
     out
 }
 
+/// Guided Hamming matcher. Uses `h_prior` (typically the last-frame
+/// `H_anchor→view`) to project each anchor keypoint into expected view
+/// coords; only frame keypoints inside a `search_radius_px`-pixel disk
+/// around that prediction are candidates. The Lowe ratio test is
+/// applied within that restricted set, so a blur-degraded descriptor —
+/// whose "best" candidate in brute matching is barely better than the
+/// "second best" amongst the global ~500 frame keypoints — competes
+/// only against the handful of candidates in its predicted neighbourhood
+/// and usually wins decisively. This is what lets the matcher *survive*
+/// motion blur and produce spread inliers when brute matching would
+/// collapse to clustered noise.
+///
+/// Returns brute-style matches; downstream RANSAC + sanity gate are
+/// unchanged.
+pub fn match_descriptors_guided(
+    anchor_descs: &[Descriptor],
+    anchor_positions: &[(f32, f32)],
+    frame_kps: &[KeyPoint],
+    frame_descs: &[Descriptor],
+    lowe_ratio: f32,
+    h_prior: &[f32; 9],
+    search_radius_px: f32,
+) -> Vec<Match> {
+    let mut out = Vec::new();
+    if frame_kps.len() < 2 {
+        return out;
+    }
+    let r_sq = search_radius_px * search_radius_px;
+    for (a_idx, (a_desc, a_pos)) in anchor_descs.iter().zip(anchor_positions.iter()).enumerate() {
+        let Some(predicted) = project(h_prior, a_pos.0, a_pos.1) else {
+            continue;
+        };
+        let mut best = u32::MAX;
+        let mut best_idx = 0usize;
+        let mut second = u32::MAX;
+        let mut window_count = 0usize;
+        for (f_idx, fkp) in frame_kps.iter().enumerate() {
+            let dx = fkp.x - predicted.0;
+            let dy = fkp.y - predicted.1;
+            if dx * dx + dy * dy > r_sq {
+                continue;
+            }
+            window_count += 1;
+            let d = a_desc.hamming(&frame_descs[f_idx]);
+            if d < best {
+                second = best;
+                best = d;
+                best_idx = f_idx;
+            } else if d < second {
+                second = d;
+            }
+        }
+        // Need at least 2 candidates for the Lowe ratio test to be
+        // meaningful; with only 1 in-window candidate we can't measure
+        // ambiguity vs the second-best.
+        if window_count < 2 {
+            continue;
+        }
+        if (best as f32) < lowe_ratio * (second as f32) {
+            out.push(Match {
+                anchor_idx: a_idx,
+                frame_idx: best_idx,
+                distance: best,
+            });
+        }
+    }
+    out
+}
+
 /// RANSAC over `(canonical_x, canonical_y, frame_x, frame_y)` pairs.
 /// Samples 4 random correspondences per iteration, fits a homography,
 /// counts inliers (residual under `cfg.ransac_residual_px`), keeps the
@@ -541,6 +641,33 @@ pub fn ransac_homography_with_prior(
     // implementation simplicity — the gain over uniform random is
     // primarily from phase 0, not the exact growth law.
     let quarter = (cfg.ransac_iters / 4).max(1);
+    let count_inliers = |h: &[f32; 9]| -> Vec<usize> {
+        let mut out = Vec::with_capacity(n);
+        for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
+            let Some((px2, py2)) = project(h, px, py) else {
+                continue;
+            };
+            let dx = px2 - qx;
+            let dy = py2 - qy;
+            if dx * dx + dy * dy <= r_thresh_sq {
+                out.push(i);
+            }
+        }
+        out
+    };
+    let sample_unique = |k: usize, growth_cap: usize, rng: &mut SmallRng| -> [usize; 4] {
+        let mut idxs = [0usize; 4];
+        for j in 0..k {
+            loop {
+                let candidate = (rng.next_u32() as usize) % growth_cap;
+                if idxs[..j].iter().all(|&p| p != candidate) {
+                    idxs[j] = candidate;
+                    break;
+                }
+            }
+        }
+        idxs
+    };
     for t in 0..cfg.ransac_iters {
         let phase = (t / quarter).min(3);
         let growth_cap = match phase {
@@ -549,46 +676,51 @@ pub fn ransac_homography_with_prior(
             2 => (n * 3 / 4).max(8).min(n),
             _ => n,
         };
-        let mut sample = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
-        let mut idxs = [0usize; 4];
-        for k in 0..4 {
-            loop {
-                let candidate = (rng.next_u32() as usize) % growth_cap;
-                if idxs[..k].iter().all(|&p| p != candidate) {
-                    idxs[k] = candidate;
-                    sample[k] = pairs[candidate];
-                    break;
-                }
+        // 4-point homography hypothesis: 8-DoF, captures perspective.
+        let h_idxs = sample_unique(4, growth_cap, &mut rng);
+        let h_sample = [
+            pairs[h_idxs[0]],
+            pairs[h_idxs[1]],
+            pairs[h_idxs[2]],
+            pairs[h_idxs[3]],
+        ];
+        if let Some(h) = fit_homography(&h_sample) {
+            let inliers_idx = count_inliers(&h);
+            // `>=` rather than `>`: a random sample that *ties* the
+            // current best (often the prior) gets to replace it. Strict
+            // `>` made the prior sticky — once seeded, a fast camera
+            // move that produced equally-noisy correspondences for
+            // *every* random sample couldn't displace it, so the engine
+            // returned the same H frame after frame while the scene
+            // visibly moved underneath. Tie-replacement is slightly
+            // non-deterministic (last winning sample wins) but allows
+            // escape from a stale seed when random sampling finds an
+            // equally-good fresh fit.
+            if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
+                best_inliers_idx = inliers_idx;
+                best_h = Some(h);
             }
         }
-        let h = match fit_homography(&sample) {
-            Some(h) => h,
-            None => continue,
-        };
-        let mut inliers_idx = Vec::with_capacity(n);
-        for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
-            let Some((px2, py2)) = project(&h, px, py) else {
-                continue;
-            };
-            let dx = px2 - qx;
-            let dy = py2 - qy;
-            if dx * dx + dy * dy <= r_thresh_sq {
-                inliers_idx.push(i);
+        // 2-point similarity hypothesis: 4-DoF (rotation + uniform scale
+        // + translation). Only 2 inlier correspondences needed to form
+        // the sample, vs 4 for homography. At low effective inlier
+        // ratios this dominates the homography branch on
+        // probability-of-clean-sample. The geometric constraint also
+        // makes it robust to *clustered* inliers — even when 100
+        // matches all land on the same text band, a similarity fit
+        // can't over-fit the periphery the way homography can. If a
+        // similarity sample produces more inliers than the current
+        // best 4-point fit, we use it instead and the refinement
+        // step below picks the right model order from the resulting
+        // inlier count.
+        let s_idxs = sample_unique(2, growth_cap, &mut rng);
+        let s_sample = [pairs[s_idxs[0]], pairs[s_idxs[1]]];
+        if let Some(h) = fit_similarity(&s_sample) {
+            let inliers_idx = count_inliers(&h);
+            if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
+                best_inliers_idx = inliers_idx;
+                best_h = Some(h);
             }
-        }
-        // `>=` rather than `>`: a random sample that *ties* the
-        // current best (often the prior) gets to replace it. Strict
-        // `>` made the prior sticky — once seeded, a fast camera
-        // move that produced equally-noisy correspondences for
-        // *every* random sample couldn't displace it, so the engine
-        // returned the same H frame after frame while the scene
-        // visibly moved underneath. Tie-replacement is slightly
-        // non-deterministic (last winning sample wins) but allows
-        // escape from a stale seed when random sampling finds an
-        // equally-good fresh fit.
-        if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
-            best_inliers_idx = inliers_idx;
-            best_h = Some(h);
         }
     }
     if best_inliers_idx.len() < min_inliers {
