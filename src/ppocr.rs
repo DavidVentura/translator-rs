@@ -64,6 +64,17 @@ const PPOCR_REC_STD: [f32; 3] = [0.5, 0.5, 0.5];
 const PULC_WIDTH: u32 = 160;
 const PULC_HEIGHT: u32 = 80;
 const PULC_MIN_SCORE: f32 = 0.85;
+/// PaddleOCR textline orientation classifier input shape and preprocessing
+/// (`textline_ori_x0_25_wq8.mnn`, exported from `PP-LCNet_x0_25_textline_ori_infer`).
+/// PaddleX's inference yaml specifies ImageNet normalization (NOT
+/// [0.5, 0.5, 0.5]); with the wrong normalization the model collapses to
+/// near-uniform "upright" predictions regardless of input.
+/// Outputs 2 logits: class 0 = upright (0°), class 1 = flipped (180°).
+const TEXTLINE_ORI_WIDTH: u32 = 160;
+const TEXTLINE_ORI_HEIGHT: u32 = 80;
+const TEXTLINE_ORI_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const TEXTLINE_ORI_STD: [f32; 3] = [0.229, 0.224, 0.225];
+const TEXTLINE_ORI_CLASSES: usize = 2;
 const PULC_MIN_STRIP_AREA: u32 = 768;
 const PULC_MIN_STRIP_WIDTH: u32 = 24;
 const PULC_MIN_STRIP_HEIGHT: u32 = 8;
@@ -206,6 +217,25 @@ pub struct PpocrScriptClassifier {
     session: MnnSession,
 }
 
+/// Binary 0°/180° label out of the textline orientation model. Resolving the
+/// full 90° quadrant requires running the model on the strip and again on the
+/// strip rotated 90° clockwise (see `live_session::estimate_canonical_quadrant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextlineOriLabel {
+    Up,
+    Flipped180,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TextlineOriCandidate {
+    pub label: TextlineOriLabel,
+    pub score: f32,
+}
+
+pub struct PpocrTextlineOrientationClassifier {
+    session: MnnSession,
+}
+
 #[derive(Debug, Clone)]
 pub struct PpocrRecognizerSpec {
     pub script: PpocrScript,
@@ -221,6 +251,7 @@ struct PpocrRecognizerSlot {
 pub struct PpocrEngine {
     detector: PpocrDetector,
     classifier: Option<PpocrScriptClassifier>,
+    textline_orientation: Option<PpocrTextlineOrientationClassifier>,
     recognizers: HashMap<PpocrScript, PpocrRecognizerSlot>,
 }
 
@@ -228,6 +259,7 @@ impl PpocrEngine {
     pub fn load(
         det_path: &Path,
         classifier_path: Option<&Path>,
+        textline_orientation_path: Option<&Path>,
         recognizer_specs: Vec<PpocrRecognizerSpec>,
         det_intra_threads: usize,
     ) -> Result<Self, TranslatorError> {
@@ -237,6 +269,9 @@ impl PpocrEngine {
         let detector = PpocrDetector::load(det_path, det_intra_threads)?;
         let classifier = classifier_path
             .map(PpocrScriptClassifier::load)
+            .transpose()?;
+        let textline_orientation = textline_orientation_path
+            .map(PpocrTextlineOrientationClassifier::load)
             .transpose()?;
         let recognizers = recognizer_specs
             .into_iter()
@@ -253,12 +288,35 @@ impl PpocrEngine {
         Ok(Self {
             detector,
             classifier,
+            textline_orientation,
             recognizers,
         })
     }
 
     pub fn has_classifier(&self) -> bool {
         self.classifier.is_some()
+    }
+
+    pub fn has_textline_orientation(&self) -> bool {
+        self.textline_orientation.is_some()
+    }
+
+    /// Batched textline orientation classification. Each crop should be a
+    /// dewarped text strip in its natural box-local orientation. Output is
+    /// 1:1 with input; entries that produced non-finite logits come back
+    /// as `None`. Errors out if no model was loaded — callers should gate
+    /// on `has_textline_orientation()`.
+    pub fn textline_orientation_classify(
+        &self,
+        crops: &[DynamicImage],
+    ) -> Result<Vec<Option<TextlineOriCandidate>>, TranslatorError> {
+        let Some(classifier) = &self.textline_orientation else {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::MissingAsset,
+                "ppocr textline orientation classifier is not available",
+            ));
+        };
+        classifier.classify_many(crops)
     }
 
     pub fn installed_scripts(&self) -> impl Iterator<Item = PpocrScript> + '_ {
@@ -353,6 +411,7 @@ impl PpocrEngine {
         image: &DynamicImage,
         gray: &GrayImage,
         boxes: &[crate::ocr::DetectedTextBox],
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<Option<PpocrScriptPrediction>>, TranslatorError> {
         let Some(classifier) = &self.classifier else {
             return Err(TranslatorError::new(
@@ -360,7 +419,7 @@ impl PpocrEngine {
                 "ppocr script classifier is not available",
             ));
         };
-        let crops = crop_text_strips(image, gray, boxes).0;
+        let crops = crop_text_strips(image, gray, boxes, canonical_quadrant).0;
         let image_area = (image.width() as f32) * (image.height() as f32);
         let mut predictions = vec![None; boxes.len()];
         let mut eligible_crops = Vec::new();
@@ -455,6 +514,7 @@ impl PpocrEngine {
         boxes: &[crate::ocr::DetectedTextBox],
         scripts: &[PpocrScript],
         profile: PpocrProfile,
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
         if boxes.is_empty() {
             return Ok(Vec::new());
@@ -470,7 +530,7 @@ impl PpocrEngine {
         let height = image.height();
 
         let t_crops = Instant::now();
-        let (crops, dewarp_count) = crop_text_strips(image, gray, boxes);
+        let (crops, dewarp_count) = crop_text_strips(image, gray, boxes, canonical_quadrant);
         let mean_crop_w: f32 =
             crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32;
         let mean_crop_h: f32 =
@@ -689,10 +749,20 @@ fn crop_dynamic(image: &DynamicImage, rect: &PpocrRect) -> DynamicImage {
     image.crop_imm(rect.left, rect.top, w, h)
 }
 
-fn crop_text_strips(
+/// Crop one text strip per box, dewarping along the PCA principal axis when a
+/// contour is available and otherwise falling back to an AABB cutout.
+///
+/// When `canonical_quadrant` is supplied, `dewarp_contour_to_strip` aligns
+/// the strip's +x to the canonical reading direction (using a dot-product
+/// sign check against the PCA principal axis) — deterministic per strip,
+/// no per-frame classifier inference. AABB fallback strips are rotated by
+/// `R0.sub(canonical)` so the camera-frame reading direction becomes the
+/// strip's reading direction.
+pub(crate) fn crop_text_strips(
     image: &DynamicImage,
     gray: &GrayImage,
     boxes: &[crate::ocr::DetectedTextBox],
+    canonical_quadrant: Option<crate::coords::Quadrant>,
 ) -> (Vec<DynamicImage>, usize) {
     let mut dewarp_count = 0usize;
     let crops = boxes
@@ -706,7 +776,7 @@ fn crop_text_strips(
                 };
             let dewarped = contour_pairs
                 .as_deref()
-                .and_then(|c| dewarp_contour_to_strip(gray, c))
+                .and_then(|c| dewarp_contour_to_strip(gray, c, canonical_quadrant))
                 .map(DynamicImage::ImageLuma8);
             if let Some(dewarped) = dewarped {
                 dewarp_count += 1;
@@ -718,11 +788,26 @@ fn crop_text_strips(
                     right: b.rect.right,
                     bottom: b.rect.bottom,
                 };
-                crop_dynamic(image, &rect)
+                let aabb = crop_dynamic(image, &rect);
+                match canonical_quadrant {
+                    Some(canon) => rotate_strip_ccw(aabb, crate::coords::Quadrant::R0.sub(canon)),
+                    None => aabb,
+                }
             }
         })
         .collect();
     (crops, dewarp_count)
+}
+
+fn rotate_strip_ccw(image: DynamicImage, by: crate::coords::Quadrant) -> DynamicImage {
+    use crate::coords::Quadrant;
+    match by {
+        Quadrant::R0 => image,
+        // image crate's rotate90/180/270 are clockwise. CCW 90° == CW 270°.
+        Quadrant::R90 => image.rotate270(),
+        Quadrant::R180 => image.rotate180(),
+        Quadrant::R270 => image.rotate90(),
+    }
 }
 
 fn resized_rec_width(crop: &DynamicImage) -> u32 {
@@ -1082,6 +1167,100 @@ impl PpocrScriptClassifier {
             .map(top_pulc_candidate)
             .collect())
     }
+}
+
+impl PpocrTextlineOrientationClassifier {
+    fn load(model_path: &Path) -> Result<Self, TranslatorError> {
+        let session =
+            MnnSession::load_with_modes(model_path, 4, PrecisionMode::Low, MemoryMode::Low)?;
+        Ok(Self { session })
+    }
+
+    fn classify_many(
+        &self,
+        crops: &[DynamicImage],
+    ) -> Result<Vec<Option<TextlineOriCandidate>>, TranslatorError> {
+        if crops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input = preprocess_for_textline_ori(crops);
+        let (out, out_shape) = self.session.run(
+            &input,
+            &[
+                crops.len(),
+                3,
+                TEXTLINE_ORI_HEIGHT as usize,
+                TEXTLINE_ORI_WIDTH as usize,
+            ],
+        )?;
+        if out_shape.len() != 2
+            || out_shape[0] != crops.len()
+            || out_shape[1] != TEXTLINE_ORI_CLASSES
+        {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                format!(
+                    "ppocr textline orientation classifier output shape unexpected: {:?}",
+                    out_shape
+                ),
+            ));
+        }
+        Ok(out
+            .chunks_exact(TEXTLINE_ORI_CLASSES)
+            .map(top_textline_ori_candidate)
+            .collect())
+    }
+}
+
+fn preprocess_for_textline_ori(crops: &[DynamicImage]) -> Vec<f32> {
+    let plane = (TEXTLINE_ORI_HEIGHT as usize) * (TEXTLINE_ORI_WIDTH as usize);
+    let mut buf = vec![0.0f32; crops.len() * 3 * plane];
+    for (batch, crop) in crops.iter().enumerate() {
+        let resized = crop.resize_exact(
+            TEXTLINE_ORI_WIDTH,
+            TEXTLINE_ORI_HEIGHT,
+            FilterType::Triangle,
+        );
+        let rgb = resized.to_rgb8();
+        let batch_base = batch * 3 * plane;
+        for y in 0..TEXTLINE_ORI_HEIGHT as usize {
+            for x in 0..TEXTLINE_ORI_WIDTH as usize {
+                let pixel = rgb.get_pixel(x as u32, y as u32);
+                let idx = y * TEXTLINE_ORI_WIDTH as usize + x;
+                buf[batch_base + idx] =
+                    (pixel[0] as f32 / 255.0 - TEXTLINE_ORI_MEAN[0]) / TEXTLINE_ORI_STD[0];
+                buf[batch_base + plane + idx] =
+                    (pixel[1] as f32 / 255.0 - TEXTLINE_ORI_MEAN[1]) / TEXTLINE_ORI_STD[1];
+                buf[batch_base + 2 * plane + idx] =
+                    (pixel[2] as f32 / 255.0 - TEXTLINE_ORI_MEAN[2]) / TEXTLINE_ORI_STD[2];
+            }
+        }
+    }
+    buf
+}
+
+fn top_textline_ori_candidate(row: &[f32]) -> Option<TextlineOriCandidate> {
+    let probs = if row.iter().all(|v| v.is_finite()) {
+        let sum = row.iter().sum::<f32>();
+        if (0.95..=1.05).contains(&sum) {
+            row.to_vec()
+        } else {
+            softmax(row)
+        }
+    } else {
+        return None;
+    };
+    let (idx, score) = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())?;
+    let label = match idx {
+        0 => TextlineOriLabel::Up,
+        1 => TextlineOriLabel::Flipped180,
+        _ => return None,
+    };
+    Some(TextlineOriCandidate { label, score })
 }
 
 fn pad_to_multiple(v: u32, m: u32) -> u32 {
@@ -1689,22 +1868,35 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
         v_min = v_min.min(v);
         v_max = v_max.max(v);
     }
-    let raw_width = u_max - u_min;
-    let raw_height = v_max - v_min;
-    if raw_width < 4.0 || raw_height < 2.0 {
-        return None;
-    }
+    let raw_u = u_max - u_min;
+    let raw_v = v_max - v_min;
     let u_center = (u_min + u_max) * 0.5;
     let v_center = (v_min + v_max) * 0.5;
     let cx = mean_x + ux * u_center + vx * v_center;
     let cy = mean_y + uy * u_center + vy * v_center;
 
+    // OrientedRect convention: `width` = reading axis (long), `height` =
+    // perpendicular. `estimate_horizontal_tilt` only resolves near-
+    // horizontal tilts; for text that's actually rotated ~90° (e.g.
+    // phone held in portrait while shooting a landscape doc) it
+    // returns 0 and the contour's y-extent is then the long side.
+    // Swap so the rect's long side is always the reading axis, with
+    // angle bumped by π/2.
+    let (final_width, final_height, final_angle) = if raw_v > raw_u {
+        (raw_v, raw_u, angle_radians + std::f32::consts::FRAC_PI_2)
+    } else {
+        (raw_u, raw_v, angle_radians)
+    };
+    if final_width < 4.0 || final_height < 2.0 {
+        return None;
+    }
+
     let tight = crate::ocr::OrientedRect {
         cx,
         cy,
-        width: raw_width,
-        height: raw_height,
-        angle_radians,
+        width: final_width,
+        height: final_height,
+        angle_radians: final_angle,
     };
 
     // DB segmentation produces a *shrunken* contour relative to the actual ink. The AABB path
@@ -1712,22 +1904,26 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     // plus a small border (see `extract_boxes` and `expand_box`). Apply the same inflation
     // here so the oriented rect covers ascenders/descenders for erase, and so its height
     // matches the AABB pipeline's height — what the renderer uses to size the font.
-    let area = raw_width * raw_height;
-    let perimeter = 2.0 * (raw_width + raw_height);
+    let area = final_width * final_height;
+    let perimeter = 2.0 * (final_width + final_height);
     let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0);
     let pad = expand_dist + DET_BOX_BORDER as f32;
     let inflated = crate::ocr::OrientedRect {
         cx,
         cy,
-        width: raw_width + 2.0 * pad,
-        height: raw_height + 2.0 * pad,
-        angle_radians,
+        width: final_width + 2.0 * pad,
+        height: final_height + 2.0 * pad,
+        angle_radians: final_angle,
     };
 
     Some(ContourBoxes { tight, inflated })
 }
 
-fn dewarp_contour_to_strip(gray: &GrayImage, contour: &[(f32, f32)]) -> Option<GrayImage> {
+fn dewarp_contour_to_strip(
+    gray: &GrayImage,
+    contour: &[(f32, f32)],
+    canonical_quadrant: Option<crate::coords::Quadrant>,
+) -> Option<GrayImage> {
     if contour.len() < 8 {
         return None;
     }
@@ -1771,7 +1967,23 @@ fn dewarp_contour_to_strip(gray: &GrayImage, contour: &[(f32, f32)]) -> Option<G
     let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
     let mut ux = ex / norm;
     let mut uy = ey / norm;
-    if ux < 0.0 {
+    // PCA gives a sign-ambiguous principal axis; we have to pick which
+    // way along it the strip's +x should point. Without a reference,
+    // `ux >= 0` is the only deterministic choice — but it's also
+    // *wrong* for any scene whose reading direction is along -x (R180)
+    // or has a vertical component pointing camera-down (a chunk of
+    // R90/R270 cases). When the scene's reading direction is known
+    // (canonical_quadrant), align the strip's +x with that direction
+    // instead, by flipping when the dot product against canonical is
+    // negative. Falls back to `ux >= 0` when canonical isn't supplied.
+    let need_flip = match canonical_quadrant {
+        Some(q) => {
+            let theta = q.radians();
+            ux * theta.cos() + uy * theta.sin() < 0.0
+        }
+        None => ux < 0.0,
+    };
+    if need_flip {
         ux = -ux;
         uy = -uy;
     }

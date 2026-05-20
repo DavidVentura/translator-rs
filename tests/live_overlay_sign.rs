@@ -180,7 +180,8 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
         model_path: rec_path.clone(),
         keys_path: keys_path.clone(),
     };
-    let engine = PpocrEngine::load(&det_path, None, vec![recognizer_spec], 1).expect("load ppocr");
+    let engine =
+        PpocrEngine::load(&det_path, None, None, vec![recognizer_spec], 1).expect("load ppocr");
     let det_boxes = engine
         .detect_only_image(&frame.rgb_det, PpocrProfile::Live)
         .expect("live detection succeeds");
@@ -203,6 +204,7 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
             &boxes,
             &scripts,
             PpocrProfile::Live,
+            None,
         )
         .expect("live recognition succeeds");
     let recognised: Vec<_> = lines

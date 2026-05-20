@@ -639,6 +639,7 @@ impl SimPipeline {
             &rec_boxes,
             &scripts,
             PpocrProfile::Live,
+            None,
         );
         let rec_ms = t.elapsed().as_secs_f32() * 1000.0;
         match result {
@@ -707,6 +708,7 @@ fn main() {
     let rec_latin_keys = cli.model_dir.join("latin_PP-OCRv5_keys.txt");
     let ppocr = match PpocrEngine::load(
         &det_model,
+        None,
         None,
         vec![PpocrRecognizerSpec {
             script: PpocrScript::Latin,

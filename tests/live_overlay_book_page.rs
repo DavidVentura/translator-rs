@@ -72,7 +72,7 @@ fn book_page_grouping_dump() {
     .expect("build frame");
     let rgb_det = frame.rgb_det.as_ref().expect("with_rgb populated rgb_det");
 
-    let engine = PpocrEngine::load(&det_path, None, vec![], 1).expect("load ppocr");
+    let engine = PpocrEngine::load(&det_path, None, None, vec![], 1).expect("load ppocr");
     let det_boxes = engine
         .detect_only_image(rgb_det, PpocrProfile::Live)
         .expect("detection succeeds");

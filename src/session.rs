@@ -106,6 +106,7 @@ struct PpocrCache {
 struct PpocrEngineKey {
     detector_path: String,
     classifier_path: Option<String>,
+    textline_orientation_path: Option<String>,
     recognizers: Vec<(crate::catalog::PpocrScript, String, String)>,
 }
 
@@ -460,15 +461,45 @@ impl TranslatorSession {
         ppocr.detect_only_image(rgb_det, crate::ppocr::PpocrProfile::Live)
     }
 
+    /// Estimate the scene's reading-direction quadrant from a set of
+    /// detections against the supplied `OrientedImage`. Wraps
+    /// [`crate::live_session::estimate_canonical_quadrant`] so callers
+    /// don't have to extract `rgb` / build a matching gray themselves.
+    /// Returns `None` when the orientation model isn't installed, no
+    /// wide boxes qualified, or consensus didn't reach the gate.
+    #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+    pub fn estimate_canonical_quadrant_in_oriented_image(
+        &self,
+        oriented: &crate::live_frame::OrientedImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Option<crate::coords::Quadrant>, TranslatorError> {
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        let rgb = oriented
+            .rgb
+            .as_ref()
+            .expect("estimate path requires build_with_rgb");
+        let gray_display = image::imageops::grayscale(&rgb.to_rgb8());
+        Ok(crate::live_session::estimate_canonical_quadrant(
+            &ppocr,
+            rgb,
+            &gray_display,
+            boxes,
+        ))
+    }
+
     /// Live-OCR recognize: takes the same `OrientedImage` (full-resolution crop +
     /// pre-built grayscale) and caller-supplied boxes in *display-orient
     /// full-crop* coords (i.e. already scaled up from detection coords).
+    /// `canonical_quadrant` is the anchor's stored orientation (None for
+    /// still-image / first-acquire paths that have no anchor).
     #[cfg(feature = "ppocr")]
     pub fn recognize_in_oriented_image(
         &self,
         oriented: &crate::live_frame::OrientedImage,
         boxes: &[crate::ocr::DetectedTextBox],
         source_selection: OcrSourceSelection,
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
         use crate::ppocr::PpocrProfile;
 
@@ -487,7 +518,12 @@ impl TranslatorSession {
         let gray_display = image::imageops::grayscale(&rgb8);
         match source_selection {
             OcrSourceSelection::Auto => {
-                let predictions = ppocr.classify_text_boxes_image(rgb, &gray_display, boxes)?;
+                let predictions = ppocr.classify_text_boxes_image(
+                    rgb,
+                    &gray_display,
+                    boxes,
+                    canonical_quadrant,
+                )?;
                 let scripts = route_ppocr_predictions(&ppocr, &predictions, boxes)?;
                 let mut lines = ppocr.recognize_text_in_boxes_image(
                     rgb,
@@ -495,6 +531,7 @@ impl TranslatorSession {
                     boxes,
                     &scripts,
                     PpocrProfile::Live,
+                    canonical_quadrant,
                 )?;
                 let source = ocr_source_for_lines(&snap, &lines, None);
                 if let Some(code) = source {
@@ -516,6 +553,7 @@ impl TranslatorSession {
                     boxes,
                     &scripts,
                     PpocrProfile::Live,
+                    canonical_quadrant,
                 )
             }
         }
@@ -637,6 +675,11 @@ impl TranslatorSession {
             .iter()
             .find(|f| f.name.ends_with(".mnn") && f.name.contains("PULC"))
             .map(|f| base.join(&f.install_path));
+        let textline_orientation_path = det_pack
+            .files
+            .iter()
+            .find(|f| f.name.ends_with(".mnn") && f.name.contains("textline_ori"))
+            .map(|f| base.join(&f.install_path));
 
         let mut specs = Vec::new();
         for (pack_id, pack) in &catalog.packs {
@@ -675,6 +718,9 @@ impl TranslatorSession {
             classifier_path: classifier_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            textline_orientation_path: textline_orientation_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             recognizers: specs
                 .iter()
                 .map(|s| {
@@ -696,6 +742,7 @@ impl TranslatorSession {
         let engine = Arc::new(PpocrEngine::load(
             &det_path,
             classifier_path.as_deref(),
+            textline_orientation_path.as_deref(),
             specs,
             4,
         )?);

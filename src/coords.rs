@@ -299,6 +299,78 @@ impl<To> AnchorHomography<To> {
     }
 }
 
+/// Coarse 4-way rotation between two oriented frames. Used for "which
+/// way is text reading-up?" at the camera/anchor level: the live tracker
+/// already absorbs sub-quadrant rotation through its homography, so the
+/// only thing the orientation estimator needs to commit to is one of
+/// four 90° buckets.
+///
+/// Conventions: angles are measured counter-clockwise from the
+/// camera-frame +x axis. `R0` means the strip's reading direction is
+/// already along +x; `R90` means it points along +y (i.e. it needs to be
+/// rotated -90° / CW 90° to read horizontally), etc.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Quadrant {
+    R0,
+    R90,
+    R180,
+    R270,
+}
+
+impl Default for Quadrant {
+    fn default() -> Self {
+        Self::R0
+    }
+}
+
+impl Quadrant {
+    pub const ALL: [Quadrant; 4] = [Quadrant::R0, Quadrant::R90, Quadrant::R180, Quadrant::R270];
+
+    pub fn degrees(self) -> i32 {
+        match self {
+            Quadrant::R0 => 0,
+            Quadrant::R90 => 90,
+            Quadrant::R180 => 180,
+            Quadrant::R270 => 270,
+        }
+    }
+
+    pub fn radians(self) -> f32 {
+        (self.degrees() as f32) * std::f32::consts::PI / 180.0
+    }
+
+    pub fn from_degrees_mod360(deg: i32) -> Self {
+        let mut d = deg % 360;
+        if d < 0 {
+            d += 360;
+        }
+        let bucket = (((d as f32) / 90.0).round() as i32).rem_euclid(4);
+        match bucket {
+            0 => Quadrant::R0,
+            1 => Quadrant::R90,
+            2 => Quadrant::R180,
+            _ => Quadrant::R270,
+        }
+    }
+
+    /// Snap a radians value (any range) to the nearest quadrant.
+    pub fn from_radians(angle: f32) -> Self {
+        let deg = (angle * 180.0 / std::f32::consts::PI).round() as i32;
+        Self::from_degrees_mod360(deg)
+    }
+
+    /// `self - other` as a quadrant. Encodes "how much further is `self`
+    /// rotated CCW from `other`."
+    pub fn sub(self, other: Quadrant) -> Quadrant {
+        Self::from_degrees_mod360(self.degrees() - other.degrees())
+    }
+
+    /// `self + other` as a quadrant.
+    pub fn add(self, other: Quadrant) -> Quadrant {
+        Self::from_degrees_mod360(self.degrees() + other.degrees())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +450,32 @@ mod tests {
             1.5, 0.0, 7.0, 0.0, 1.5, -3.0, 0.0, 0.0, 1.0,
         ]);
         assert!((h.approx_scale() - 1.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn quadrant_from_radians_snaps_to_nearest() {
+        assert_eq!(Quadrant::from_radians(0.0), Quadrant::R0);
+        assert_eq!(Quadrant::from_radians(0.1), Quadrant::R0);
+        assert_eq!(
+            Quadrant::from_radians(std::f32::consts::FRAC_PI_2),
+            Quadrant::R90
+        );
+        assert_eq!(
+            Quadrant::from_radians(-std::f32::consts::FRAC_PI_2),
+            Quadrant::R270
+        );
+        assert_eq!(Quadrant::from_radians(std::f32::consts::PI), Quadrant::R180);
+        assert_eq!(
+            Quadrant::from_radians(3.0 * std::f32::consts::PI),
+            Quadrant::R180
+        );
+    }
+
+    #[test]
+    fn quadrant_arithmetic_wraps() {
+        assert_eq!(Quadrant::R90.sub(Quadrant::R270), Quadrant::R180);
+        assert_eq!(Quadrant::R0.sub(Quadrant::R90), Quadrant::R270);
+        assert_eq!(Quadrant::R270.add(Quadrant::R180), Quadrant::R90);
     }
 
     #[test]

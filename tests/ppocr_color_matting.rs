@@ -80,7 +80,8 @@ fn visual_color_matting_for_live_label() {
         model_path: rec_path,
         keys_path,
     };
-    let engine = PpocrEngine::load(&det_path, None, vec![recognizer_spec], 1).expect("load ppocr");
+    let engine =
+        PpocrEngine::load(&det_path, None, None, vec![recognizer_spec], 1).expect("load ppocr");
     let t_detect = Instant::now();
     let boxes = engine
         .detect_only_image(&dyn_image, PpocrProfile::Still)
@@ -95,7 +96,14 @@ fn visual_color_matting_for_live_label() {
     let t_rec = Instant::now();
     let scripts = vec![PpocrScript::Latin; boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image(&dyn_image, &gray, &boxes, &scripts, PpocrProfile::Still)
+        .recognize_text_in_boxes_image(
+            &dyn_image,
+            &gray,
+            &boxes,
+            &scripts,
+            PpocrProfile::Still,
+            None,
+        )
         .expect("recognize fixture");
     let rec_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
 

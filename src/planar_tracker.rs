@@ -93,14 +93,6 @@ pub struct TrackResult {
     pub matches: usize,
     /// Median re-projection residual in pixels (over inliers).
     pub median_residual_px: f32,
-    /// Bounding box (min_x, min_y, max_x, max_y) of the surviving
-    /// inliers' positions in **anchor (canonical) space**. The sanity
-    /// gate uses this to detect spatially-clustered inlier sets — a
-    /// fit constrained by inliers only in a fraction of the anchor
-    /// bbox extrapolates badly outside the cluster, producing the
-    /// "overlay snaps toward the feature-dense region" wobble even
-    /// when the count looks fine.
-    pub inlier_anchor_bbox: (f32, f32, f32, f32),
 }
 
 /// Public-facing tracker state. Wraps an optional anchor and the
@@ -727,23 +719,11 @@ pub fn ransac_homography_with_prior(
     } else {
         residuals[residuals.len() / 2]
     };
-    let mut min_ax = f32::INFINITY;
-    let mut min_ay = f32::INFINITY;
-    let mut max_ax = f32::NEG_INFINITY;
-    let mut max_ay = f32::NEG_INFINITY;
-    for &(ax, ay, _, _) in &inlier_pairs {
-        min_ax = min_ax.min(ax);
-        min_ay = min_ay.min(ay);
-        max_ax = max_ax.max(ax);
-        max_ay = max_ay.max(ay);
-    }
-    let inlier_anchor_bbox = (min_ax, min_ay, max_ax, max_ay);
     Some(TrackResult {
         homography: refined,
         inliers: inlier_pairs.len(),
         matches: pairs.len(),
         median_residual_px: median,
-        inlier_anchor_bbox,
     })
 }
 

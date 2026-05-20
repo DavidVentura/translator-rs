@@ -87,7 +87,9 @@ fn test_engine_config() -> EngineConfig {
         sanity_gate_min_ema: 60.0,
         sanity_gate_max_consecutive: 3,
         inlier_ema_alpha: 0.2,
-        sanity_gate_min_bbox_coverage: 0.25,
+        degraded_inlier_threshold: 0,
+        degraded_max_frames: u32::MAX,
+        default_canonical_quadrant: translator::coords::Quadrant::R0,
     }
 }
 
@@ -133,14 +135,7 @@ fn locked_through_known_translation() {
 fn lost_then_recovered_via_same_anchor() {
     let mut engine = LivePlanarEngine::new(test_engine_config());
     let gray = load_gray("book.jpg", 480);
-    let other = warp_with_h(
-        &load_gray("sign.jpg", 480),
-        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-    );
-    // Resize sign to book's dims so it's not a dimensional mismatch.
-    let other = image::DynamicImage::ImageLuma8(other)
-        .resize_exact(gray.width(), gray.height(), FilterType::Triangle)
-        .to_luma8();
+    let other = GrayImage::from_pixel(gray.width(), gray.height(), Luma([128u8]));
 
     let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
     // Three lost frames → Lost.
@@ -168,10 +163,7 @@ fn lost_then_recovered_via_same_anchor() {
 fn lost_to_idle_after_give_up() {
     let mut engine = LivePlanarEngine::new(test_engine_config());
     let gray = load_gray("book.jpg", 480);
-    let other = load_gray("sign.jpg", 480);
-    let other = image::DynamicImage::ImageLuma8(other)
-        .resize_exact(gray.width(), gray.height(), FilterType::Triangle)
-        .to_luma8();
+    let other = GrayImage::from_pixel(gray.width(), gray.height(), Luma([128u8]));
 
     engine.acquire_now(&gray, 1_000_000).expect("acquire");
     // Feed enough unrelated frames to walk through Locked-loss then Lost-give-up.
@@ -587,5 +579,132 @@ fn anchor_chain_persists_overlays_across_handoffs() {
             }
         }
         other => panic!("expected Locked on come-back, got {:?}", other),
+    }
+}
+
+#[test]
+fn handoff_children_inherit_root_quadrant() {
+    use translator::coords::Quadrant;
+    let mut cfg = test_engine_config();
+    // Same recipe as `anchor_chain_persists_overlays_across_handoffs`:
+    // force a handoff on essentially any frame motion.
+    cfg.handoff_min_inliers = 1000;
+    cfg.handoff_min_visible_ratio = 0.95;
+    cfg.handoff_cooldown_ns = 0;
+    let mut engine = LivePlanarEngine::new(cfg);
+    let gray = load_gray("book.jpg", 480);
+    let root_id = engine
+        .acquire_now_with_orientation(&gray, &[], 0, 1_000_000, Some(Quadrant::R180))
+        .expect("acquire with orientation");
+
+    // Drive a couple of translated frames so a handoff fires.
+    let translations: [[f32; 9]; 2] = [
+        [1.0, 0.0, 6.0, 0.0, 1.0, -3.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 14.0, 0.0, 1.0, -8.0, 0.0, 0.0, 1.0],
+    ];
+    let mut t_ns = 2_000_000_u64;
+    for h_known in translations {
+        let warped = warp_with_h(&gray, &h_known);
+        let cmd = engine.process_frame(&warped, true, t_ns);
+        match cmd {
+            TrackerCommand::Locked {
+                anchor_id,
+                canonical_rotation,
+                ..
+            } => {
+                assert_eq!(
+                    anchor_id, root_id,
+                    "external anchor id stays = root through handoff",
+                );
+                assert_eq!(
+                    canonical_rotation,
+                    Quadrant::R180,
+                    "child anchor inherited root quadrant",
+                );
+            }
+            other => panic!("expected Locked, got {:?}", other),
+        }
+        t_ns += 1_000_000;
+    }
+    // Sanity: we did spawn at least one child.
+    assert!(
+        engine.cache_len() >= 2,
+        "expected chain growth, cache_len={}",
+        engine.cache_len()
+    );
+}
+
+#[test]
+fn acquire_with_orientation_stores_quadrant_on_root() {
+    use translator::coords::Quadrant;
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let id = engine
+        .acquire_now_with_orientation(&gray, &[], 0, 1_000_000, Some(Quadrant::R270))
+        .expect("acquire with orientation");
+    let cmd = engine.process_frame(&gray, true, 2_000_000);
+    match cmd {
+        TrackerCommand::Locked {
+            anchor_id,
+            canonical_rotation,
+            ..
+        } => {
+            assert_eq!(anchor_id, id);
+            assert_eq!(canonical_rotation, Quadrant::R270);
+        }
+        other => panic!("expected Locked, got {:?}", other),
+    }
+}
+
+#[test]
+fn no_estimator_consensus_falls_back_to_default() {
+    use translator::coords::Quadrant;
+    // Engine configured with a non-R0 default (e.g. phone-portrait).
+    let mut cfg = test_engine_config();
+    cfg.default_canonical_quadrant = Quadrant::R270;
+    let mut engine = LivePlanarEngine::new(cfg);
+    let gray = load_gray("book.jpg", 480);
+    let id = engine
+        .acquire_now_with_orientation(&gray, &[], 0, 1_000_000, None)
+        .expect("acquire without consensus");
+    let cmd = engine.process_frame(&gray, true, 2_000_000);
+    match cmd {
+        TrackerCommand::Locked {
+            anchor_id,
+            canonical_rotation,
+            ..
+        } => {
+            assert_eq!(anchor_id, id);
+            assert_eq!(canonical_rotation, Quadrant::R270);
+        }
+        other => panic!("expected Locked, got {:?}", other),
+    }
+}
+
+#[test]
+fn no_consensus_falls_back_to_previous_known() {
+    use translator::coords::Quadrant;
+    let mut engine = LivePlanarEngine::new(test_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    // First acquire establishes R90 as last_known.
+    let _first = engine
+        .acquire_now_with_orientation(&gray, &[], 0, 1_000_000, Some(Quadrant::R90))
+        .expect("first acquire");
+    assert_eq!(engine.last_known_quadrant(), Quadrant::R90);
+    // Second acquire with no consensus inherits R90 (not the default R0).
+    let second = engine
+        .acquire_now_with_orientation(&gray, &[], 0, 2_000_000, None)
+        .expect("second acquire");
+    let cmd = engine.process_frame(&gray, true, 3_000_000);
+    match cmd {
+        TrackerCommand::Locked {
+            anchor_id,
+            canonical_rotation,
+            ..
+        } => {
+            assert_eq!(anchor_id, second);
+            assert_eq!(canonical_rotation, Quadrant::R90);
+        }
+        other => panic!("expected Locked, got {:?}", other),
     }
 }

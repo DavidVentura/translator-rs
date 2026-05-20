@@ -11,6 +11,7 @@
 
 use image::GrayImage;
 
+use crate::coords::Quadrant;
 use crate::homography::mat3_mul;
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
@@ -69,11 +70,15 @@ pub enum TrackerCommand {
     /// first frame after a fresh acquisition (Kotlin should run OCR
     /// then); false on subsequent frames or when we've snapped back to
     /// a cached anchor (skip OCR — Phase F caching benefit).
+    /// `canonical_rotation` is the anchor's stored reading-direction
+    /// quadrant (resolved at acquire-time by the textline-orientation
+    /// estimator, then inherited by handoffs from their root).
     Locked {
         anchor_id: AnchorId,
         homography: [f32; 9],
         is_new: bool,
         inliers: usize,
+        canonical_rotation: Quadrant,
     },
     /// We had `last_anchor_id` locked recently but lost the track.
     /// Kotlin can briefly hide overlays or extrapolate via IMU until a
@@ -140,12 +145,24 @@ pub struct EngineConfig {
     /// EMA smoothing factor for accepted inlier counts. Higher = more
     /// responsive to recent inlier counts; lower = more stable.
     pub inlier_ema_alpha: f32,
-    /// Spatial-spread sanity check: minimum fraction of the anchor's
-    /// keypoint bbox area that the inlier set must cover for the fit
-    /// to be trusted. Catches the "lots of inliers, all clustered in
-    /// one region" failure mode that produces overlay wobble even at
-    /// inlier counts the count-based gate would accept.
-    pub sanity_gate_min_bbox_coverage: f32,
+    /// Inlier count below which an accepted fit is considered
+    /// "degraded" — the anchor's BRIEF descriptors are losing
+    /// correspondences as perspective drifts, and RANSAC will start
+    /// over-fitting to whichever pocket of features still matches.
+    pub degraded_inlier_threshold: usize,
+    /// After this many consecutive degraded frames, force the engine
+    /// back to Idle so the harness can re-acquire from the current
+    /// view. Lets us bound cumulative H-drift on a single anchor
+    /// instead of riding it through a perspective shift that the
+    /// descriptors can no longer track.
+    pub degraded_max_frames: u32,
+    /// Quadrant used for a fresh anchor when the textline-orientation
+    /// estimator can't reach consensus AND no previous anchor has ever
+    /// produced one in this engine. Caller (Android, sim, tests) sets
+    /// this per camera mount: phones held portrait with rear camera
+    /// typically want `R270`; desktop sim with a synthetic flat image
+    /// wants `R0`.
+    pub default_canonical_quadrant: Quadrant,
 }
 
 impl Default for EngineConfig {
@@ -200,17 +217,9 @@ impl Default for EngineConfig {
             sanity_gate_min_ema: 60.0,
             sanity_gate_max_consecutive: 3,
             inlier_ema_alpha: 0.2,
-            // Minimum fraction of the anchor's keypoint bbox area
-            // that the inlier set's bbox must cover for the fit to
-            // be considered spatially well-constrained. Below this
-            // the inliers are clustered (typically on the
-            // feature-dense top half of the subject), the H is
-            // over-fit to that region, and the overlay projection
-            // outside the cluster wobbles toward the cluster —
-            // visible as the "snap up" you observe at sub-30 inlier
-            // counts. Defaults to 25% (i.e. 50% × 50% of anchor
-            // bbox dimensions).
-            sanity_gate_min_bbox_coverage: 0.25,
+            degraded_inlier_threshold: 75,
+            degraded_max_frames: 5,
+            default_canonical_quadrant: Quadrant::R0,
         }
     }
 }
@@ -230,6 +239,11 @@ pub struct LivePlanarEngine {
     /// History of accepted H + inlier EMA for the active anchor.
     /// Drives the inlier-discontinuity sanity gate.
     track_quality: TrackQualityState,
+    /// Most recent quadrant the estimator confirmed (across all
+    /// acquires, not just the active anchor). Used as fallback when a
+    /// later acquire fails to reach consensus. Seeded from
+    /// `EngineConfig.default_canonical_quadrant`.
+    last_known_quadrant: Quadrant,
 }
 
 /// Single-step history of accepted `H_anchor→view` for the active anchor,
@@ -244,6 +258,11 @@ struct TrackQualityState {
     anchor_id: Option<AnchorId>,
     inlier_ema: Option<f32>,
     suspicious_frames: u32,
+    /// Consecutive accepted frames whose inlier count fell below
+    /// `degraded_inlier_threshold`. When this exceeds
+    /// `degraded_max_frames`, the engine forces a re-acquire rather
+    /// than continuing to track a bleeding anchor.
+    degraded_frames: u32,
 }
 
 impl TrackQualityState {
@@ -253,6 +272,7 @@ impl TrackQualityState {
             anchor_id: None,
             inlier_ema: None,
             suspicious_frames: 0,
+            degraded_frames: 0,
         }
     }
     fn reset(&mut self) {
@@ -318,6 +338,11 @@ struct CachedAnchor {
     h_root_to_canonical: [f32; 9],
     created_at_ns: u64,
     last_locked_ns: u64,
+    /// Reading-direction quadrant in the camera frame at acquire time.
+    /// Roots get this from the estimator (with fallback to
+    /// `last_known_quadrant`). Handoff children inherit from their
+    /// root.
+    canonical_rotation: Quadrant,
 }
 
 /// Hand-rolled LRU. Capacity is small (≤5 in production) so a Vec keyed
@@ -384,6 +409,7 @@ impl AnchorCache {
 impl LivePlanarEngine {
     pub fn new(config: EngineConfig) -> Self {
         let cache_size = config.anchor_cache_size;
+        let default_quadrant = config.default_canonical_quadrant;
         Self {
             config,
             cache: AnchorCache::new(cache_size),
@@ -393,7 +419,24 @@ impl LivePlanarEngine {
             stable_since_ns: None,
             last_spawn_ns: 0,
             track_quality: TrackQualityState::new(),
+            last_known_quadrant: default_quadrant,
         }
+    }
+
+    /// Coarse rotation the engine last committed to (most recent
+    /// successful acquire-time estimate, or `default_canonical_quadrant`
+    /// if the estimator has never confirmed one).
+    pub fn last_known_quadrant(&self) -> Quadrant {
+        self.last_known_quadrant
+    }
+
+    /// Reading-direction quadrant stored on an anchor's chain root.
+    /// Returns `None` if the anchor isn't cached anymore (LRU-evicted).
+    /// Use this on the refresh path to populate
+    /// `PostDetectInput.canonical_quadrant` for the active anchor.
+    pub fn canonical_rotation_for(&self, anchor_id: AnchorId) -> Option<Quadrant> {
+        let root_id = self.root_of(anchor_id);
+        self.cache.get(root_id).map(|a| a.canonical_rotation)
     }
 
     /// Process one camera frame. Decides whether to track against the
@@ -430,11 +473,13 @@ impl LivePlanarEngine {
                         self.transition_to_locked(id, &result, timestamp_ns, false);
                         let (root_id, h_root_to_view) =
                             self.chain_homography(id, &result.homography);
+                        let canonical_rotation = self.quadrant_for_active(id);
                         return TrackerCommand::Locked {
                             anchor_id: root_id,
                             homography: h_root_to_view,
                             is_new: false,
                             inliers: result.inliers,
+                            canonical_rotation,
                         };
                     }
                 }
@@ -507,13 +552,25 @@ impl LivePlanarEngine {
                         }
                     }
                 });
-                let anchor_bbox = self
-                    .cache
-                    .get(anchor_id)
-                    .map(|a| Self::keypoint_bbox(&a.anchor.positions))
-                    .unwrap_or((0.0, 0.0, 1.0, 1.0));
-                let result = result.and_then(|r| self.apply_sanity_gate(r, anchor_bbox));
+                let result = result.and_then(|r| self.apply_sanity_gate(r));
                 if let Some(r) = result {
+                    // Sustained inlier decline: the anchor's
+                    // descriptors are losing correspondences as
+                    // perspective drifts, and RANSAC will start
+                    // over-fitting to whichever pocket still matches.
+                    // Bail to Idle so the harness re-acquires on the
+                    // current view instead of riding cumulative drift.
+                    if self.track_quality.degraded_frames >= self.config.degraded_max_frames {
+                        log::info!(
+                            "[engine] anchor {} degraded ({} consecutive frames < {} inliers); forcing re-acquire",
+                            anchor_id,
+                            self.track_quality.degraded_frames,
+                            self.config.degraded_inlier_threshold,
+                        );
+                        self.state = EngineState::Idle;
+                        self.track_quality.reset();
+                        return TrackerCommand::Idle;
+                    }
                     self.cache.touch(anchor_id);
                     if let Some(entry) = self.cache.get_mut(anchor_id) {
                         entry.last_locked_ns = timestamp_ns;
@@ -578,22 +635,26 @@ impl LivePlanarEngine {
                         frames_lost: 0,
                         last_homography: new_state_h,
                     };
+                    let canonical_rotation = self.quadrant_for_active(new_state_id);
                     return TrackerCommand::Locked {
                         anchor_id: root_id,
                         homography: h_root_to_view,
                         is_new: false,
                         inliers: r.inliers,
+                        canonical_rotation,
                     };
                 }
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
                     self.transition_to_locked(id, &alt, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &alt.homography);
+                    let canonical_rotation = self.quadrant_for_active(id);
                     return TrackerCommand::Locked {
                         anchor_id: root_id,
                         homography: h_root_to_view,
                         is_new: false,
                         inliers: alt.inliers,
+                        canonical_rotation,
                     };
                 }
                 let new_frames_lost = frames_lost + 1;
@@ -636,11 +697,13 @@ impl LivePlanarEngine {
                 if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                     self.transition_to_locked(id, &result, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
+                    let canonical_rotation = self.quadrant_for_active(id);
                     return TrackerCommand::Locked {
                         anchor_id: root_id,
                         homography: h_root_to_view,
                         is_new: false,
                         inliers: result.inliers,
+                        canonical_rotation,
                     };
                 }
                 let new_frames_lost = frames_lost + 1;
@@ -666,7 +729,7 @@ impl LivePlanarEngine {
     /// surface in place. Returns the new anchor id, or `None` if the
     /// frame had insufficient features.
     pub fn acquire_now(&mut self, gray: &GrayImage, timestamp_ns: u64) -> Option<AnchorId> {
-        self.acquire_inner(gray, &[], 0, timestamp_ns)
+        self.acquire_inner(gray, &[], 0, timestamp_ns, None)
     }
 
     /// Like [`acquire_now`] but restricts anchor features to those
@@ -681,7 +744,23 @@ impl LivePlanarEngine {
         pad_px: u32,
         timestamp_ns: u64,
     ) -> Option<AnchorId> {
-        self.acquire_inner(gray, regions, pad_px, timestamp_ns)
+        self.acquire_inner(gray, regions, pad_px, timestamp_ns, None)
+    }
+
+    /// Acquire variant that carries a pre-computed reading-direction
+    /// quadrant. Passing `None` for `estimated_quadrant` means the
+    /// orientation estimator either couldn't run or didn't reach
+    /// consensus; the engine then falls back to `last_known_quadrant`
+    /// (which itself starts as `EngineConfig.default_canonical_quadrant`).
+    pub fn acquire_now_with_orientation(
+        &mut self,
+        gray: &GrayImage,
+        regions: &[(u32, u32, u32, u32)],
+        pad_px: u32,
+        timestamp_ns: u64,
+        estimated_quadrant: Option<Quadrant>,
+    ) -> Option<AnchorId> {
+        self.acquire_inner(gray, regions, pad_px, timestamp_ns, estimated_quadrant)
     }
 
     fn acquire_inner(
@@ -690,6 +769,7 @@ impl LivePlanarEngine {
         regions: &[(u32, u32, u32, u32)],
         pad_px: u32,
         timestamp_ns: u64,
+        estimated_quadrant: Option<Quadrant>,
     ) -> Option<AnchorId> {
         if timestamp_ns < self.last_acquire_ns
             || timestamp_ns - self.last_acquire_ns < self.config.acquire_cooldown_ns
@@ -708,6 +788,13 @@ impl LivePlanarEngine {
         }
         let id = self.next_anchor_id;
         self.next_anchor_id += 1;
+        let canonical_rotation = match estimated_quadrant {
+            Some(q) => {
+                self.last_known_quadrant = q;
+                q
+            }
+            None => self.last_known_quadrant,
+        };
         self.cache.insert(
             id,
             CachedAnchor {
@@ -719,6 +806,7 @@ impl LivePlanarEngine {
                 h_root_to_canonical: IDENTITY,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
+                canonical_rotation,
             },
         );
         self.state = EngineState::Locked {
@@ -885,75 +973,47 @@ impl LivePlanarEngine {
             .unwrap_or(active_id)
     }
 
-    /// Compute the bbox of a set of keypoint positions in canonical
-    /// (anchor) coords. Returns (min_x, min_y, max_x, max_y).
-    fn keypoint_bbox(positions: &[(f32, f32)]) -> (f32, f32, f32, f32) {
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        for &(x, y) in positions {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-        }
-        (min_x, min_y, max_x, max_y)
+    /// Resolve the canonical reading-direction quadrant for an active
+    /// anchor: look up its root, then read the root's stored quadrant.
+    /// Falls back to `last_known_quadrant` if either lookup fails (e.g.
+    /// the root has been evicted from the cache).
+    fn quadrant_for_active(&self, active_id: AnchorId) -> Quadrant {
+        let root_id = self.root_of(active_id);
+        self.cache
+            .get(root_id)
+            .map(|a| a.canonical_rotation)
+            .unwrap_or(self.last_known_quadrant)
     }
 
-    /// Inlier-discontinuity sanity gate (fix A) + spatial-spread check.
+    /// Inlier-discontinuity sanity gate.
     ///
     /// Three outcomes per call:
-    ///   - *Accept*: fit looks fine (not a catastrophic drop, inliers
-    ///     well-spread over the anchor bbox). Push to history, update
-    ///     EMA, return the fit.
-    ///   - *Freeze*: fit is suspicious (count drop OR spatial cluster)
-    ///     and we have a last-accepted H within budget. Substitute the
-    ///     *frozen* last-accepted H instead of the suspicious fit. We
-    ///     don't extrapolate forward (that was fix #1; in practice the
-    ///     extrapolation overshoots on non-linear motion and drifts the
-    ///     overlay off-target). Don't advance history or EMA — the
-    ///     freeze baseline stays anchored to last-known-good
-    ///     observations.
-    ///   - *Reject*: fit is suspicious and we either have no history to
-    ///     freeze on, or we've already burned the substitution budget.
-    ///     Return None so the caller treats this like a matcher miss;
-    ///     `frames_lost` advances toward Lost via the normal path. We
-    ///     don't push the bad H to history (avoids "split" artefacts on
-    ///     the next frame) and don't update EMA (a wrong fit shouldn't
-    ///     drag the running average down and weaken the gate).
-    fn apply_sanity_gate(
-        &mut self,
-        r: TrackResult,
-        anchor_bbox: (f32, f32, f32, f32),
-    ) -> Option<TrackResult> {
+    ///   - *Accept*: inlier count is consistent with the running EMA.
+    ///     Push to history, update EMA, return the fit.
+    ///   - *Freeze*: count dropped catastrophically (wrong-basin fit
+    ///     or descriptor-collapse) and we have a last-accepted H
+    ///     within budget. Substitute the frozen H instead of the
+    ///     suspicious fit; don't advance history or EMA.
+    ///   - *Reject*: drop happened but we have no history or have
+    ///     burned the substitution budget. Return None so the caller
+    ///     treats this like a matcher miss; `frames_lost` advances
+    ///     toward Lost via the normal path.
+    fn apply_sanity_gate(&mut self, r: TrackResult) -> Option<TrackResult> {
         let cfg = &self.config;
         let new_inliers_f = r.inliers as f32;
         let ema = self.track_quality.inlier_ema.unwrap_or(new_inliers_f);
         let freeze_h = self.track_quality.h_prev;
-        let count_suspicious =
+        let suspicious =
             ema >= cfg.sanity_gate_min_ema && new_inliers_f < cfg.sanity_gate_drop_ratio * ema;
-        let coverage = bbox_coverage(r.inlier_anchor_bbox, anchor_bbox);
-        let spread_suspicious = coverage < cfg.sanity_gate_min_bbox_coverage;
-        let suspicious = count_suspicious || spread_suspicious;
         let can_freeze = self.track_quality.suspicious_frames < cfg.sanity_gate_max_consecutive
             && freeze_h.is_some();
-        let trigger = if count_suspicious && spread_suspicious {
-            "count+spread"
-        } else if count_suspicious {
-            "count"
-        } else {
-            "spread"
-        };
         if suspicious && can_freeze {
             self.track_quality.suspicious_frames += 1;
             let hf = freeze_h.expect("freeze_h is Some when can_freeze");
             log::info!(
-                "[sanity_gate] freeze (substitute with last accepted H): inliers={} ema={:.1} coverage={:.2} trigger={} run={}",
+                "[sanity_gate] freeze (substitute with last accepted H): inliers={} ema={:.1} run={}",
                 r.inliers,
                 ema,
-                coverage,
-                trigger,
                 self.track_quality.suspicious_frames,
             );
             Some(TrackResult {
@@ -970,11 +1030,9 @@ impl LivePlanarEngine {
                 )
             };
             log::info!(
-                "[sanity_gate] reject suspicious fit: inliers={} ema={:.1} coverage={:.2} trigger={} reason={}",
+                "[sanity_gate] reject suspicious fit: inliers={} ema={:.1} reason={}",
                 r.inliers,
                 ema,
-                coverage,
-                trigger,
                 reason,
             );
             self.track_quality.reset_ema_and_budget();
@@ -984,6 +1042,11 @@ impl LivePlanarEngine {
             self.track_quality
                 .update_ema(new_inliers_f, cfg.inlier_ema_alpha);
             self.track_quality.push_h(r.homography);
+            if r.inliers < cfg.degraded_inlier_threshold {
+                self.track_quality.degraded_frames += 1;
+            } else {
+                self.track_quality.degraded_frames = 0;
+            }
             Some(r)
         }
     }
@@ -1025,6 +1088,14 @@ impl LivePlanarEngine {
             let active = self.cache.get(active_id)?;
             (active.root_id, active.h_root_to_canonical)
         };
+        // Inherit canonical rotation from the chain's root, not the
+        // immediate parent. Keeps orientation pinned to the original
+        // acquire even across multiple handoffs.
+        let inherited_rotation = self
+            .cache
+            .get(root_id)
+            .map(|a| a.canonical_rotation)
+            .unwrap_or(self.last_known_quadrant);
         let new_anchor = build_anchor(gray, &self.config.tracker, timestamp_ns)?;
         if new_anchor.len() < self.config.tracker.min_inliers {
             return None;
@@ -1041,6 +1112,7 @@ impl LivePlanarEngine {
                 h_root_to_canonical: h_root_to_new,
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
+                canonical_rotation: inherited_rotation,
             },
         );
         self.last_spawn_ns = timestamp_ns;
@@ -1265,22 +1337,6 @@ fn visible_keypoint_ratio(positions: &[(f32, f32)], h: &[f32; 9], view_w: u32, v
 /// `lost_after_frames` consecutive rejects, transition to Lost
 /// (overlay hides, scene re-acquires when matcher recovers).
 const MAX_CORNER_JUMP_PX: f32 = 300.0;
-
-/// Fraction of `anchor_bbox`'s area covered by `inlier_bbox`. Returns
-/// 0.0 if the anchor bbox is degenerate. Clamped to [0, 1].
-fn bbox_coverage(inlier_bbox: (f32, f32, f32, f32), anchor_bbox: (f32, f32, f32, f32)) -> f32 {
-    let (imin_x, imin_y, imax_x, imax_y) = inlier_bbox;
-    let (amin_x, amin_y, amax_x, amax_y) = anchor_bbox;
-    let aw = (amax_x - amin_x).max(0.0);
-    let ah = (amax_y - amin_y).max(0.0);
-    if aw <= 0.0 || ah <= 0.0 {
-        return 0.0;
-    }
-    let iw = (imax_x - imin_x).max(0.0);
-    let ih = (imax_y - imin_y).max(0.0);
-    let coverage = (iw * ih) / (aw * ah);
-    coverage.clamp(0.0, 1.0)
-}
 
 /// True when the corner displacement between `h_new` and `h_prev`
 /// projected over the canonical rect stays below

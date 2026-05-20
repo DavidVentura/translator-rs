@@ -895,31 +895,51 @@ pub fn group_lines_into_paragraphs(
 /// Live camera overlays see more centered packaging/signage text than document paragraphs.
 /// This keeps the conservative document grouper intact and adds a simpler visual grouping pass
 /// for stacked, center-aligned labels such as product names and compact package claims.
+///
+/// R0-axis variant — equivalent to
+/// `group_live_lines_into_blocks_in_quadrant(lines, Quadrant::R0)`. Kept
+/// as a no-arg shim for callers that don't yet know about the scene
+/// canonical quadrant (still-image OCR, legacy tests, doc-style pages).
 pub fn group_live_lines_into_blocks(lines: Vec<TextLine>) -> Vec<TextBlock> {
+    group_live_lines_into_blocks_in_quadrant(lines, crate::coords::Quadrant::R0)
+}
+
+/// Same as `group_live_lines_into_blocks` but expresses the sort key and
+/// merge predicate in the **canonical reading frame**. Necessary for
+/// scenes captured with the camera rotated 90° / 180° / 270°: in image
+/// coords the lines stack along a non-`+y` axis, so a sort by image-y and
+/// a merge predicate based on `cy ± height/2` gap give the wrong block
+/// order (180° reverses, 270° re-orders) and the wrong merge decision
+/// (90° puts each line in its own block because their AABB heights look
+/// like wide separators rather than tight stacked rows).
+///
+/// Implementation: project each line's center onto the paragraph axis
+/// (perpendicular to reading direction in image coords) and onto the
+/// reading axis. Lines in canonical reading order have increasing
+/// paragraph-axis projection.
+pub fn group_live_lines_into_blocks_in_quadrant(
+    lines: Vec<TextLine>,
+    canonical_quadrant: crate::coords::Quadrant,
+) -> Vec<TextBlock> {
     if lines.is_empty() {
         return Vec::new();
     }
 
+    let theta = canonical_quadrant.radians();
+    let sort_key = |l: &TextLine| (canonical_v(l, theta), canonical_u(l, theta));
+
     let mut ordered = lines;
     ordered.sort_by(|a, b| {
-        tight_top(a)
-            .partial_cmp(&tight_top(b))
+        let (va, ua) = sort_key(a);
+        let (vb, ub) = sort_key(b);
+        va.partial_cmp(&vb)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                tight_left(a)
-                    .partial_cmp(&tight_left(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .then_with(|| ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    // Union-find over all-pairs mergeability. Sequential-pairwise
-    // chain-walking breaks the body paragraph any time a small
-    // detection (line-trailing fragment, marginal note, footnote
-    // ref) sits at an intermediate y between two body lines: the
-    // body→fragment and fragment→body checks both fail, so the
-    // body line below the fragment starts its own block. Switching
-    // to connected components lets body lines connect directly to
-    // each other across interleaved short content.
+    // Union-find over all-pairs mergeability. Same connected-components
+    // strategy as the R0 grouper; only the per-pair merge predicate
+    // changes for non-R0 scenes.
     let n = ordered.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -931,7 +951,7 @@ pub fn group_live_lines_into_blocks(lines: Vec<TextLine>) -> Vec<TextBlock> {
     }
     for i in 0..n {
         for j in (i + 1)..n {
-            if live_lines_should_merge(&ordered[i], &ordered[j]) {
+            if live_lines_should_merge_in_quadrant(&ordered[i], &ordered[j], canonical_quadrant) {
                 let ri = find(&mut parent, i);
                 let rj = find(&mut parent, j);
                 if ri != rj {
@@ -954,15 +974,50 @@ pub fn group_live_lines_into_blocks(lines: Vec<TextLine>) -> Vec<TextBlock> {
         .into_values()
         .map(|lines| TextBlock { lines })
         .collect();
+    // Order blocks by their min paragraph-axis projection, then by min
+    // reading-axis projection. Same intent as the R0 sort but in
+    // canonical coords.
     blocks.sort_by(|a, b| {
-        let ta = a.lines.iter().map(tight_top).fold(f32::INFINITY, f32::min);
-        let tb = b.lines.iter().map(tight_top).fold(f32::INFINITY, f32::min);
-        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+        let va = a
+            .lines
+            .iter()
+            .map(|l| canonical_v(l, theta))
+            .fold(f32::INFINITY, f32::min);
+        let vb = b
+            .lines
+            .iter()
+            .map(|l| canonical_v(l, theta))
+            .fold(f32::INFINITY, f32::min);
+        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
     });
     blocks
 }
 
+/// Reading-axis projection of a line's center: `cx*cos(θ) + cy*sin(θ)`.
+fn canonical_u(line: &TextLine, theta: f32) -> f32 {
+    line.tight_box.cx * theta.cos() + line.tight_box.cy * theta.sin()
+}
+
+/// Paragraph-axis projection of a line's center: `-cx*sin(θ) + cy*cos(θ)`.
+/// In all four quadrants, lines later in reading order have larger `v`.
+fn canonical_v(line: &TextLine, theta: f32) -> f32 {
+    -line.tight_box.cx * theta.sin() + line.tight_box.cy * theta.cos()
+}
+
 pub fn live_lines_should_merge(prev: &TextLine, next: &TextLine) -> bool {
+    live_lines_should_merge_in_quadrant(prev, next, crate::coords::Quadrant::R0)
+}
+
+/// Same as `live_lines_should_merge` but performs all geometric checks
+/// in the canonical reading frame. Gap is measured along the paragraph
+/// axis (`v`); column alignment along the reading axis (`u`). Heights
+/// (cross-line) and widths (reading-axis extents) come straight from
+/// `tight_box` since those are already in reading-axis-aligned coords.
+pub fn live_lines_should_merge_in_quadrant(
+    prev: &TextLine,
+    next: &TextLine,
+    canonical_quadrant: crate::coords::Quadrant,
+) -> bool {
     if is_live_measurement_token(prev.text.trim()) || is_live_measurement_token(next.text.trim()) {
         return false;
     }
@@ -973,20 +1028,39 @@ pub fn live_lines_should_merge(prev: &TextLine, next: &TextLine) -> bool {
     let small_h = prev_h.min(next_h);
     let height_ratio = big_h / small_h;
 
-    let gap = tight_top(next) - tight_bottom(prev);
-    if gap < -big_h * 0.75 || gap > big_h * 4.25 {
+    let theta = canonical_quadrant.radians();
+    let prev_u = canonical_u(prev, theta);
+    let next_u = canonical_u(next, theta);
+    let prev_v = canonical_v(prev, theta);
+    let next_v = canonical_v(next, theta);
+
+    // Gap along the paragraph axis. `next_v - prev_v` is signed; a
+    // negative gap means the lines overlap on the paragraph axis (or
+    // were passed in non-canonical order). Both directions are valid
+    // for merging within tolerance.
+    let canonical_gap = (next_v - prev_v).abs() - (prev_h + next_h) * 0.5;
+    if canonical_gap < -big_h * 0.75 || canonical_gap > big_h * 4.25 {
         return false;
     }
 
     let max_w = prev.tight_box.width.max(next.tight_box.width).max(1.0);
     let min_w = prev.tight_box.width.min(next.tight_box.width).max(1.0);
-    let center_aligned = (prev.tight_box.cx - next.tight_box.cx).abs() <= max_w * 0.25;
+
+    // Column alignment is measured along the *reading* axis: center
+    // alignment is about how much the line midpoints differ in `u`;
+    // left/right alignment is about how the (u - width/2) and
+    // (u + width/2) edges line up.
+    let center_aligned = (prev_u - next_u).abs() <= max_w * 0.25;
     let edge_tol = big_h * 2.0;
     let similar_width = max_w / min_w <= 1.8;
-    let left_aligned = similar_width && (tight_left(prev) - tight_left(next)).abs() <= edge_tol;
-    let right_aligned = similar_width && (tight_right(prev) - tight_right(next)).abs() <= edge_tol;
-    let strongly_centered = (prev.tight_box.cx - next.tight_box.cx).abs() <= max_w * 0.12;
-    let very_close = gap <= big_h * 1.25;
+    let prev_left = prev_u - prev.tight_box.width * 0.5;
+    let next_left = next_u - next.tight_box.width * 0.5;
+    let prev_right = prev_u + prev.tight_box.width * 0.5;
+    let next_right = next_u + next.tight_box.width * 0.5;
+    let left_aligned = similar_width && (prev_left - next_left).abs() <= edge_tol;
+    let right_aligned = similar_width && (prev_right - next_right).abs() <= edge_tol;
+    let strongly_centered = (prev_u - next_u).abs() <= max_w * 0.12;
+    let very_close = canonical_gap <= big_h * 1.25;
 
     let height_compatible =
         height_ratio <= 1.8 || (height_ratio <= 2.2 && strongly_centered && very_close);

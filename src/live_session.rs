@@ -806,6 +806,7 @@ pub trait LiveRecognizer {
         oriented: &OrientedImage,
         boxes: &[DetectedTextBox],
         source_selection: &OcrSourceSelection,
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<RecognizedTextLine>, String>;
 }
 
@@ -829,9 +830,15 @@ impl LiveRecognizer for &crate::session::TranslatorSession {
         oriented: &OrientedImage,
         boxes: &[DetectedTextBox],
         source_selection: &OcrSourceSelection,
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<RecognizedTextLine>, String> {
         (*self)
-            .recognize_in_oriented_image(oriented, boxes, source_selection.clone())
+            .recognize_in_oriented_image(
+                oriented,
+                boxes,
+                source_selection.clone(),
+                canonical_quadrant,
+            )
             .map_err(|e| format!("{e:?}"))
     }
 }
@@ -882,6 +889,193 @@ impl LiveTranslator for NoopTranslator {
     }
 }
 
+/// Estimate the scene's reading-direction quadrant from a freshly-detected
+/// set of text boxes. Runs the textline orientation classifier twice per
+/// candidate strip (raw + CW90) so the binary 0°/180° model resolves the
+/// full 90° quadrant; per-strip votes are aggregated with confidence,
+/// quorum, and majority gates. Returns `None` if the classifier model
+/// isn't installed, no wide strips qualified, or consensus didn't reach
+/// the gate.
+///
+/// Pure relative to its arguments: no engine state is mutated. The caller
+/// (the platform acquire path) feeds the result into
+/// `LivePlanarEngine::acquire_now_with_orientation`.
+#[cfg(feature = "ppocr")]
+pub fn estimate_canonical_quadrant(
+    engine: &crate::ppocr::PpocrEngine,
+    image: &image::DynamicImage,
+    gray: &image::GrayImage,
+    boxes: &[DetectedTextBox],
+) -> Option<crate::coords::Quadrant> {
+    use crate::coords::Quadrant;
+    use crate::ppocr::TextlineOriLabel;
+
+    const MIN_LONG_TO_SHORT: f32 = 3.0;
+    const MIN_LONG_PX: f32 = 40.0;
+    const MIN_DET_SCORE: f32 = 0.5;
+    const TOP_N: usize = 10;
+    const PER_STRIP_MIN_CONF: f32 = 0.6;
+    const MIN_VOTES: usize = 3;
+    const MAJORITY_RATIO: f32 = 0.6;
+    const WINNER_AVG_CONF_MIN: f32 = 0.75;
+
+    if !engine.has_textline_orientation() || boxes.is_empty() {
+        return None;
+    }
+
+    let mut wide: Vec<(usize, f32)> = boxes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let long = b.oriented_box.width.max(b.oriented_box.height);
+            let short = b.oriented_box.width.min(b.oriented_box.height);
+            if short <= 0.0 || long < MIN_LONG_PX || b.score < MIN_DET_SCORE {
+                return None;
+            }
+            if long / short < MIN_LONG_TO_SHORT {
+                return None;
+            }
+            Some((i, long))
+        })
+        .collect();
+    wide.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    wide.truncate(TOP_N);
+    if wide.is_empty() {
+        log::debug!(
+            "[estimate_canonical_quadrant] no wide-enough boxes among {} detections",
+            boxes.len()
+        );
+        return None;
+    }
+
+    let subset: Vec<DetectedTextBox> = wide.iter().map(|(i, _)| boxes[*i].clone()).collect();
+    // AABB crops, NOT dewarped strips. Dewarp PCA-aligns content to the
+    // strip's local frame, which throws away the camera-frame orientation
+    // signal we're trying to estimate here — every dewarped strip would
+    // look "horizontal" to the classifier regardless of how the page is
+    // rotated. AABB preserves the camera frame; the raw + CW90 candidate
+    // pair below then resolves R0 / R90 / R180 / R270 properly.
+    let _ = gray;
+    let raw_strips: Vec<image::DynamicImage> = subset
+        .iter()
+        .map(|b| {
+            let w = b.rect.right.saturating_sub(b.rect.left).max(1);
+            let h = b.rect.bottom.saturating_sub(b.rect.top).max(1);
+            image.crop_imm(b.rect.left, b.rect.top, w, h)
+        })
+        .collect();
+    if raw_strips.is_empty() {
+        return None;
+    }
+
+    let raw_labels = match engine.textline_orientation_classify(&raw_strips) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("[estimate_canonical_quadrant] raw classify failed: {e:?}");
+            return None;
+        }
+    };
+    let rotated_strips: Vec<image::DynamicImage> =
+        raw_strips.iter().map(|s| s.rotate90()).collect();
+    let rot_labels = match engine.textline_orientation_classify(&rotated_strips) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("[estimate_canonical_quadrant] rotated classify failed: {e:?}");
+            return None;
+        }
+    };
+
+    // Per-strip argmax across the 4 candidates. Mapping derived from:
+    // applying a CW 90° rotation to a strip whose content reads in
+    // direction Q makes the rotated strip read in direction Q + R90.
+    //   raw model "Up"         ⇒ content reads R0  in original strip
+    //   raw model "Flipped180" ⇒ content reads R180 in original strip
+    //   rot model "Up"         ⇒ rotated reads R0 ⇒ original reads R270
+    //   rot model "Flipped180" ⇒ rotated reads R180 ⇒ original reads R90
+    let mut votes: Vec<(Quadrant, f32)> = Vec::with_capacity(raw_strips.len());
+    for (raw, rot) in raw_labels.iter().zip(rot_labels.iter()) {
+        let candidates: [Option<(Quadrant, f32)>; 2] = [
+            raw.as_ref().map(|c| {
+                let q = match c.label {
+                    TextlineOriLabel::Up => Quadrant::R0,
+                    TextlineOriLabel::Flipped180 => Quadrant::R180,
+                };
+                (q, c.score)
+            }),
+            rot.as_ref().map(|c| {
+                let q = match c.label {
+                    TextlineOriLabel::Up => Quadrant::R270,
+                    TextlineOriLabel::Flipped180 => Quadrant::R90,
+                };
+                (q, c.score)
+            }),
+        ];
+        let best = candidates
+            .iter()
+            .filter_map(|x| *x)
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(b) = best {
+            if b.1 >= PER_STRIP_MIN_CONF {
+                votes.push(b);
+            }
+        }
+    }
+
+    if votes.len() < MIN_VOTES {
+        log::debug!(
+            "[estimate_canonical_quadrant] only {} confident votes (need {})",
+            votes.len(),
+            MIN_VOTES
+        );
+        return None;
+    }
+
+    let mut counts: [(Quadrant, f32, usize); 4] = [
+        (Quadrant::R0, 0.0, 0),
+        (Quadrant::R90, 0.0, 0),
+        (Quadrant::R180, 0.0, 0),
+        (Quadrant::R270, 0.0, 0),
+    ];
+    for (q, conf) in &votes {
+        let idx = match q {
+            Quadrant::R0 => 0,
+            Quadrant::R90 => 1,
+            Quadrant::R180 => 2,
+            Quadrant::R270 => 3,
+        };
+        counts[idx].1 += conf;
+        counts[idx].2 += 1;
+    }
+    let (winner, sum_conf, winner_count) = counts.iter().copied().max_by_key(|c| c.2)?;
+    let majority = (winner_count as f32) / (votes.len() as f32);
+    if majority < MAJORITY_RATIO {
+        log::debug!(
+            "[estimate_canonical_quadrant] no majority: winner {:?} {}/{}",
+            winner,
+            winner_count,
+            votes.len()
+        );
+        return None;
+    }
+    let avg_conf = sum_conf / winner_count.max(1) as f32;
+    if avg_conf < WINNER_AVG_CONF_MIN {
+        log::debug!(
+            "[estimate_canonical_quadrant] winner avg conf too low: {:?} avg={:.3}",
+            winner,
+            avg_conf
+        );
+        return None;
+    }
+    log::debug!(
+        "[estimate_canonical_quadrant] winner={:?} votes={}/{} avg_conf={:.3}",
+        winner,
+        winner_count,
+        votes.len(),
+        avg_conf
+    );
+    Some(winner)
+}
+
 /// Inputs to [`LiveSession::run_post_detect`]. The orchestrator owns
 /// per-line state internally; callers only thread inputs and pull a
 /// summary out.
@@ -912,6 +1106,11 @@ pub struct PostDetectInput<'a> {
     /// Translate-block batch size. Production uses 4; sim may pick a
     /// smaller value to keep per-frame work bounded.
     pub rec_batch_size: usize,
+    /// The active anchor's canonical reading-direction quadrant. `None`
+    /// when not running against a tracked anchor (still-image flow, or
+    /// the orientation estimator has never produced consensus and there
+    /// is no fallback yet).
+    pub canonical_quadrant: Option<crate::coords::Quadrant>,
 }
 
 /// Result of [`LiveSession::run_post_detect`].
@@ -967,7 +1166,7 @@ impl LiveSession {
 
         // Project tight_boxes into surface coords (identity when
         // h_view_to_surface is None).
-        let surface_boxes: Vec<OrientedRect> = match input.h_view_to_surface {
+        let mut surface_boxes: Vec<OrientedRect> = match input.h_view_to_surface {
             None => input
                 .detections
                 .iter()
@@ -981,6 +1180,54 @@ impl LiveSession {
                 })
                 .collect(),
         };
+        // Snap each box's principal-axis angle to the full reading
+        // direction. `oriented_boxes_from_contour` only resolves the
+        // angle modulo π (it can't tell `+x` from `-x` reading), so
+        // overlay rendering would draw glyphs along `+x` even for
+        // a 180°-rotated page. With the scene-level
+        // `canonical_quadrant` we know which side of the principal
+        // axis is reading-up, and we can flip the angle by π when it
+        // disagrees. Perpendicular boxes (sideways callouts) keep
+        // their own angle.
+        if let Some(canon) = input.canonical_quadrant {
+            let canonical_radians = canon.radians();
+            let mut snapped_to_canonical = 0usize;
+            let mut snapped_by_pi = 0usize;
+            let mut left_perp = 0usize;
+            for sb in surface_boxes.iter_mut() {
+                let before = sb.angle_radians;
+                let after = align_angle_to_canonical(before, canonical_radians);
+                if (after - before).abs() < 1e-3 {
+                    let two_pi = 2.0 * std::f32::consts::PI;
+                    let diff = (canonical_radians - before).rem_euclid(two_pi);
+                    if diff < std::f32::consts::FRAC_PI_4
+                        || diff > 7.0 * std::f32::consts::FRAC_PI_4
+                    {
+                        snapped_to_canonical += 1;
+                    } else {
+                        left_perp += 1;
+                    }
+                } else {
+                    snapped_by_pi += 1;
+                }
+                sb.angle_radians = after;
+            }
+            log::info!(
+                "[run_post_detect] anchor={} canonical={:?} ({:.3} rad) | snap: kept_aligned={} flipped_pi={} left_perp={} of {}",
+                input.anchor_id,
+                canon,
+                canonical_radians,
+                snapped_to_canonical,
+                snapped_by_pi,
+                left_perp,
+                surface_boxes.len(),
+            );
+        } else {
+            log::info!(
+                "[run_post_detect] anchor={} canonical=None — no angle snap (will use principal-axis modulo π for overlay rendering)",
+                input.anchor_id,
+            );
+        }
 
         let outcomes = self.observe_detections(input.anchor_id, &surface_boxes, input.from_lang);
 
@@ -1064,7 +1311,12 @@ impl LiveSession {
                 },
                 Err(_) => Vec::new(),
             };
-            let groups = group_surface_lines_into_blocks(&snapshot_lines);
+            let groups = group_surface_lines_into_blocks_in_quadrant(
+                &snapshot_lines,
+                input
+                    .canonical_quadrant
+                    .unwrap_or(crate::coords::Quadrant::R0),
+            );
             block_strip_indices = groups
                 .iter()
                 .map(|g| {
@@ -1196,7 +1448,12 @@ impl LiveSession {
             let lines = if batch_boxes.is_empty() {
                 Vec::new()
             } else {
-                match recognizer.recognize(input.oriented, &batch_boxes, &source_selection) {
+                match recognizer.recognize(
+                    input.oriented,
+                    &batch_boxes,
+                    &source_selection,
+                    input.canonical_quadrant,
+                ) {
                     Ok(l) => l,
                     Err(e) => {
                         log::warn!("[post_detect] recognize failed: {e}");
@@ -1438,6 +1695,41 @@ fn pick_matted_for_block(
 
 /// Project an `OrientedRect` through the homography `h` by projecting
 /// each corner and re-fitting an `OrientedRect` from the resulting
+/// Pull a box's principal-axis angle to the right side of the scene's
+/// canonical reading direction.
+///
+/// `oriented_boxes_from_contour` only resolves the angle modulo π — it
+/// can't tell apart "text reading +x" from "text reading -x" since the
+/// contour shape is identical. For a 180°-rotated or 270°-rotated
+/// scene, every box's angle ends up on the wrong side of the principal
+/// axis and the overlay renderer draws glyphs in the original-reading
+/// direction (so they appear upside down).
+///
+/// With the scene-level `canonical_radians` (from
+/// `estimate_canonical_quadrant`) we know which side of the principal
+/// axis is "reading-up", and can flip the angle by π when the input
+/// disagrees. Perpendicular boxes (sideways callouts in an otherwise
+/// horizontally-oriented page) are left alone — they're already on a
+/// different axis and overriding them would break their layout.
+pub fn align_angle_to_canonical(angle: f32, canonical_radians: f32) -> f32 {
+    use std::f32::consts::{FRAC_PI_4, PI};
+    let two_pi = 2.0 * PI;
+    let diff = (canonical_radians - angle).rem_euclid(two_pi);
+    // diff ∈ [0, 2π).
+    if diff < FRAC_PI_4 || diff > 7.0 * FRAC_PI_4 {
+        // Within ±π/4 of canonical → already aligned.
+        angle
+    } else if diff > 3.0 * FRAC_PI_4 && diff < 5.0 * FRAC_PI_4 {
+        // Within ±π/4 of canonical+π → 180° flipped, snap by +π.
+        angle + PI
+    } else {
+        // Perpendicular axis (~ canonical ±π/2). Likely a sideways
+        // element in an otherwise canonically-oriented scene; keep
+        // its own angle so its overlay still lines up with it.
+        angle
+    }
+}
+
 /// quad. For mild homographies (pan/zoom/in-plane rotation) the
 /// projected quad is near-rectangular; we approximate with the
 /// centroid + averaged edge direction + averaged side lengths. Returns
@@ -1889,9 +2181,22 @@ pub fn render_block_bitmap(
 }
 
 /// Group `SurfaceLine`s into translation blocks (paragraphs) via the
-/// shared OCR grouping. Returns indices into the input slice.
+/// shared OCR grouping. Returns indices into the input slice. R0
+/// variant kept for callers that don't track a scene canonical
+/// quadrant.
 pub fn group_surface_lines_into_blocks(
     lines: &[crate::surface_map::SurfaceLine],
+) -> Vec<Vec<usize>> {
+    group_surface_lines_into_blocks_in_quadrant(lines, crate::coords::Quadrant::R0)
+}
+
+/// Canonical-quadrant-aware variant: routes through
+/// `crate::ocr::group_live_lines_into_blocks_in_quadrant` so that scenes
+/// captured with the camera rotated produce blocks in the page's actual
+/// reading order rather than image-y order.
+pub fn group_surface_lines_into_blocks_in_quadrant(
+    lines: &[crate::surface_map::SurfaceLine],
+    canonical_quadrant: crate::coords::Quadrant,
 ) -> Vec<Vec<usize>> {
     use crate::ocr::TextLine;
     if lines.is_empty() {
@@ -1907,7 +2212,8 @@ pub fn group_surface_lines_into_blocks(
             word_rects: Vec::new(),
         })
         .collect();
-    let blocks = crate::ocr::group_live_lines_into_blocks(text_lines);
+    let blocks =
+        crate::ocr::group_live_lines_into_blocks_in_quadrant(text_lines, canonical_quadrant);
     blocks
         .into_iter()
         .map(|b| {

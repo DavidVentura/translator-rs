@@ -6,7 +6,7 @@ pub mod bergamot;
 pub mod catalog;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod color_matting;
-#[cfg(feature = "planar-tracker")]
+#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod coords;
 #[cfg(feature = "doc-align")]
 pub mod doc_align;
@@ -22,8 +22,6 @@ pub mod homography;
 pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub mod image_render;
-#[cfg(feature = "planar-tracker")]
-pub mod imu_prior;
 #[cfg(feature = "doc-align")]
 mod inference;
 pub mod language;

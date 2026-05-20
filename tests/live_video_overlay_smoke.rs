@@ -76,6 +76,7 @@ fn video_frames_drive_live_overlay_pipeline() {
     let ppocr = PpocrEngine::load(
         &model.det,
         None,
+        None,
         vec![PpocrRecognizerSpec {
             script: model.script,
             model_path: model.rec,
@@ -294,6 +295,7 @@ fn video_frames_drive_live_overlay_pipeline() {
                     font_provider: &font_provider,
                     matted_strips: &[],
                     rec_batch_size: env_usize("LIVE_VIDEO_REC_BATCH_SIZE").unwrap_or(8),
+                    canonical_quadrant: None,
                 },
                 &recognizer,
                 &translator,
@@ -584,12 +586,20 @@ impl LiveRecognizer for PpocrLiveRecognizer<'_> {
         oriented: &OrientedImage,
         boxes: &[DetectedTextBox],
         _source_selection: &OcrSourceSelection,
+        canonical_quadrant: Option<translator::coords::Quadrant>,
     ) -> Result<Vec<RecognizedTextLine>, String> {
         let rgb = oriented.rgb.as_ref().expect("recognize requires rgb");
         let gray = image::imageops::grayscale(&rgb.to_rgb8());
         let scripts = vec![self.script; boxes.len()];
         self.engine
-            .recognize_text_in_boxes_image(rgb, &gray, boxes, &scripts, PpocrProfile::Live)
+            .recognize_text_in_boxes_image(
+                rgb,
+                &gray,
+                boxes,
+                &scripts,
+                PpocrProfile::Live,
+                canonical_quadrant,
+            )
             .map_err(|e| format!("{e:?}"))
     }
 }

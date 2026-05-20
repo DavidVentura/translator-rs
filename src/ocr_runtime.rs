@@ -182,7 +182,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let scripts = match source_selection {
         OcrSourceSelection::Auto => {
             let predictions = ppocr
-                .classify_text_boxes_image(rgb, &gray_display, &det_boxes)
+                .classify_text_boxes_image(rgb, &gray_display, &det_boxes, None)
                 .map_err(|e| {
                     TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
                 })?;
@@ -201,6 +201,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
             &det_boxes,
             &scripts,
             PpocrProfile::Still,
+            None,
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
