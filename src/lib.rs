@@ -24,6 +24,8 @@ pub mod html_translate;
 pub mod image_render;
 #[cfg(feature = "doc-align")]
 mod inference;
+#[cfg(feature = "planar-tracker")]
+pub mod klt;
 pub mod language;
 pub mod language_detect;
 #[cfg(feature = "planar-tracker")]

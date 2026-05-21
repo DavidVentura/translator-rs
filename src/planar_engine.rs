@@ -13,9 +13,10 @@ use image::GrayImage;
 
 use crate::coords::Quadrant;
 use crate::homography::mat3_mul;
+use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
-    track_against_anchor, track_against_anchor_with_prior,
+    track_against_anchor, track_against_anchor_with_prior_and_extra,
 };
 
 #[cfg(feature = "image-render")]
@@ -249,7 +250,23 @@ pub struct LivePlanarEngine {
     /// usable fit (Idle/Lost/no-match). Read by diagnostics & smoke
     /// harnesses; not used by the engine itself.
     last_track_result: Option<TrackResult>,
+    /// KLT propagation state: previous-frame gray pyramid + the
+    /// `(anchor_pt, prev_view_pt)` correspondences we want to track
+    /// forward into the next frame. Reset on anchor change / Lost.
+    klt_state: Option<KltFrameState>,
 }
+
+/// Per-anchor KLT propagation snapshot. Carried across frames so the
+/// next frame's tracker call can prepend sub-pixel correspondences to
+/// the descriptor-matched pairs before RANSAC.
+struct KltFrameState {
+    anchor_id: AnchorId,
+    prev_pyramid: Pyramid,
+    /// Bounded to the top-N inliers from the last accepted fit.
+    inlier_pairs: Vec<(f32, f32, f32, f32)>,
+}
+
+const KLT_MAX_SEEDS: usize = 80;
 
 /// Single-step history of accepted `H_anchor→view` for the active anchor,
 /// plus a running EMA of accepted inlier counts. Drives the inlier-
@@ -433,6 +450,7 @@ impl LivePlanarEngine {
             track_quality: TrackQualityState::new(),
             last_known_quadrant: default_quadrant,
             last_track_result: None,
+            klt_state: None,
         }
     }
 
@@ -492,6 +510,7 @@ impl LivePlanarEngine {
                 if !self.cache.is_empty() {
                     if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                         self.last_track_result = Some(result.clone());
+                        self.refresh_klt_state(id, &Pyramid::build(gray, 3), &result.inlier_pairs);
                         self.transition_to_locked(id, &result, timestamp_ns, false);
                         let (root_id, h_root_to_view) =
                             self.chain_homography(id, &result.homography);
@@ -505,6 +524,7 @@ impl LivePlanarEngine {
                         };
                     }
                 }
+                self.clear_klt_state();
                 if self.is_stable_enough(timestamp_ns) {
                     TrackerCommand::Acquiring
                 } else {
@@ -539,14 +559,22 @@ impl LivePlanarEngine {
                 // rotation is small.
                 let keep_min = self.config.tracker.min_inliers_keep_locked;
                 let seed_prior = prior.or(Some(last_homography));
+                // KLT propagation: track the previous frame's inliers
+                // forward into the current frame. The successful
+                // sub-pixel correspondences are prepended to the
+                // descriptor matches so PROSAC's early phases sample
+                // them first.
+                let cur_pyramid = Pyramid::build(gray, 3);
+                let klt_extras = self.collect_klt_extras(anchor_id, &cur_pyramid);
                 let result = self.cache.get(anchor_id).and_then(|a| {
                     let dims = a.anchor.image_dims;
-                    let brute = track_against_anchor_with_prior(
+                    let brute = track_against_anchor_with_prior_and_extra(
                         &a.anchor,
                         gray,
                         &self.config.tracker,
                         keep_min,
                         seed_prior,
+                        &klt_extras,
                     );
                     match brute {
                         None => {
@@ -577,6 +605,7 @@ impl LivePlanarEngine {
                 let result = result.and_then(|r| self.apply_sanity_gate(r));
                 if let Some(r) = result {
                     self.last_track_result = Some(r.clone());
+                    self.refresh_klt_state(anchor_id, &cur_pyramid, &r.inlier_pairs);
                     // Sustained inlier decline: the anchor's
                     // descriptors are losing correspondences as
                     // perspective drifts, and RANSAC will start
@@ -635,7 +664,15 @@ impl LivePlanarEngine {
                     .approx_scale();
                     let scale_log = if scale > 0.0 { scale.ln().abs() } else { 0.0 };
                     let scale_changed = scale_log > self.config.handoff_scale_log_threshold;
-                    let needs_handoff = r.inliers < self.config.handoff_min_inliers
+                    // Use descriptor-only inliers for the handoff
+                    // trigger: KLT-propagated correspondences make the
+                    // total inlier count look healthy even while the
+                    // descriptor matcher is degrading (scale drift past
+                    // BRIEF's invariance, blur, etc.) and the anchor
+                    // genuinely needs replacement. Counting total
+                    // inliers here masks that degradation and starves
+                    // handoffs until the matcher cliffs entirely.
+                    let needs_handoff = r.descriptor_inliers < self.config.handoff_min_inliers
                         || visible_ratio < self.config.handoff_min_visible_ratio
                         || scale_changed;
                     // Defer handoff while the matcher is still recovering
@@ -678,6 +715,7 @@ impl LivePlanarEngine {
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
                     self.last_track_result = Some(alt.clone());
+                    self.refresh_klt_state(id, &cur_pyramid, &alt.inlier_pairs);
                     self.transition_to_locked(id, &alt, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &alt.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
@@ -689,6 +727,11 @@ impl LivePlanarEngine {
                         canonical_rotation,
                     };
                 }
+                // Matcher failed AND no cached sibling caught the frame:
+                // the previous anchor's KLT seeds are no longer reliable
+                // (we don't know where features are now). Clear to avoid
+                // poisoning the next frame's RANSAC pool.
+                self.clear_klt_state();
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(anchor_id);
                 log::info!(
@@ -728,6 +771,7 @@ impl LivePlanarEngine {
             } => {
                 if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                     self.last_track_result = Some(result.clone());
+                    self.refresh_klt_state(id, &Pyramid::build(gray, 3), &result.inlier_pairs);
                     self.transition_to_locked(id, &result, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
@@ -739,6 +783,7 @@ impl LivePlanarEngine {
                         canonical_rotation,
                     };
                 }
+                self.clear_klt_state();
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(last_anchor_id);
                 if new_frames_lost >= self.config.give_up_after_frames {
@@ -755,6 +800,64 @@ impl LivePlanarEngine {
                 }
             }
         }
+    }
+
+    /// Track the previous frame's inlier view-positions into the
+    /// current frame using pyramidal LK. Returns sub-pixel
+    /// correspondences ready to feed RANSAC alongside the descriptor
+    /// matches. Returns empty when there's no prior state for this
+    /// anchor or the frame dimensions changed.
+    fn collect_klt_extras(
+        &self,
+        anchor_id: AnchorId,
+        cur_pyramid: &Pyramid,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let Some(state) = self.klt_state.as_ref() else {
+            return Vec::new();
+        };
+        if state.anchor_id != anchor_id || state.inlier_pairs.is_empty() {
+            return Vec::new();
+        }
+        if state.prev_pyramid.levels[0].dimensions() != cur_pyramid.levels[0].dimensions() {
+            return Vec::new();
+        }
+        let prev_view_pts: Vec<(f32, f32)> = state
+            .inlier_pairs
+            .iter()
+            .map(|&(_, _, vx, vy)| (vx, vy))
+            .collect();
+        let cfg = KltConfig::default();
+        let tracked = track_points(&state.prev_pyramid, cur_pyramid, &prev_view_pts, &cfg);
+        let mut out = Vec::with_capacity(state.inlier_pairs.len());
+        for (orig, t) in state.inlier_pairs.iter().zip(tracked.iter()) {
+            if t.success {
+                out.push((orig.0, orig.1, t.x, t.y));
+            }
+        }
+        out
+    }
+
+    fn refresh_klt_state(
+        &mut self,
+        anchor_id: AnchorId,
+        cur_pyramid: &Pyramid,
+        inlier_pairs: &[(f32, f32, f32, f32)],
+    ) {
+        if inlier_pairs.is_empty() {
+            self.klt_state = None;
+            return;
+        }
+        let seeds: Vec<(f32, f32, f32, f32)> =
+            inlier_pairs.iter().take(KLT_MAX_SEEDS).cloned().collect();
+        self.klt_state = Some(KltFrameState {
+            anchor_id,
+            prev_pyramid: cur_pyramid.clone(),
+            inlier_pairs: seeds,
+        });
+    }
+
+    fn clear_klt_state(&mut self) {
+        self.klt_state = None;
     }
 
     /// Force-acquire a new scene anchor from `gray`. Use this when
@@ -1074,12 +1177,14 @@ impl LivePlanarEngine {
             None
         } else {
             self.track_quality.suspicious_frames = 0;
-            self.track_quality.consecutive_clean_frames =
-                self.track_quality.consecutive_clean_frames.saturating_add(1);
+            self.track_quality.consecutive_clean_frames = self
+                .track_quality
+                .consecutive_clean_frames
+                .saturating_add(1);
             self.track_quality
                 .update_ema(new_inliers_f, cfg.inlier_ema_alpha);
             self.track_quality.push_h(r.homography);
-            if r.inliers < cfg.degraded_inlier_threshold {
+            if r.descriptor_inliers < cfg.degraded_inlier_threshold {
                 self.track_quality.degraded_frames += 1;
             } else {
                 self.track_quality.degraded_frames = 0;

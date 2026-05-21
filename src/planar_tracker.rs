@@ -93,6 +93,17 @@ pub struct TrackResult {
     pub matches: usize,
     /// Median re-projection residual in pixels (over inliers).
     pub median_residual_px: f32,
+    /// The actual inlier correspondences `(anchor_x, anchor_y, view_x,
+    /// view_y)` — populated by RANSAC for callers that need to feed
+    /// them back next frame (e.g. the KLT propagator).
+    pub inlier_pairs: Vec<(f32, f32, f32, f32)>,
+    /// Subset of `inliers` that came from the descriptor matcher
+    /// (i.e. not from externally-injected KLT correspondences). The
+    /// engine uses this to drive handoff decisions on descriptor-
+    /// matcher health rather than the KLT-padded total, which would
+    /// otherwise mask sustained descriptor degradation (e.g. scale
+    /// drift past BRIEF's invariance) and starve handoffs.
+    pub descriptor_inliers: usize,
 }
 
 /// Public-facing tracker state. Wraps an optional anchor and the
@@ -181,7 +192,7 @@ impl Default for TrackerConfig {
             // brief blur than a wild 8-DoF wrong-basin fit. The
             // per-frame H-delta cap + sanity gate spread-coverage
             // check still catch egregiously bad similarity fits.
-            min_inliers_keep_locked: 10,
+            min_inliers_keep_locked: 25,
             nms_radius: 3,
             guided_search_radius_px: 30.0,
         }
@@ -341,6 +352,22 @@ pub fn track_against_anchor_with_prior(
     min_inliers: usize,
     prior: Option<[f32; 9]>,
 ) -> Option<TrackResult> {
+    track_against_anchor_with_prior_and_extra(anchor, gray, cfg, min_inliers, prior, &[])
+}
+
+/// Like [`track_against_anchor_with_prior`] but accepts pre-computed
+/// `(anchor_x, anchor_y, view_x, view_y)` correspondences from outside
+/// the descriptor matcher (e.g. KLT-tracked inliers from the previous
+/// frame). Extras are prepended to the descriptor-matched pairs so
+/// PROSAC's high-quality early phases sample them first.
+pub fn track_against_anchor_with_prior_and_extra(
+    anchor: &SceneAnchor,
+    gray: &GrayImage,
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+    prior: Option<[f32; 9]>,
+    extra_pairs: &[(f32, f32, f32, f32)],
+) -> Option<TrackResult> {
     let t0 = std::time::Instant::now();
     let mut kps = detect_fast(gray, cfg.fast_threshold, cfg.max_features, cfg.nms_radius);
     if kps.len() < cfg.fast_min_keypoints && cfg.fast_threshold_fallback < cfg.fast_threshold {
@@ -425,21 +452,39 @@ pub fn track_against_anchor_with_prior(
         }
         return None;
     }
-    let pairs: Vec<(f32, f32, f32, f32)> = matches
-        .iter()
-        .map(|m| {
-            let (ax, ay) = anchor.positions[m.anchor_idx];
-            let fk = &frame_kps[m.frame_idx];
-            (ax, ay, fk.x, fk.y)
-        })
-        .collect();
+    let mut pairs: Vec<(f32, f32, f32, f32)> =
+        Vec::with_capacity(extra_pairs.len() + matches.len());
+    pairs.extend_from_slice(extra_pairs);
+    pairs.extend(matches.iter().map(|m| {
+        let (ax, ay) = anchor.positions[m.anchor_idx];
+        let fk = &frame_kps[m.frame_idx];
+        (ax, ay, fk.x, fk.y)
+    }));
     let t3 = std::time::Instant::now();
-    let out = ransac_homography_with_prior(&pairs, cfg, min_inliers, prior);
+    let mut out = ransac_homography_with_prior(&pairs, cfg, min_inliers, prior);
     let t_ransac = t3.elapsed();
+    if let Some(r) = out.as_mut() {
+        let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
+        let n_klt = extra_pairs.len();
+        let descriptor_pairs = &pairs[n_klt..];
+        r.descriptor_inliers = descriptor_pairs
+            .iter()
+            .filter(
+                |&&(px, py, qx, qy)| match crate::homography::project(&r.homography, px, py) {
+                    Some((px2, py2)) => {
+                        let dx = px2 - qx;
+                        let dy = py2 - qy;
+                        dx * dx + dy * dy <= r_thresh_sq
+                    }
+                    None => false,
+                },
+            )
+            .count();
+    }
     if PER_FRAME_TIMING_LOG {
         log::info!(
             target: "planar_timing",
-            "brute: detect={:.1}ms describe={:.1}ms match={:.1}ms ransac={:.1}ms (kps={} matches={} inliers={:?})",
+            "brute: detect={:.1}ms describe={:.1}ms match={:.1}ms ransac={:.1}ms (kps={} matches={} inliers={:?} desc_inliers={:?})",
             t_detect.as_secs_f64() * 1000.0,
             t_describe.as_secs_f64() * 1000.0,
             t_match.as_secs_f64() * 1000.0,
@@ -447,6 +492,7 @@ pub fn track_against_anchor_with_prior(
             n_raw_kps,
             n_matches,
             out.as_ref().map(|r| r.inliers),
+            out.as_ref().map(|r| r.descriptor_inliers),
         );
     }
     out
@@ -724,6 +770,8 @@ pub fn ransac_homography_with_prior(
         inliers: inlier_pairs.len(),
         matches: pairs.len(),
         median_residual_px: median,
+        inlier_pairs,
+        descriptor_inliers: 0,
     })
 }
 
