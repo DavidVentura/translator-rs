@@ -790,7 +790,17 @@ pub(crate) fn crop_text_strips(
                 };
                 let aabb = crop_dynamic(image, &rect);
                 match canonical_quadrant {
-                    Some(canon) => rotate_strip_ccw(aabb, crate::coords::Quadrant::R0.sub(canon)),
+                    // `rotate_strip_ccw(_, q)` subtracts `q` from
+                    // the source's angle convention. The source's
+                    // reading-direction angle is `canon`; we want
+                    // the dst's reading-direction angle to be R0
+                    // (= +x, what the recognizer expects). Rotation
+                    // amount = canon, not `R0.sub(canon)`. Earlier
+                    // sign was invisible while canon was almost
+                    // always R0 in display frame; surfaced once
+                    // canonical moved to sensor frame and R90/R270
+                    // became the common cases.
+                    Some(canon) => rotate_strip_ccw(aabb, canon),
                     None => aabb,
                 }
             }
@@ -1919,7 +1929,61 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     Some(ContourBoxes { tight, inflated })
 }
 
-fn dewarp_contour_to_strip(
+/// Contour PCA principal-axis angle in image coords, with `ux >= 0`
+/// canonicalisation (so the angle lives in `[0, π)` — sign-ambiguous
+/// reading direction). Used by the orientation estimator to deskew
+/// each detected strip before feeding it to the textline-ori model;
+/// the classifier then resolves the ±x ambiguity. Same PCA math as
+/// `dewarp_contour_to_strip` below, factored out so both callers
+/// agree on the axis.
+pub fn contour_principal_axis_angle(contour: &[(f32, f32)]) -> Option<f32> {
+    if contour.len() < 8 {
+        return None;
+    }
+    let n = contour.len() as f32;
+    let mut mean_x = 0.0f32;
+    let mut mean_y = 0.0f32;
+    for &(x, y) in contour {
+        mean_x += x;
+        mean_y += y;
+    }
+    mean_x /= n;
+    mean_y /= n;
+    let mut cxx = 0.0f32;
+    let mut cyy = 0.0f32;
+    let mut cxy = 0.0f32;
+    for &(x, y) in contour {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        cxx += dx * dx;
+        cyy += dy * dy;
+        cxy += dx * dy;
+    }
+    cxx /= n;
+    cyy /= n;
+    cxy /= n;
+    let trace = cxx + cyy;
+    let det = cxx * cyy - cxy * cxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let lambda1 = (trace + disc) * 0.5;
+    let (ex, ey) = if cxy.abs() > 1e-6 {
+        (lambda1 - cyy, cxy)
+    } else if cxx >= cyy {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
+    let mut ux = ex / norm;
+    let mut uy = ey / norm;
+    if ux < 0.0 {
+        ux = -ux;
+        uy = -uy;
+    }
+    Some(uy.atan2(ux))
+}
+
+pub fn dewarp_contour_to_strip(
     gray: &GrayImage,
     contour: &[(f32, f32)],
     canonical_quadrant: Option<crate::coords::Quadrant>,

@@ -488,6 +488,50 @@ impl TranslatorSession {
         ))
     }
 
+    /// Rec-based orientation estimator: enumerates the four canonical
+    /// quadrants on the K best sample detections via the script-specific
+    /// recognizer, picks the canonical with the highest avg confidence.
+    /// More accurate than the textline-ori path on out-of-distribution
+    /// content (signage, large glyphs, non-Latin scripts) because rec's
+    /// confidence drops sharply on wrong orientation while the binary
+    /// classifier falls back to its class prior.
+    ///
+    /// Requires a known script — use this on the forced-source-language
+    /// path. Auto-source callers should use
+    /// `estimate_canonical_quadrant_in_oriented_image` instead.
+    ///
+    /// Returns the winning canonical plus the rec lines from the sample
+    /// boxes at that canonical, so the downstream rec pass can skip
+    /// recognising those boxes a second time.
+    #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+    pub fn estimate_canonical_via_rec_in_oriented_image(
+        &self,
+        oriented: &crate::live_frame::OrientedImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+        script: crate::PpocrScript,
+    ) -> Result<Option<crate::coords::Quadrant>, TranslatorError> {
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        Ok(crate::live_session::estimate_canonical_via_rec(
+            &ppocr, oriented, boxes, script,
+        ))
+    }
+
+    /// Resolve a forced source language code (e.g. "en", "ja") to the
+    /// PPOCR script it routes to via the installed catalog. Returns
+    /// `None` when no ppocr recognizer is installed for the language.
+    /// Used by the live acquire pipeline to pick between the rec-based
+    /// and textline-ori-based orientation estimators.
+    #[cfg(feature = "ppocr")]
+    pub fn ppocr_script_for_language_code(
+        &self,
+        language_code: &str,
+    ) -> Option<crate::PpocrScript> {
+        let snap = self.snapshot();
+        let code = crate::LanguageCode::from(language_code);
+        crate::ocr_runtime::recognizer_script_for_language(&snap, &code).ok()
+    }
+
     /// Live-OCR recognize: takes the same `OrientedImage` (full-resolution crop +
     /// pre-built grayscale) and caller-supplied boxes in *display-orient
     /// full-crop* coords (i.e. already scaled up from detection coords).

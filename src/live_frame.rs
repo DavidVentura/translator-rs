@@ -30,7 +30,16 @@ use crate::ocr::Rect;
 /// `det_to_full_scale` is meaningful iff `rgb_det.is_some()`.
 pub struct OrientedImage {
     pub gray: GrayImage,
+    /// Cache key from the caller (visible region in display coords).
+    /// Kept verbatim so the eq-check that drives cache reuse still
+    /// matches what the Kotlin side passes.
     pub display_crop: Rect,
+    /// Same region projected into sensor coords. Source of truth for
+    /// "where in the full sensor frame these derived buffers live" —
+    /// `gray`/`rgb`/`rgb_det` are all sensor-orient, sized to this
+    /// rect. Callers translate PPOCR boxes into full-sensor coords by
+    /// adding `sensor_crop.left/top`.
+    pub sensor_crop: Rect,
     pub rgb: Option<DynamicImage>,
     pub rgb_det: Option<DynamicImage>,
     pub det_to_full_scale: f32,
@@ -84,6 +93,7 @@ impl OrientedImage {
         Ok(OrientedImage {
             gray,
             display_crop,
+            sensor_crop,
             rgb: None,
             rgb_det: None,
             det_to_full_scale,
@@ -92,7 +102,7 @@ impl OrientedImage {
 
     /// Eager build for callers (detect / recognize / matting) that
     /// need the colour image as well. Uses the same fused gray pass
-    /// plus a scalar rotate-RGB chain for `rgb` and a bilinear
+    /// plus a sensor-orient RGB build (no rotation) and a bilinear
     /// downscale for `rgb_det`.
     pub fn build_with_rgb(
         rgba: &[u8],
@@ -103,6 +113,8 @@ impl OrientedImage {
         det_max_pixels: u32,
     ) -> Result<Self, TranslatorError> {
         validate_rgba_len(rgba, sensor_width, sensor_height)?;
+        let sensor_crop =
+            display_crop_to_sensor(display_crop, sensor_width, sensor_height, rotation_degrees)?;
         let gray = build_gray_fused(
             rgba,
             sensor_width,
@@ -137,6 +149,7 @@ impl OrientedImage {
         Ok(OrientedImage {
             gray,
             display_crop,
+            sensor_crop,
             rgb: Some(rgb_full),
             rgb_det: Some(rgb_det),
             det_to_full_scale,
@@ -280,6 +293,10 @@ fn build_gray_fused_downsampled(
     })
 }
 
+/// Crops the sensor RGBA to the sensor-space rect equivalent to
+/// `display_crop` and returns RGB **in sensor orientation** (no rotation).
+/// The Kotlin SurfaceView rotates the final composite for display at
+/// scanout; the OCR pipeline operates entirely in sensor frame.
 fn build_rgb_full(
     rgba: &[u8],
     sensor_width: u32,
@@ -304,8 +321,7 @@ fn build_rgb_full(
     let sensor_rgb = RgbImage::from_raw(crop_w, crop_h, rgb_bytes).ok_or_else(|| {
         TranslatorError::new(TranslatorErrorKind::Internal, "rgb buffer size mismatch")
     })?;
-    let rotated = rotate_rgb(sensor_rgb, rotation_degrees);
-    Ok(DynamicImage::ImageRgb8(rotated))
+    Ok(DynamicImage::ImageRgb8(sensor_rgb))
 }
 
 /// 3×3 homography mapping display-orient pixel coords to sensor-orient
@@ -390,17 +406,6 @@ pub fn display_crop_to_sensor(
         ));
     }
     Ok(out)
-}
-
-fn rotate_rgb(image: RgbImage, rotation_degrees: i32) -> RgbImage {
-    use image::imageops;
-    let r = ((rotation_degrees % 360) + 360) % 360;
-    match r {
-        90 => imageops::rotate90(&image),
-        180 => imageops::rotate180(&image),
-        270 => imageops::rotate270(&image),
-        _ => image,
-    }
 }
 
 #[allow(dead_code)] // exposed for tests / future direct callers
