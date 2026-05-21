@@ -324,42 +324,14 @@ fn build_rgb_full(
     Ok(DynamicImage::ImageRgb8(sensor_rgb))
 }
 
-/// 3×3 homography mapping display-orient pixel coords to sensor-orient
-/// pixel coords under the given camera rotation. Composed into the
-/// `h_view_to_surface` matrix at the PPOCR boundary so detected text
-/// boxes (in display coords, since PPOCR runs on display-orient RGB)
-/// project correctly into the tracker's sensor-orient surface frame
-/// via one matrix multiply.
-///
-/// Row-major. `rotation_degrees` is the CameraX
-/// `ImageInfo.rotationDegrees` (the sensor→display rotation).
-pub fn display_to_sensor_homography(
-    sensor_w: u32,
-    sensor_h: u32,
-    rotation_degrees: i32,
-) -> [f32; 9] {
-    let r = ((rotation_degrees % 360) + 360) % 360;
-    let sw = sensor_w as f32;
-    let sh = sensor_h as f32;
-    match r {
-        0 => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        // display(dx, dy) → sensor(dy, sh - dx)
-        90 => [0.0, 1.0, 0.0, -1.0, 0.0, sh, 0.0, 0.0, 1.0],
-        // display(dx, dy) → sensor(sw - dx, sh - dy)
-        180 => [-1.0, 0.0, sw, 0.0, -1.0, sh, 0.0, 0.0, 1.0],
-        // display(dx, dy) → sensor(sw - dy, dx)
-        270 => [0.0, -1.0, sw, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-    }
-}
-
 /// Apply the inverse of a sensor→display rotation to a display-orient rect to
 /// recover the corresponding sensor-orient rect. Both rects are in pixel coords.
 ///
-/// Public so the bindings layer can use it to convert PPOCR-detected
-/// boxes (display-orient, since PPOCR runs on display-orient RGB) into
-/// sensor-orient regions for the tracker's anchor builder (which works
-/// on sensor-orient gray).
+/// The caller (Kotlin → bindings) still passes the visible region as a
+/// display-orient rect (it's what the SurfaceView's geometry produces);
+/// this converts to the sensor sub-rect we actually crop from. The
+/// resulting `sensor_crop` is stored on [`OrientedImage`] and is the
+/// source of truth for the rest of the OCR pipeline.
 pub fn display_crop_to_sensor(
     crop: Rect,
     sensor_w: u32,
