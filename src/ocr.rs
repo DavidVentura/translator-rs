@@ -1034,6 +1034,11 @@ pub fn live_lines_should_merge_in_quadrant(
     let prev_v = canonical_v(prev, theta);
     let next_v = canonical_v(next, theta);
 
+    let upper = if prev_v <= next_v { prev } else { next };
+    if ends_with_heading_punct(&upper.text) {
+        return false;
+    }
+
     // Gap along the paragraph axis. `next_v - prev_v` is signed; a
     // negative gap means the lines overlap on the paragraph axis (or
     // were passed in non-canonical order). Both directions are valid
@@ -1069,6 +1074,13 @@ pub fn live_lines_should_merge_in_quadrant(
     }
 
     center_aligned || left_aligned || right_aligned
+}
+
+/// Does this line's trimmed text end in heading-style punctuation (`!` or `?`)?
+/// Used to refuse merging a heading/callout with the body that follows. `.` is
+/// excluded — body paragraphs end in periods, so it would split mid-paragraph.
+fn ends_with_heading_punct(text: &str) -> bool {
+    matches!(text.trim_end().chars().last(), Some('!') | Some('?'))
 }
 
 fn is_live_measurement_token(text: &str) -> bool {
@@ -2192,7 +2204,8 @@ pub fn build_text_blocks(
 mod tests {
     use super::{
         DetectedWord, OrientedRect, OverlayLayoutMode, ParagraphGroupingOptions, Rect, TextBlock,
-        TextLine, build_text_blocks, group_lines_into_paragraphs, prepare_overlay_image,
+        TextLine, build_text_blocks, group_lines_into_paragraphs, live_lines_should_merge,
+        prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
 
@@ -2715,5 +2728,47 @@ mod tests {
             ],
         };
         assert_eq!(block.translation_text(), "hello world from rust");
+    }
+
+    #[test]
+    fn live_merge_refuses_heading_terminated_by_exclamation() {
+        let heading = line("DANGER!", 20, 10, 120, 26, 14.0);
+        let body = line("Keep out", 20, 32, 120, 46, 12.0);
+        assert!(!live_lines_should_merge(&heading, &body));
+    }
+
+    #[test]
+    fn live_merge_refuses_heading_terminated_by_question_mark() {
+        let heading = line("What should you do?", 20, 10, 220, 26, 12.0);
+        let body = line("Stay calm and wait.", 20, 30, 220, 44, 12.0);
+        assert!(!live_lines_should_merge(&heading, &body));
+    }
+
+    #[test]
+    fn live_merge_refuses_when_heading_is_passed_second() {
+        let body = line("Stay calm and wait.", 20, 30, 220, 44, 12.0);
+        let heading = line("What should you do?", 20, 10, 220, 26, 12.0);
+        assert!(!live_lines_should_merge(&body, &heading));
+    }
+
+    #[test]
+    fn live_merge_allows_body_lines_ending_in_period() {
+        let first = line("This is a sentence.", 20, 10, 220, 24, 12.0);
+        let second = line("And another one.", 20, 28, 220, 42, 12.0);
+        assert!(live_lines_should_merge(&first, &second));
+    }
+
+    #[test]
+    fn live_merge_does_not_check_lower_lines_punctuation() {
+        let body = line("Some prose continues", 20, 10, 220, 24, 12.0);
+        let next = line("with a question?", 20, 28, 220, 42, 12.0);
+        assert!(live_lines_should_merge(&body, &next));
+    }
+
+    #[test]
+    fn live_merge_heading_check_ignores_trailing_whitespace() {
+        let heading = line("WARNING!   ", 20, 10, 220, 26, 12.0);
+        let body = line("Read carefully.", 20, 30, 220, 44, 12.0);
+        assert!(!live_lines_should_merge(&heading, &body));
     }
 }
