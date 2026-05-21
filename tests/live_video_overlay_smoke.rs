@@ -157,6 +157,7 @@ fn video_frames_drive_live_overlay_pipeline() {
         let mut tracker_inliers: Option<usize> = None;
         let mut lost_anchor: Option<u64> = None;
         let cmd = engine.process_frame(&oriented.gray, true, timestamp_ns);
+        let last_fit = engine.last_track_result().cloned();
         let tracker_state = match cmd {
             TrackerCommand::Idle | TrackerCommand::Acquiring => {
                 if let Some(anchor_id) = engine.acquire_now(&oriented.gray, timestamp_ns) {
@@ -329,13 +330,33 @@ fn video_frames_drive_live_overlay_pipeline() {
         }
 
         composite_writer.write_frame(w, h, &composite);
+        let (matches_str, residual_str, model_str) = match last_fit.as_ref() {
+            Some(r) => {
+                let model = if r.inliers >= 30 {
+                    "homography"
+                } else if r.inliers >= 15 {
+                    "affine"
+                } else {
+                    "similarity"
+                };
+                (
+                    r.matches.to_string(),
+                    format!("{:.4}", r.median_residual_px),
+                    format!("\"{model}\""),
+                )
+            }
+            None => ("null".to_string(), "null".to_string(), "null".to_string()),
+        };
         summaries.push(format!(
-            "{{\"frame\":{idx},\"input\":\"{}\",\"tracker\":\"{}\",\"tracker_inliers\":{},\"lost_anchor\":{},\"detect_reason\":\"{}\",\"anchor\":{},\"render_anchor\":{},\"h_surface_to_view\":[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.6}],\"overlay_items\":{},\"detected\":{},\"rec_ok\":{},\"cache_hits\":{}}}",
+            "{{\"frame\":{idx},\"input\":\"{}\",\"tracker\":\"{}\",\"tracker_inliers\":{},\"matches\":{},\"median_residual_px\":{},\"fit_model\":{},\"lost_anchor\":{},\"detect_reason\":\"{}\",\"anchor\":{},\"render_anchor\":{},\"h_surface_to_view\":[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.6}],\"overlay_items\":{},\"detected\":{},\"rec_ok\":{},\"cache_hits\":{}}}",
             json_escape(frame.label()),
             tracker_state,
             tracker_inliers
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string()),
+            matches_str,
+            residual_str,
+            model_str,
             lost_anchor
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string()),

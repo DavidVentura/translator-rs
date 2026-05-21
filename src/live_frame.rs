@@ -29,20 +29,20 @@ use crate::ocr::Rect;
 ///
 /// `det_to_full_scale` is meaningful iff `rgb_det.is_some()`.
 pub struct OrientedImage {
-    pub(crate) gray: GrayImage,
+    pub gray: GrayImage,
     /// Cache key from the caller (visible region in display coords).
     /// Kept verbatim so the eq-check that drives cache reuse still
     /// matches what the Kotlin side passes.
-    pub(crate) display_crop: Rect,
+    pub display_crop: Rect,
     /// Same region projected into sensor coords. Source of truth for
     /// "where in the full sensor frame these derived buffers live" —
     /// `gray`/`rgb`/`rgb_det` are all sensor-orient, sized to this
     /// rect. Callers translate PPOCR boxes into full-sensor coords by
     /// adding `sensor_crop.left/top`.
-    pub(crate) sensor_crop: Rect,
-    pub(crate) rgb: Option<DynamicImage>,
-    pub(crate) rgb_det: Option<DynamicImage>,
-    pub(crate) det_to_full_scale: f32,
+    pub sensor_crop: Rect,
+    pub rgb: Option<DynamicImage>,
+    pub rgb_det: Option<DynamicImage>,
+    pub det_to_full_scale: f32,
 }
 
 impl OrientedImage {

@@ -244,6 +244,11 @@ pub struct LivePlanarEngine {
     /// later acquire fails to reach consensus. Seeded from
     /// `EngineConfig.default_canonical_quadrant`.
     last_known_quadrant: Quadrant,
+    /// Most recent TrackResult produced by the per-frame fit (after
+    /// the sanity gate). Cleared whenever the frame did not produce a
+    /// usable fit (Idle/Lost/no-match). Read by diagnostics & smoke
+    /// harnesses; not used by the engine itself.
+    last_track_result: Option<TrackResult>,
 }
 
 /// Single-step history of accepted `H_anchor→view` for the active anchor,
@@ -263,6 +268,12 @@ struct TrackQualityState {
     /// `degraded_max_frames`, the engine forces a re-acquire rather
     /// than continuing to track a bleeding anchor.
     degraded_frames: u32,
+    /// Consecutive frames the sanity gate accepted normally (path 3).
+    /// Reset on freeze (path 1) and reject (path 2). Used to defer
+    /// handoff right after a freeze sequence: the first post-freeze
+    /// accepted fit is often wrong-basin, and we don't want to bake
+    /// that into a new anchor's canonical alignment.
+    consecutive_clean_frames: u32,
 }
 
 impl TrackQualityState {
@@ -273,6 +284,7 @@ impl TrackQualityState {
             inlier_ema: None,
             suspicious_frames: 0,
             degraded_frames: 0,
+            consecutive_clean_frames: 0,
         }
     }
     fn reset(&mut self) {
@@ -420,7 +432,15 @@ impl LivePlanarEngine {
             last_spawn_ns: 0,
             track_quality: TrackQualityState::new(),
             last_known_quadrant: default_quadrant,
+            last_track_result: None,
         }
+    }
+
+    /// Last accepted TrackResult from the per-frame fit, if any. Lets
+    /// diagnostics & smoke harnesses log `matches`, `median_residual_px`
+    /// alongside the inlier count already exposed via `TrackerCommand`.
+    pub fn last_track_result(&self) -> Option<&TrackResult> {
+        self.last_track_result.as_ref()
     }
 
     /// Coarse rotation the engine last committed to (most recent
@@ -463,6 +483,7 @@ impl LivePlanarEngine {
         prior: Option<[f32; 9]>,
     ) -> TrackerCommand {
         self.tick_stable(imu_stable, timestamp_ns);
+        self.last_track_result = None;
         match self.state.clone() {
             EngineState::Idle => {
                 // Even when "Idle", we still try matching against cached
@@ -470,6 +491,7 @@ impl LivePlanarEngine {
                 // we want to snap back to it without forcing a new acquire.
                 if !self.cache.is_empty() {
                     if let Some((id, result)) = self.try_cached_anchors(gray, None) {
+                        self.last_track_result = Some(result.clone());
                         self.transition_to_locked(id, &result, timestamp_ns, false);
                         let (root_id, h_root_to_view) =
                             self.chain_homography(id, &result.homography);
@@ -554,6 +576,7 @@ impl LivePlanarEngine {
                 });
                 let result = result.and_then(|r| self.apply_sanity_gate(r));
                 if let Some(r) = result {
+                    self.last_track_result = Some(r.clone());
                     // Sustained inlier decline: the anchor's
                     // descriptors are losing correspondences as
                     // perspective drifts, and RANSAC will start
@@ -615,7 +638,15 @@ impl LivePlanarEngine {
                     let needs_handoff = r.inliers < self.config.handoff_min_inliers
                         || visible_ratio < self.config.handoff_min_visible_ratio
                         || scale_changed;
-                    let new_active = if cooldown_elapsed && needs_handoff {
+                    // Defer handoff while the matcher is still recovering
+                    // from a sanity-gate freeze. The first one or two
+                    // accepted fits after a freeze sequence are often
+                    // wrong-basin (matcher was starved, then released
+                    // into whichever pocket re-matched first). Baking
+                    // such a fit into a new anchor's canonical alignment
+                    // produces a visible overlay snap at handoff.
+                    let recovering = self.track_quality.consecutive_clean_frames < 2;
+                    let new_active = if cooldown_elapsed && needs_handoff && !recovering {
                         self.spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
                             .unwrap_or(anchor_id)
                     } else {
@@ -646,6 +677,7 @@ impl LivePlanarEngine {
                 }
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
+                    self.last_track_result = Some(alt.clone());
                     self.transition_to_locked(id, &alt, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &alt.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
@@ -695,6 +727,7 @@ impl LivePlanarEngine {
                 frames_lost,
             } => {
                 if let Some((id, result)) = self.try_cached_anchors(gray, None) {
+                    self.last_track_result = Some(result.clone());
                     self.transition_to_locked(id, &result, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
@@ -1009,6 +1042,7 @@ impl LivePlanarEngine {
             && freeze_h.is_some();
         if suspicious && can_freeze {
             self.track_quality.suspicious_frames += 1;
+            self.track_quality.consecutive_clean_frames = 0;
             let hf = freeze_h.expect("freeze_h is Some when can_freeze");
             log::info!(
                 "[sanity_gate] freeze (substitute with last accepted H): inliers={} ema={:.1} run={}",
@@ -1036,9 +1070,12 @@ impl LivePlanarEngine {
                 reason,
             );
             self.track_quality.reset_ema_and_budget();
+            self.track_quality.consecutive_clean_frames = 0;
             None
         } else {
             self.track_quality.suspicious_frames = 0;
+            self.track_quality.consecutive_clean_frames =
+                self.track_quality.consecutive_clean_frames.saturating_add(1);
             self.track_quality
                 .update_ema(new_inliers_f, cfg.inlier_ema_alpha);
             self.track_quality.push_h(r.homography);
