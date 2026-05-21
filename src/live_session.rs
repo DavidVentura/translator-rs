@@ -1427,7 +1427,7 @@ pub fn estimate_canonical_quadrant(
 /// Inputs to [`LiveSession::run_post_detect`]. The orchestrator owns
 /// per-line state internally; callers only thread inputs and pull a
 /// summary out.
-pub struct PostDetectInput<'a> {
+pub(crate) struct PostDetectInput<'a> {
     /// Detections in *camera/full-crop* coords. `tight_box` is what
     /// the surface map gets after projecting through `h_view_to_surface`;
     /// the whole struct is what the recognizer crops from.
@@ -1497,7 +1497,7 @@ impl LiveSession {
     /// returns early with `canceled = true`. Outputs already pushed
     /// into the surface map / overlay store are kept (so a cancelled
     /// run doesn't undo any partial progress).
-    pub fn run_post_detect(
+    pub(crate) fn run_post_detect(
         &self,
         input: PostDetectInput<'_>,
         recognizer: &dyn LiveRecognizer,

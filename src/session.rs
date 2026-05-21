@@ -448,7 +448,7 @@ impl TranslatorSession {
     /// coords; multiply by `oriented.det_to_full_scale` to lift to the full
     /// display-orient crop's coord space.
     #[cfg(feature = "ppocr")]
-    pub fn detect_text_in_oriented_image(
+    pub(crate) fn detect_text_in_oriented_image(
         &self,
         oriented: &crate::live_frame::OrientedImage,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
@@ -468,7 +468,7 @@ impl TranslatorSession {
     /// Returns `None` when the orientation model isn't installed, no
     /// wide boxes qualified, or consensus didn't reach the gate.
     #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
-    pub fn estimate_canonical_quadrant_in_oriented_image(
+    pub(crate) fn estimate_canonical_quadrant_in_oriented_image(
         &self,
         oriented: &crate::live_frame::OrientedImage,
         boxes: &[crate::ocr::DetectedTextBox],
@@ -504,7 +504,7 @@ impl TranslatorSession {
     /// boxes at that canonical, so the downstream rec pass can skip
     /// recognising those boxes a second time.
     #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
-    pub fn estimate_canonical_via_rec_in_oriented_image(
+    pub(crate) fn estimate_canonical_via_rec_in_oriented_image(
         &self,
         oriented: &crate::live_frame::OrientedImage,
         boxes: &[crate::ocr::DetectedTextBox],
@@ -523,7 +523,7 @@ impl TranslatorSession {
     /// Used by the live acquire pipeline to pick between the rec-based
     /// and textline-ori-based orientation estimators.
     #[cfg(feature = "ppocr")]
-    pub fn ppocr_script_for_language_code(
+    pub(crate) fn ppocr_script_for_language_code(
         &self,
         language_code: &str,
     ) -> Option<crate::PpocrScript> {
@@ -538,7 +538,7 @@ impl TranslatorSession {
     /// `canonical_quadrant` is the anchor's stored orientation (None for
     /// still-image / first-acquire paths that have no anchor).
     #[cfg(feature = "ppocr")]
-    pub fn recognize_in_oriented_image(
+    pub(crate) fn recognize_in_oriented_image(
         &self,
         oriented: &crate::live_frame::OrientedImage,
         boxes: &[crate::ocr::DetectedTextBox],

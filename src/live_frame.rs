@@ -29,20 +29,20 @@ use crate::ocr::Rect;
 ///
 /// `det_to_full_scale` is meaningful iff `rgb_det.is_some()`.
 pub struct OrientedImage {
-    pub gray: GrayImage,
+    pub(crate) gray: GrayImage,
     /// Cache key from the caller (visible region in display coords).
     /// Kept verbatim so the eq-check that drives cache reuse still
     /// matches what the Kotlin side passes.
-    pub display_crop: Rect,
+    pub(crate) display_crop: Rect,
     /// Same region projected into sensor coords. Source of truth for
     /// "where in the full sensor frame these derived buffers live" —
     /// `gray`/`rgb`/`rgb_det` are all sensor-orient, sized to this
     /// rect. Callers translate PPOCR boxes into full-sensor coords by
     /// adding `sensor_crop.left/top`.
-    pub sensor_crop: Rect,
-    pub rgb: Option<DynamicImage>,
-    pub rgb_det: Option<DynamicImage>,
-    pub det_to_full_scale: f32,
+    pub(crate) sensor_crop: Rect,
+    pub(crate) rgb: Option<DynamicImage>,
+    pub(crate) rgb_det: Option<DynamicImage>,
+    pub(crate) det_to_full_scale: f32,
 }
 
 impl OrientedImage {
@@ -411,6 +411,280 @@ pub fn rgba_bytes_to_dynamic(rgba: &[u8], width: u32, height: u32) -> DynamicIma
     }
     let img = RgbImage::from_raw(width, height, rgb).expect("rgb buffer sized correctly");
     DynamicImage::ImageRgb8(img)
+}
+
+/// Pointer + length into a foreign-owned RGBA buffer (typically a
+/// CameraX `DirectByteBuffer`). The caller (Kotlin) guarantees the
+/// backing memory stays alive for the duration of any borrow.
+pub struct ExternalRgba {
+    pub(crate) ptr: *const u8,
+    pub(crate) len: usize,
+}
+unsafe impl Send for ExternalRgba {}
+unsafe impl Sync for ExternalRgba {}
+
+impl ExternalRgba {
+    /// Wrap a raw pointer + length. Safety: caller guarantees the
+    /// pointed-to memory is valid for `len` bytes for the lifetime
+    /// of any read against the wrapping [`LiveFrameState`].
+    pub fn new(ptr: *const u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+}
+
+/// One camera frame's mutable state: owned bytes OR borrowed bytes,
+/// dims/rotation, and the two cached `OrientedImage` derivatives
+/// (visible-region for OCR + full-display for tracker).
+pub struct LiveFrameState {
+    /// Owned RGBA bytes. Populated by the `writeFrom` JNI memcpy path,
+    /// the `reset_via_uniffi` fallback, OR by
+    /// [`Self::materialize_owned`] which copies from `external_rgba`
+    /// so async pipelines can drop the camera buffer.
+    pub(crate) rgba: Vec<u8>,
+    /// Borrowed RGBA bytes from a Kotlin-held DirectByteBuffer. Set by
+    /// the `setExternalBuffer` JNI path for zero-copy per-frame ingest.
+    /// Caller (Kotlin) MUST keep the backing ImageProxy alive until
+    /// [`Self::materialize_owned`] or [`Self::clear_external`] runs.
+    pub(crate) external_rgba: Option<ExternalRgba>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rotation_degrees: i32,
+    /// Cache for the OCR-side oriented image (visible-region crop,
+    /// gray + rgb + rgb_det). Built by [`Self::ensure_oriented_with_rgb`].
+    pub(crate) cached: Option<OrientedImage>,
+    /// Cache for the tracker-side oriented image (full-display crop,
+    /// gray-only). Built by [`Self::ensure_tracker_oriented`]. Kept
+    /// separate so the OCR path can downscale aggressively for detect
+    /// while the tracker keeps every feature.
+    pub(crate) cached_tracker: Option<OrientedImage>,
+}
+
+impl LiveFrameState {
+    pub(crate) fn rgba_bytes(&self) -> &[u8] {
+        if let Some(ext) = &self.external_rgba {
+            // SAFETY: caller contract guarantees the ImageProxy is
+            // alive for the duration of this borrow.
+            unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) }
+        } else {
+            &self.rgba
+        }
+    }
+
+    /// Memcpy `external_rgba` into the owned `rgba` Vec and drop the
+    /// borrow. Called by the pipeline right before spawning an async
+    /// acquire/refresh worker so the worker can read the bytes after
+    /// the caller closes its `ImageProxy`. No-op when no external
+    /// buffer is set.
+    pub(crate) fn materialize_owned(&mut self) {
+        if let Some(ext) = self.external_rgba.take() {
+            self.rgba.clear();
+            self.rgba.reserve(ext.len);
+            // SAFETY: caller has not yet closed the ImageProxy; source
+            // pointer is valid for `ext.len` bytes; dest Vec was just
+            // reserved to that capacity; regions are disjoint.
+            unsafe {
+                std::ptr::copy_nonoverlapping(ext.ptr, self.rgba.as_mut_ptr(), ext.len);
+                self.rgba.set_len(ext.len);
+            }
+        }
+    }
+
+    /// Drop the external borrow without copying. Called by the
+    /// pipeline when no async pipeline will run, so the camera buffer
+    /// can be released right after `process_frame` returns.
+    pub(crate) fn clear_external(&mut self) {
+        self.external_rgba = None;
+    }
+
+    /// Full-display rect for the current frame state, accounting for
+    /// rotation. Used by the tracker-side ensure to build an oriented
+    /// image covering every available feature, not just the visible
+    /// region.
+    pub(crate) fn full_display_rect(&self) -> Rect {
+        let r = ((self.rotation_degrees % 360) + 360) % 360;
+        let (w, h) = if r == 90 || r == 270 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        Rect {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        }
+    }
+
+    /// Build (or reuse) the OCR-side oriented image with rgb + rgb_det
+    /// populated, sized to `display_crop`. Rebuild triggers: cache
+    /// missing, crop changed, or cached entry is gray-only.
+    pub(crate) fn ensure_oriented_with_rgb(
+        &mut self,
+        display_crop: Rect,
+        det_max_pixels: u32,
+    ) -> Result<(), TranslatorError> {
+        let needs_rebuild = match self.cached.as_ref() {
+            Some(oi) => oi.display_crop != display_crop || !oi.has_rgb(),
+            None => true,
+        };
+        if needs_rebuild {
+            let oi = OrientedImage::build_with_rgb(
+                self.rgba_bytes(),
+                self.width,
+                self.height,
+                self.rotation_degrees,
+                display_crop,
+                det_max_pixels,
+            )?;
+            self.cached = Some(oi);
+        }
+        Ok(())
+    }
+
+    /// Build (or reuse) the tracker-side gray-only oriented image
+    /// sized to the full-display rect. Always full-display so the
+    /// anchor includes every available feature.
+    pub(crate) fn ensure_tracker_oriented(
+        &mut self,
+        det_max_pixels: u32,
+    ) -> Result<(), TranslatorError> {
+        let crop = self.full_display_rect();
+        let needs_rebuild = match self.cached_tracker.as_ref() {
+            Some(oi) => oi.display_crop != crop,
+            None => true,
+        };
+        if needs_rebuild {
+            let oi = OrientedImage::build(
+                self.rgba_bytes(),
+                self.width,
+                self.height,
+                self.rotation_degrees,
+                crop,
+                det_max_pixels,
+            )?;
+            self.cached_tracker = Some(oi);
+        }
+        Ok(())
+    }
+}
+
+/// Cross-platform live-frame buffer. Pool of these on the Kotlin side
+/// keeps per-frame allocation at zero; the underlying `Vec<u8>` is
+/// written into in place each frame (either via uniffi marshalling or,
+/// the fast path, directly from a DirectByteBuffer through the JNI
+/// `LiveFrameJni.writeFrom` / `setExternalBuffer` shims). The cached
+/// oriented image is rebuilt whenever the crop region changes.
+///
+/// The struct itself is plain Rust; the uniffi `FrameHandle` in the
+/// bindings crate wraps an `Arc<LiveFrame>` to give Kotlin a typed
+/// handle.
+pub struct LiveFrame {
+    pub(crate) state: std::sync::Mutex<LiveFrameState>,
+}
+
+impl LiveFrame {
+    pub fn new(initial_capacity: usize) -> Self {
+        LiveFrame {
+            state: std::sync::Mutex::new(LiveFrameState {
+                rgba: Vec::with_capacity(initial_capacity),
+                external_rgba: None,
+                width: 0,
+                height: 0,
+                rotation_degrees: 0,
+                cached: None,
+                cached_tracker: None,
+            }),
+        }
+    }
+
+    /// Rust-heap address of `self`, returned to Kotlin as a `u64` and
+    /// passed back into the JNI shims to recover `&LiveFrame` without
+    /// crossing the uniffi marshalling layer. The caller's `Arc<LiveFrame>`
+    /// keeps the address stable for the duration of any JNI call.
+    pub fn raw_address(&self) -> u64 {
+        self as *const LiveFrame as u64
+    }
+
+    /// Inner state mutex. Exposed `pub` so the JNI shims in the
+    /// bindings crate (a different crate, can't see `pub(crate)`) can
+    /// reach in. Not part of any stable API contract; callers outside
+    /// the JNI shims should use the higher-level methods instead.
+    pub fn state(&self) -> &std::sync::Mutex<LiveFrameState> {
+        &self.state
+    }
+
+    /// Replace the owned bytes (clearing any external borrow + caches).
+    /// Used by the `reset_via_uniffi` fallback when the camera plane
+    /// isn't a contiguous DirectByteBuffer.
+    pub fn reset_owned(&self, rgba: Vec<u8>, width: u32, height: u32, rotation_degrees: i32) {
+        let mut state = self.state.lock().expect("frame mutex poisoned");
+        state.rgba = rgba;
+        state.external_rgba = None;
+        state.width = width;
+        state.height = height;
+        state.rotation_degrees = rotation_degrees;
+        state.cached = None;
+        state.cached_tracker = None;
+    }
+
+    /// Memcpy `len` bytes from `src` into the owned RGBA buffer and
+    /// atomically update dims/rotation. Used by the JNI shims when a
+    /// caller has a raw pointer (DirectByteBuffer) rather than a `Vec`.
+    ///
+    /// # Safety
+    /// `src` must point to at least `len` bytes of readable memory.
+    pub unsafe fn write_from_raw(
+        &self,
+        src: *const u8,
+        len: usize,
+        width: u32,
+        height: u32,
+        rotation_degrees: i32,
+    ) {
+        let mut state = self.state.lock().expect("frame mutex poisoned");
+        state.rgba.clear();
+        state.rgba.reserve(len);
+        // SAFETY: caller guarantees `src` is valid for `len` bytes;
+        // dest was just reserved with at least that capacity; regions
+        // are disjoint (foreign-owned source vs Rust heap).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, state.rgba.as_mut_ptr(), len);
+            state.rgba.set_len(len);
+        }
+        state.external_rgba = None;
+        state.width = width;
+        state.height = height;
+        state.rotation_degrees = rotation_degrees;
+        state.cached = None;
+        state.cached_tracker = None;
+    }
+
+    /// Set the external-borrow pointer (no memcpy). The caller
+    /// guarantees the memory at `src` stays valid for `len` bytes
+    /// until the next frame action consumes or clears the borrow
+    /// (typically inside [`crate::live_tracker_pipeline::LiveTrackerPipeline::process_frame`]).
+    ///
+    /// # Safety
+    /// `src` must remain valid + readable for `len` bytes until the
+    /// borrow is consumed (materialized or cleared). Inside the
+    /// pipeline this is guaranteed by Kotlin holding the source
+    /// `ImageProxy` alive across the `processFrame` JNI call.
+    pub unsafe fn set_external_buffer(
+        &self,
+        src: *const u8,
+        len: usize,
+        width: u32,
+        height: u32,
+        rotation_degrees: i32,
+    ) {
+        let mut state = self.state.lock().expect("frame mutex poisoned");
+        state.external_rgba = Some(ExternalRgba::new(src, len));
+        state.width = width;
+        state.height = height;
+        state.rotation_degrees = rotation_degrees;
+        state.cached = None;
+        state.cached_tracker = None;
+    }
 }
 
 #[cfg(test)]
