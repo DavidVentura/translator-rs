@@ -355,27 +355,24 @@ pub fn track_against_anchor_with_prior(
     track_against_anchor_with_prior_and_extra(anchor, gray, cfg, min_inliers, prior, &[])
 }
 
-/// Like [`track_against_anchor_with_prior`] but accepts pre-computed
-/// `(anchor_x, anchor_y, view_x, view_y)` correspondences from outside
-/// the descriptor matcher (e.g. KLT-tracked inliers from the previous
-/// frame). Extras are prepended to the descriptor-matched pairs so
-/// PROSAC's high-quality early phases sample them first.
-pub fn track_against_anchor_with_prior_and_extra(
-    anchor: &SceneAnchor,
-    gray: &GrayImage,
-    cfg: &TrackerConfig,
-    min_inliers: usize,
-    prior: Option<[f32; 9]>,
-    extra_pairs: &[(f32, f32, f32, f32)],
-) -> Option<TrackResult> {
-    let t0 = std::time::Instant::now();
+/// Per-frame keypoint + descriptor cache. Reuse one set of features
+/// across multiple anchor-match attempts (Lost-state cached-anchor
+/// retry loop) instead of redetecting/redescribing per anchor.
+#[derive(Clone, Debug)]
+pub struct FrameFeatures {
+    pub frame_kps: Vec<KeyPoint>,
+    pub frame_descs: Vec<Descriptor>,
+    /// Raw FAST keypoint count before describe_brief filtered the
+    /// near-edge ones. Carried for diagnostics / timing logs only.
+    pub raw_kp_count: usize,
+}
+
+/// FAST + BRIEF on a single frame, with the same blur-fallback
+/// behaviour used inside `track_against_anchor_with_prior_and_extra`.
+/// Returns `None` if no usable keypoints survive.
+pub fn compute_frame_features(gray: &GrayImage, cfg: &TrackerConfig) -> Option<FrameFeatures> {
     let mut kps = detect_fast(gray, cfg.fast_threshold, cfg.max_features, cfg.nms_radius);
     if kps.len() < cfg.fast_min_keypoints && cfg.fast_threshold_fallback < cfg.fast_threshold {
-        // Blur survival: the strict threshold returned too few corners,
-        // suggesting the frame is blurred or low-contrast. Redetect at
-        // the looser threshold to pick up the soft, sub-strict corners
-        // that blur created. RANSAC + the previous-frame H seed will
-        // filter the inevitable noise; the alternative is going Lost.
         let retry = detect_fast(
             gray,
             cfg.fast_threshold_fallback,
@@ -386,24 +383,36 @@ pub fn track_against_anchor_with_prior_and_extra(
             kps = retry;
         }
     }
-    let n_raw_kps = kps.len();
-    let t_detect = t0.elapsed();
+    let raw_kp_count = kps.len();
     if kps.is_empty() {
-        if PER_FRAME_TIMING_LOG {
-            log::info!(
-                target: "planar_timing",
-                "brute: detect={:.1}ms (0 kps) → bail",
-                t_detect.as_secs_f64() * 1000.0,
-            );
-        }
         return None;
     }
-    let t1 = std::time::Instant::now();
     let (frame_kps, frame_descs) = describe_brief(gray, &kps);
-    let t_describe = t1.elapsed();
     if frame_kps.is_empty() {
         return None;
     }
+    Some(FrameFeatures {
+        frame_kps,
+        frame_descs,
+        raw_kp_count,
+    })
+}
+
+/// Like [`track_against_anchor_with_prior_and_extra`] but with the
+/// per-frame FAST + BRIEF already computed by
+/// [`compute_frame_features`]. Use when matching the same frame
+/// against multiple candidate anchors (e.g. the Lost-state cached-
+/// anchor retry loop).
+pub fn track_against_anchor_with_features(
+    anchor: &SceneAnchor,
+    features: &FrameFeatures,
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+    prior: Option<[f32; 9]>,
+    extra_pairs: &[(f32, f32, f32, f32)],
+) -> Option<TrackResult> {
+    let frame_kps = &features.frame_kps;
+    let frame_descs = &features.frame_descs;
     let t2 = std::time::Instant::now();
     // Guided when we have a prior (= Locked, tracking through the
     // scene): restrict each anchor's match candidates to a small
@@ -420,21 +429,14 @@ pub fn track_against_anchor_with_prior_and_extra(
         Some(h_prior) => match_descriptors_guided(
             &anchor.descriptors,
             &anchor.positions,
-            &frame_kps,
-            &frame_descs,
+            frame_kps,
+            frame_descs,
             cfg.lowe_ratio_locked,
             &h_prior,
             cfg.guided_search_radius_px,
         ),
-        None => match_descriptors(&anchor.descriptors, &frame_descs, cfg.lowe_ratio_locked),
+        None => match_descriptors(&anchor.descriptors, frame_descs, cfg.lowe_ratio_locked),
     };
-    // Sort by Hamming distance ascending — pairs[i] now corresponds
-    // to the i-th best match. RANSAC samples from a progressively
-    // growing prefix of this list (PROSAC), so early iterations draw
-    // from the high-likelihood-inlier top matches and find the
-    // correct model in fewer tries. If those top matches are
-    // misleading (degenerate / repetitive features), later phases
-    // widen the pool to the full match set.
     matches.sort_unstable_by_key(|m| m.distance);
     let t_match = t2.elapsed();
     let n_matches = matches.len();
@@ -442,11 +444,8 @@ pub fn track_against_anchor_with_prior_and_extra(
         if PER_FRAME_TIMING_LOG {
             log::info!(
                 target: "planar_timing",
-                "brute: detect={:.1}ms describe={:.1}ms match={:.1}ms (kps={} matches={}) → bail",
-                t_detect.as_secs_f64() * 1000.0,
-                t_describe.as_secs_f64() * 1000.0,
+                "match-only: match={:.1}ms (matches={}) → bail",
                 t_match.as_secs_f64() * 1000.0,
-                n_raw_kps,
                 n_matches,
             );
         }
@@ -484,18 +483,32 @@ pub fn track_against_anchor_with_prior_and_extra(
     if PER_FRAME_TIMING_LOG {
         log::info!(
             target: "planar_timing",
-            "brute: detect={:.1}ms describe={:.1}ms match={:.1}ms ransac={:.1}ms (kps={} matches={} inliers={:?} desc_inliers={:?})",
-            t_detect.as_secs_f64() * 1000.0,
-            t_describe.as_secs_f64() * 1000.0,
+            "match-only: match={:.1}ms ransac={:.1}ms (matches={} inliers={:?} desc_inliers={:?})",
             t_match.as_secs_f64() * 1000.0,
             t_ransac.as_secs_f64() * 1000.0,
-            n_raw_kps,
             n_matches,
             out.as_ref().map(|r| r.inliers),
             out.as_ref().map(|r| r.descriptor_inliers),
         );
     }
     out
+}
+
+/// Like [`track_against_anchor_with_prior`] but accepts pre-computed
+/// `(anchor_x, anchor_y, view_x, view_y)` correspondences from outside
+/// the descriptor matcher (e.g. KLT-tracked inliers from the previous
+/// frame). Extras are prepended to the descriptor-matched pairs so
+/// PROSAC's high-quality early phases sample them first.
+pub fn track_against_anchor_with_prior_and_extra(
+    anchor: &SceneAnchor,
+    gray: &GrayImage,
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+    prior: Option<[f32; 9]>,
+    extra_pairs: &[(f32, f32, f32, f32)],
+) -> Option<TrackResult> {
+    let features = compute_frame_features(gray, cfg)?;
+    track_against_anchor_with_features(anchor, &features, cfg, min_inliers, prior, extra_pairs)
 }
 
 /// One match between an anchor descriptor and a current-frame descriptor.

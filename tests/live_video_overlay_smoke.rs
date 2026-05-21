@@ -70,8 +70,17 @@ fn video_frames_drive_live_overlay_pipeline() {
     fs::create_dir_all(&dump_dir).expect("create dump dir");
     let output_fps = env_u32("LIVE_VIDEO_OUTPUT_FPS").unwrap_or(30);
     let jpeg_quality = env_u8("LIVE_VIDEO_MJPEG_QUALITY").unwrap_or(90);
-    let mut composite_writer =
-        Mp4Writer::new(&dump_dir.join("composite.mp4"), output_fps, jpeg_quality);
+    let skip_mp4 = env_bool("LIVE_VIDEO_SKIP_MP4").unwrap_or(false);
+    let mut composite_writer: Option<Mp4Writer> = if skip_mp4 {
+        eprintln!("[live_video_overlay_smoke] SKIP_MP4 set: composite.mp4 will not be written");
+        None
+    } else {
+        Some(Mp4Writer::new(
+            &dump_dir.join("composite.mp4"),
+            output_fps,
+            jpeg_quality,
+        ))
+    };
 
     let ppocr = PpocrEngine::load(
         &model.det,
@@ -139,8 +148,17 @@ fn video_frames_drive_live_overlay_pipeline() {
     let mut prev_inliers: Option<usize> = None;
     let mut prev_anchor: Option<u64> = None;
 
+    let timing_every = env_usize("LIVE_VIDEO_TIMING_EVERY").unwrap_or(0);
+    let mut t_decode_sum = std::time::Duration::ZERO;
+    let mut t_oriented_sum = std::time::Duration::ZERO;
+    let mut t_track_sum = std::time::Duration::ZERO;
+    let mut t_render_sum = std::time::Duration::ZERO;
+    let mut t_encode_sum = std::time::Duration::ZERO;
     for (idx, frame) in frames.iter().take(frame_count).enumerate() {
+        let t_decode_start = std::time::Instant::now();
         let rgba = frame.decode();
+        let t_decode = t_decode_start.elapsed();
+        t_decode_sum += t_decode;
         let (w, h) = rgba.dimensions();
         let crop = Rect {
             left: 0,
@@ -148,15 +166,20 @@ fn video_frames_drive_live_overlay_pipeline() {
             right: w,
             bottom: h,
         };
+        let t_oriented_start = std::time::Instant::now();
         let oriented =
             OrientedImage::build_with_rgb(&rgba, w, h, 0, crop, det_max_pixels).expect("frame");
+        t_oriented_sum += t_oriented_start.elapsed();
         let timestamp_ns = idx as u64 * 33_333_333;
 
         let mut detect_reason = DetectReason::None;
         let mut h_view_to_surface = None;
         let mut tracker_inliers: Option<usize> = None;
         let mut lost_anchor: Option<u64> = None;
+        let t_track_start = std::time::Instant::now();
         let cmd = engine.process_frame(&oriented.gray, true, timestamp_ns);
+        let t_track = t_track_start.elapsed();
+        t_track_sum += t_track;
         let last_fit = engine.last_track_result().cloned();
         let tracker_state = match cmd {
             TrackerCommand::Idle | TrackerCommand::Acquiring => {
@@ -319,6 +342,7 @@ fn video_frames_drive_live_overlay_pipeline() {
         } else {
             active_anchor
         };
+        let t_render_start = std::time::Instant::now();
         let (mut composite, item_count) =
             render_outputs(&session, render_anchor, h_surface_to_view, &rgba);
         if item_count > 0 {
@@ -328,8 +352,22 @@ fn video_frames_drive_live_overlay_pipeline() {
             composite =
                 draw_frame_label(composite, w, h, font, idx, tracker_state, tracker_inliers);
         }
+        t_render_sum += t_render_start.elapsed();
 
-        composite_writer.write_frame(w, h, &composite);
+        let t_encode_start = std::time::Instant::now();
+        if let Some(writer) = composite_writer.as_mut() {
+            writer.write_frame(w, h, &composite);
+        }
+        let t_encode = t_encode_start.elapsed();
+        t_encode_sum += t_encode;
+        if timing_every > 0 && idx % timing_every == 0 {
+            eprintln!(
+                "[timing] frame {idx}: decode={:.1}ms track={:.1}ms encode={:.1}ms",
+                t_decode.as_secs_f64() * 1000.0,
+                t_track.as_secs_f64() * 1000.0,
+                t_encode.as_secs_f64() * 1000.0,
+            );
+        }
         let (matches_str, residual_str, model_str) = match last_fit.as_ref() {
             Some(r) => {
                 let model = if r.inliers >= 30 {
@@ -379,7 +417,19 @@ fn video_frames_drive_live_overlay_pipeline() {
         ));
     }
 
-    composite_writer.finish();
+    let n_f = frame_count.max(1) as f64;
+    eprintln!(
+        "[timing] avg per-frame over {} frames: decode={:.1}ms oriented={:.1}ms track={:.1}ms render={:.1}ms encode={:.1}ms",
+        frame_count,
+        t_decode_sum.as_secs_f64() * 1000.0 / n_f,
+        t_oriented_sum.as_secs_f64() * 1000.0 / n_f,
+        t_track_sum.as_secs_f64() * 1000.0 / n_f,
+        t_render_sum.as_secs_f64() * 1000.0 / n_f,
+        t_encode_sum.as_secs_f64() * 1000.0 / n_f,
+    );
+    if let Some(writer) = composite_writer {
+        writer.finish();
+    }
     fs::write(dump_dir.join("summary.jsonl"), summaries.join("\n")).expect("write summary");
     eprintln!(
         "[live_video_overlay_smoke] overlay frames: {}/{}; detected total={}; rec_ok total={}",

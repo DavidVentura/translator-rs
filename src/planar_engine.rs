@@ -16,7 +16,8 @@ use crate::homography::mat3_mul;
 use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
-    track_against_anchor, track_against_anchor_with_prior_and_extra,
+    compute_frame_features, track_against_anchor_with_features,
+    track_against_anchor_with_prior_and_extra,
 };
 
 #[cfg(feature = "image-render")]
@@ -1283,16 +1284,40 @@ impl LivePlanarEngine {
         gray: &GrayImage,
         skip_id: Option<AnchorId>,
     ) -> Option<(AnchorId, TrackResult)> {
+        let ids: Vec<AnchorId> = self
+            .cache
+            .ids_mru()
+            .into_iter()
+            .filter(|id| Some(*id) != skip_id)
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        // FAST + BRIEF once per frame. Without this, the cached-anchor
+        // retry loop on Lost-state frames runs the full detect+describe
+        // pipeline against the same `gray` for every cached anchor
+        // (O(cached_anchors × per_frame_matcher_cost)). On park.mp4
+        // this dominates: tracker time was ~50 ms/frame in Lost vs
+        // ~10 ms in steady-state Locked.
+        let features = match compute_frame_features(gray, &self.config.tracker) {
+            Some(f) => f,
+            None => return None,
+        };
+        let min = self.config.tracker.min_inliers;
         let mut best: Option<(AnchorId, TrackResult)> = None;
-        for &id in &self.cache.ids_mru() {
-            if Some(id) == skip_id {
-                continue;
-            }
+        for id in ids {
             let entry = match self.cache.get(id) {
                 Some(e) => e,
                 None => continue,
             };
-            if let Some(r) = track_against_anchor(&entry.anchor, gray, &self.config.tracker) {
+            if let Some(r) = track_against_anchor_with_features(
+                &entry.anchor,
+                &features,
+                &self.config.tracker,
+                min,
+                None,
+                &[],
+            ) {
                 let beats_current = match &best {
                     Some((_, b)) => r.inliers > b.inliers,
                     None => true,
