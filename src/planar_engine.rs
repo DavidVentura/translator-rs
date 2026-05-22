@@ -367,6 +367,29 @@ pub struct LivePlanarEngine {
     /// temporal continuity at the measurement level. See
     /// `cleanup_plan.md` § 2.
     gate_counters: GateCounters,
+    /// Sub-step timings from the most recent `process_frame` call.
+    /// Reset at the start of each call; populated for the Locked
+    /// branch (other branches are cheap and leave it at zeros).
+    last_step_timings: StepTimings,
+}
+
+/// Sub-step timings from the most recent `process_frame` call.
+/// Diagnostic surface for the prod per-window timing log — lets the
+/// caller break a 20 ms tracker step down into the pieces (FAST/BRIEF,
+/// match+RANSAC, KLT pyramid build, chain refinement) so regressions
+/// can be attributed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepTimings {
+    /// KLT pyramid build on the current gray frame.
+    pub pyramid_ms: f64,
+    /// `collect_klt_extras`: tracking previous inliers forward.
+    pub klt_extras_ms: f64,
+    /// `compute_frame_features`: FAST detect + BRIEF describe.
+    pub features_ms: f64,
+    /// `track_against_anchor_with_features`: match + RANSAC + refit.
+    pub track_ms: f64,
+    /// `step_chain_refine`: re-track parent for chain-mean averaging.
+    pub chain_refine_ms: f64,
 }
 
 /// Read-only snapshot of the engine's bandaid-gate fire counts.
@@ -643,6 +666,7 @@ impl LivePlanarEngine {
             last_cmd_kind: None,
             last_process_ns: None,
             gate_counters: GateCounters::default(),
+            last_step_timings: StepTimings::default(),
         }
     }
 
@@ -651,6 +675,12 @@ impl LivePlanarEngine {
     /// emission, never read by the engine itself.
     pub fn gate_counters(&self) -> GateCounters {
         self.gate_counters
+    }
+
+    /// Sub-step timings from the most recent `process_frame` call.
+    /// Diagnostic surface for the per-window prod timing log.
+    pub fn last_step_timings(&self) -> StepTimings {
+        self.last_step_timings
     }
 
     /// Last accepted TrackResult from the per-frame fit, if any. Lets
@@ -727,6 +757,7 @@ impl LivePlanarEngine {
     ) -> TrackerCommand {
         self.tick_stable(imu_stable, timestamp_ns);
         self.last_track_result = None;
+        self.last_step_timings = StepTimings::default();
         match self.state.clone() {
             EngineState::Idle => {
                 // Even when "Idle", we still try matching against cached
@@ -800,14 +831,23 @@ impl LivePlanarEngine {
                 // sub-pixel correspondences are prepended to the
                 // descriptor matches so PROSAC's early phases sample
                 // them first.
+                let t_pyramid = std::time::Instant::now();
                 let cur_pyramid = Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS);
+                self.last_step_timings.pyramid_ms = t_pyramid.elapsed().as_secs_f64() * 1000.0;
+                let t_klt_extras = std::time::Instant::now();
                 let klt_extras = self.collect_klt_extras(anchor_id, &cur_pyramid);
+                self.last_step_timings.klt_extras_ms =
+                    t_klt_extras.elapsed().as_secs_f64() * 1000.0;
                 // Compute features once and reuse them both for the
                 // main track and (if active) the chain-refinement
                 // parent re-track. The latter previously called
                 // `compute_frame_features` again over the same gray,
                 // doubling FAST+BRIEF cost on every refining frame.
+                let t_features = std::time::Instant::now();
                 let features = compute_frame_features(gray, &self.config.tracker);
+                self.last_step_timings.features_ms =
+                    t_features.elapsed().as_secs_f64() * 1000.0;
+                let t_track = std::time::Instant::now();
                 let (brute_result, dims) = match (self.cache.get(anchor_id), features.as_ref()) {
                     (Some(a), Some(features)) => {
                         let dims = a.anchor.image_dims;
@@ -824,6 +864,7 @@ impl LivePlanarEngine {
                     (Some(a), None) => (None, a.anchor.image_dims),
                     (None, _) => (None, (0, 0)),
                 };
+                self.last_step_timings.track_ms = t_track.elapsed().as_secs_f64() * 1000.0;
                 let result = match brute_result {
                     None => {
                         log::debug!("[engine] brute force returned None (matcher failed)");
@@ -879,7 +920,10 @@ impl LivePlanarEngine {
                     // No-op when no refinement is active. Reuses the
                     // main path's `features` instead of running
                     // FAST+BRIEF a second time.
+                    let t_chain = std::time::Instant::now();
                     self.step_chain_refine(features.as_ref(), anchor_id, &r.homography);
+                    self.last_step_timings.chain_refine_ms =
+                        t_chain.elapsed().as_secs_f64() * 1000.0;
                     self.last_track_result = Some(r.clone());
                     self.refresh_klt_state(anchor_id, &cur_pyramid, &r.inlier_pairs);
                     // Sustained inlier decline: the anchor's

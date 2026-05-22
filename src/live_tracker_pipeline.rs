@@ -288,11 +288,21 @@ impl Drop for Worker {
 /// Rolling per-frame timing for `process_frame`. Reset every
 /// `TIMING_WINDOW_FRAMES` calls; emits one log line per window so the
 /// caller can spot regressions or pauses without per-frame chatter.
+///
+/// `tracker_ms_sum` is the engine's wall time; the `*_sub_sum` fields
+/// break it down into the same sub-steps the engine reports via
+/// `LivePlanarEngine::last_step_timings`. `composite_overlay_count_sum`
+/// lets the consumer see overlay count alongside warp time.
 struct TimingStats {
     window_count: u32,
     total_ms_sum: f64,
     tracker_ms_sum: f64,
+    tracker_pyramid_ms_sum: f64,
+    tracker_features_ms_sum: f64,
+    tracker_track_ms_sum: f64,
+    tracker_chain_refine_ms_sum: f64,
     composite_ms_sum: f64,
+    composite_overlay_count_sum: u64,
     window_start: Instant,
 }
 
@@ -302,7 +312,12 @@ impl Default for TimingStats {
             window_count: 0,
             total_ms_sum: 0.0,
             tracker_ms_sum: 0.0,
+            tracker_pyramid_ms_sum: 0.0,
+            tracker_features_ms_sum: 0.0,
+            tracker_track_ms_sum: 0.0,
+            tracker_chain_refine_ms_sum: 0.0,
             composite_ms_sum: 0.0,
+            composite_overlay_count_sum: 0,
             window_start: Instant::now(),
         }
     }
@@ -451,7 +466,7 @@ impl LiveTrackerPipeline {
 
         let t_frame = Instant::now();
         let t_tracker = Instant::now();
-        let (tracker_state, tracker_anchor, tracker_inliers, tracker_h) =
+        let (tracker_state, tracker_anchor, tracker_inliers, tracker_h, step_timings) =
             self.step_tracker(frame, cfg.det_max_pixels, imu_stable, timestamp_ns)?;
         let tracker_ms = t_tracker.elapsed().as_secs_f64() * 1000.0;
         let frame_state_dims = {
@@ -465,7 +480,7 @@ impl LiveTrackerPipeline {
         }
 
         let t_composite = Instant::now();
-        let composite_bytes = match self.composite_into_slice(
+        let (composite_bytes, overlay_count) = match self.composite_into_slice(
             frame,
             dst,
             visible_sensor_w,
@@ -473,10 +488,10 @@ impl LiveTrackerPipeline {
             h_for_compose,
             tracker_anchor,
         ) {
-            Ok(()) => dst_w.saturating_mul(dst_h).saturating_mul(4),
+            Ok(n) => (dst_w.saturating_mul(dst_h).saturating_mul(4), n),
             Err(e) => {
                 log::warn!("composite failed: {e:?}");
-                0
+                (0, 0)
             }
         };
         let composite_ms = t_composite.elapsed().as_secs_f64() * 1000.0;
@@ -525,24 +540,30 @@ impl LiveTrackerPipeline {
             t.window_count += 1;
             t.total_ms_sum += total_ms;
             t.tracker_ms_sum += tracker_ms;
+            t.tracker_pyramid_ms_sum += step_timings.pyramid_ms;
+            t.tracker_features_ms_sum += step_timings.features_ms;
+            t.tracker_track_ms_sum += step_timings.track_ms;
+            t.tracker_chain_refine_ms_sum += step_timings.chain_refine_ms;
             t.composite_ms_sum += composite_ms;
+            t.composite_overlay_count_sum += overlay_count as u64;
             if t.window_count >= TIMING_WINDOW_FRAMES {
                 let n = t.window_count as f64;
                 let wall_s = t.window_start.elapsed().as_secs_f64();
                 let fps = if wall_s > 1e-6 { n / wall_s } else { 0.0 };
                 log::info!(
-                    "[lt] {} frames fps={:.1} total={:.1}ms (tracker={:.1}ms composite={:.1}ms)",
+                    "[lt] {} frames fps={:.1} total={:.1}ms tracker={:.1}ms (pyr={:.1} feat={:.1} match={:.1} chain={:.1}) composite={:.1}ms (overlays={:.1})",
                     t.window_count,
                     fps,
                     t.total_ms_sum / n,
                     t.tracker_ms_sum / n,
+                    t.tracker_pyramid_ms_sum / n,
+                    t.tracker_features_ms_sum / n,
+                    t.tracker_track_ms_sum / n,
+                    t.tracker_chain_refine_ms_sum / n,
                     t.composite_ms_sum / n,
+                    t.composite_overlay_count_sum as f64 / n,
                 );
-                t.window_count = 0;
-                t.total_ms_sum = 0.0;
-                t.tracker_ms_sum = 0.0;
-                t.composite_ms_sum = 0.0;
-                t.window_start = Instant::now();
+                *t = TimingStats::default();
             }
         }
 
@@ -564,7 +585,16 @@ impl LiveTrackerPipeline {
         det_max_pixels: u32,
         imu_stable: bool,
         timestamp_ns: u64,
-    ) -> Result<(PlanarTrackerState, u64, u32, Option<[f32; 9]>), TranslatorError> {
+    ) -> Result<
+        (
+            PlanarTrackerState,
+            u64,
+            u32,
+            Option<[f32; 9]>,
+            crate::planar_engine::StepTimings,
+        ),
+        TranslatorError,
+    > {
         let mut state = frame.state().lock().map_err(|_| poisoned())?;
         state.ensure_tracker_oriented(det_max_pixels)?;
         let oriented = state
@@ -574,6 +604,7 @@ impl LiveTrackerPipeline {
         let det_to_full = oriented.det_to_full_scale;
         let mut engine = self.engine.lock().map_err(|_| poisoned())?;
         let cmd = engine.process_frame(&oriented.gray, imu_stable, timestamp_ns);
+        let step_timings = engine.last_step_timings();
         drop(engine);
         drop(state);
         let (state_kind, anchor_id, h, inliers) = match cmd {
@@ -601,7 +632,7 @@ impl LiveTrackerPipeline {
                 (PlanarTrackerState::Lost, last_anchor_id, None, 0)
             }
         };
-        Ok((state_kind, anchor_id, inliers, h))
+        Ok((state_kind, anchor_id, inliers, h, step_timings))
     }
 
     fn select_compose_h(
@@ -642,7 +673,7 @@ impl LiveTrackerPipeline {
         bitmap_h: u32,
         h_surface_to_viewport: Option<[f32; 9]>,
         active_anchor_id: u64,
-    ) -> Result<(), CompositeError> {
+    ) -> Result<u32, CompositeError> {
         let state = frame.state().lock().expect("frame mutex poisoned");
         let sensor_w = state.width;
         let sensor_h = state.height;
@@ -677,6 +708,7 @@ impl LiveTrackerPipeline {
             1.0,
         ];
         let h_translated = homography::mat3_mul(&translate, &h_for_call);
+        let overlay_count = items_vec.len() as u32;
         live_compositor::composite_frame_into_cropped(
             dst,
             bitmap_w,
@@ -689,6 +721,7 @@ impl LiveTrackerPipeline {
             &h_translated,
             &items_vec,
         )
+        .map(|()| overlay_count)
     }
 
     fn update_refresh_trigger(
