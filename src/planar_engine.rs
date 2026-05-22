@@ -187,6 +187,17 @@ pub struct EngineConfig {
     /// handoffs in a row. Capping the chain forces a fresh root
     /// before drift becomes structural.
     pub max_chain_depth: u32,
+    /// Acceptance gate on the spawn-frame's H fit *quality* before
+    /// allowing a handoff. The handoff bakes the spawn-frame H into
+    /// `H_root→canonical_new`; if that fit is noisy, every downstream
+    /// frame inherits the bias. Block the handoff when the spawn
+    /// frame's median per-inlier residual exceeds this value.
+    pub handoff_max_median_residual_px: f32,
+    /// Acceptance gate on inlier *ratio* (descriptor_inliers /
+    /// matches) at the spawn frame. A handoff fitted with low inlier
+    /// ratio is likely in a wrong basin even if the absolute inlier
+    /// count is healthy — block it.
+    pub handoff_min_inlier_ratio: f32,
     /// Minimum α for the perspective EMA in the per-frame H
     /// smoother. α = 1.0 disables the EMA (passthrough); smaller α
     /// = heavier smoothing of the perspective DoFs (h6, h7) where
@@ -268,9 +279,33 @@ impl Default for EngineConfig {
             anchor_switch_blend_frames: 5,
             anchor_switch_blend_threshold_px: 15.0,
             max_chain_depth: 1,
+            // Quality gates on the spawn-frame H fit. The handoff
+            // bakes that fit into `H_root→canonical_new`; if it's
+            // noisy the new chain inherits the bias permanently.
+            // 1.5 px median residual and 0.4 inlier ratio are above
+            // typical clean-fit values (median residual ~0.5-1 px;
+            // ratio ~0.6-0.9 on stable scenes) but below the
+            // wrong-basin / degraded regimes (residual ~2-3 px,
+            // ratio ~0.2-0.3) we saw in earlier traces.
+            handoff_max_median_residual_px: 1.5,
+            handoff_min_inlier_ratio: 0.4,
             p_ema_min_alpha: 0.15,
-            p_ema_low_delta_px: 3.0,
-            p_ema_high_delta_px: 9.0,
+            // Thresholds calibrated for `perframe_motion_delta`'s
+            // R = 50 centered reference. At that scale, per-frame
+            // RANSAC translation/scale noise gives ~0.5-2 px
+            // delta, real handheld pan gives 5-20 px; these
+            // thresholds put noise into heavy smoothing and real
+            // motion into passthrough.
+            p_ema_low_delta_px: 2.0,
+            // Tightened from 8.0: a wider ramp window meant the
+            // EMA stayed partially engaged (α ≈ 0.4–0.8) for 2–3
+            // frames after motion started, producing a visible
+            // "overlay catching up" lag at the very beginning of
+            // a pan. With high=4 the gate fully releases within
+            // 1 frame of motion crossing the low threshold, while
+            // still gating noise (~0.5–2 px deltas) into the
+            // heavy-smoothing branch.
+            p_ema_high_delta_px: 4.0,
         }
     }
 }
@@ -325,14 +360,6 @@ struct EmitSmoothState {
     last_active_id: Option<AnchorId>,
     last_emitted_h: Option<[f32; 9]>,
     blend: Option<BlendState>,
-    /// Previous frame's perspective component (P in H = S · P) after
-    /// EMA. Smoothing target for the next frame's `p_emaed = α · P_now
-    /// + (1−α) · last_p`. None at start, after Lost/Idle, or after a
-    /// handoff blend resets (so we don't lerp from a stale P that
-    /// belongs to a different chain root). Heavy smoothing on P
-    /// kills the corner-amplified perspective wobble described in
-    /// `analysis.md` § "Perspective wobble".
-    last_p: Option<[f32; 9]>,
 }
 
 #[derive(Clone, Debug)]
@@ -758,10 +785,22 @@ impl LivePlanarEngine {
                         .map(|a| a.chain_depth)
                         .unwrap_or(0);
                     let chain_cap_ok = active_depth < self.config.max_chain_depth;
+                    let handoff_quality_ok = self.handoff_quality_ok(&r);
                     if self.track_quality.degraded_frames >= self.config.degraded_max_frames {
-                        let spawned = if chain_cap_ok {
+                        let spawned = if chain_cap_ok && handoff_quality_ok {
                             self.spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
                         } else {
+                            if !handoff_quality_ok {
+                                log::debug!(
+                                    "[engine] degraded handoff blocked by quality gate: median_residual={:.2}px inl_ratio={:.2}",
+                                    r.median_residual_px,
+                                    if r.matches > 0 {
+                                        r.descriptor_inliers as f32 / r.matches as f32
+                                    } else {
+                                        0.0
+                                    },
+                                );
+                            }
                             None
                         };
                         if let Some(new_id) = spawned {
@@ -865,32 +904,50 @@ impl LivePlanarEngine {
                     // such a fit into a new anchor's canonical alignment
                     // produces a visible overlay snap at handoff.
                     let recovering = self.track_quality.consecutive_clean_frames < 2;
-                    let new_active =
-                        if cooldown_elapsed && needs_handoff && !recovering && chain_cap_ok {
-                            let spawned = self
-                                .spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
-                                .unwrap_or(anchor_id);
-                            if spawned != anchor_id {
-                                let reason = if r.descriptor_inliers
-                                    < self.config.handoff_min_inliers
-                                {
-                                    "low_desc_inliers"
-                                } else if visible_ratio < self.config.handoff_min_visible_ratio {
-                                    "low_visibility"
-                                } else {
-                                    "scale_drift"
-                                };
-                                log::debug!(
-                                    "[engine] handoff {anchor_id} → {spawned} reason={reason} desc_inl={} vis={:.2} scale_log={:.2}",
-                                    r.descriptor_inliers,
-                                    visible_ratio,
-                                    scale_log,
-                                );
-                            }
-                            spawned
-                        } else {
-                            anchor_id
-                        };
+                    if needs_handoff
+                        && cooldown_elapsed
+                        && !recovering
+                        && chain_cap_ok
+                        && !handoff_quality_ok
+                    {
+                        log::debug!(
+                            "[engine] handoff blocked by quality gate: median_residual={:.2}px inl_ratio={:.2}",
+                            r.median_residual_px,
+                            if r.matches > 0 {
+                                r.descriptor_inliers as f32 / r.matches as f32
+                            } else {
+                                0.0
+                            },
+                        );
+                    }
+                    let new_active = if cooldown_elapsed
+                        && needs_handoff
+                        && !recovering
+                        && chain_cap_ok
+                        && handoff_quality_ok
+                    {
+                        let spawned = self
+                            .spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
+                            .unwrap_or(anchor_id);
+                        if spawned != anchor_id {
+                            let reason = if r.descriptor_inliers < self.config.handoff_min_inliers {
+                                "low_desc_inliers"
+                            } else if visible_ratio < self.config.handoff_min_visible_ratio {
+                                "low_visibility"
+                            } else {
+                                "scale_drift"
+                            };
+                            log::debug!(
+                                "[engine] handoff {anchor_id} → {spawned} reason={reason} desc_inl={} vis={:.2} scale_log={:.2}",
+                                r.descriptor_inliers,
+                                visible_ratio,
+                                scale_log,
+                            );
+                        }
+                        spawned
+                    } else {
+                        anchor_id
+                    };
                     // If we handed off, the new anchor's canonical frame
                     // IS this view, so its `last_homography` is identity.
                     // Otherwise we stay on the old anchor with its
@@ -1182,12 +1239,45 @@ impl LivePlanarEngine {
         // passthrough during real motion, so the EMA doesn't ever
         // visibly lag legitimate movement. Reset to passthrough
         // when α is configured to 1.0 (lifecycle tests / disabled).
+        // Per-frame EMA on the full 9-element H. Earlier iterations
+        // tried (a) decomposing into similarity + perspective and
+        // EMAing the perspective component — `fit_similarity`'s own
+        // jitter leaked into the computed P and added more noise
+        // than it removed; (b) direct EMA on h6/h7 only — fixed the
+        // edge-amplified "breathing" but left visible rotation/
+        // shear oscillation (the linear 2×2 block: h0, h1, h3, h4)
+        // unsmoothed. Per-element EMA on all 9 catches every noise
+        // mode the RANSAC fit introduces.
+        //
+        // The translation elements (h2, h5) get smoothed too. The
+        // "won't this lag pans?" concern is answered by the
+        // adaptive motion gate below: at the first frame of a real
+        // pan, `perframe_motion_delta` crosses
+        // `p_ema_high_delta_px` → α saturates at 1.0 → passthrough.
+        // At steady state, motion delta is dominated by RANSAC noise
+        // (~0.5-2 px on the R=50 reference) → α at `p_ema_min_alpha`
+        // → 6× attenuation. The lag during the 1-frame ramp-up
+        // (when α is partway between min and 1.0) is one frame at
+        // worst, imperceptible.
+        //
+        // Motion gate uses `perframe_motion_delta` (R = 50, centered)
+        // not `approx_corner_delta` (R = 1000, far-corner). The
+        // 1000-corner version geometrically amplifies the very
+        // noise we're smoothing — h6 ≈ 10⁻⁵ produces ~10 px corner
+        // delta at (1000, 1000), which would trip the gate's
+        // passthrough branch and silently disable the EMA on every
+        // frame.
+        //
+        // Trade-off: a pure tripod-mounted pivot tilt (zero
+        // translation, all perspective) registers low motion → α
+        // at min → tilt lags by ~1/α frames (~150 ms at α = 0.15).
+        // Handheld tilt always has some translation so is invisible
+        // in real use.
         let emit = if self.config.p_ema_min_alpha >= 1.0 {
             h_after_blend
         } else {
-            let (s, p_natural) = crate::homography::decompose_similarity_perspective(&h_after_blend);
             let motion_delta = match self.emit_smooth.last_emitted_h {
-                Some(prev) => approx_corner_delta(&prev, &h_after_blend),
+                Some(prev) => perframe_motion_delta(&prev, &h_after_blend),
                 None => f32::INFINITY,
             };
             let low = self.config.p_ema_low_delta_px;
@@ -1201,12 +1291,28 @@ impl LivePlanarEngine {
                 let t = (motion_delta - low) / (high - low);
                 min_alpha + t * (1.0 - min_alpha)
             };
-            let p_emaed = match self.emit_smooth.last_p {
-                Some(last_p) if alpha < 1.0 => lerp_h(&last_p, &p_natural, alpha),
-                _ => p_natural,
-            };
-            self.emit_smooth.last_p = Some(p_emaed);
-            mat3_mul(&s, &p_emaed)
+            let mut emit = h_after_blend;
+            if alpha < 1.0 {
+                if let Some(last) = self.emit_smooth.last_emitted_h {
+                    for i in 0..9 {
+                        emit[i] = alpha * h_after_blend[i] + (1.0 - alpha) * last[i];
+                    }
+                }
+            }
+            log::debug!(
+                "[h_ema] motion_delta={:.2}px alpha={:.2} | linear h0={:.4} h1={:.4} h3={:.4} h4={:.4} | persp h6={:.2e} h7={:.2e} | trans h2={:.2} h5={:.2}",
+                motion_delta,
+                alpha,
+                emit[0],
+                emit[1],
+                emit[3],
+                emit[4],
+                emit[6],
+                emit[7],
+                emit[2],
+                emit[5],
+            );
+            emit
         };
         self.emit_smooth.last_active_id = Some(active_id);
         self.emit_smooth.last_emitted_h = Some(emit);
@@ -1215,6 +1321,31 @@ impl LivePlanarEngine {
 
     fn reset_emit_smooth(&mut self) {
         self.emit_smooth = EmitSmoothState::default();
+    }
+
+    /// Acceptance gate on a TrackResult considered as the spawn frame
+    /// for a handoff. Returns true iff the fit is clean enough that
+    /// baking it into `H_root→canonical_new` won't introduce a
+    /// visible-permanently bias into the chain. Checks two
+    /// independent quality signals from RANSAC:
+    /// - median per-inlier residual (absolute fit error)
+    /// - descriptor inlier ratio (fraction of matches RANSAC kept)
+    ///
+    /// Both must clear their respective `EngineConfig` thresholds.
+    /// Either failing means the current frame's fit is in a noisy
+    /// region (low overlap with anchor, wrong-basin, or sanity-gate
+    /// adjacent) and the handoff is deferred. The matcher will
+    /// retry next frame; if the user is in a sustained noisy regime
+    /// the degraded path eventually falls back to Idle.
+    fn handoff_quality_ok(&self, r: &TrackResult) -> bool {
+        if r.median_residual_px > self.config.handoff_max_median_residual_px {
+            return false;
+        }
+        if r.matches == 0 {
+            return false;
+        }
+        let inl_ratio = r.descriptor_inliers as f32 / r.matches as f32;
+        inl_ratio >= self.config.handoff_min_inlier_ratio
     }
 
     /// Force-acquire a new scene anchor from `gray`. Use this when
@@ -1603,7 +1734,11 @@ impl LivePlanarEngine {
     ) -> Option<AnchorId> {
         let (root_id, h_root_to_active, parent_depth) = {
             let active = self.cache.get(active_id)?;
-            (active.root_id, active.h_root_to_canonical, active.chain_depth)
+            (
+                active.root_id,
+                active.h_root_to_canonical,
+                active.chain_depth,
+            )
         };
         // Inherit canonical rotation from the chain's root, not the
         // immediate parent. Keeps orientation pinned to the original
@@ -1915,10 +2050,41 @@ fn homography_delta_is_sane(
 /// a fixed 1000×1000 reference square. Used to size the anchor-switch
 /// blend trigger: real motion within an anchor produces small per-
 /// frame deltas; a switch produces a one-frame jump in the tens to
-/// hundreds of px here.
+/// hundreds of px here. **Large reference is deliberate** for this
+/// caller — chain-composition discontinuities at switch time are
+/// most visible at far corners, so amplifying them is correct.
 fn approx_corner_delta(a: &[f32; 9], b: &[f32; 9]) -> f32 {
     const W: f32 = 1000.0;
     let corners = [(0.0_f32, 0.0_f32), (W, 0.0), (W, W), (0.0, W)];
+    let mut max_d = 0.0_f32;
+    for &(x, y) in &corners {
+        let pa = crate::homography::project(a, x, y);
+        let pb = crate::homography::project(b, x, y);
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            let dx = pa.0 - pb.0;
+            let dy = pa.1 - pb.1;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d.is_finite() && d > max_d {
+                max_d = d;
+            }
+        }
+    }
+    max_d
+}
+
+/// Per-frame motion measure for the P-EMA gate. Same form as
+/// [`approx_corner_delta`] but on a **small centered** reference
+/// square (corners at (±50, ±50) instead of (0..1000)²). The
+/// large-reference version geometrically amplifies steady-state
+/// perspective noise: h6 ≈ 10⁻⁵ produces ~10 px corner delta at
+/// (1000, 1000) — which is exactly the noise the EMA is supposed
+/// to suppress, but the same number drives the EMA's α to its
+/// "passthrough" branch and disables itself. The small centered
+/// reference keeps "is the user moving the camera?" separate from
+/// "is there perspective noise we want to smooth?".
+fn perframe_motion_delta(a: &[f32; 9], b: &[f32; 9]) -> f32 {
+    const R: f32 = 50.0;
+    let corners = [(-R, -R), (R, -R), (R, R), (-R, R)];
     let mut max_d = 0.0_f32;
     for &(x, y) in &corners {
         let pa = crate::homography::project(a, x, y);

@@ -854,7 +854,103 @@ pub fn detect_fast(
             }
         }
     }
-    nms_filter(raw, nms_radius, max_features)
+    let mut kps = nms_filter(raw, nms_radius, max_features);
+    // Sub-pixel refinement: each FAST keypoint comes out at an
+    // integer pixel because the corner test runs at integer pixel
+    // positions. The actual visual corner lies somewhere within
+    // that pixel's footprint — typically ±0.5 px. Fitting a parabola
+    // to the SAD score response across the 4 cardinal neighbours
+    // and interpolating to its peak recovers ~0.1-0.2 px localisation
+    // accuracy, which propagates directly to a tighter RANSAC fit
+    // (per-keypoint position error is the source noise the H fit
+    // distributes across its DoFs). See `analysis.md` § "Source-
+    // side fixes". Cost: ~32 k extra ops per frame on 500 kps,
+    // negligible vs detect itself.
+    for kp in kps.iter_mut() {
+        refine_keypoint_subpixel(buf, w as usize, w_i, h_i, kp);
+    }
+    kps
+}
+
+/// Compute the FAST SAD score at an arbitrary pixel — sum of
+/// |circle_pixel − centre| over the 16 Bresenham-radius-3 circle
+/// pixels. Unlike `fast9_test`, this returns a score regardless of
+/// whether the pixel actually passes the FAST-9 corner test;
+/// callers use it to evaluate the score *surface* around a confirmed
+/// corner for parabolic peak fitting.
+#[inline]
+fn fast_sad_at(buf: &[u8], w: usize, x: i32, y: i32) -> i32 {
+    let c = buf[(y as usize) * w + (x as usize)] as i32;
+    let p = |dx: i32, dy: i32| -> i32 { buf[((y + dy) as usize) * w + ((x + dx) as usize)] as i32 };
+    let offsets: [(i32, i32); 16] = [
+        (0, -3),
+        (1, -3),
+        (2, -2),
+        (3, -1),
+        (3, 0),
+        (3, 1),
+        (2, 2),
+        (1, 3),
+        (0, 3),
+        (-1, 3),
+        (-2, 2),
+        (-3, 1),
+        (-3, 0),
+        (-3, -1),
+        (-2, -2),
+        (-1, -3),
+    ];
+    let mut s = 0i32;
+    for &(dx, dy) in &offsets {
+        s += (p(dx, dy) - c).abs();
+    }
+    s
+}
+
+/// Refine a FAST keypoint's (x, y) to sub-pixel position by fitting
+/// a 1D parabola in x and y separately to the SAD response at the
+/// integer-pixel centre and its 4 cardinal neighbours. The keypoint's
+/// `score` field is unchanged (still the integer-pixel SAD); only
+/// `x` and `y` are refined.
+///
+/// Parabola through `(-1, S_l), (0, S_c), (1, S_r)` peaks at
+/// `x_peak = (S_l − S_r) / (2 · (S_l + S_r − 2·S_c))`. Only valid
+/// when `S_c` is a local max in that axis (denom < 0). If the
+/// integer pixel isn't a local max along an axis (because the SAD
+/// surface around this corner is degenerate or saddle-like), no
+/// refinement is applied on that axis. The result is clamped to
+/// `[-0.5, +0.5]` — parabolic fit is only trustworthy for offsets
+/// smaller than the sample spacing.
+fn refine_keypoint_subpixel(buf: &[u8], w: usize, w_i: i32, h_i: i32, kp: &mut KeyPoint) {
+    let kx = kp.x as i32;
+    let ky = kp.y as i32;
+    // SAD evaluation at (kx±1, ky) and (kx, ky±1) needs the radius-3
+    // circle around those neighbours to be in-frame: i.e. positions
+    // (kx±4, ky) and (kx, ky±4) must be valid pixels. The detector's
+    // KEYPOINT_BORDER (24) already guarantees a much wider margin
+    // for all kept keypoints, so this is just a defensive check.
+    if kx < 4 || kx >= w_i - 4 || ky < 4 || ky >= h_i - 4 {
+        return;
+    }
+    let s_c = kp.score;
+    let s_l = fast_sad_at(buf, w, kx - 1, ky);
+    let s_r = fast_sad_at(buf, w, kx + 1, ky);
+    let s_u = fast_sad_at(buf, w, kx, ky - 1);
+    let s_d = fast_sad_at(buf, w, kx, ky + 1);
+    let denom_x = (s_l + s_r - 2 * s_c) as f32;
+    let denom_y = (s_u + s_d - 2 * s_c) as f32;
+    let dx = if denom_x < -1e-3 {
+        (0.5 * (s_l - s_r) as f32 / denom_x).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    let dy = if denom_y < -1e-3 {
+        (0.5 * (s_u - s_d) as f32 / denom_y).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    kp.x += dx;
+    kp.y += dy;
 }
 
 /// Check FAST-9 condition on 16 circle pixels: 9 contiguous brighter

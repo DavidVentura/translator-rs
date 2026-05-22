@@ -2272,7 +2272,7 @@ impl Default for LiveSession {
 /// Inflation of the detector's "tight" rect into the visible pill's
 /// vertical extent. Tight is glyph-only; we leave headroom for
 /// ascenders/descenders so the pill looks like it covers the line.
-pub const TIGHT_VERTICAL_INFLATE: f32 = 2.2;
+pub const TIGHT_VERTICAL_INFLATE: f32 = 2.4;
 
 /// Diagnostic: tint each block's bg with a deterministic palette
 /// colour (selected by `block_id % 8`) so we can see at a glance

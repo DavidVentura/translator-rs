@@ -96,6 +96,11 @@ fn test_engine_config() -> EngineConfig {
         anchor_switch_blend_frames: 0,
         anchor_switch_blend_threshold_px: f32::INFINITY,
         max_chain_depth: u32::MAX,
+        // Disabled in lifecycle tests: per-frame quality gating
+        // would block handoff on synthetic data where the per-fit
+        // residual and inlier ratio aren't representative.
+        handoff_max_median_residual_px: f32::INFINITY,
+        handoff_min_inlier_ratio: 0.0,
         // Disabled in lifecycle tests: per-frame P-EMA would
         // perturb exact-H assertions. The default 0.15 with
         // adaptive ramp would barely move H on synthetic transforms,
