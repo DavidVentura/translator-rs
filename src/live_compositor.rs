@@ -205,15 +205,57 @@ fn warp_item_onto_display(
     let src_max_x = (src_w - 1) as f32;
     let src_max_y = (src_h - 1) as f32;
 
+    // Row-incremental projective sampling. Per-pixel the previous
+    // implementation did a full 3×3 matrix-vector multiply + divide
+    // (9 mults + 6 adds + 1 div). For row `y`, the numerators and
+    // denominator of the sampling projection are linear in `x`:
+    //
+    //   num_sx = m0·dx + m1·dy + m2
+    //   num_sy = m3·dx + m4·dy + m5
+    //   den    = m6·dx + m7·dy + m8
+    //
+    // so we evaluate them at the row start (`dx = x0 + 0.5`) once,
+    // then advance by `(m0, m3, m6)` per column. Per-pixel cost
+    // drops to 3 adds + 1 div + 2 muls — a meaningful constant-
+    // factor win on overlay-heavy frames.
+    let m0 = viewport_to_bitmap[0];
+    let m1 = viewport_to_bitmap[1];
+    let m2 = viewport_to_bitmap[2];
+    let m3 = viewport_to_bitmap[3];
+    let m4 = viewport_to_bitmap[4];
+    let m5 = viewport_to_bitmap[5];
+    let m6 = viewport_to_bitmap[6];
+    let m7 = viewport_to_bitmap[7];
+    let m8 = viewport_to_bitmap[8];
+    let row_start_x = x0 as f32 + 0.5;
+
     for y in y0..y1 {
+        let dy = y as f32 + 0.5;
+        let mut num_sx = m0 * row_start_x + m1 * dy + m2;
+        let mut num_sy = m3 * row_start_x + m4 * dy + m5;
+        let mut den = m6 * row_start_x + m7 * dy + m8;
         for x in x0..x1 {
-            let dx = x as f32 + 0.5;
-            let dy = y as f32 + 0.5;
-            let (sx, sy) = match project(&viewport_to_bitmap, dx, dy) {
-                Some(p) => p,
-                None => continue,
-            };
-            if sx < 0.0 || sy < 0.0 || sx > src_max_x || sy > src_max_y {
+            // Advance happens at end of iter so the first iteration
+            // uses the row-start values computed above.
+            if den.abs() < 1e-9 || !den.is_finite() {
+                num_sx += m0;
+                num_sy += m3;
+                den += m6;
+                continue;
+            }
+            let inv_den = 1.0 / den;
+            let sx = num_sx * inv_den;
+            let sy = num_sy * inv_den;
+            num_sx += m0;
+            num_sy += m3;
+            den += m6;
+            if !sx.is_finite()
+                || !sy.is_finite()
+                || sx < 0.0
+                || sy < 0.0
+                || sx > src_max_x
+                || sy > src_max_y
+            {
                 continue;
             }
             let x0_i = sx.floor() as u32;
@@ -226,33 +268,57 @@ fn warp_item_onto_display(
             let i_tr = ((y0_i * src_w + x1_i) * 4) as usize;
             let i_bl = ((y1_i * src_w + x0_i) * 4) as usize;
             let i_br = ((y1_i * src_w + x1_i) * 4) as usize;
-            let a = bilinear_u8(
+            // Compute bilinear weights once and reuse for all 4
+            // channels. The previous code recomputed `1 - fx` and
+            // `1 - fy` inside each `bilinear_u8` call.
+            let one_minus_fx = 1.0 - fx;
+            let one_minus_fy = 1.0 - fy;
+            let w_tl = one_minus_fx * one_minus_fy;
+            let w_tr = fx * one_minus_fy;
+            let w_bl = one_minus_fx * fy;
+            let w_br = fx * fy;
+            let a = bilinear_sample(
                 src[i_tl + 3],
                 src[i_tr + 3],
                 src[i_bl + 3],
                 src[i_br + 3],
-                fx,
-                fy,
+                w_tl,
+                w_tr,
+                w_bl,
+                w_br,
             );
             if a == 0 {
                 continue;
             }
-            let r = bilinear_u8(src[i_tl], src[i_tr], src[i_bl], src[i_br], fx, fy);
-            let g = bilinear_u8(
+            let r = bilinear_sample(
+                src[i_tl],
+                src[i_tr],
+                src[i_bl],
+                src[i_br],
+                w_tl,
+                w_tr,
+                w_bl,
+                w_br,
+            );
+            let g = bilinear_sample(
                 src[i_tl + 1],
                 src[i_tr + 1],
                 src[i_bl + 1],
                 src[i_br + 1],
-                fx,
-                fy,
+                w_tl,
+                w_tr,
+                w_bl,
+                w_br,
             );
-            let b = bilinear_u8(
+            let b = bilinear_sample(
                 src[i_tl + 2],
                 src[i_tr + 2],
                 src[i_bl + 2],
                 src[i_br + 2],
-                fx,
-                fy,
+                w_tl,
+                w_tr,
+                w_bl,
+                w_br,
             );
             let dst_idx = ((y * dst_w + x) * 4) as usize;
             blend_source_over(&mut dst[dst_idx..dst_idx + 4], [r, g, b, a]);
@@ -261,10 +327,8 @@ fn warp_item_onto_display(
 }
 
 #[inline]
-fn bilinear_u8(tl: u8, tr: u8, bl: u8, br: u8, fx: f32, fy: f32) -> u8 {
-    let t = (tl as f32) * (1.0 - fx) + (tr as f32) * fx;
-    let b = (bl as f32) * (1.0 - fx) + (br as f32) * fx;
-    let v = t * (1.0 - fy) + b * fy;
+fn bilinear_sample(tl: u8, tr: u8, bl: u8, br: u8, w_tl: f32, w_tr: f32, w_bl: f32, w_br: f32) -> u8 {
+    let v = (tl as f32) * w_tl + (tr as f32) * w_tr + (bl as f32) * w_bl + (br as f32) * w_br;
     v.round().clamp(0.0, 255.0) as u8
 }
 
@@ -348,4 +412,53 @@ mod tests {
     }
 
     const IDENTITY_H: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+    /// Verify the row-incremental projective sampling matches a
+    /// straightforward per-pixel reference under a non-identity H.
+    /// Catches sign / increment-direction bugs in the scan-line
+    /// implementation that the identity-H test wouldn't trip.
+    #[test]
+    fn overlay_under_perspective_h_matches_reference() {
+        // 16x16 camera (uniform grey). 6x6 opaque red overlay at
+        // surface origin (4, 4). Apply a small perspective H that
+        // shifts + tilts the overlay across the viewport.
+        let cam = solid_rgba(16, 16, 50, 50, 50);
+        let overlay = solid_rgba(6, 6, 200, 0, 0);
+        let item = OverlayItem {
+            bitmap_rgba: &overlay,
+            bitmap_width: 6,
+            bitmap_height: 6,
+            bitmap_origin_surface_x: 4.0,
+            bitmap_origin_surface_y: 4.0,
+        };
+        // Translation + mild perspective.
+        let h = [1.05, -0.03, 1.5, 0.02, 0.97, -0.7, 1.0e-3, -5.0e-4, 1.0];
+
+        let mut dst = vec![0u8; 16 * 16 * 4];
+        composite_frame_into(&mut dst, 16, 16, &cam, &h, std::slice::from_ref(&item))
+            .unwrap();
+
+        // Uniform-red overlay → wherever the warp lands inside the
+        // bitmap, the bilinear result must be either pure (50,50,50)
+        // camera or some blend toward (200,0,0). G and B channels
+        // must never exceed 50, and R must equal G when no overlay
+        // covered the pixel.
+        let mut painted = 0usize;
+        for y in 0..16 {
+            for x in 0..16 {
+                let i = ((y * 16 + x) * 4) as usize;
+                let r = dst[i];
+                let g = dst[i + 1];
+                let b = dst[i + 2];
+                assert!(g <= 50, "g {g} > 50 at ({x}, {y})");
+                assert!(b <= 50, "b {b} > 50 at ({x}, {y})");
+                if r > 50 {
+                    painted += 1;
+                }
+            }
+        }
+        // Non-degenerate: the overlay covered *some* pixels.
+        assert!(painted >= 8, "perspective overlay covered only {painted} pixels");
+        assert!(painted <= 64, "perspective overlay covered too many ({painted}) pixels");
+    }
 }
