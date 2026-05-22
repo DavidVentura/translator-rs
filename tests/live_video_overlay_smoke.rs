@@ -368,7 +368,7 @@ fn video_frames_drive_live_overlay_pipeline() {
                 t_encode.as_secs_f64() * 1000.0,
             );
         }
-        let (matches_str, residual_str, model_str) = match last_fit.as_ref() {
+        let (matches_str, residual_str, model_str, desc_inliers_str) = match last_fit.as_ref() {
             Some(r) => {
                 let model = if r.inliers >= 30 {
                     "homography"
@@ -381,17 +381,24 @@ fn video_frames_drive_live_overlay_pipeline() {
                     r.matches.to_string(),
                     format!("{:.4}", r.median_residual_px),
                     format!("\"{model}\""),
+                    r.descriptor_inliers.to_string(),
                 )
             }
-            None => ("null".to_string(), "null".to_string(), "null".to_string()),
+            None => (
+                "null".to_string(),
+                "null".to_string(),
+                "null".to_string(),
+                "null".to_string(),
+            ),
         };
         summaries.push(format!(
-            "{{\"frame\":{idx},\"input\":\"{}\",\"tracker\":\"{}\",\"tracker_inliers\":{},\"matches\":{},\"median_residual_px\":{},\"fit_model\":{},\"lost_anchor\":{},\"detect_reason\":\"{}\",\"anchor\":{},\"render_anchor\":{},\"h_surface_to_view\":[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.6}],\"overlay_items\":{},\"detected\":{},\"rec_ok\":{},\"cache_hits\":{}}}",
+            "{{\"frame\":{idx},\"input\":\"{}\",\"tracker\":\"{}\",\"tracker_inliers\":{},\"descriptor_inliers\":{},\"matches\":{},\"median_residual_px\":{},\"fit_model\":{},\"lost_anchor\":{},\"detect_reason\":\"{}\",\"anchor\":{},\"render_anchor\":{},\"h_surface_to_view\":[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.6}],\"overlay_items\":{},\"detected\":{},\"rec_ok\":{},\"cache_hits\":{}}}",
             json_escape(frame.label()),
             tracker_state,
             tracker_inliers
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string()),
+            desc_inliers_str,
             matches_str,
             residual_str,
             model_str,

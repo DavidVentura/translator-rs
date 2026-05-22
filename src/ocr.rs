@@ -949,8 +949,33 @@ pub fn group_live_lines_into_blocks_in_quadrant(
         }
         i
     }
+
+    // Heading-row barriers: any line ending in `!`/`?` marks a row that
+    // shouldn't merge with the body below it. The threshold sits just
+    // below the barrier line (v + h/2) so sibling strips on the same
+    // reading line (e.g. "WORD" + "!" as separate detections) stay with
+    // the heading, while strips on the next visual line are blocked.
+    // Blocking direct pairs is enough: any transitive path between a
+    // heading-row and a body strip must cross some pair that itself
+    // straddles a barrier.
+    let line_vs: Vec<f32> = ordered.iter().map(|l| canonical_v(l, theta)).collect();
+    let barrier_thresholds: Vec<f32> = ordered
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| ends_with_heading_punct(&l.text))
+        .map(|(i, l)| line_vs[i] + l.tight_box.height.max(1.0) * 0.5)
+        .collect();
+    let straddles_heading_barrier = |i: usize, j: usize| -> bool {
+        let lo = line_vs[i].min(line_vs[j]);
+        let hi = line_vs[i].max(line_vs[j]);
+        barrier_thresholds.iter().any(|&t| lo <= t && hi > t)
+    };
+
     for i in 0..n {
         for j in (i + 1)..n {
+            if straddles_heading_barrier(i, j) {
+                continue;
+            }
             if live_lines_should_merge_in_quadrant(&ordered[i], &ordered[j], canonical_quadrant) {
                 let ri = find(&mut parent, i);
                 let rj = find(&mut parent, j);
@@ -1033,11 +1058,6 @@ pub fn live_lines_should_merge_in_quadrant(
     let next_u = canonical_u(next, theta);
     let prev_v = canonical_v(prev, theta);
     let next_v = canonical_v(next, theta);
-
-    let upper = if prev_v <= next_v { prev } else { next };
-    if ends_with_heading_punct(&upper.text) {
-        return false;
-    }
 
     // Gap along the paragraph axis. `next_v - prev_v` is signed; a
     // negative gap means the lines overlap on the paragraph axis (or
@@ -2204,7 +2224,7 @@ pub fn build_text_blocks(
 mod tests {
     use super::{
         DetectedWord, OrientedRect, OverlayLayoutMode, ParagraphGroupingOptions, Rect, TextBlock,
-        TextLine, build_text_blocks, group_lines_into_paragraphs, live_lines_should_merge,
+        TextLine, build_text_blocks, group_lines_into_paragraphs, group_live_lines_into_blocks,
         prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
@@ -2730,45 +2750,111 @@ mod tests {
         assert_eq!(block.translation_text(), "hello world from rust");
     }
 
-    #[test]
-    fn live_merge_refuses_heading_terminated_by_exclamation() {
-        let heading = line("DANGER!", 20, 10, 120, 26, 14.0);
-        let body = line("Keep out", 20, 32, 120, 46, 12.0);
-        assert!(!live_lines_should_merge(&heading, &body));
+    fn block_texts(blocks: &[TextBlock]) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = blocks
+            .iter()
+            .map(|b| b.lines.iter().map(|l| l.text.clone()).collect())
+            .collect();
+        for texts in &mut out {
+            texts.sort();
+        }
+        out.sort();
+        out
     }
 
     #[test]
-    fn live_merge_refuses_heading_terminated_by_question_mark() {
-        let heading = line("What should you do?", 20, 10, 220, 26, 12.0);
-        let body = line("Stay calm and wait.", 20, 30, 220, 44, 12.0);
-        assert!(!live_lines_should_merge(&heading, &body));
+    fn live_grouping_splits_heading_with_embedded_exclamation() {
+        let lines = vec![
+            line("DANGER!", 20, 10, 120, 26, 14.0),
+            line("Keep out", 20, 32, 120, 46, 12.0),
+        ];
+        let blocks = group_live_lines_into_blocks(lines);
+        assert_eq!(
+            block_texts(&blocks),
+            vec![vec!["DANGER!".to_string()], vec!["Keep out".to_string()]]
+        );
     }
 
     #[test]
-    fn live_merge_refuses_when_heading_is_passed_second() {
-        let body = line("Stay calm and wait.", 20, 30, 220, 44, 12.0);
-        let heading = line("What should you do?", 20, 10, 220, 26, 12.0);
-        assert!(!live_lines_should_merge(&body, &heading));
+    fn live_grouping_splits_heading_with_embedded_question_mark() {
+        let lines = vec![
+            line("What should you do?", 20, 10, 220, 26, 12.0),
+            line("Stay calm and wait.", 20, 30, 220, 44, 12.0),
+        ];
+        let blocks = group_live_lines_into_blocks(lines);
+        assert_eq!(
+            block_texts(&blocks),
+            vec![
+                vec!["Stay calm and wait.".to_string()],
+                vec!["What should you do?".to_string()],
+            ]
+        );
     }
 
     #[test]
-    fn live_merge_allows_body_lines_ending_in_period() {
-        let first = line("This is a sentence.", 20, 10, 220, 24, 12.0);
-        let second = line("And another one.", 20, 28, 220, 42, 12.0);
-        assert!(live_lines_should_merge(&first, &second));
+    fn live_grouping_splits_heading_when_punctuation_is_its_own_strip() {
+        // Reproduces the sign_raw.jpg case: OCR detects the heading word
+        // and its trailing `!` as two separate strips on the same reading
+        // line, with the body on the line below. The barrier rule must
+        // prevent the heading row from merging into the body row even
+        // though the pair (heading-word, body) doesn't itself involve a
+        // `!`-terminated strip.
+        let lines = vec![
+            line("ATTENTION", 20, 10, 140, 26, 14.0),
+            line("!", 150, 10, 160, 26, 14.0),
+            line("HIGH TENSION", 20, 34, 220, 48, 12.0),
+        ];
+        let blocks = group_live_lines_into_blocks(lines);
+        let leaked = blocks.iter().any(|b| {
+            let has_heading = b
+                .lines
+                .iter()
+                .any(|l| l.text == "ATTENTION" || l.text == "!");
+            let has_body = b.lines.iter().any(|l| l.text == "HIGH TENSION");
+            has_heading && has_body
+        });
+        assert!(
+            !leaked,
+            "heading row leaked into body block: {:?}",
+            block_texts(&blocks)
+        );
     }
 
     #[test]
-    fn live_merge_does_not_check_lower_lines_punctuation() {
-        let body = line("Some prose continues", 20, 10, 220, 24, 12.0);
-        let next = line("with a question?", 20, 28, 220, 42, 12.0);
-        assert!(live_lines_should_merge(&body, &next));
+    fn live_grouping_keeps_body_paragraphs_terminated_by_period() {
+        let lines = vec![
+            line("This is a sentence.", 20, 10, 220, 24, 12.0),
+            line("And another one.", 20, 28, 220, 42, 12.0),
+        ];
+        let blocks = group_live_lines_into_blocks(lines);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 2);
     }
 
     #[test]
-    fn live_merge_heading_check_ignores_trailing_whitespace() {
-        let heading = line("WARNING!   ", 20, 10, 220, 26, 12.0);
-        let body = line("Read carefully.", 20, 30, 220, 44, 12.0);
-        assert!(!live_lines_should_merge(&heading, &body));
+    fn live_grouping_ignores_lower_lines_terminal_question() {
+        let lines = vec![
+            line("Some prose continues", 20, 10, 220, 24, 12.0),
+            line("with a question?", 20, 28, 220, 42, 12.0),
+        ];
+        let blocks = group_live_lines_into_blocks(lines);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn live_grouping_heading_check_ignores_trailing_whitespace() {
+        let lines = vec![
+            line("WARNING!   ", 20, 10, 220, 26, 12.0),
+            line("Read carefully.", 20, 30, 220, 44, 12.0),
+        ];
+        let blocks = group_live_lines_into_blocks(lines);
+        assert_eq!(
+            block_texts(&blocks),
+            vec![
+                vec!["Read carefully.".to_string()],
+                vec!["WARNING!   ".to_string()],
+            ]
+        );
     }
 }

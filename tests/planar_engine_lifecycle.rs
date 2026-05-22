@@ -95,6 +95,7 @@ fn test_engine_config() -> EngineConfig {
         // handoff/snap frames.
         anchor_switch_blend_frames: 0,
         anchor_switch_blend_threshold_px: f32::INFINITY,
+        max_chain_depth: u32::MAX,
     }
 }
 

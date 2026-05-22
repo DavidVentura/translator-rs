@@ -179,6 +179,14 @@ pub struct EngineConfig {
     /// natural H before a blend is started. Below this, the switch
     /// is small enough that smoothing isn't worth the extra latency.
     pub anchor_switch_blend_threshold_px: f32,
+    /// Maximum chain depth allowed before handoff is refused and the
+    /// engine falls back to Idle/re-acquire instead. Each handoff
+    /// multiplies a small RANSAC fit error into the chain's
+    /// `H_root→canonical` composition; on motion-heavy clips this
+    /// accumulates into a visibly-drifting overlay after a few
+    /// handoffs in a row. Capping the chain forces a fresh root
+    /// before drift becomes structural.
+    pub max_chain_depth: u32,
 }
 
 impl Default for EngineConfig {
@@ -238,6 +246,7 @@ impl Default for EngineConfig {
             default_canonical_quadrant: Quadrant::R0,
             anchor_switch_blend_frames: 5,
             anchor_switch_blend_threshold_px: 15.0,
+            max_chain_depth: 1,
         }
     }
 }
@@ -275,6 +284,16 @@ pub struct LivePlanarEngine {
     /// anchor switches. Cleared on Lost/Idle so a re-acquire after
     /// loss doesn't lerp from a stale pre-loss H.
     emit_smooth: EmitSmoothState,
+    /// Discriminant of the last `TrackerCommand` returned by
+    /// `process_frame`. Used only to emit a debug line per change-of-
+    /// kind — without it, debug logging in the Acquiring or Locked
+    /// branches would fire every frame.
+    last_cmd_kind: Option<&'static str>,
+    /// Wall-clock-ish timestamp (frame timestamp) of the last
+    /// successful `process_frame` call. Lets the debug log surface
+    /// long gaps between calls (e.g. Kotlin pausing the pipeline)
+    /// alongside engine-internal state changes.
+    last_process_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -409,6 +428,13 @@ struct CachedAnchor {
     /// `last_known_quadrant`). Handoff children inherit from their
     /// root.
     canonical_rotation: Quadrant,
+    /// Number of handoffs between this anchor and its chain root.
+    /// 0 for roots; +1 per handoff spawn. Used to cap chain length —
+    /// each handoff multiplies a small fit-error into `h_root_to_canonical`
+    /// and deep chains visibly drift on motion-heavy clips. When the
+    /// active anchor's depth reaches `max_chain_depth`, the engine
+    /// stops handing off and falls back to Idle/re-acquire instead.
+    chain_depth: u32,
 }
 
 /// Hand-rolled LRU. Capacity is small (≤5 in production) so a Vec keyed
@@ -489,6 +515,8 @@ impl LivePlanarEngine {
             last_track_result: None,
             klt_state: None,
             emit_smooth: EmitSmoothState::default(),
+            last_cmd_kind: None,
+            last_process_ns: None,
         }
     }
 
@@ -524,7 +552,33 @@ impl LivePlanarEngine {
         imu_stable: bool,
         timestamp_ns: u64,
     ) -> TrackerCommand {
+        // Surface long gaps between calls — the engine being silent
+        // for many frames usually means Kotlin paused the pipeline
+        // (AF scan, surface lifecycle, etc.) and is the most likely
+        // cause of UI "Locked → IDLE → Locked" flickers that have no
+        // corresponding state transition in the engine's own logs.
+        if let Some(prev_ns) = self.last_process_ns {
+            let gap_ns = timestamp_ns.saturating_sub(prev_ns);
+            if gap_ns > 200_000_000 {
+                log::debug!(
+                    "[engine] process_frame: {:.0} ms gap since last call (Kotlin pause? AF scan?)",
+                    gap_ns as f64 / 1_000_000.0,
+                );
+            }
+        }
+        self.last_process_ns = Some(timestamp_ns);
         let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, None);
+        let kind = match &cmd {
+            TrackerCommand::Idle => "Idle",
+            TrackerCommand::Acquiring => "Acquiring",
+            TrackerCommand::Locked { .. } => "Locked",
+            TrackerCommand::Lost { .. } => "Lost",
+        };
+        if self.last_cmd_kind != Some(kind) {
+            let from = self.last_cmd_kind.unwrap_or("(start)");
+            log::debug!("[engine] emit {from} → {kind}");
+            self.last_cmd_kind = Some(kind);
+        }
         if matches!(cmd, TrackerCommand::Idle) {
             self.track_quality.reset();
         }
@@ -552,6 +606,11 @@ impl LivePlanarEngine {
                             id,
                             &Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS),
                             &result.inlier_pairs,
+                        );
+                        log::debug!(
+                            "[engine] Idle → Locked via cached anchor leaf={id} (inliers={} desc={})",
+                            result.inliers,
+                            result.descriptor_inliers,
                         );
                         self.transition_to_locked(id, &result, timestamp_ns, false);
                         let (root_id, h_root_to_view) =
@@ -654,17 +713,64 @@ impl LivePlanarEngine {
                     // descriptors are losing correspondences as
                     // perspective drifts, and RANSAC will start
                     // over-fitting to whichever pocket still matches.
-                    // Bail to Idle so the harness re-acquires on the
-                    // current view instead of riding cumulative drift.
+                    // First try to spawn a single handoff anchor at
+                    // the current view (provided the chain isn't
+                    // already at its depth cap — deep chains
+                    // accumulate fit error across the cascading
+                    // composition). If spawn is refused or fails,
+                    // fall back to Idle so the harness re-acquires
+                    // on a later frame with a fresh chain root.
+                    let active_depth = self
+                        .cache
+                        .get(anchor_id)
+                        .map(|a| a.chain_depth)
+                        .unwrap_or(0);
+                    let chain_cap_ok = active_depth < self.config.max_chain_depth;
                     if self.track_quality.degraded_frames >= self.config.degraded_max_frames {
+                        let spawned = if chain_cap_ok {
+                            self.spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
+                        } else {
+                            None
+                        };
+                        if let Some(new_id) = spawned {
+                            log::info!(
+                                "[engine] anchor {anchor_id} degraded ({} consecutive frames < {} desc inliers); handoff → {new_id} (avoids Idle)",
+                                self.track_quality.degraded_frames,
+                                self.config.degraded_inlier_threshold,
+                            );
+                            self.cache.touch(new_id);
+                            if let Some(entry) = self.cache.get_mut(new_id) {
+                                entry.last_locked_ns = timestamp_ns;
+                            }
+                            self.state = EngineState::Locked {
+                                anchor_id: new_id,
+                                frames_lost: 0,
+                                last_homography: IDENTITY,
+                            };
+                            self.track_quality.degraded_frames = 0;
+                            let (root_id, h_root_to_view) =
+                                self.chain_homography(anchor_id, &r.homography);
+                            let canonical_rotation = self.quadrant_for_active(new_id);
+                            return self.emit_locked(
+                                root_id,
+                                new_id,
+                                h_root_to_view,
+                                false,
+                                r.inliers,
+                                canonical_rotation,
+                            );
+                        }
                         log::info!(
-                            "[engine] anchor {} degraded ({} consecutive frames < {} inliers); forcing re-acquire",
+                            "[engine] anchor {} degraded ({} consecutive frames < {} desc inliers), chain_depth={} cap={} → forcing re-acquire",
                             anchor_id,
                             self.track_quality.degraded_frames,
                             self.config.degraded_inlier_threshold,
+                            active_depth,
+                            self.config.max_chain_depth,
                         );
                         self.state = EngineState::Idle;
                         self.track_quality.reset();
+                        self.reset_emit_smooth();
                         return TrackerCommand::Idle;
                     }
                     self.cache.touch(anchor_id);
@@ -727,12 +833,32 @@ impl LivePlanarEngine {
                     // such a fit into a new anchor's canonical alignment
                     // produces a visible overlay snap at handoff.
                     let recovering = self.track_quality.consecutive_clean_frames < 2;
-                    let new_active = if cooldown_elapsed && needs_handoff && !recovering {
-                        self.spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
-                            .unwrap_or(anchor_id)
-                    } else {
-                        anchor_id
-                    };
+                    let new_active =
+                        if cooldown_elapsed && needs_handoff && !recovering && chain_cap_ok {
+                            let spawned = self
+                                .spawn_handoff(gray, anchor_id, &r.homography, timestamp_ns)
+                                .unwrap_or(anchor_id);
+                            if spawned != anchor_id {
+                                let reason = if r.descriptor_inliers
+                                    < self.config.handoff_min_inliers
+                                {
+                                    "low_desc_inliers"
+                                } else if visible_ratio < self.config.handoff_min_visible_ratio {
+                                    "low_visibility"
+                                } else {
+                                    "scale_drift"
+                                };
+                                log::debug!(
+                                    "[engine] handoff {anchor_id} → {spawned} reason={reason} desc_inl={} vis={:.2} scale_log={:.2}",
+                                    r.descriptor_inliers,
+                                    visible_ratio,
+                                    scale_log,
+                                );
+                            }
+                            spawned
+                        } else {
+                            anchor_id
+                        };
                     // If we handed off, the new anchor's canonical frame
                     // IS this view, so its `last_homography` is identity.
                     // Otherwise we stay on the old anchor with its
@@ -761,6 +887,11 @@ impl LivePlanarEngine {
                 if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
                     self.last_track_result = Some(alt.clone());
                     self.refresh_klt_state(id, &cur_pyramid, &alt.inlier_pairs);
+                    log::debug!(
+                        "[engine] Locked active={anchor_id} produced no fit → cached sibling leaf={id} (inl={} desc={})",
+                        alt.inliers,
+                        alt.descriptor_inliers,
+                    );
                     self.transition_to_locked(id, &alt, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &alt.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
@@ -788,6 +919,10 @@ impl LivePlanarEngine {
                     self.track_quality.suspicious_frames,
                 );
                 if new_frames_lost >= self.config.lost_after_frames {
+                    log::debug!(
+                        "[engine] Locked active={anchor_id} → Lost after {} consecutive bad frames",
+                        new_frames_lost,
+                    );
                     self.state = EngineState::Lost {
                         last_anchor_id: anchor_id,
                         frames_lost: 0,
@@ -824,6 +959,11 @@ impl LivePlanarEngine {
                         &Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS),
                         &result.inlier_pairs,
                     );
+                    log::debug!(
+                        "[engine] Lost (last_active={last_anchor_id}) → Locked via cached leaf={id} (inl={} desc={})",
+                        result.inliers,
+                        result.descriptor_inliers,
+                    );
                     self.transition_to_locked(id, &result, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
@@ -840,6 +980,10 @@ impl LivePlanarEngine {
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(last_anchor_id);
                 if new_frames_lost >= self.config.give_up_after_frames {
+                    log::debug!(
+                        "[engine] Lost (last_active={last_anchor_id}) → Idle (gave up after {} frames without re-lock)",
+                        new_frames_lost,
+                    );
                     self.state = EngineState::Idle;
                     self.reset_emit_smooth();
                     TrackerCommand::Idle
@@ -954,7 +1098,14 @@ impl LivePlanarEngine {
         if switched {
             if let Some(prior_h) = self.emit_smooth.last_emitted_h {
                 let delta = approx_corner_delta(&prior_h, &h_natural);
+                let prev_leaf = self.emit_smooth.last_active_id;
                 if delta > threshold_px {
+                    log::debug!(
+                        "[emit_smooth] switch leaf={:?} → {active_id} delta={:.1}px > {:.1}px, blending {blend_frames} frames",
+                        prev_leaf,
+                        delta,
+                        threshold_px,
+                    );
                     self.emit_smooth.blend = Some(BlendState {
                         base_h_at_switch: prior_h,
                         target_active_id: active_id,
@@ -962,6 +1113,11 @@ impl LivePlanarEngine {
                         elapsed_frames: 0,
                     });
                 } else {
+                    log::debug!(
+                        "[emit_smooth] switch leaf={:?} → {active_id} delta={:.1}px below threshold, no blend",
+                        prev_leaf,
+                        delta,
+                    );
                     self.emit_smooth.blend = None;
                 }
             }
@@ -1078,6 +1234,7 @@ impl LivePlanarEngine {
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
                 canonical_rotation,
+                chain_depth: 0,
             },
         );
         self.state = EngineState::Locked {
@@ -1311,6 +1468,14 @@ impl LivePlanarEngine {
             self.track_quality.consecutive_clean_frames = 0;
             None
         } else {
+            if self.track_quality.suspicious_frames > 0 {
+                log::debug!(
+                    "[sanity_gate] resumed: cleared {} suspicious frame(s); accepted fit inliers={} ema={:.1}",
+                    self.track_quality.suspicious_frames,
+                    r.inliers,
+                    ema,
+                );
+            }
             self.track_quality.suspicious_frames = 0;
             self.track_quality.consecutive_clean_frames = self
                 .track_quality
@@ -1361,9 +1526,9 @@ impl LivePlanarEngine {
         h_active_to_view: &[f32; 9],
         timestamp_ns: u64,
     ) -> Option<AnchorId> {
-        let (root_id, h_root_to_active) = {
+        let (root_id, h_root_to_active, parent_depth) = {
             let active = self.cache.get(active_id)?;
-            (active.root_id, active.h_root_to_canonical)
+            (active.root_id, active.h_root_to_canonical, active.chain_depth)
         };
         // Inherit canonical rotation from the chain's root, not the
         // immediate parent. Keeps orientation pinned to the original
@@ -1390,6 +1555,7 @@ impl LivePlanarEngine {
                 created_at_ns: timestamp_ns,
                 last_locked_ns: timestamp_ns,
                 canonical_rotation: inherited_rotation,
+                chain_depth: parent_depth + 1,
             },
         );
         self.last_spawn_ns = timestamp_ns;

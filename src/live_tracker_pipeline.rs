@@ -40,7 +40,9 @@ use crate::font_provider::FontProvider;
 use crate::homography;
 use crate::live_compositor::{self, CompositeError, OverlayItem};
 use crate::live_frame::LiveFrame;
-use crate::live_session::{LiveSession, PostDetectInput};
+use crate::live_session::{
+    LiveSession, PostDetectInput, h_view_to_surface_from, viewport_surface_aabb,
+};
 use crate::ocr::{DetectedTextBox, OrientedRect, Rect};
 use crate::planar_engine::{EngineConfig, LivePlanarEngine, TrackerCommand};
 use crate::session::TranslatorSession;
@@ -149,6 +151,12 @@ const SMOOTH_HIGH_PX: f32 = 9.0;
 const SMOOTH_MIN_ALPHA: f32 = 0.35;
 const LOSS_HIDE_AFTER_FRAMES: u32 = 4;
 const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
+/// Inflation around the viewport AABB when asking the session
+/// "is this view already covered?". A small pad swallows the
+/// per-frame tracker jitter without admitting genuinely-new
+/// surface area as already-covered. Surface coords are anchor-
+/// resolution, so 24 px = ~2-3% of typical viewport extent.
+const COVERAGE_PAD_PX: f32 = 24.0;
 const DISABLE_SMOOTH_H: bool = false;
 const ENABLE_COLOR_MATTING: bool = false;
 
@@ -674,6 +682,32 @@ impl LiveTrackerPipeline {
             full_view_h,
             RELOCK_OVERLAP_THRESHOLD,
         ) {
+            // Quadrilateral area changed enough to *consider* a
+            // refresh, but a pure tilt / perspective change can flip
+            // this trigger without actually revealing new content.
+            // Gate on coverage: if the new viewport AABB is still
+            // inside the surface area we've already detected text in,
+            // every visible line is already in the surface map and a
+            // detect+OCR pass would be wasted work — at best a no-op,
+            // at worst (if tracker drift exceeds the merge tolerance)
+            // it produces stacked duplicate overlays.
+            let Some(h_view_to_surface) = h_view_to_surface_from(&h) else {
+                return false;
+            };
+            let viewport = match viewport_surface_aabb(&h_view_to_surface, full_view_w, full_view_h)
+            {
+                Some(v) => v,
+                None => return false,
+            };
+            if self
+                .session
+                .viewport_contained_in_coverage(anchor_id, &viewport, COVERAGE_PAD_PX)
+            {
+                return false;
+            }
+            log::debug!(
+                "[refresh] firing: viewport AABB extends beyond covered surface region (anchor={anchor_id})",
+            );
             self.session.clear_last_lock_h(anchor_id);
             if let Ok(mut slot) = self.pending_refresh_target.lock() {
                 *slot = Some((anchor_id, h));

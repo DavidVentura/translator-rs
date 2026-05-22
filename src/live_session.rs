@@ -527,13 +527,50 @@ impl LiveSession {
         (curr_area.min(lock_area) / max_area) < threshold
     }
 
-    /// Wipe the surface map + overlay items for `anchor_id` so the
-    /// next `run_post_detect` starts from empty state. Used by the
-    /// re-lock pipeline to convert the existing merge semantics into
-    /// an atomic replace: clear → detect → OCR → translate → insert
-    /// into the empty map. `covered_region` and `lock_viewport` are
-    /// preserved here; the caller updates `lock_viewport` after the
-    /// fresh pass succeeds (via `set_lock_viewport`).
+    /// Pre-refresh hook for the re-lock pipeline. Wipes the surface
+    /// map AND overlay items for `anchor_id` so the next
+    /// `run_post_detect` starts from empty state.
+    ///
+    /// This is the **clear + flash** approach. On production where
+    /// OCR runs on a worker thread, the compositor renders 4–5
+    /// frames between this wipe and the new overlays arriving, so
+    /// the user sees a brief "bubbles disappear then snap back"
+    /// flash on every refresh trigger. Trade-off: this is the only
+    /// implementation we've found that *reliably* avoids stale
+    /// overlays staying on screen indefinitely after the scene
+    /// changes.
+    ///
+    /// **Heuristics that were tried and rejected** (see
+    /// `analysis.md` § "Overlay swap on refresh" for full history):
+    /// - Skip the wipe + rely on `SurfaceMap::add_or_merge` to
+    ///   reuse existing block ids: tracker drift between refreshes
+    ///   exceeded the 0.3·line_height baseline tolerance, producing
+    ///   `Created` block ids at offsets → stacked duplicates that
+    ///   `retain_blocks` doesn't drop (because production preserves
+    ///   non-observed-this-run items for pan-away UX).
+    /// - Displace by IoU > 0.5 at upsert: misses containment (a
+    ///   narrow new bbox inside a wide old bbox has low IoU).
+    /// - Displace by IoU > 0.5 OR containment > 0.7: catches the
+    ///   narrow-inside-wide case but mishandles legitimate
+    ///   re-segmentation, e.g. a 9-line paragraph being re-detected
+    ///   as 1 line — containment of 1/9 ≈ 0.11 doesn't trigger
+    ///   displace, so the 9-line overlay stays stacked under the 1
+    ///   new overlay.
+    ///
+    /// **The proper fix is a larger refactor**: keep the *old*
+    /// overlay items rendering throughout `detect → OCR → translate`
+    /// (no flash); collect the *new* overlay items in a staging
+    /// buffer; when the full new set is ready, atomic-swap old → new
+    /// under the overlay-items mutex in a single transaction. That
+    /// requires `run_post_detect` to defer all `upsert_block_overlay_bitmap`
+    /// calls until completion and stage them via a "pending overlays"
+    /// list, which crosses several module boundaries. Until that's
+    /// done, this clear+flash version is correct (no stacking)
+    /// even if it's visually unpolished.
+    ///
+    /// `covered_region` / `lock_viewport` are preserved here; the
+    /// caller updates `lock_viewport` after the fresh pass succeeds
+    /// (via `set_lock_viewport`).
     pub fn clear_anchor_state_for_relock(&self, anchor_id: AnchorId) {
         if let Ok(mut states) = self.anchor_states.lock() {
             if let Some(state) = states.get_mut(&anchor_id) {
@@ -775,6 +812,24 @@ impl LiveSession {
                 surface_origin_y: raster.surface_origin_y,
                 content_hash: hash,
             };
+            // NB: we used to try a bbox-overlap "displace stale
+            // duplicates" pass here (IoU + containment in surface
+            // coords) so the clear-before-refresh wipe could be
+            // dropped (which would eliminate the flash). It worked
+            // for in-place duplicates but broke on re-segmentation:
+            // when the detector merges a 9-line paragraph into one
+            // box at frame A and then sees it as 1 line at frame B,
+            // the new 1-line bbox is 1/9 of the old paragraph's area
+            // — containment = 1/9 ≈ 0.11, well below any usable
+            // threshold — and the old 9-line overlay stays stacked.
+            // No purely-geometric heuristic over (old_bbox, new_bbox)
+            // distinguishes "stale duplicate of the same physical
+            // text" from "legitimate sub-region of a larger block",
+            // so we now rely on `clear_anchor_state_for_relock` to
+            // wipe the slate on each refresh. The flash that creates
+            // is the price of correctness until the staged-atomic-
+            // swap refactor lands. See `analysis.md` § "Overlay swap
+            // on refresh" for context.
             if let Some(slot) = items.iter_mut().find(|it| it.id == id) {
                 *slot = new_item;
             } else {
