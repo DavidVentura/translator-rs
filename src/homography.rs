@@ -357,6 +357,49 @@ pub fn invert(h: &[f32; 9]) -> Option<[f32; 9]> {
     Some(m)
 }
 
+/// Decompose `h` into a 4-DoF similarity `S` (rotation + uniform
+/// scale + translation) and a perspective/shear residual `P` such
+/// that `H = S · P`. Returns `(S, P)`.
+///
+/// Used by the per-frame H smoother to apply different time-
+/// constants to similarity (passed through — real camera motion
+/// lives here) and perspective (heavily EMA'd — the corner-amplified
+/// wobble lives here). See `analysis.md` § "Perspective wobble".
+///
+/// Method: project four corners of a reference square through H,
+/// fit a similarity to (square, projected_quad), then compute
+/// `P = S⁻¹ · H`. Falls back to `(identity, h)` if the H is
+/// degenerate enough that the projection or fit fails.
+pub fn decompose_similarity_perspective(h: &[f32; 9]) -> ([f32; 9], [f32; 9]) {
+    const W: f32 = 100.0;
+    let src = [(0.0_f32, 0.0_f32), (W, 0.0), (W, W), (0.0, W)];
+    let mut dst = [(0.0_f32, 0.0_f32); 4];
+    for i in 0..4 {
+        match project(h, src[i].0, src[i].1) {
+            Some(p) => dst[i] = p,
+            None => return (IDENTITY3, *h),
+        }
+    }
+    let pairs: [(f32, f32, f32, f32); 4] = [
+        (src[0].0, src[0].1, dst[0].0, dst[0].1),
+        (src[1].0, src[1].1, dst[1].0, dst[1].1),
+        (src[2].0, src[2].1, dst[2].0, dst[2].1),
+        (src[3].0, src[3].1, dst[3].0, dst[3].1),
+    ];
+    let s = match fit_similarity(&pairs) {
+        Some(s) => s,
+        None => return (IDENTITY3, *h),
+    };
+    let s_inv = match invert(&s) {
+        Some(i) => i,
+        None => return (IDENTITY3, *h),
+    };
+    let p = mat3_mul(&s_inv, h);
+    (s, p)
+}
+
+const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
 #[cfg(test)]
 mod tests {
     use super::*;

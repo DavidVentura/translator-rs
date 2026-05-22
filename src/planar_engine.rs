@@ -187,6 +187,27 @@ pub struct EngineConfig {
     /// handoffs in a row. Capping the chain forces a fresh root
     /// before drift becomes structural.
     pub max_chain_depth: u32,
+    /// Minimum α for the perspective EMA in the per-frame H
+    /// smoother. α = 1.0 disables the EMA (passthrough); smaller α
+    /// = heavier smoothing of the perspective DoFs (h6, h7) where
+    /// the corner-amplified steady-state wobble lives. The actual
+    /// α used per frame is `lerp(p_ema_min_alpha, 1.0, t)` where
+    /// `t` is how much the frame's natural H moved relative to the
+    /// previous emit — small motion → t ≈ 0 → smoothing engaged,
+    /// big motion → t ≈ 1 → passthrough (no lag on real camera
+    /// motion). Default 0.15 = ~6× attenuation of high-freq noise
+    /// at steady state.
+    pub p_ema_min_alpha: f32,
+    /// Below this corner-delta (in tracker px), the perspective EMA
+    /// is at its minimum α (heavy smoothing). Above
+    /// [`Self::p_ema_high_delta_px`], passthrough. The same
+    /// thresholds shape used by the handoff smoother (`SMOOTH_LOW`
+    /// / `SMOOTH_HIGH` in `live_tracker_pipeline.rs`), but here on
+    /// the per-frame H rather than at anchor-switch events.
+    pub p_ema_low_delta_px: f32,
+    /// Above this corner-delta, perspective EMA passes through. See
+    /// [`Self::p_ema_low_delta_px`].
+    pub p_ema_high_delta_px: f32,
 }
 
 impl Default for EngineConfig {
@@ -247,6 +268,9 @@ impl Default for EngineConfig {
             anchor_switch_blend_frames: 5,
             anchor_switch_blend_threshold_px: 15.0,
             max_chain_depth: 1,
+            p_ema_min_alpha: 0.15,
+            p_ema_low_delta_px: 3.0,
+            p_ema_high_delta_px: 9.0,
         }
     }
 }
@@ -301,6 +325,14 @@ struct EmitSmoothState {
     last_active_id: Option<AnchorId>,
     last_emitted_h: Option<[f32; 9]>,
     blend: Option<BlendState>,
+    /// Previous frame's perspective component (P in H = S · P) after
+    /// EMA. Smoothing target for the next frame's `p_emaed = α · P_now
+    /// + (1−α) · last_p`. None at start, after Lost/Idle, or after a
+    /// handoff blend resets (so we don't lerp from a stale P that
+    /// belongs to a different chain root). Heavy smoothing on P
+    /// kills the corner-amplified perspective wobble described in
+    /// `analysis.md` § "Perspective wobble".
+    last_p: Option<[f32; 9]>,
 }
 
 #[derive(Clone, Debug)]
@@ -1122,7 +1154,7 @@ impl LivePlanarEngine {
                 }
             }
         }
-        let emit = match self.emit_smooth.blend.as_mut() {
+        let h_after_blend = match self.emit_smooth.blend.as_mut() {
             Some(blend) if blend.target_active_id == active_id => {
                 blend.elapsed_frames = blend.elapsed_frames.saturating_add(1);
                 let t = (blend.elapsed_frames as f32) / (blend.total_frames as f32);
@@ -1141,6 +1173,40 @@ impl LivePlanarEngine {
                 h_natural
             }
             None => h_natural,
+        };
+        // Per-frame perspective EMA. Decompose H = S · P, smooth P
+        // (where the corner-amplified steady-state wobble lives),
+        // pass S through unchanged (where every real camera motion
+        // lives — smoothing here would visibly lag the overlay). α
+        // ramps with motion magnitude: heavy smoothing at rest,
+        // passthrough during real motion, so the EMA doesn't ever
+        // visibly lag legitimate movement. Reset to passthrough
+        // when α is configured to 1.0 (lifecycle tests / disabled).
+        let emit = if self.config.p_ema_min_alpha >= 1.0 {
+            h_after_blend
+        } else {
+            let (s, p_natural) = crate::homography::decompose_similarity_perspective(&h_after_blend);
+            let motion_delta = match self.emit_smooth.last_emitted_h {
+                Some(prev) => approx_corner_delta(&prev, &h_after_blend),
+                None => f32::INFINITY,
+            };
+            let low = self.config.p_ema_low_delta_px;
+            let high = self.config.p_ema_high_delta_px.max(low + 1e-3);
+            let min_alpha = self.config.p_ema_min_alpha;
+            let alpha = if motion_delta <= low {
+                min_alpha
+            } else if motion_delta >= high {
+                1.0
+            } else {
+                let t = (motion_delta - low) / (high - low);
+                min_alpha + t * (1.0 - min_alpha)
+            };
+            let p_emaed = match self.emit_smooth.last_p {
+                Some(last_p) if alpha < 1.0 => lerp_h(&last_p, &p_natural, alpha),
+                _ => p_natural,
+            };
+            self.emit_smooth.last_p = Some(p_emaed);
+            mat3_mul(&s, &p_emaed)
         };
         self.emit_smooth.last_active_id = Some(active_id);
         self.emit_smooth.last_emitted_h = Some(emit);
@@ -1506,10 +1572,19 @@ impl LivePlanarEngine {
     ) -> (AnchorId, [f32; 9]) {
         match self.cache.get(active_id) {
             Some(a) => {
-                let h_root_to_view = mat3_mul(h_active_to_view, &a.h_root_to_canonical);
+                // Canonicalize the composed H (divide all 9 elements
+                // by h22) so the downstream similarity/perspective
+                // decomposition (used by the P-EMA smoother) sees a
+                // matrix with h22 = 1. `mat3_mul` of two h22 = 1
+                // matrices generally yields h22 ≈ 1 + small cross-
+                // term contributions; without this step the
+                // decomposition's S would absorb the scale offset
+                // and P would be skewed, defeating the EMA's job.
+                let composed = mat3_mul(h_active_to_view, &a.h_root_to_canonical);
+                let h_root_to_view = canonicalize_h(&composed);
                 (a.root_id, h_root_to_view)
             }
-            None => (active_id, *h_active_to_view),
+            None => (active_id, canonicalize_h(h_active_to_view)),
         }
     }
 
@@ -1869,6 +1944,25 @@ fn lerp_h(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {
     let mut out = [0.0_f32; 9];
     for i in 0..9 {
         out[i] = a[i] * s + b[i] * t;
+    }
+    out
+}
+
+/// Divide every element by `h22` so the matrix is in the "h22 = 1"
+/// canonical form. Projective transforms are scale-invariant so this
+/// is a no-op for the projection itself, but the S/P decomposition
+/// (used by the P-EMA smoother) assumes h22 = 1 to keep S in
+/// 4-DoF similarity form. Degenerate matrices (h22 ≈ 0) are passed
+/// through unchanged — they were already broken.
+fn canonicalize_h(h: &[f32; 9]) -> [f32; 9] {
+    let scale = h[8];
+    if scale.abs() < 1e-9 {
+        return *h;
+    }
+    let inv = 1.0 / scale;
+    let mut out = [0.0_f32; 9];
+    for i in 0..9 {
+        out[i] = h[i] * inv;
     }
     out
 }
