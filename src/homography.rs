@@ -108,6 +108,154 @@ pub fn fit_homography(pairs: &[(f32, f32, f32, f32)]) -> Option<[f32; 9]> {
     Some(h2)
 }
 
+/// Like [`fit_homography`] but adds a damped Tikhonov-style prior
+/// term that pulls the solution toward `h_prior`. Used as the
+/// post-RANSAC refit step when a previous frame's H is available:
+/// the data term `||A·h − b||²` (algebraic DLT residuals on
+/// normalised coords) is augmented with `λ · ||h − h_prior_norm||²`,
+/// so the solver picks the basin closest to the prior when the
+/// data is consistent with multiple basins (a recurring source of
+/// frame-96-style wrong-basin events on sparse-inlier frames).
+///
+/// `lambda` is in normalised-coord units (Hartley-normalised
+/// coordinates have RMS ≈ √2). A reasonable scale is the inlier
+/// count `N`: setting `lambda = N` puts the prior on the same
+/// footing as roughly one inlier pair's worth of data. For well-
+/// determined DoFs (data Jacobian dominates) the prior contributes
+/// ≲ 25% of the diagonal. For under-determined DoFs (e.g.
+/// perspective elements at large rotation, where the data
+/// Jacobian column collapses), the prior takes over.
+///
+/// The prior H is transformed into the normalised coordinate
+/// frame before being baked into the normal equations and the
+/// result is de-normalised back to image coords.
+pub fn fit_homography_with_temporal_prior(
+    pairs: &[(f32, f32, f32, f32)],
+    h_prior: &[f32; 9],
+    lambda: f32,
+) -> Option<[f32; 9]> {
+    if pairs.len() < 4 {
+        return None;
+    }
+    let n = pairs.len() as f32;
+    let (mut mpx, mut mpy, mut mqx, mut mqy) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+    for &(px, py, qx, qy) in pairs {
+        mpx += px;
+        mpy += py;
+        mqx += qx;
+        mqy += qy;
+    }
+    mpx /= n;
+    mpy /= n;
+    mqx /= n;
+    mqy /= n;
+    let (mut sp, mut sq) = (0.0_f32, 0.0_f32);
+    for &(px, py, qx, qy) in pairs {
+        let dpx = px - mpx;
+        let dpy = py - mpy;
+        let dqx = qx - mqx;
+        let dqy = qy - mqy;
+        sp += (dpx * dpx + dpy * dpy).sqrt();
+        sq += (dqx * dqx + dqy * dqy).sqrt();
+    }
+    sp /= n;
+    sq /= n;
+    if sp <= 1e-3 || sq <= 1e-3 {
+        return None;
+    }
+    let kp = (2.0_f32).sqrt() / sp;
+    let kq = (2.0_f32).sqrt() / sq;
+    // Forward normalisation matrices: maps image coords → normalised.
+    let tp = [kp, 0.0, -kp * mpx, 0.0, kp, -kp * mpy, 0.0, 0.0, 1.0];
+    let tq = [kq, 0.0, -kq * mqx, 0.0, kq, -kq * mqy, 0.0, 0.0, 1.0];
+    // Transform the prior into the normalised coordinate frame:
+    //   H_norm = T_q · H_prior · T_p⁻¹
+    let tp_inv = invert(&tp)?;
+    let h_prior_norm = mat3_mul(&tq, &mat3_mul(h_prior, &tp_inv));
+    // Rescale so h_prior_norm[8] = 1 (consistent with the DLT solver's
+    // h22 = 1 convention).
+    let scale = h_prior_norm[8];
+    if scale.abs() < 1e-9 {
+        return None;
+    }
+    let inv_scale = 1.0 / scale;
+    let h_prior_8 = [
+        (h_prior_norm[0] * inv_scale) as f64,
+        (h_prior_norm[1] * inv_scale) as f64,
+        (h_prior_norm[2] * inv_scale) as f64,
+        (h_prior_norm[3] * inv_scale) as f64,
+        (h_prior_norm[4] * inv_scale) as f64,
+        (h_prior_norm[5] * inv_scale) as f64,
+        (h_prior_norm[6] * inv_scale) as f64,
+        (h_prior_norm[7] * inv_scale) as f64,
+    ];
+    // Same DLT system as `fit_homography`, accumulating A^T A and A^T b.
+    let mut ata = [[0.0_f64; 8]; 8];
+    let mut atb = [0.0_f64; 8];
+    for &(px, py, qx, qy) in pairs {
+        let px_n = (px - mpx) * kp;
+        let py_n = (py - mpy) * kp;
+        let qx_n = (qx - mqx) * kq;
+        let qy_n = (qy - mqy) * kq;
+        let r1 = [
+            px_n as f64,
+            py_n as f64,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            (-px_n * qx_n) as f64,
+            (-py_n * qx_n) as f64,
+        ];
+        let r2 = [
+            0.0,
+            0.0,
+            0.0,
+            px_n as f64,
+            py_n as f64,
+            1.0,
+            (-px_n * qy_n) as f64,
+            (-py_n * qy_n) as f64,
+        ];
+        for i in 0..8 {
+            for j in 0..8 {
+                ata[i][j] += r1[i] * r1[j] + r2[i] * r2[j];
+            }
+            atb[i] += r1[i] * qx_n as f64 + r2[i] * qy_n as f64;
+        }
+    }
+    // Prior damping: (A^T A + λI) h = A^T b + λ h_prior_8.
+    // In normalised coords, A^T A diagonals scale ~ N; choosing λ = N
+    // puts the prior at "one pair's worth" of data weight on well-
+    // determined DoFs (contributes ≲ 25%) and dominates on DoFs whose
+    // diagonal is much smaller than N (the under-determined ones).
+    let lambda_f64 = lambda as f64;
+    for i in 0..8 {
+        ata[i][i] += lambda_f64;
+        atb[i] += lambda_f64 * h_prior_8[i];
+    }
+    let h_norm = solve_8x8(ata, atb)?;
+    let h_normalised = [
+        h_norm[0] as f32,
+        h_norm[1] as f32,
+        h_norm[2] as f32,
+        h_norm[3] as f32,
+        h_norm[4] as f32,
+        h_norm[5] as f32,
+        h_norm[6] as f32,
+        h_norm[7] as f32,
+        1.0_f32,
+    ];
+    // De-normalise: H = T_q⁻¹ · H_norm · T_p.
+    let tq_inv = [1.0 / kq, 0.0, mqx, 0.0, 1.0 / kq, mqy, 0.0, 0.0, 1.0];
+    let h1 = mat3_mul(&h_normalised, &tp);
+    let h2 = mat3_mul(&tq_inv, &h1);
+    if !h2.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(h2)
+}
+
 /// 4-DoF similarity transform fit (translation + uniform scale +
 /// rotation). Returns a 3×3 matrix lifted from the 2×3 affine form so
 /// callers can use it interchangeably with a homography:

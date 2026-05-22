@@ -479,6 +479,21 @@ pub fn track_against_anchor_with_features(
                 },
             )
             .count();
+        // Temporal-prior post-refit was tried here and reverted:
+        // `homography::fit_homography_with_temporal_prior` with
+        // `lambda = max(0, 50 - desc_inliers)` (sparse-only) helped
+        // book (M2 19.3 → 13.9) but regressed magn (M2 6.4 → 19.4)
+        // and increased Lost frames on park/gintonic. The
+        // fundamental tension: λ strong enough to break wrong-basin
+        // ties is strong enough to lag during real motion, and
+        // descriptor inlier count alone doesn't distinguish
+        // "sparse because under-determined" from "sparse because
+        // fast motion / transitional frame". A proper Kalman-style
+        // per-DoF covariance tracking would solve this; the simple
+        // damped DLT cannot. The implementation
+        // `fit_homography_with_temporal_prior` is kept in
+        // `homography.rs` for future use. See `analysis.md` § "EKF
+        // path" for the principled-fit roadmap.
     }
     if PER_FRAME_TIMING_LOG {
         log::info!(
