@@ -90,6 +90,11 @@ fn test_engine_config() -> EngineConfig {
         degraded_inlier_threshold: 0,
         degraded_max_frames: u32::MAX,
         default_canonical_quadrant: translator::coords::Quadrant::R0,
+        // Disable in lifecycle tests: they assert on exact emitted H
+        // values, which the blend would intentionally perturb across
+        // handoff/snap frames.
+        anchor_switch_blend_frames: 0,
+        anchor_switch_blend_threshold_px: f32::INFINITY,
     }
 }
 

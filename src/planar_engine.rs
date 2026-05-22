@@ -165,6 +165,20 @@ pub struct EngineConfig {
     /// typically want `R270`; desktop sim with a synthetic flat image
     /// wants `R0`.
     pub default_canonical_quadrant: Quadrant,
+    /// When the leaf active anchor switches (handoff or cached snap-
+    /// back) the chain-composed `H_root→view` jumps because the new
+    /// anchor's canonical alignment was fitted on a different frame.
+    /// Blend the emitted H from the prior frame's value toward the
+    /// natural new-anchor value over this many frames to mask the
+    /// discontinuity. Zero disables. Real motion within a stable
+    /// anchor still emits naturally — the blend is only triggered on
+    /// anchor switches.
+    pub anchor_switch_blend_frames: u32,
+    /// Minimum corner-projection delta (on a 1000×1000 reference
+    /// square) between the prior emitted H and the new anchor's
+    /// natural H before a blend is started. Below this, the switch
+    /// is small enough that smoothing isn't worth the extra latency.
+    pub anchor_switch_blend_threshold_px: f32,
 }
 
 impl Default for EngineConfig {
@@ -222,6 +236,8 @@ impl Default for EngineConfig {
             degraded_inlier_threshold: 75,
             degraded_max_frames: 5,
             default_canonical_quadrant: Quadrant::R0,
+            anchor_switch_blend_frames: 5,
+            anchor_switch_blend_threshold_px: 15.0,
         }
     }
 }
@@ -255,6 +271,26 @@ pub struct LivePlanarEngine {
     /// `(anchor_pt, prev_view_pt)` correspondences we want to track
     /// forward into the next frame. Reset on anchor change / Lost.
     klt_state: Option<KltFrameState>,
+    /// Per-emission state used to blend `H_root→view` across leaf-
+    /// anchor switches. Cleared on Lost/Idle so a re-acquire after
+    /// loss doesn't lerp from a stale pre-loss H.
+    emit_smooth: EmitSmoothState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EmitSmoothState {
+    last_active_id: Option<AnchorId>,
+    last_emitted_h: Option<[f32; 9]>,
+    blend: Option<BlendState>,
+}
+
+#[derive(Clone, Debug)]
+struct BlendState {
+    base_h_at_switch: [f32; 9],
+    target_active_id: AnchorId,
+    total_frames: u32,
+    /// 0-based, incremented after each emission within the blend.
+    elapsed_frames: u32,
 }
 
 /// Per-anchor KLT propagation snapshot. Carried across frames so the
@@ -452,6 +488,7 @@ impl LivePlanarEngine {
             last_known_quadrant: default_quadrant,
             last_track_result: None,
             klt_state: None,
+            emit_smooth: EmitSmoothState::default(),
         }
     }
 
@@ -516,16 +553,18 @@ impl LivePlanarEngine {
                         let (root_id, h_root_to_view) =
                             self.chain_homography(id, &result.homography);
                         let canonical_rotation = self.quadrant_for_active(id);
-                        return TrackerCommand::Locked {
-                            anchor_id: root_id,
-                            homography: h_root_to_view,
-                            is_new: false,
-                            inliers: result.inliers,
+                        return self.emit_locked(
+                            root_id,
+                            id,
+                            h_root_to_view,
+                            false,
+                            result.inliers,
                             canonical_rotation,
-                        };
+                        );
                     }
                 }
                 self.clear_klt_state();
+                self.reset_emit_smooth();
                 if self.is_stable_enough(timestamp_ns) {
                     TrackerCommand::Acquiring
                 } else {
@@ -705,13 +744,14 @@ impl LivePlanarEngine {
                         last_homography: new_state_h,
                     };
                     let canonical_rotation = self.quadrant_for_active(new_state_id);
-                    return TrackerCommand::Locked {
-                        anchor_id: root_id,
-                        homography: h_root_to_view,
-                        is_new: false,
-                        inliers: r.inliers,
+                    return self.emit_locked(
+                        root_id,
+                        new_state_id,
+                        h_root_to_view,
+                        false,
+                        r.inliers,
                         canonical_rotation,
-                    };
+                    );
                 }
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
@@ -720,13 +760,14 @@ impl LivePlanarEngine {
                     self.transition_to_locked(id, &alt, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &alt.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
-                    return TrackerCommand::Locked {
-                        anchor_id: root_id,
-                        homography: h_root_to_view,
-                        is_new: false,
-                        inliers: alt.inliers,
+                    return self.emit_locked(
+                        root_id,
+                        id,
+                        h_root_to_view,
+                        false,
+                        alt.inliers,
                         canonical_rotation,
-                    };
+                    );
                 }
                 // Matcher failed AND no cached sibling caught the frame:
                 // the previous anchor's KLT seeds are no longer reliable
@@ -747,6 +788,7 @@ impl LivePlanarEngine {
                         last_anchor_id: anchor_id,
                         frames_lost: 0,
                     };
+                    self.reset_emit_smooth();
                     TrackerCommand::Lost {
                         last_anchor_id: root,
                     }
@@ -761,6 +803,7 @@ impl LivePlanarEngine {
                             _ => unreachable!(),
                         },
                     };
+                    self.reset_emit_smooth();
                     TrackerCommand::Lost {
                         last_anchor_id: root,
                     }
@@ -776,25 +819,28 @@ impl LivePlanarEngine {
                     self.transition_to_locked(id, &result, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
-                    return TrackerCommand::Locked {
-                        anchor_id: root_id,
-                        homography: h_root_to_view,
-                        is_new: false,
-                        inliers: result.inliers,
+                    return self.emit_locked(
+                        root_id,
+                        id,
+                        h_root_to_view,
+                        false,
+                        result.inliers,
                         canonical_rotation,
-                    };
+                    );
                 }
                 self.clear_klt_state();
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(last_anchor_id);
                 if new_frames_lost >= self.config.give_up_after_frames {
                     self.state = EngineState::Idle;
+                    self.reset_emit_smooth();
                     TrackerCommand::Idle
                 } else {
                     self.state = EngineState::Lost {
                         last_anchor_id,
                         frames_lost: new_frames_lost,
                     };
+                    self.reset_emit_smooth();
                     TrackerCommand::Lost {
                         last_anchor_id: root,
                     }
@@ -859,6 +905,86 @@ impl LivePlanarEngine {
 
     fn clear_klt_state(&mut self) {
         self.klt_state = None;
+    }
+
+    /// Build a `TrackerCommand::Locked` whose `homography` has been
+    /// smoothed across leaf-anchor switches. When the engine swaps
+    /// between two anchors that disagree on `H_root→view` by more
+    /// than `anchor_switch_blend_threshold_px`, the emitted H is
+    /// lerped from the prior frame's emitted H toward the natural
+    /// new-anchor H over `anchor_switch_blend_frames` frames. Real
+    /// motion inside a single anchor is emitted naturally.
+    fn emit_locked(
+        &mut self,
+        root_id: AnchorId,
+        active_id: AnchorId,
+        h_root_to_view: [f32; 9],
+        is_new: bool,
+        inliers: usize,
+        canonical_rotation: Quadrant,
+    ) -> TrackerCommand {
+        let smoothed = self.smooth_emit_h(active_id, h_root_to_view);
+        TrackerCommand::Locked {
+            anchor_id: root_id,
+            homography: smoothed,
+            is_new,
+            inliers,
+            canonical_rotation,
+        }
+    }
+
+    fn smooth_emit_h(&mut self, active_id: AnchorId, h_natural: [f32; 9]) -> [f32; 9] {
+        let blend_frames = self.config.anchor_switch_blend_frames;
+        let threshold_px = self.config.anchor_switch_blend_threshold_px;
+        if blend_frames == 0 {
+            self.emit_smooth.last_active_id = Some(active_id);
+            self.emit_smooth.last_emitted_h = Some(h_natural);
+            self.emit_smooth.blend = None;
+            return h_natural;
+        }
+        let switched = matches!(self.emit_smooth.last_active_id, Some(prev) if prev != active_id);
+        if switched {
+            if let Some(prior_h) = self.emit_smooth.last_emitted_h {
+                let delta = approx_corner_delta(&prior_h, &h_natural);
+                if delta > threshold_px {
+                    self.emit_smooth.blend = Some(BlendState {
+                        base_h_at_switch: prior_h,
+                        target_active_id: active_id,
+                        total_frames: blend_frames,
+                        elapsed_frames: 0,
+                    });
+                } else {
+                    self.emit_smooth.blend = None;
+                }
+            }
+        }
+        let emit = match self.emit_smooth.blend.as_mut() {
+            Some(blend) if blend.target_active_id == active_id => {
+                blend.elapsed_frames = blend.elapsed_frames.saturating_add(1);
+                let t = (blend.elapsed_frames as f32) / (blend.total_frames as f32);
+                if t >= 1.0 {
+                    self.emit_smooth.blend = None;
+                    h_natural
+                } else {
+                    lerp_h(&blend.base_h_at_switch, &h_natural, t)
+                }
+            }
+            Some(_) => {
+                // Target moved to a different active anchor mid-blend
+                // (rapid second switch). Abandon the previous blend
+                // and start fresh on the next switch detection.
+                self.emit_smooth.blend = None;
+                h_natural
+            }
+            None => h_natural,
+        };
+        self.emit_smooth.last_active_id = Some(active_id);
+        self.emit_smooth.last_emitted_h = Some(emit);
+        emit
+    }
+
+    fn reset_emit_smooth(&mut self) {
+        self.emit_smooth = EmitSmoothState::default();
     }
 
     /// Force-acquire a new scene anchor from `gray`. Use this when
@@ -1534,6 +1660,43 @@ fn homography_delta_is_sane(
         }
     }
     true
+}
+
+/// Max corner-projection distance between two 3×3 homographies over
+/// a fixed 1000×1000 reference square. Used to size the anchor-switch
+/// blend trigger: real motion within an anchor produces small per-
+/// frame deltas; a switch produces a one-frame jump in the tens to
+/// hundreds of px here.
+fn approx_corner_delta(a: &[f32; 9], b: &[f32; 9]) -> f32 {
+    const W: f32 = 1000.0;
+    let corners = [(0.0_f32, 0.0_f32), (W, 0.0), (W, W), (0.0, W)];
+    let mut max_d = 0.0_f32;
+    for &(x, y) in &corners {
+        let pa = crate::homography::project(a, x, y);
+        let pb = crate::homography::project(b, x, y);
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            let dx = pa.0 - pb.0;
+            let dy = pa.1 - pb.1;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d.is_finite() && d > max_d {
+                max_d = d;
+            }
+        }
+    }
+    max_d
+}
+
+/// Per-element linear interpolation between two 3×3 row-major
+/// homographies. Not geometrically rigorous for projective matrices,
+/// but accurate enough over the 3–5 frame blend window we use, and
+/// avoids the cost of decompose/recompose. The blend's t goes 0→1.
+fn lerp_h(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {
+    let s = 1.0 - t;
+    let mut out = [0.0_f32; 9];
+    for i in 0..9 {
+        out[i] = a[i] * s + b[i] * t;
+    }
+    out
 }
 
 fn homography_is_sane(h: &[f32; 9], canonical_w: u32, canonical_h: u32) -> bool {
