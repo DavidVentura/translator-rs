@@ -289,7 +289,7 @@ impl Default for EngineConfig {
             default_canonical_quadrant: Quadrant::R0,
             anchor_switch_blend_frames: 5,
             anchor_switch_blend_threshold_px: 15.0,
-            max_chain_depth: 1,
+            max_chain_depth: 3,
             // Quality gates on the spawn-frame H fit. The handoff
             // bakes that fit into `H_root→canonical_new`; if it's
             // noisy the new chain inherits the bias permanently.

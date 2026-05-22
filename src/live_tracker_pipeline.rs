@@ -285,6 +285,31 @@ impl Drop for Worker {
     }
 }
 
+/// Rolling per-frame timing for `process_frame`. Reset every
+/// `TIMING_WINDOW_FRAMES` calls; emits one log line per window so the
+/// caller can spot regressions or pauses without per-frame chatter.
+struct TimingStats {
+    window_count: u32,
+    total_ms_sum: f64,
+    tracker_ms_sum: f64,
+    composite_ms_sum: f64,
+    window_start: Instant,
+}
+
+impl Default for TimingStats {
+    fn default() -> Self {
+        Self {
+            window_count: 0,
+            total_ms_sum: 0.0,
+            tracker_ms_sum: 0.0,
+            composite_ms_sum: 0.0,
+            window_start: Instant::now(),
+        }
+    }
+}
+
+const TIMING_WINDOW_FRAMES: u32 = 10;
+
 /// The pipeline itself.
 pub struct LiveTrackerPipeline {
     engine: Mutex<LivePlanarEngine>,
@@ -300,6 +325,7 @@ pub struct LiveTrackerPipeline {
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
     worker: Mutex<Option<Worker>>,
+    timing: Mutex<TimingStats>,
 }
 
 impl LiveTrackerPipeline {
@@ -324,6 +350,7 @@ impl LiveTrackerPipeline {
             font_provider,
             last_telemetry: Mutex::new(None),
             worker: Mutex::new(None),
+            timing: Mutex::new(TimingStats::default()),
         });
         let worker = Worker::spawn(Arc::clone(&pipeline));
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
@@ -422,8 +449,11 @@ impl LiveTrackerPipeline {
             }
         }
 
+        let t_frame = Instant::now();
+        let t_tracker = Instant::now();
         let (tracker_state, tracker_anchor, tracker_inliers, tracker_h) =
             self.step_tracker(frame, cfg.det_max_pixels, imu_stable, timestamp_ns)?;
+        let tracker_ms = t_tracker.elapsed().as_secs_f64() * 1000.0;
         let frame_state_dims = {
             let state = frame.state().lock().map_err(|_| poisoned())?;
             (state.width, state.height, state.rotation_degrees)
@@ -434,6 +464,7 @@ impl LiveTrackerPipeline {
             *slot = h_for_compose.map(|h| (tracker_anchor, h));
         }
 
+        let t_composite = Instant::now();
         let composite_bytes = match self.composite_into_slice(
             frame,
             dst,
@@ -448,6 +479,7 @@ impl LiveTrackerPipeline {
                 0
             }
         };
+        let composite_ms = t_composite.elapsed().as_secs_f64() * 1000.0;
 
         // Detect-on-tracking refresh trigger.
         let should_refresh = matches!(tracker_state, PlanarTrackerState::Locked)
@@ -485,6 +517,32 @@ impl LiveTrackerPipeline {
                 state.materialize_owned();
             } else {
                 state.clear_external();
+            }
+        }
+
+        let total_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(mut t) = self.timing.lock() {
+            t.window_count += 1;
+            t.total_ms_sum += total_ms;
+            t.tracker_ms_sum += tracker_ms;
+            t.composite_ms_sum += composite_ms;
+            if t.window_count >= TIMING_WINDOW_FRAMES {
+                let n = t.window_count as f64;
+                let wall_s = t.window_start.elapsed().as_secs_f64();
+                let fps = if wall_s > 1e-6 { n / wall_s } else { 0.0 };
+                log::info!(
+                    "[lt] {} frames fps={:.1} total={:.1}ms (tracker={:.1}ms composite={:.1}ms)",
+                    t.window_count,
+                    fps,
+                    t.total_ms_sum / n,
+                    t.tracker_ms_sum / n,
+                    t.composite_ms_sum / n,
+                );
+                t.window_count = 0;
+                t.total_ms_sum = 0.0;
+                t.tracker_ms_sum = 0.0;
+                t.composite_ms_sum = 0.0;
+                t.window_start = Instant::now();
             }
         }
 
