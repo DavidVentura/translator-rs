@@ -24,6 +24,13 @@
 
 use image::GrayImage;
 
+/// Default pyramid depth used by the engine. Each level halves the
+/// resolution; the coarse-to-fine search extends KLT's tractable
+/// frame-to-frame displacement to roughly `window_radius × 2^(N-1)` px
+/// in L0 coordinates. 4 levels with r=5 → ~40 px ceiling, matched to
+/// the per-frame motion seen on fast-pan clips (park, gintonic).
+pub const DEFAULT_PYRAMID_LEVELS: usize = 4;
+
 /// One pyramid level + the level's downsample factor relative to L0.
 #[derive(Clone)]
 pub struct Pyramid {
@@ -116,7 +123,7 @@ pub struct KltConfig {
 impl Default for KltConfig {
     fn default() -> Self {
         Self {
-            num_levels: 3,
+            num_levels: DEFAULT_PYRAMID_LEVELS,
             window_radius: 5,
             max_iterations: 8,
             convergence_epsilon: 0.03,

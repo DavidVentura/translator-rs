@@ -548,7 +548,11 @@ impl LivePlanarEngine {
                 if !self.cache.is_empty() {
                     if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                         self.last_track_result = Some(result.clone());
-                        self.refresh_klt_state(id, &Pyramid::build(gray, 3), &result.inlier_pairs);
+                        self.refresh_klt_state(
+                            id,
+                            &Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS),
+                            &result.inlier_pairs,
+                        );
                         self.transition_to_locked(id, &result, timestamp_ns, false);
                         let (root_id, h_root_to_view) =
                             self.chain_homography(id, &result.homography);
@@ -604,7 +608,7 @@ impl LivePlanarEngine {
                 // sub-pixel correspondences are prepended to the
                 // descriptor matches so PROSAC's early phases sample
                 // them first.
-                let cur_pyramid = Pyramid::build(gray, 3);
+                let cur_pyramid = Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS);
                 let klt_extras = self.collect_klt_extras(anchor_id, &cur_pyramid);
                 let result = self.cache.get(anchor_id).and_then(|a| {
                     let dims = a.anchor.image_dims;
@@ -815,7 +819,11 @@ impl LivePlanarEngine {
             } => {
                 if let Some((id, result)) = self.try_cached_anchors(gray, None) {
                     self.last_track_result = Some(result.clone());
-                    self.refresh_klt_state(id, &Pyramid::build(gray, 3), &result.inlier_pairs);
+                    self.refresh_klt_state(
+                        id,
+                        &Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS),
+                        &result.inlier_pairs,
+                    );
                     self.transition_to_locked(id, &result, timestamp_ns, false);
                     let (root_id, h_root_to_view) = self.chain_homography(id, &result.homography);
                     let canonical_rotation = self.quadrant_for_active(id);
