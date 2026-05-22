@@ -16,9 +16,8 @@ use crate::homography::{invert, mat3_mul};
 use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
-    SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
+    FrameFeatures, SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
     compute_frame_features, track_against_anchor_with_features,
-    track_against_anchor_with_prior_and_extra,
 };
 
 #[cfg(feature = "image-render")]
@@ -803,12 +802,18 @@ impl LivePlanarEngine {
                 // them first.
                 let cur_pyramid = Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS);
                 let klt_extras = self.collect_klt_extras(anchor_id, &cur_pyramid);
-                let (brute_result, dims) = match self.cache.get(anchor_id) {
-                    Some(a) => {
+                // Compute features once and reuse them both for the
+                // main track and (if active) the chain-refinement
+                // parent re-track. The latter previously called
+                // `compute_frame_features` again over the same gray,
+                // doubling FAST+BRIEF cost on every refining frame.
+                let features = compute_frame_features(gray, &self.config.tracker);
+                let (brute_result, dims) = match (self.cache.get(anchor_id), features.as_ref()) {
+                    (Some(a), Some(features)) => {
                         let dims = a.anchor.image_dims;
-                        let r = track_against_anchor_with_prior_and_extra(
+                        let r = track_against_anchor_with_features(
                             &a.anchor,
-                            gray,
+                            features,
                             &self.config.tracker,
                             keep_min,
                             seed_prior,
@@ -816,7 +821,8 @@ impl LivePlanarEngine {
                         );
                         (r, dims)
                     }
-                    None => (None, (0, 0)),
+                    (Some(a), None) => (None, a.anchor.image_dims),
+                    (None, _) => (None, (0, 0)),
                 };
                 let result = match brute_result {
                     None => {
@@ -870,8 +876,10 @@ impl LivePlanarEngine {
                     // parent anchor against the current frame and
                     // fold the implied `h_root_to_canonical_new` into
                     // the running mean stored on the cached anchor.
-                    // No-op when no refinement is active.
-                    self.step_chain_refine(gray, anchor_id, &r.homography);
+                    // No-op when no refinement is active. Reuses the
+                    // main path's `features` instead of running
+                    // FAST+BRIEF a second time.
+                    self.step_chain_refine(features.as_ref(), anchor_id, &r.homography);
                     self.last_track_result = Some(r.clone());
                     self.refresh_klt_state(anchor_id, &cur_pyramid, &r.inlier_pairs);
                     // Sustained inlier decline: the anchor's
@@ -1438,7 +1446,17 @@ impl LivePlanarEngine {
     /// No-op when the refinement is inactive, has expired, or the
     /// active anchor doesn't match the one being refined (cached
     /// snap, additional handoff, etc.).
-    fn step_chain_refine(&mut self, gray: &GrayImage, current_active: AnchorId, h_new_to_view: &[f32; 9]) {
+    ///
+    /// `features` is the main-path's FAST+BRIEF for this frame —
+    /// reused to avoid a second pass over `gray`. Pass `None` when
+    /// the main path failed to extract features (the refinement
+    /// still ticks down a frame, just without an observation).
+    fn step_chain_refine(
+        &mut self,
+        features: Option<&FrameFeatures>,
+        current_active: AnchorId,
+        h_new_to_view: &[f32; 9],
+    ) {
         let in_progress = self.chain_refine.as_ref().map_or(false, |s| {
             s.new_anchor_id == current_active && s.frames_remaining > 0
         });
@@ -1468,11 +1486,6 @@ impl LivePlanarEngine {
                 self.chain_refine = None;
                 return;
             };
-            // Recompute features for this frame. Skipping the main-
-            // path's existing FAST+BRIEF would be cheaper but requires
-            // restructuring the hot path. The ~4 ms feature cost
-            // applies for `chain_refine_frames` (default 10) at each
-            // handoff event — a rare cost on the smoke clips.
             // Use the same inlier floor as the regular tracker. A
             // lower threshold here makes more parent re-tracks
             // succeed, but those low-inlier fits are usually biased
@@ -1480,10 +1493,10 @@ impl LivePlanarEngine {
             // and degrade further over subsequent frames) — averaging
             // biased candidates pulls the running mean away from the
             // spawn-frame value rather than toward truth.
-            compute_frame_features(gray, &self.config.tracker).and_then(|features| {
+            features.and_then(|features| {
                 track_against_anchor_with_features(
                     &parent.anchor,
-                    &features,
+                    features,
                     &self.config.tracker,
                     self.config.tracker.min_inliers_keep_locked,
                     None,
