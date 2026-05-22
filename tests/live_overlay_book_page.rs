@@ -193,17 +193,27 @@ fn book_page_grouping_dump() {
             rasters.push(raster);
         }
     }
-    let items: Vec<OverlayItem<'_>> = rasters
-        .iter()
-        .map(|r| OverlayItem {
-            bitmap_rgba: &r.bitmap,
+    let mut items: Vec<OverlayItem<'_>> = Vec::with_capacity(rasters.len() * 2);
+    for r in &rasters {
+        items.push(OverlayItem {
+            bitmap_rgba: &r.bg_bitmap,
             bitmap_width: r.width,
             bitmap_height: r.height,
             bitmap_origin_surface_x: r.surface_origin_x,
             bitmap_origin_surface_y: r.surface_origin_y,
             row_extents: &[],
-        })
-        .collect();
+        });
+    }
+    for r in &rasters {
+        items.push(OverlayItem {
+            bitmap_rgba: &r.text_bitmap,
+            bitmap_width: r.width,
+            bitmap_height: r.height,
+            bitmap_origin_surface_x: r.surface_origin_x,
+            bitmap_origin_surface_y: r.surface_origin_y,
+            row_extents: &[],
+        });
+    }
 
     // Camera RGBA in display orientation = the rotated `rgb` from
     // OrientedImage. Pad to 4 bytes per pixel (RGB → RGBA with α=255).

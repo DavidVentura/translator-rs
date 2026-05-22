@@ -680,19 +680,35 @@ impl LiveTrackerPipeline {
         let src_offset_x = sensor_w.saturating_sub(bitmap_w) / 2;
         let src_offset_y = sensor_h.saturating_sub(bitmap_h) / 2;
         let overlay_guard = self.session.overlay_items.lock().ok();
+        // Two-pass layout: all bg layers first (so overlapping bgs
+        // overwrite to the same opaque dark colour without stacking
+        // 2× as dark), then all text layers on top (so each block's
+        // text remains visible even where another block's bg lands).
         let items_vec: Vec<OverlayItem<'_>> = match (&overlay_guard, h_surface_to_viewport) {
-            (Some(items), Some(_)) => items
-                .iter()
-                .filter(|it| it.anchor_id == active_anchor_id)
-                .map(|it| OverlayItem {
-                    bitmap_rgba: &it.bitmap,
-                    bitmap_width: it.width,
-                    bitmap_height: it.height,
-                    bitmap_origin_surface_x: it.surface_origin_x,
-                    bitmap_origin_surface_y: it.surface_origin_y,
-                    row_extents: &it.row_extents,
-                })
-                .collect(),
+            (Some(items), Some(_)) => {
+                let mut out: Vec<OverlayItem<'_>> = Vec::with_capacity(items.len() * 2);
+                for it in items.iter().filter(|it| it.anchor_id == active_anchor_id) {
+                    out.push(OverlayItem {
+                        bitmap_rgba: &it.bg_bitmap,
+                        bitmap_width: it.width,
+                        bitmap_height: it.height,
+                        bitmap_origin_surface_x: it.surface_origin_x,
+                        bitmap_origin_surface_y: it.surface_origin_y,
+                        row_extents: &it.bg_row_extents,
+                    });
+                }
+                for it in items.iter().filter(|it| it.anchor_id == active_anchor_id) {
+                    out.push(OverlayItem {
+                        bitmap_rgba: &it.text_bitmap,
+                        bitmap_width: it.width,
+                        bitmap_height: it.height,
+                        bitmap_origin_surface_x: it.surface_origin_x,
+                        bitmap_origin_surface_y: it.surface_origin_y,
+                        row_extents: &it.text_row_extents,
+                    });
+                }
+                out
+            }
             _ => Vec::new(),
         };
         let h_for_call =

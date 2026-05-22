@@ -180,8 +180,14 @@ pub struct OverlayItem {
     /// compose time so cached state for a cached anchor doesn't
     /// render at the wrong place under the current anchor's H.
     pub anchor_id: AnchorId,
-    /// RGBA bitmap in canonical (surface) coords.
-    pub bitmap: Vec<u8>,
+    /// Background layer (opaque dark fill behind text). Separate
+    /// from `text_bitmap` so the compositor can draw all blocks'
+    /// bgs first (no overlap stacking) and all blocks' text on
+    /// top in a second pass. Both layers share dimensions.
+    pub bg_bitmap: Vec<u8>,
+    /// Text-glyphs layer on a transparent canvas. Rendered second
+    /// so each block's text lands on top of every block's bg.
+    pub text_bitmap: Vec<u8>,
     pub width: u32,
     pub height: u32,
     /// Where the bitmap's top-left sits in surface coords. The
@@ -191,12 +197,10 @@ pub struct OverlayItem {
     /// Hash of (strips + display text + language). Used to skip
     /// re-raster when content is unchanged across acquires.
     pub content_hash: u64,
-    /// Per-source-row half-open `[first, last)` range of columns
-    /// containing any non-zero alpha. Precomputed when the bitmap
-    /// is rasterised; the compositor consults this each frame to
-    /// skip per-pixel sampling on guaranteed-transparent regions
-    /// (typically 40-60% of the bbox area on text overlays).
-    pub row_extents: Vec<(u32, u32)>,
+    /// Per-source-row non-transparent column extents for `bg_bitmap`.
+    pub bg_row_extents: Vec<(u32, u32)>,
+    /// Per-source-row non-transparent column extents for `text_bitmap`.
+    pub text_row_extents: Vec<(u32, u32)>,
 }
 
 /// Scan an RGBA bitmap and return, per row, the half-open
@@ -839,17 +843,22 @@ impl LiveSession {
             None => return,
         };
         if let Ok(mut items) = self.overlay_items.lock() {
-            let row_extents = compute_row_extents(&raster.bitmap, raster.width, raster.height);
+            let bg_row_extents =
+                compute_row_extents(&raster.bg_bitmap, raster.width, raster.height);
+            let text_row_extents =
+                compute_row_extents(&raster.text_bitmap, raster.width, raster.height);
             let new_item = OverlayItem {
                 id,
                 anchor_id,
-                bitmap: raster.bitmap,
+                bg_bitmap: raster.bg_bitmap,
+                text_bitmap: raster.text_bitmap,
                 width: raster.width,
                 height: raster.height,
                 surface_origin_x: raster.surface_origin_x,
                 surface_origin_y: raster.surface_origin_y,
                 content_hash: hash,
-                row_extents,
+                bg_row_extents,
+                text_row_extents,
             };
             // NB: we used to try a bbox-overlap "displace stale
             // duplicates" pass here (IoU + containment in surface
@@ -2348,9 +2357,18 @@ pub const ITEM_BITMAP_PAD_PX: f32 = 4.0;
 
 /// Per-item raster result: an RGBA bitmap with bounded dimensions
 /// plus the surface-coord position of its top-left pixel.
+///
+/// Holds the bg and text as **separate** RGBA layers so the compositor
+/// can warp all bgs across all overlay items first, then all texts on
+/// top. Without this split, two overlapping blocks' bgs stack their
+/// translucent alpha (visible "2× as dark" overlap region) AND the
+/// later-drawn block's bg occludes the earlier-drawn block's text in
+/// the overlap area. Drawing bgs together (opaque, no stacking) and
+/// then texts together fixes both at once.
 #[derive(Clone, Debug)]
 pub struct ItemRaster {
-    pub bitmap: Vec<u8>,
+    pub bg_bitmap: Vec<u8>,
+    pub text_bitmap: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub surface_origin_x: f32,
@@ -2501,11 +2519,21 @@ pub fn render_block_bitmap(
     let bitmap_h = ((max_y + pad - origin_y).ceil() as i32).max(1) as u32;
 
     let pixels = (bitmap_w as usize) * (bitmap_h as usize);
-    let mut rgba = vec![0u8; pixels * 4];
+    // Two separate layers — see `ItemRaster` doc. `bg_rgba` is the
+    // dark fill behind each strip; `text_rgba` is the translated text
+    // on a transparent canvas. Both are bitmap_w × bitmap_h and share
+    // `surface_origin_*`.
+    let mut bg_rgba = vec![0u8; pixels * 4];
+    let text_rgba = vec![0u8; pixels * 4];
     let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
+        // Debug palette keeps its translucent alpha (each block is
+        // distinguishable). In debug mode overlapping bgs are
+        // intentionally visible.
         DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
     } else {
-        [0x10, 0x10, 0x10, 0xC8]
+        // Opaque dark bg. Two adjacent blocks' bgs that land on the
+        // same viewport pixel write the same colour; no double-dark.
+        [0x10, 0x10, 0x10, 0xFF]
     };
     let visuals_local: Vec<OrientedRect> = visuals
         .iter()
@@ -2523,9 +2551,15 @@ pub fn render_block_bitmap(
             .and_then(|m| m.as_ref())
             .and_then(|m| m.bg_uniform_argb)
             .map(argb_to_rgba_bytes)
+            .map(|mut rgba| {
+                // Force opaque even when matted: same rationale as
+                // the default bg, just with the matted colour.
+                rgba[3] = 0xFF;
+                rgba
+            })
             .unwrap_or(default_bg);
         crate::planar_engine::fill_oriented_rect_blended(
-            &mut rgba,
+            &mut bg_rgba,
             bitmap_w,
             bitmap_h,
             v,
@@ -2540,7 +2574,8 @@ pub fn render_block_bitmap(
 
     if display_text.trim().is_empty() {
         return Some(ItemRaster {
-            bitmap: rgba,
+            bg_bitmap: bg_rgba,
+            text_bitmap: text_rgba,
             width: bitmap_w,
             height: bitmap_h,
             surface_origin_x: origin_x,
@@ -2600,8 +2635,13 @@ pub fn render_block_bitmap(
         foreground_argb,
     };
 
+    // Render the text onto a *transparent* canvas (not the bg layer).
+    // `render_overlay` clones `prepared.rgba_bytes` and paints glyphs
+    // onto the clone, so passing `text_rgba` (all zeros) gives us a
+    // text-only bitmap. The compositor then warps bg layer + text
+    // layer in two passes.
     let prepared = PreparedImageOverlay {
-        rgba_bytes: rgba,
+        rgba_bytes: text_rgba,
         width: bitmap_w,
         height: bitmap_h,
         extracted_text: String::new(),
@@ -2612,9 +2652,10 @@ pub fn render_block_bitmap(
         language: language.to_string(),
         min_font_size_px: 6.0,
     };
-    let final_bytes = crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?;
+    let text_only = crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?;
     Some(ItemRaster {
-        bitmap: final_bytes,
+        bg_bitmap: bg_rgba,
+        text_bitmap: text_only,
         width: bitmap_w,
         height: bitmap_h,
         surface_origin_x: origin_x,

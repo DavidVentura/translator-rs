@@ -386,18 +386,34 @@ fn composite_overlay(
     let Ok(items_guard) = session.overlay_items.lock() else {
         return composite;
     };
-    let items: Vec<CompositeOverlayItem<'_>> = items_guard
-        .iter()
-        .filter(|it| it.anchor_id == anchor_id)
-        .map(|it| CompositeOverlayItem {
-            bitmap_rgba: &it.bitmap,
-            bitmap_width: it.width,
-            bitmap_height: it.height,
-            bitmap_origin_surface_x: it.surface_origin_x,
-            bitmap_origin_surface_y: it.surface_origin_y,
-            row_extents: &it.row_extents,
-        })
-        .collect();
+    let items: Vec<CompositeOverlayItem<'_>> = {
+        let live = items_guard
+            .iter()
+            .filter(|it| it.anchor_id == anchor_id)
+            .collect::<Vec<_>>();
+        let mut out: Vec<CompositeOverlayItem<'_>> = Vec::with_capacity(live.len() * 2);
+        for it in &live {
+            out.push(CompositeOverlayItem {
+                bitmap_rgba: &it.bg_bitmap,
+                bitmap_width: it.width,
+                bitmap_height: it.height,
+                bitmap_origin_surface_x: it.surface_origin_x,
+                bitmap_origin_surface_y: it.surface_origin_y,
+                row_extents: &it.bg_row_extents,
+            });
+        }
+        for it in &live {
+            out.push(CompositeOverlayItem {
+                bitmap_rgba: &it.text_bitmap,
+                bitmap_width: it.width,
+                bitmap_height: it.height,
+                bitmap_origin_surface_x: it.surface_origin_x,
+                bitmap_origin_surface_y: it.surface_origin_y,
+                row_extents: &it.text_row_extents,
+            });
+        }
+        out
+    };
     composite_frame_into(
         &mut composite,
         w,
