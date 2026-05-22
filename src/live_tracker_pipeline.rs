@@ -157,7 +157,12 @@ const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// surface area as already-covered. Surface coords are anchor-
 /// resolution, so 24 px = ~2-3% of typical viewport extent.
 const COVERAGE_PAD_PX: f32 = 24.0;
-const DISABLE_SMOOTH_H: bool = false;
+// Disabled (true) by default since the EKF on `H_anchor→view` landed
+// in `planar_engine`. This older scalar α low-pass was stacked
+// downstream of both the engine's per-element P-EMA and the EKF —
+// three temporal filters in series doing one job. See
+// `cleanup_plan.md` § 1 for the deletion follow-up.
+const DISABLE_SMOOTH_H: bool = true;
 const ENABLE_COLOR_MATTING: bool = false;
 
 /// What kind of async job the per-frame fast path needs to dispatch.

@@ -391,8 +391,9 @@ fn video_frames_drive_live_overlay_pipeline() {
                 "null".to_string(),
             ),
         };
+        let gc = engine.gate_counters();
         summaries.push(format!(
-            "{{\"frame\":{idx},\"input\":\"{}\",\"tracker\":\"{}\",\"tracker_inliers\":{},\"descriptor_inliers\":{},\"matches\":{},\"median_residual_px\":{},\"fit_model\":{},\"lost_anchor\":{},\"detect_reason\":\"{}\",\"anchor\":{},\"render_anchor\":{},\"h_surface_to_view\":[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.6}],\"overlay_items\":{},\"detected\":{},\"rec_ok\":{},\"cache_hits\":{}}}",
+            "{{\"frame\":{idx},\"input\":\"{}\",\"tracker\":\"{}\",\"tracker_inliers\":{},\"descriptor_inliers\":{},\"matches\":{},\"median_residual_px\":{},\"fit_model\":{},\"lost_anchor\":{},\"detect_reason\":\"{}\",\"anchor\":{},\"render_anchor\":{},\"h_surface_to_view\":[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.6}],\"overlay_items\":{},\"detected\":{},\"rec_ok\":{},\"cache_hits\":{},\"gates\":{{\"sanity_freeze\":{},\"sanity_reject\":{},\"delta_cap\":{},\"h_sanity\":{}}}}}",
             json_escape(frame.label()),
             tracker_state,
             tracker_inliers
@@ -421,6 +422,10 @@ fn video_frames_drive_live_overlay_pipeline() {
             detected_count,
             rec_ok_count,
             cache_hits,
+            gc.sanity_gate_freeze,
+            gc.sanity_gate_reject,
+            gc.delta_cap_reject,
+            gc.h_sanity_reject,
         ));
     }
 

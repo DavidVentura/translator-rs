@@ -309,22 +309,16 @@ impl Default for EngineConfig {
             // ratio ~0.2-0.3) we saw in earlier traces.
             handoff_max_median_residual_px: 1.5,
             handoff_min_inlier_ratio: 0.4,
-            p_ema_min_alpha: 0.15,
-            // Thresholds calibrated for `perframe_motion_delta`'s
-            // R = 50 centered reference. At that scale, per-frame
-            // RANSAC translation/scale noise gives ~0.5-2 px
-            // delta, real handheld pan gives 5-20 px; these
-            // thresholds put noise into heavy smoothing and real
-            // motion into passthrough.
+            // Disabled (passthrough) by default once the EKF on
+            // `H_anchor→view` landed. The EKF subsumes the per-
+            // element EMA's job with per-DoF gain set by the
+            // measurement Jacobian's structure, which is a strictly
+            // stronger filter than a scalar α applied to all 9
+            // elements. The motion gate was also miscalibrated
+            // against the EKF's smoother upstream delta. See
+            // `cleanup_plan.md` § 1 for the deletion follow-up.
+            p_ema_min_alpha: 1.0,
             p_ema_low_delta_px: 2.0,
-            // Tightened from 8.0: a wider ramp window meant the
-            // EMA stayed partially engaged (α ≈ 0.4–0.8) for 2–3
-            // frames after motion started, producing a visible
-            // "overlay catching up" lag at the very beginning of
-            // a pan. With high=4 the gate fully releases within
-            // 1 frame of motion crossing the low threshold, while
-            // still gating noise (~0.5–2 px deltas) into the
-            // heavy-smoothing branch.
             p_ema_high_delta_px: 4.0,
             use_h_ekf: true,
             h_ekf_r_var: EKF_R_DEFAULT,
@@ -381,6 +375,30 @@ pub struct LivePlanarEngine {
     /// long gaps between calls (e.g. Kotlin pausing the pipeline)
     /// alongside engine-internal state changes.
     last_process_ns: Option<u64>,
+    /// Cumulative counters for the inlier-discontinuity sanity gate
+    /// and the corner-jump delta cap. Used to measure whether these
+    /// gates still fire meaningfully now that the EKF provides
+    /// temporal continuity at the measurement level. See
+    /// `cleanup_plan.md` § 2.
+    gate_counters: GateCounters,
+}
+
+/// Read-only snapshot of the engine's bandaid-gate fire counts.
+/// Diagnostic surface for smoke runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GateCounters {
+    /// Frames where the sanity gate substituted the previous H for
+    /// the raw RANSAC fit (path 1: suspicious drop, budget available).
+    pub sanity_gate_freeze: u32,
+    /// Frames where the sanity gate rejected the fit outright (path 2:
+    /// suspicious drop, no history or budget exhausted).
+    pub sanity_gate_reject: u32,
+    /// Brute fits dropped by `homography_delta_is_sane` (300 px
+    /// corner-jump cap vs the prior accepted H).
+    pub delta_cap_reject: u32,
+    /// Brute fits dropped by `homography_is_sane` (out-of-frame /
+    /// degenerate projected viewport).
+    pub h_sanity_reject: u32,
 }
 
 struct HomographyEkfTracker {
@@ -610,7 +628,15 @@ impl LivePlanarEngine {
             h_ekf: None,
             last_cmd_kind: None,
             last_process_ns: None,
+            gate_counters: GateCounters::default(),
         }
+    }
+
+    /// Cumulative counts of bandaid-gate fire events since engine
+    /// construction. Diagnostic surface — exposed for smoke-trace
+    /// emission, never read by the engine itself.
+    pub fn gate_counters(&self) -> GateCounters {
+        self.gate_counters
     }
 
     /// Last accepted TrackResult from the per-frame fit, if any. Lets
@@ -762,42 +788,50 @@ impl LivePlanarEngine {
                 // them first.
                 let cur_pyramid = Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS);
                 let klt_extras = self.collect_klt_extras(anchor_id, &cur_pyramid);
-                let result = self.cache.get(anchor_id).and_then(|a| {
-                    let dims = a.anchor.image_dims;
-                    let brute = track_against_anchor_with_prior_and_extra(
-                        &a.anchor,
-                        gray,
-                        &self.config.tracker,
-                        keep_min,
-                        seed_prior,
-                        &klt_extras,
-                    );
-                    match brute {
-                        None => {
-                            log::debug!("[engine] brute force returned None (matcher failed)");
-                            None
+                let (brute_result, dims) = match self.cache.get(anchor_id) {
+                    Some(a) => {
+                        let dims = a.anchor.image_dims;
+                        let r = track_against_anchor_with_prior_and_extra(
+                            &a.anchor,
+                            gray,
+                            &self.config.tracker,
+                            keep_min,
+                            seed_prior,
+                            &klt_extras,
+                        );
+                        (r, dims)
+                    }
+                    None => (None, (0, 0)),
+                };
+                let result = match brute_result {
+                    None => {
+                        log::debug!("[engine] brute force returned None (matcher failed)");
+                        None
+                    }
+                    Some(t) => {
+                        let raw_inliers = t.inliers;
+                        let h_ok = homography_is_sane(&t.homography, dims.0, dims.1);
+                        let delta_ok =
+                            homography_delta_is_sane(&t.homography, &last_homography, dims.0, dims.1);
+                        if !h_ok {
+                            self.gate_counters.h_sanity_reject =
+                                self.gate_counters.h_sanity_reject.saturating_add(1);
                         }
-                        Some(t) => {
-                            let raw_inliers = t.inliers;
-                            if !homography_is_sane(&t.homography, dims.0, dims.1)
-                                || !homography_delta_is_sane(
-                                    &t.homography,
-                                    &last_homography,
-                                    dims.0,
-                                    dims.1,
-                                )
-                            {
-                                log::debug!(
-                                    "[engine] brute force fit rejected by validate() (insane H or large delta vs last_homography); raw inliers={}",
-                                    raw_inliers
-                                );
-                                None
-                            } else {
-                                Some(t)
-                            }
+                        if h_ok && !delta_ok {
+                            self.gate_counters.delta_cap_reject =
+                                self.gate_counters.delta_cap_reject.saturating_add(1);
+                        }
+                        if !h_ok || !delta_ok {
+                            log::debug!(
+                                "[engine] brute force fit rejected by validate() (insane H or large delta vs last_homography); raw inliers={}",
+                                raw_inliers
+                            );
+                            None
+                        } else {
+                            Some(t)
                         }
                     }
-                });
+                };
                 // Capture the raw H before the sanity gate so we can
                 // detect a freeze (gate substitutes `h_prev`) and skip
                 // the EKF measurement update on that frame — the
@@ -1731,6 +1765,8 @@ impl LivePlanarEngine {
         if suspicious && can_freeze {
             self.track_quality.suspicious_frames += 1;
             self.track_quality.consecutive_clean_frames = 0;
+            self.gate_counters.sanity_gate_freeze =
+                self.gate_counters.sanity_gate_freeze.saturating_add(1);
             let hf = freeze_h.expect("freeze_h is Some when can_freeze");
             log::info!(
                 "[sanity_gate] freeze (substitute with last accepted H): inliers={} ema={:.1} run={}",
@@ -1757,6 +1793,8 @@ impl LivePlanarEngine {
                 ema,
                 reason,
             );
+            self.gate_counters.sanity_gate_reject =
+                self.gate_counters.sanity_gate_reject.saturating_add(1);
             self.track_quality.reset_ema_and_budget();
             self.track_quality.consecutive_clean_frames = 0;
             None
