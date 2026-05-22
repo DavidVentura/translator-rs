@@ -738,6 +738,7 @@ fn render_outputs(
             bitmap_height: it.height,
             bitmap_origin_surface_x: it.surface_origin_x,
             bitmap_origin_surface_y: it.surface_origin_y,
+            row_extents: &it.row_extents,
         })
         .collect();
     let item_count = items.len();

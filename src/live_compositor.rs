@@ -32,6 +32,15 @@ pub struct OverlayItem<'a> {
     pub bitmap_height: u32,
     pub bitmap_origin_surface_x: f32,
     pub bitmap_origin_surface_y: f32,
+    /// Per-source-row half-open `[first, last)` range of columns
+    /// containing any non-zero alpha. Used by the warp inner loop
+    /// to skip sampling for inverse-projected pixels that land in a
+    /// guaranteed-transparent source region — the precomputation is
+    /// done once when the overlay is rasterised, off the per-frame
+    /// hot path. Pass an empty slice (or any slice whose length
+    /// differs from `bitmap_height`) to disable the optimisation
+    /// and fall back to the per-pixel alpha-check inside the loop.
+    pub row_extents: &'a [(u32, u32)],
 }
 
 #[derive(Debug)]
@@ -229,6 +238,15 @@ fn warp_item_onto_display(
     let m8 = viewport_to_bitmap[8];
     let row_start_x = x0 as f32 + 0.5;
 
+    // Per-source-row non-transparent column extents. Computed once
+    // when the overlay was rasterised; used here to skip the bilinear
+    // sample + blend for any inverse-projected pixel that lands in a
+    // guaranteed-transparent source region. On dense text overlays
+    // typically 40-60% of the bbox is transparent inter-glyph / inter-
+    // line space — that work was previously paid in full.
+    let extents_active =
+        !item.row_extents.is_empty() && item.row_extents.len() == src_h as usize;
+
     for y in y0..y1 {
         let dy = y as f32 + 0.5;
         let mut num_sx = m0 * row_start_x + m1 * dy + m2;
@@ -262,6 +280,19 @@ fn warp_item_onto_display(
             let y0_i = sy.floor() as u32;
             let x1_i = (x0_i + 1).min(src_w - 1);
             let y1_i = (y0_i + 1).min(src_h - 1);
+            // Cheap guaranteed-transparent skip: if neither of the two
+            // source rows touched by this bilinear sample has any non-
+            // zero alpha within [x0_i, x1_i], all four corners are
+            // transparent and the output cannot be visible.
+            if extents_active {
+                let r0 = item.row_extents[y0_i as usize];
+                let r1 = item.row_extents[y1_i as usize];
+                let r0_overlaps = r0.0 <= x1_i && x0_i < r0.1;
+                let r1_overlaps = r1.0 <= x1_i && x0_i < r1.1;
+                if !r0_overlaps && !r1_overlaps {
+                    continue;
+                }
+            }
             let fx = sx - x0_i as f32;
             let fy = sy - y0_i as f32;
             let i_tl = ((y0_i * src_w + x0_i) * 4) as usize;
@@ -390,6 +421,7 @@ mod tests {
             bitmap_height: 4,
             bitmap_origin_surface_x: 1.0,
             bitmap_origin_surface_y: 1.0,
+            row_extents: &[],
         };
         composite_frame_into(
             &mut dst,
@@ -430,6 +462,7 @@ mod tests {
             bitmap_height: 6,
             bitmap_origin_surface_x: 4.0,
             bitmap_origin_surface_y: 4.0,
+            row_extents: &[],
         };
         // Translation + mild perspective.
         let h = [1.05, -0.03, 1.5, 0.02, 0.97, -0.7, 1.0e-3, -5.0e-4, 1.0];

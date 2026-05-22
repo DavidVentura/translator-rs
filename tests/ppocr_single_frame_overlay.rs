@@ -395,6 +395,7 @@ fn composite_overlay(
             bitmap_height: it.height,
             bitmap_origin_surface_x: it.surface_origin_x,
             bitmap_origin_surface_y: it.surface_origin_y,
+            row_extents: &it.row_extents,
         })
         .collect();
     composite_frame_into(

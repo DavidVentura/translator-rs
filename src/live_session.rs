@@ -191,6 +191,43 @@ pub struct OverlayItem {
     /// Hash of (strips + display text + language). Used to skip
     /// re-raster when content is unchanged across acquires.
     pub content_hash: u64,
+    /// Per-source-row half-open `[first, last)` range of columns
+    /// containing any non-zero alpha. Precomputed when the bitmap
+    /// is rasterised; the compositor consults this each frame to
+    /// skip per-pixel sampling on guaranteed-transparent regions
+    /// (typically 40-60% of the bbox area on text overlays).
+    pub row_extents: Vec<(u32, u32)>,
+}
+
+/// Scan an RGBA bitmap and return, per row, the half-open
+/// `[first_x, last_x_exclusive)` range of columns containing any
+/// non-zero alpha. Empty rows get `(0, 0)`. Runs once when the
+/// bitmap is constructed; the result is then read O(1) per warped
+/// pixel.
+pub fn compute_row_extents(bitmap: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(height as usize);
+    for y in 0..height {
+        let row_start = (y as usize) * (width as usize) * 4;
+        let mut first: Option<u32> = None;
+        let mut last: u32 = 0;
+        for x in 0..width {
+            let alpha = bitmap[row_start + (x as usize) * 4 + 3];
+            if alpha != 0 {
+                if first.is_none() {
+                    first = Some(x);
+                }
+                last = x;
+            }
+        }
+        out.push(match first {
+            Some(f) => (f, last + 1),
+            None => (0, 0),
+        });
+    }
+    out
 }
 
 /// Per-anchor live state. Each acquired anchor (engine
@@ -802,6 +839,7 @@ impl LiveSession {
             None => return,
         };
         if let Ok(mut items) = self.overlay_items.lock() {
+            let row_extents = compute_row_extents(&raster.bitmap, raster.width, raster.height);
             let new_item = OverlayItem {
                 id,
                 anchor_id,
@@ -811,6 +849,7 @@ impl LiveSession {
                 surface_origin_x: raster.surface_origin_x,
                 surface_origin_y: raster.surface_origin_y,
                 content_hash: hash,
+                row_extents,
             };
             // NB: we used to try a bbox-overlap "displace stale
             // duplicates" pass here (IoU + containment in surface
