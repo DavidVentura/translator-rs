@@ -18,6 +18,8 @@ pub mod font_metrics;
 pub mod font_provider;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod homography;
+#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+pub mod homography_ekf;
 #[cfg(feature = "html")]
 pub mod html_translate;
 #[cfg(feature = "image-render")]

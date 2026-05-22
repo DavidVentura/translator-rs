@@ -108,6 +108,12 @@ fn test_engine_config() -> EngineConfig {
         p_ema_min_alpha: 1.0,
         p_ema_low_delta_px: 0.0,
         p_ema_high_delta_px: 0.0,
+        // Disabled in lifecycle tests: the EKF intentionally biases
+        // the per-frame H toward its temporal estimate, which would
+        // perturb the projection-equality assertions these tests use.
+        // Dedicated EKF behaviour is exercised by the `h_ekf_*` tests.
+        use_h_ekf: false,
+        h_ekf_r_var: 4.0,
     }
 }
 
@@ -724,5 +730,161 @@ fn no_consensus_falls_back_to_previous_known() {
             assert_eq!(canonical_rotation, Quadrant::R90);
         }
         other => panic!("expected Locked, got {:?}", other),
+    }
+}
+
+fn ekf_engine_config() -> EngineConfig {
+    let mut cfg = test_engine_config();
+    cfg.use_h_ekf = true;
+    cfg
+}
+
+/// First Locked frame after acquire emits the raw RANSAC homography
+/// unchanged — the EKF has no history yet and must initialise from
+/// the current measurement. Anything else would mean the filter is
+/// silently biasing the first frame toward an arbitrary default.
+#[test]
+fn h_ekf_first_frame_after_acquire_is_passthrough() {
+    let mut ekf_cfg = ekf_engine_config();
+    ekf_cfg.use_h_ekf = false;
+    let mut baseline = LivePlanarEngine::new(ekf_cfg);
+    let mut ekf_engine = LivePlanarEngine::new(ekf_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let translated = warp_with_h(&gray, &[1.0, 0.0, 7.0, 0.0, 1.0, -3.0, 0.0, 0.0, 1.0]);
+
+    baseline.acquire_now(&gray, 1_000_000).expect("baseline acquire");
+    ekf_engine.acquire_now(&gray, 1_000_000).expect("ekf acquire");
+    let baseline_cmd = baseline.process_frame(&translated, true, 2_000_000);
+    let ekf_cmd = ekf_engine.process_frame(&translated, true, 2_000_000);
+    let baseline_h = match baseline_cmd {
+        TrackerCommand::Locked { homography, .. } => homography,
+        other => panic!("baseline expected Locked, got {:?}", other),
+    };
+    let ekf_h = match ekf_cmd {
+        TrackerCommand::Locked { homography, .. } => homography,
+        other => panic!("ekf expected Locked, got {:?}", other),
+    };
+    for i in 0..9 {
+        assert!(
+            (baseline_h[i] - ekf_h[i]).abs() < 1e-6,
+            "first frame h[{}] differs: baseline={} ekf={}",
+            i,
+            baseline_h[i],
+            ekf_h[i]
+        );
+    }
+}
+
+/// With the EKF active, a sequence of identical frames against the
+/// same anchor must keep the emitted homography arbitrarily close to
+/// the per-frame fit — the underlying observation is the same every
+/// frame, so the filter's steady state must match it. Catches the
+/// regression where the EKF silently drifts away from the measurement
+/// stream (sign error in the Jacobian, broken covariance update,
+/// stale process noise, etc.).
+#[test]
+fn h_ekf_steady_state_tracks_constant_h() {
+    let mut engine = LivePlanarEngine::new(ekf_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let known = [1.0, 0.0, 9.0, 0.0, 1.0, -5.0, 0.0, 0.0, 1.0];
+    let warped = warp_with_h(&gray, &known);
+    let anchor_id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
+    // Attach an overlay we can project through the emitted H so the
+    // assertion is in display-space pixels rather than raw matrix
+    // entries (which obscures whether the drift is geometrically
+    // meaningful).
+    let quad = [(140.0_f32, 220.0), (260.0, 220.0), (260.0, 270.0), (140.0, 270.0)];
+    let overlay = CanonicalOverlay {
+        id: 1,
+        quad,
+        payload: String::new(),
+    };
+    assert!(engine.set_overlays(anchor_id, vec![overlay]));
+
+    let mut worst_after_warmup = 0.0_f32;
+    for frame in 1..=20 {
+        let cmd = engine.process_frame(&warped, true, (1 + frame) * 1_000_000);
+        let h = match cmd {
+            TrackerCommand::Locked { homography, .. } => homography,
+            other => panic!("frame {} expected Locked, got {:?}", frame, other),
+        };
+        let projected = engine.project_overlays(anchor_id, &h);
+        assert_eq!(projected.len(), 1);
+        for i in 0..4 {
+            let (cx, cy) = quad[i];
+            let (ex, ey) = translator::homography::project(&known, cx, cy).unwrap();
+            let (rx, ry) = projected[0].quad[i];
+            let err = ((rx - ex).powi(2) + (ry - ey).powi(2)).sqrt();
+            // Warm-up: the EKF's covariance starts at `EKF_P0_DEFAULT`
+            // and shrinks over the first handful of measurements. The
+            // first frame is the initialisation (raw fit, no filtering)
+            // and frames 2-3 may still have appreciable disagreement
+            // between the filter and the measurement; from frame 4
+            // onward the steady state should be tight.
+            if frame >= 4 && err > worst_after_warmup {
+                worst_after_warmup = err;
+            }
+        }
+    }
+    assert!(
+        worst_after_warmup < 2.0,
+        "steady-state overlay corner error {} px should be < 2",
+        worst_after_warmup
+    );
+}
+
+/// EKF state is per-active-anchor. When the engine switches anchors
+/// (force_acquire ⇒ new root id), the EKF must re-initialise rather
+/// than feed the new anchor's measurements into the previous
+/// anchor's covariance (which is in a different canonical frame).
+#[test]
+fn h_ekf_resets_on_anchor_change() {
+    let mut engine = LivePlanarEngine::new(ekf_engine_config());
+    let gray = load_gray("book.jpg", 480);
+    let translated = warp_with_h(&gray, &[1.0, 0.0, 6.0, 0.0, 1.0, -2.0, 0.0, 0.0, 1.0]);
+
+    let root_a = engine.acquire_now(&gray, 1_000_000).expect("acquire A");
+    for frame in 1..=6 {
+        let _ = engine.process_frame(&translated, true, (1 + frame) * 1_000_000);
+    }
+    // Force a fresh acquire — anchor changes.
+    let root_b = engine.acquire_now(&gray, 50_000_000).expect("acquire B");
+    assert_ne!(root_a, root_b, "force-acquire must produce a new anchor id");
+    // First frame on new anchor: EKF must re-init, not blend with
+    // anchor A's filter state.
+    let cmd_a = engine.process_frame(&translated, true, 60_000_000);
+    let h_a = match cmd_a {
+        TrackerCommand::Locked { homography, anchor_id, .. } => {
+            assert_eq!(anchor_id, root_b);
+            homography
+        }
+        other => panic!("expected Locked on B, got {:?}", other),
+    };
+    // Same engine with EKF disabled would emit the raw fit on the
+    // same first frame. The two should be ~equal because the EKF
+    // initialises from the raw fit on first frame after anchor
+    // change (the passthrough behaviour the per-frame-after-acquire
+    // test asserts).
+    let mut baseline_cfg = ekf_engine_config();
+    baseline_cfg.use_h_ekf = false;
+    let mut baseline = LivePlanarEngine::new(baseline_cfg);
+    baseline.acquire_now(&gray, 1_000_000).expect("baseline A");
+    for frame in 1..=6 {
+        let _ = baseline.process_frame(&translated, true, (1 + frame) * 1_000_000);
+    }
+    baseline.acquire_now(&gray, 50_000_000).expect("baseline B");
+    let cmd_b = baseline.process_frame(&translated, true, 60_000_000);
+    let h_b = match cmd_b {
+        TrackerCommand::Locked { homography, .. } => homography,
+        other => panic!("baseline expected Locked, got {:?}", other),
+    };
+    for i in 0..9 {
+        assert!(
+            (h_a[i] - h_b[i]).abs() < 1e-5,
+            "post-reset h[{}] differs from baseline: ekf={} baseline={}",
+            i,
+            h_a[i],
+            h_b[i]
+        );
     }
 }

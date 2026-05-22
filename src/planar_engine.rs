@@ -13,6 +13,7 @@ use image::GrayImage;
 
 use crate::coords::Quadrant;
 use crate::homography::mat3_mul;
+use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
     SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
@@ -219,6 +220,25 @@ pub struct EngineConfig {
     /// Above this corner-delta, perspective EMA passes through. See
     /// [`Self::p_ema_low_delta_px`].
     pub p_ema_high_delta_px: f32,
+    /// Enable the Extended Kalman Filter on `H_anchor→view`. When
+    /// active, the per-frame RANSAC fit is treated as a noisy
+    /// observation instead of the final answer; the EKF carries
+    /// per-DoF covariance across frames so well-determined DoFs
+    /// respond promptly while under-determined ones (typically
+    /// `h6`/`h7` on clustered inliers) stay anchored to the prior.
+    /// See `analysis.md` § "EKF on H".
+    ///
+    /// Filtered only on the steady-state Locked → Locked branch.
+    /// Anchor-switch frames (fresh acquire, handoff spawn, cached-
+    /// snap) emit the raw RANSAC fit; the EKF re-initialises on the
+    /// first frame for the new anchor because `H` is expressed in
+    /// the active anchor's canonical frame and the covariance from
+    /// the previous anchor doesn't transfer through the chain.
+    pub use_h_ekf: bool,
+    /// Per-inlier measurement variance (σ² in pixel²) for the EKF.
+    /// Default matches the RANSAC inlier residual gate interpreted
+    /// as ≈ 2σ.
+    pub h_ekf_r_var: f64,
 }
 
 impl Default for EngineConfig {
@@ -306,6 +326,8 @@ impl Default for EngineConfig {
             // still gating noise (~0.5–2 px deltas) into the
             // heavy-smoothing branch.
             p_ema_high_delta_px: 4.0,
+            use_h_ekf: true,
+            h_ekf_r_var: EKF_R_DEFAULT,
         }
     }
 }
@@ -343,6 +365,12 @@ pub struct LivePlanarEngine {
     /// anchor switches. Cleared on Lost/Idle so a re-acquire after
     /// loss doesn't lerp from a stale pre-loss H.
     emit_smooth: EmitSmoothState,
+    /// EKF on `H_anchor→view` for the current active anchor. The
+    /// EKF's state is in the active anchor's canonical frame, so it
+    /// is dropped whenever the active anchor changes (handoff, cached
+    /// snap, Lost, Idle) and re-initialised from the next frame's
+    /// raw RANSAC fit.
+    h_ekf: Option<HomographyEkfTracker>,
     /// Discriminant of the last `TrackerCommand` returned by
     /// `process_frame`. Used only to emit a debug line per change-of-
     /// kind — without it, debug logging in the Acquiring or Locked
@@ -353,6 +381,11 @@ pub struct LivePlanarEngine {
     /// long gaps between calls (e.g. Kotlin pausing the pipeline)
     /// alongside engine-internal state changes.
     last_process_ns: Option<u64>,
+}
+
+struct HomographyEkfTracker {
+    anchor_id: AnchorId,
+    ekf: HomographyEkf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -574,6 +607,7 @@ impl LivePlanarEngine {
             last_track_result: None,
             klt_state: None,
             emit_smooth: EmitSmoothState::default(),
+            h_ekf: None,
             last_cmd_kind: None,
             last_process_ns: None,
         }
@@ -764,8 +798,25 @@ impl LivePlanarEngine {
                         }
                     }
                 });
+                // Capture the raw H before the sanity gate so we can
+                // detect a freeze (gate substitutes `h_prev`) and skip
+                // the EKF measurement update on that frame — the
+                // substituted H is not a fresh observation, and the
+                // accompanying inlier pairs came from the bad fit that
+                // tripped the gate.
+                let pre_gate_h = result.as_ref().map(|r| r.homography);
                 let result = result.and_then(|r| self.apply_sanity_gate(r));
-                if let Some(r) = result {
+                if let Some(mut r) = result {
+                    if self.config.use_h_ekf {
+                        let frozen = pre_gate_h
+                            .map_or(false, |pre| !h_elementwise_eq(&pre, &r.homography));
+                        let new_h = if frozen {
+                            self.apply_h_ekf(anchor_id, r.homography, &[])
+                        } else {
+                            self.apply_h_ekf(anchor_id, r.homography, &r.inlier_pairs)
+                        };
+                        r.homography = new_h;
+                    }
                     self.last_track_result = Some(r.clone());
                     self.refresh_klt_state(anchor_id, &cur_pyramid, &r.inlier_pairs);
                     // Sustained inlier decline: the anchor's
@@ -1321,7 +1372,52 @@ impl LivePlanarEngine {
 
     fn reset_emit_smooth(&mut self) {
         self.emit_smooth = EmitSmoothState::default();
+        // The EKF state is anchor-relative; drop it whenever the
+        // pipeline returns to a state without an active anchor (Idle,
+        // Lost). It will re-initialise from the next accepted fit.
+        self.h_ekf = None;
     }
+
+    /// Drive the per-anchor EKF on `H_anchor→view` and return the
+    /// filtered homography. Re-initialises from `raw_h` whenever the
+    /// active anchor changes or the EKF is empty (first frame after
+    /// acquire / handoff / cached-snap); otherwise predicts, folds
+    /// each correspondence in `pairs` into the state as a noisy
+    /// observation, and emits the filtered H. Passing an empty
+    /// `pairs` slice produces a predict-only step (no measurement
+    /// update) — use this on sanity-gate freeze frames, where the
+    /// upstream H is the substituted previous fit rather than a
+    /// fresh observation.
+    fn apply_h_ekf(
+        &mut self,
+        anchor_id: AnchorId,
+        raw_h: [f32; 9],
+        pairs: &[(f32, f32, f32, f32)],
+    ) -> [f32; 9] {
+        let same_anchor = self
+            .h_ekf
+            .as_ref()
+            .map_or(false, |s| s.anchor_id == anchor_id);
+        if !same_anchor {
+            match HomographyEkf::new(raw_h) {
+                Some(ekf) => {
+                    self.h_ekf = Some(HomographyEkfTracker { anchor_id, ekf });
+                }
+                None => {
+                    self.h_ekf = None;
+                }
+            }
+            return raw_h;
+        }
+        let tracker = self
+            .h_ekf
+            .as_mut()
+            .expect("same_anchor implies h_ekf is Some");
+        tracker.ekf.predict(&EKF_Q_DEFAULT);
+        tracker.ekf.update_pairs(pairs, self.config.h_ekf_r_var);
+        tracker.ekf.homography()
+    }
+
 
     /// Acceptance gate on a TrackResult considered as the spawn frame
     /// for a handoff. Returns true iff the fit is clean enough that
@@ -2120,6 +2216,17 @@ fn lerp_h(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {
 /// (used by the P-EMA smoother) assumes h22 = 1 to keep S in
 /// 4-DoF similarity form. Degenerate matrices (h22 ≈ 0) are passed
 /// through unchanged — they were already broken.
+/// Bit-exact equality across all nine elements. Used to detect when
+/// the sanity gate substituted the freeze H for the raw RANSAC fit:
+/// the gate writes the substituted matrix bit-for-bit from `h_prev`,
+/// so any difference between pre- and post-gate H indicates a freeze
+/// rather than a normal accept. Float equality is the right tool
+/// here precisely because the gate does not arithmetic-transform the
+/// value.
+fn h_elementwise_eq(a: &[f32; 9], b: &[f32; 9]) -> bool {
+    a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
 fn canonicalize_h(h: &[f32; 9]) -> [f32; 9] {
     let scale = h[8];
     if scale.abs() < 1e-9 {
