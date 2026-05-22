@@ -107,6 +107,12 @@ fn test_engine_config() -> EngineConfig {
         // Dedicated EKF behaviour is exercised by the `h_ekf_*` tests.
         use_h_ekf: false,
         h_ekf_r_var: 4.0,
+        // Disabled in lifecycle tests for the same reason as the
+        // EKF: the running mean would shift `h_root_to_canonical`
+        // between frames in the chain test's exact-projection
+        // assertions.
+        use_chain_refine: false,
+        chain_refine_frames: 0,
     }
 }
 

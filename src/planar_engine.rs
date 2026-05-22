@@ -12,7 +12,7 @@
 use image::GrayImage;
 
 use crate::coords::Quadrant;
-use crate::homography::mat3_mul;
+use crate::homography::{invert, mat3_mul};
 use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
@@ -218,6 +218,18 @@ pub struct EngineConfig {
     /// Default matches the RANSAC inlier residual gate interpreted
     /// as ≈ 2σ.
     pub h_ekf_r_var: f64,
+    /// Enable chain-composition refinement after a handoff. The
+    /// spawn frame's `h_root_to_canonical_new` is fitted from one
+    /// frame of RANSAC; on subsequent frames the engine re-tracks
+    /// the parent anchor against the current view and averages the
+    /// resulting `h_root_to_canonical_new` candidates. Each candidate
+    /// is frame-invariant on a static scene, so the running mean's
+    /// variance drops as 1/√N. See `cleanup_plan.md` § 3.
+    pub use_chain_refine: bool,
+    /// Number of post-spawn frames over which the chain matrix is
+    /// refined. After this many frames the running mean is frozen
+    /// into `CachedAnchor.h_root_to_canonical`.
+    pub chain_refine_frames: u32,
 }
 
 impl Default for EngineConfig {
@@ -290,6 +302,8 @@ impl Default for EngineConfig {
             handoff_min_inlier_ratio: 0.4,
             use_h_ekf: true,
             h_ekf_r_var: EKF_R_DEFAULT,
+            use_chain_refine: true,
+            chain_refine_frames: 10,
         }
     }
 }
@@ -333,6 +347,11 @@ pub struct LivePlanarEngine {
     /// snap, Lost, Idle) and re-initialised from the next frame's
     /// raw RANSAC fit.
     h_ekf: Option<HomographyEkfTracker>,
+    /// Running average of `h_root_to_canonical` for a freshly-spawned
+    /// handoff anchor, populated from re-tracking the parent against
+    /// the current view across the first N post-spawn frames. See
+    /// [`EngineConfig::use_chain_refine`].
+    chain_refine: Option<ChainRefineState>,
     /// Discriminant of the last `TrackerCommand` returned by
     /// `process_frame`. Used only to emit a debug line per change-of-
     /// kind — without it, debug logging in the Acquiring or Locked
@@ -372,6 +391,33 @@ pub struct GateCounters {
 struct HomographyEkfTracker {
     anchor_id: AnchorId,
     ekf: HomographyEkf,
+}
+
+/// Running mean of `h_root_to_canonical` for one freshly-spawned
+/// handoff anchor. The chain matrix is static (a property of the
+/// anchor's coordinate frame, not the current camera pose), so any
+/// per-frame estimate is a noisy observation of the same underlying
+/// quantity — averaging across N frames drops the variance as 1/√N.
+///
+/// Per frame the candidate is computed as
+/// `h_root_to_new = inv(H_new_to_view) · H_parent_to_view ·
+/// h_root_to_parent`, which is frame-invariant in the absence of
+/// RANSAC noise.
+struct ChainRefineState {
+    new_anchor_id: AnchorId,
+    parent_id: AnchorId,
+    /// Snapshot of the parent's chain matrix at spawn time. Static
+    /// for the duration of refinement even if the parent's matrix
+    /// is itself being refined elsewhere (would only matter for
+    /// chain depths > 1; with `max_chain_depth = 1` this is just
+    /// the root's identity).
+    parent_h_root_to_canonical: [f32; 9],
+    frames_remaining: u32,
+    /// Element-wise sum of canonicalised (`h22 = 1`) candidates,
+    /// including the spawn-frame's seed value at index 0.
+    chain_sum: [f64; 9],
+    /// Number of candidates folded into `chain_sum`.
+    count: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -594,6 +640,7 @@ impl LivePlanarEngine {
             klt_state: None,
             emit_smooth: EmitSmoothState::default(),
             h_ekf: None,
+            chain_refine: None,
             last_cmd_kind: None,
             last_process_ns: None,
             gate_counters: GateCounters::default(),
@@ -819,6 +866,12 @@ impl LivePlanarEngine {
                         };
                         r.homography = new_h;
                     }
+                    // Chain-composition refinement: re-track the
+                    // parent anchor against the current frame and
+                    // fold the implied `h_root_to_canonical_new` into
+                    // the running mean stored on the cached anchor.
+                    // No-op when no refinement is active.
+                    self.step_chain_refine(gray, anchor_id, &r.homography);
                     self.last_track_result = Some(r.clone());
                     self.refresh_klt_state(anchor_id, &cur_pyramid, &r.inlier_pairs);
                     // Sustained inlier decline: the anchor's
@@ -862,6 +915,7 @@ impl LivePlanarEngine {
                                 self.track_quality.degraded_frames,
                                 self.config.degraded_inlier_threshold,
                             );
+                            self.start_chain_refine(new_id, anchor_id);
                             self.cache.touch(new_id);
                             if let Some(entry) = self.cache.get_mut(new_id) {
                                 entry.last_locked_ns = timestamp_ns;
@@ -996,6 +1050,7 @@ impl LivePlanarEngine {
                                 visible_ratio,
                                 scale_log,
                             );
+                            self.start_chain_refine(spawned, anchor_id);
                         }
                         spawned
                     } else {
@@ -1295,6 +1350,10 @@ impl LivePlanarEngine {
         // pipeline returns to a state without an active anchor (Idle,
         // Lost). It will re-initialise from the next accepted fit.
         self.h_ekf = None;
+        // Chain refinement is tied to the currently-active handoff
+        // child. If we go Idle/Lost, that anchor's chain matrix is
+        // frozen at whatever the running mean has accumulated so far.
+        self.chain_refine = None;
     }
 
     /// Drive the per-anchor EKF on `H_anchor→view` and return the
@@ -1337,6 +1396,189 @@ impl LivePlanarEngine {
         tracker.ekf.homography()
     }
 
+
+    /// Seed chain-composition refinement for a newly-spawned handoff
+    /// anchor. The cached anchor's `h_root_to_canonical` was computed
+    /// from a single RANSAC fit at the spawn frame; the refinement
+    /// state averages additional same-quantity estimates across the
+    /// next `chain_refine_frames` frames.
+    fn start_chain_refine(&mut self, new_anchor_id: AnchorId, parent_id: AnchorId) {
+        if !self.config.use_chain_refine || self.config.chain_refine_frames == 0 {
+            return;
+        }
+        let initial = match self.cache.get(new_anchor_id) {
+            Some(a) => canonicalize_h(&a.h_root_to_canonical),
+            None => return,
+        };
+        let parent_h_root_to_canonical = match self.cache.get(parent_id) {
+            Some(a) => a.h_root_to_canonical,
+            None => return,
+        };
+        let chain_sum: [f64; 9] = std::array::from_fn(|i| initial[i] as f64);
+        log::debug!(
+            "[chain_refine] start: anchor {} parent {} frames {}",
+            new_anchor_id,
+            parent_id,
+            self.config.chain_refine_frames,
+        );
+        self.chain_refine = Some(ChainRefineState {
+            new_anchor_id,
+            parent_id,
+            parent_h_root_to_canonical,
+            frames_remaining: self.config.chain_refine_frames,
+            chain_sum,
+            count: 1,
+        });
+    }
+
+    /// One step of chain-composition refinement. Re-tracks the parent
+    /// anchor against the current frame and folds the implied
+    /// `h_root_to_canonical_new` into the running mean, which is
+    /// written back into the cached anchor's chain matrix each frame.
+    /// No-op when the refinement is inactive, has expired, or the
+    /// active anchor doesn't match the one being refined (cached
+    /// snap, additional handoff, etc.).
+    fn step_chain_refine(&mut self, gray: &GrayImage, current_active: AnchorId, h_new_to_view: &[f32; 9]) {
+        let in_progress = self.chain_refine.as_ref().map_or(false, |s| {
+            s.new_anchor_id == current_active && s.frames_remaining > 0
+        });
+        if !in_progress {
+            // If the refinement is still set but for a different
+            // active anchor, drop it — we lost the context that made
+            // its observations meaningful.
+            if let Some(s) = self.chain_refine.as_ref() {
+                if s.new_anchor_id != current_active {
+                    log::debug!(
+                        "[chain_refine] drop: active={} but refining={}",
+                        current_active,
+                        s.new_anchor_id,
+                    );
+                    self.chain_refine = None;
+                }
+            }
+            return;
+        }
+        let parent_r = {
+            let s = self
+                .chain_refine
+                .as_ref()
+                .expect("in_progress implies chain_refine is Some");
+            let parent_id = s.parent_id;
+            let Some(parent) = self.cache.get(parent_id) else {
+                self.chain_refine = None;
+                return;
+            };
+            // Recompute features for this frame. Skipping the main-
+            // path's existing FAST+BRIEF would be cheaper but requires
+            // restructuring the hot path. The ~4 ms feature cost
+            // applies for `chain_refine_frames` (default 10) at each
+            // handoff event — a rare cost on the smoke clips.
+            // Use the same inlier floor as the regular tracker. A
+            // lower threshold here makes more parent re-tracks
+            // succeed, but those low-inlier fits are usually biased
+            // (the parent's descriptors are post-degraded at handoff,
+            // and degrade further over subsequent frames) — averaging
+            // biased candidates pulls the running mean away from the
+            // spawn-frame value rather than toward truth.
+            compute_frame_features(gray, &self.config.tracker).and_then(|features| {
+                track_against_anchor_with_features(
+                    &parent.anchor,
+                    &features,
+                    &self.config.tracker,
+                    self.config.tracker.min_inliers_keep_locked,
+                    None,
+                    &[],
+                )
+            })
+        };
+        let s = self
+            .chain_refine
+            .as_mut()
+            .expect("in_progress implies chain_refine is Some");
+        s.frames_remaining = s.frames_remaining.saturating_sub(1);
+        let Some(parent_r) = parent_r else {
+            // No usable observation this frame. Just decrement and
+            // wait for the next; the running mean is unchanged.
+            if s.frames_remaining == 0 {
+                log::debug!(
+                    "[chain_refine] anchor {} finished with {} obs",
+                    s.new_anchor_id,
+                    s.count,
+                );
+                self.chain_refine = None;
+            }
+            return;
+        };
+        let h_inv = match invert(h_new_to_view) {
+            Some(h) => h,
+            None => {
+                if s.frames_remaining == 0 {
+                    self.chain_refine = None;
+                }
+                return;
+            }
+        };
+        let candidate_raw = mat3_mul(&h_inv, &mat3_mul(&parent_r.homography, &s.parent_h_root_to_canonical));
+        let candidate = canonicalize_h(&candidate_raw);
+        if !candidate.iter().all(|v| v.is_finite()) {
+            if s.frames_remaining == 0 {
+                self.chain_refine = None;
+            }
+            return;
+        }
+        // Reject candidates that disagree with the current running
+        // mean by more than a few pixels of corner-projection delta.
+        // Post-handoff frames frequently produce a parent fit that's
+        // biased (descriptor drift past BRIEF's invariance pulls the
+        // fit into a wrong basin); folding biased candidates into the
+        // mean pulls the chain matrix away from truth rather than
+        // toward it. With the gate, biased candidates are silently
+        // dropped and the seed value persists — which is the original
+        // pre-refinement behaviour, i.e. no regression.
+        const CHAIN_REFINE_MAX_DELTA_PX: f32 = 5.0;
+        let mean_so_far: [f32; 9] =
+            std::array::from_fn(|i| (s.chain_sum[i] / s.count as f64) as f32);
+        let delta = approx_corner_delta(&mean_so_far, &candidate);
+        if !delta.is_finite() || delta > CHAIN_REFINE_MAX_DELTA_PX {
+            log::debug!(
+                "[chain_refine] anchor {} dropped candidate: delta={:.1}px > {:.1}px",
+                s.new_anchor_id,
+                delta,
+                CHAIN_REFINE_MAX_DELTA_PX,
+            );
+            if s.frames_remaining == 0 {
+                log::debug!(
+                    "[chain_refine] anchor {} finished with {} obs",
+                    s.new_anchor_id,
+                    s.count,
+                );
+                self.chain_refine = None;
+            }
+            return;
+        }
+        for i in 0..9 {
+            s.chain_sum[i] += candidate[i] as f64;
+        }
+        s.count += 1;
+        let count = s.count;
+        let new_anchor_id = s.new_anchor_id;
+        let mean: [f32; 9] = std::array::from_fn(|i| (s.chain_sum[i] / count as f64) as f32);
+        if let Some(new_anchor) = self.cache.get_mut(new_anchor_id) {
+            new_anchor.h_root_to_canonical = mean;
+        }
+        if self
+            .chain_refine
+            .as_ref()
+            .map_or(false, |s| s.frames_remaining == 0)
+        {
+            log::debug!(
+                "[chain_refine] anchor {} finished with {} obs",
+                new_anchor_id,
+                count,
+            );
+            self.chain_refine = None;
+        }
+    }
 
     /// Acceptance gate on a TrackResult considered as the spawn frame
     /// for a handoff. Returns true iff the fit is clean enough that

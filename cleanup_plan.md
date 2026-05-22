@@ -145,27 +145,45 @@ the visible jump, reject the worst spawn frames).
 help here — it operates on `H_anchor→view`, while the noise lives
 in the static chain matrix.
 
-**Action.** Untouched in this pass. The principled fix is an EKF-
-shaped patch on the chain matrix itself:
+**Action.** Infrastructure landed; effective on the three smoke
+clips it's a silent no-op because the handoff trigger fires *after*
+the parent's descriptors have degraded, so re-tracking the parent on
+subsequent frames either fails the inlier floor (no observation
+contributed) or produces a biased fit (rejected by the delta gate).
 
-- At handoff time, don't bake `H_root→canonical_new` from the
-  spawn frame's RANSAC fit alone. Instead, run an EKF on the
-  composition `H_root→canonical_new = H_anchor→view ·
-  H_root→canonical_old` across the first ~N frames after the
-  spawn, then freeze. Each spawn-frame inlier contributes a
-  measurement of where `H_root→canonical_new` should be; the
-  filter averages out the per-frame fit noise.
-- Alternatively: keep periodically re-fitting `H_root→canonical`
-  against current inliers throughout the anchor's lifetime, so
-  the chain matrix tracks the *median* of correspondences rather
-  than the single spawn frame.
+The implementation:
 
-Once either lands, all five stabilizer knobs become much less
-aggressive or unnecessary.
+- `EngineConfig.use_chain_refine` / `chain_refine_frames` defaults.
+- `ChainRefineState { new_anchor_id, parent_id, parent_h_root_to_canonical,
+  frames_remaining, chain_sum, count }` seeded with the spawn-frame
+  value (count = 1).
+- `start_chain_refine` fires at every successful `spawn_handoff`.
+- `step_chain_refine` runs each accepted Locked frame: re-track the
+  parent against the current frame, derive a candidate
+  `h_root_to_canonical_new = inv(H_new_to_view) · H_parent_to_view ·
+  h_root_to_parent`, gate it against the running mean (max 5 px
+  corner delta — biased post-degradation fits typically fail this),
+  fold into the running mean, write back to the cached anchor's
+  chain matrix.
 
-Defer until items 1 and 2 are validated and the EKF's impact on
-the chain-related metrics (M2 motion-RMS, worst inter-frame
-delta) is measured across the three smoke clips.
+The two safeguards (inlier floor + delta gate) ensure no regression:
+either an observation is healthy (rare on these clips) or it's
+dropped silently. On the three smoke clips: metrics bit-identical
+vs the pre-refinement baseline.
+
+The refinement *does* deliver value in the structural sense: when a
+parent stays healthy enough across the post-handoff window to pass
+both gates, the chain matrix tracks the running mean rather than
+the single spawn-frame fit. This is the right behaviour for future
+clips with proactive handoff dynamics (parent still healthy at
+spawn time) or for the eventual descriptor improvements (BEBLID /
+multi-scale FAST) that would extend the parent's effective range
+past the spawn frame.
+
+What's still deferred: the five chain-stabilizer knobs
+(`handoff_cooldown_ns`, `max_chain_depth`, etc.) — relaxing them
+requires the refinement to be demonstrably reducing chain noise on
+real-device traces first.
 
 ---
 
@@ -224,9 +242,9 @@ Aggregation + fallback chain is the right design. Leave alone.
 
 | # | Category | Action this pass |
 |---|---|---|
-| 1 | Three H smoothers stacked | Phase 1: flip defaults to passthrough |
-| 2 | Sanity gates / delta cap | Instrument with event counters |
-| 3 | Chain-composition stabilizers | Deferred (next big patch) |
+| 1 | Three H smoothers stacked | Phase 2 done: dead code deleted |
+| 2 | Sanity gates / delta cap | Instrumented + measured (delta cap dead; freeze still earns its keep) |
+| 3 | Chain-composition stabilizers | In progress (sub-pixel FAST already landed in `b8ae35a`) |
 | 4 | Overlay swap clear+flash | Deferred (cross-cutting refactor) |
 | 5 | OCR route smoothing | Leave (principled) |
 | 6 | Quadrant fallback chain | Leave (principled) |
