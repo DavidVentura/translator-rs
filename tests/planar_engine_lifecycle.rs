@@ -101,13 +101,6 @@ fn test_engine_config() -> EngineConfig {
         // residual and inlier ratio aren't representative.
         handoff_max_median_residual_px: f32::INFINITY,
         handoff_min_inlier_ratio: 0.0,
-        // Disabled in lifecycle tests: per-frame P-EMA would
-        // perturb exact-H assertions. The default 0.15 with
-        // adaptive ramp would barely move H on synthetic transforms,
-        // but any divergence breaks the per-frame golden values.
-        p_ema_min_alpha: 1.0,
-        p_ema_low_delta_px: 0.0,
-        p_ema_high_delta_px: 0.0,
         // Disabled in lifecycle tests: the EKF intentionally biases
         // the per-frame H toward its temporal estimate, which would
         // perturb the projection-equality assertions these tests use.

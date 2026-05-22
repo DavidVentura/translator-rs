@@ -134,21 +134,16 @@ pub struct ProcessFrameResult {
     pub started_refresh: bool,
 }
 
-/// EMA smoother for the per-frame homography. Reset on anchor switch
-/// and on `reset()`. Detail: lives in Rust so the per-frame call can
-/// run `tracker step → smooth → composite` in one trip.
+/// Per-anchor record of the last emitted homography. Used so the
+/// `LOSS_HIDE_AFTER_FRAMES` grace period during Lost can keep
+/// projecting overlays through the last-good H before they hide.
 #[derive(Default)]
-struct SmoothedHomography {
+struct LastEmittedH {
     h: Option<[f32; 9]>,
     anchor_id: u64,
     consecutive_lost: u32,
 }
 
-/// Tuning constants previously in `bindings/uniffi_catalog.rs`. Same
-/// numbers — moved with the logic.
-const SMOOTH_LOW_PX: f32 = 3.0;
-const SMOOTH_HIGH_PX: f32 = 9.0;
-const SMOOTH_MIN_ALPHA: f32 = 0.35;
 const LOSS_HIDE_AFTER_FRAMES: u32 = 4;
 const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// Inflation around the viewport AABB when asking the session
@@ -157,12 +152,6 @@ const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// surface area as already-covered. Surface coords are anchor-
 /// resolution, so 24 px = ~2-3% of typical viewport extent.
 const COVERAGE_PAD_PX: f32 = 24.0;
-// Disabled (true) by default since the EKF on `H_anchor→view` landed
-// in `planar_engine`. This older scalar α low-pass was stacked
-// downstream of both the engine's per-element P-EMA and the EKF —
-// three temporal filters in series doing one job. See
-// `cleanup_plan.md` § 1 for the deletion follow-up.
-const DISABLE_SMOOTH_H: bool = true;
 const ENABLE_COLOR_MATTING: bool = false;
 
 /// What kind of async job the per-frame fast path needs to dispatch.
@@ -300,7 +289,7 @@ impl Drop for Worker {
 pub struct LiveTrackerPipeline {
     engine: Mutex<LivePlanarEngine>,
     session: Arc<LiveSession>,
-    smoothed_h: Mutex<SmoothedHomography>,
+    last_emitted_h: Mutex<LastEmittedH>,
     last_root_to_view: Mutex<Option<(u64, [f32; 9])>>,
     pending_refresh_target: Mutex<Option<(u64, [f32; 9])>>,
     pending_compose: Mutex<Option<(u64, [f32; 9])>>,
@@ -324,7 +313,7 @@ impl LiveTrackerPipeline {
         let pipeline = Arc::new(Self {
             engine: Mutex::new(LivePlanarEngine::new(EngineConfig::default())),
             session: Arc::new(LiveSession::new()),
-            smoothed_h: Mutex::new(SmoothedHomography::default()),
+            last_emitted_h: Mutex::new(LastEmittedH::default()),
             last_root_to_view: Mutex::new(None),
             pending_refresh_target: Mutex::new(None),
             pending_compose: Mutex::new(None),
@@ -363,8 +352,8 @@ impl LiveTrackerPipeline {
         if let Ok(mut engine) = self.engine.lock() {
             engine.clear();
         }
-        if let Ok(mut sm) = self.smoothed_h.lock() {
-            *sm = SmoothedHomography::default();
+        if let Ok(mut sm) = self.last_emitted_h.lock() {
+            *sm = LastEmittedH::default();
         }
         if let Ok(mut slot) = self.last_root_to_view.lock() {
             *slot = None;
@@ -428,8 +417,8 @@ impl LiveTrackerPipeline {
             if let Ok(mut engine) = self.engine.lock() {
                 engine.clear();
             }
-            if let Ok(mut sm) = self.smoothed_h.lock() {
-                *sm = SmoothedHomography::default();
+            if let Ok(mut sm) = self.last_emitted_h.lock() {
+                *sm = LastEmittedH::default();
             }
         }
 
@@ -440,13 +429,7 @@ impl LiveTrackerPipeline {
             (state.width, state.height, state.rotation_degrees)
         };
 
-        let h_for_compose = self.select_compose_h(
-            tracker_state,
-            tracker_anchor,
-            tracker_h,
-            dst_w as f32,
-            dst_h as f32,
-        );
+        let h_for_compose = self.select_compose_h(tracker_state, tracker_anchor, tracker_h);
         if let Ok(mut slot) = self.pending_compose.lock() {
             *slot = h_for_compose.map(|h| (tracker_anchor, h));
         }
@@ -568,23 +551,15 @@ impl LiveTrackerPipeline {
         state: PlanarTrackerState,
         anchor_id: u64,
         incoming: Option<[f32; 9]>,
-        frame_w: f32,
-        frame_h: f32,
     ) -> Option<[f32; 9]> {
-        let mut sm = self.smoothed_h.lock().ok()?;
+        let mut sm = self.last_emitted_h.lock().ok()?;
         match state {
             PlanarTrackerState::Locked => {
                 sm.consecutive_lost = 0;
                 let incoming = incoming?;
-                if DISABLE_SMOOTH_H {
-                    sm.h = Some(incoming);
-                    sm.anchor_id = anchor_id;
-                    Some(incoming)
-                } else {
-                    Some(smooth_homography(
-                        &mut sm, anchor_id, &incoming, frame_w, frame_h,
-                    ))
-                }
+                sm.h = Some(incoming);
+                sm.anchor_id = anchor_id;
+                Some(incoming)
             }
             PlanarTrackerState::Lost => {
                 sm.consecutive_lost = sm.consecutive_lost.saturating_add(1);
@@ -1307,55 +1282,6 @@ fn scale_homography(h: &[f32; 9], s: f32) -> [f32; 9] {
         h[7] * inv_s,
         h[8],
     ]
-}
-
-fn smooth_homography(
-    sm: &mut SmoothedHomography,
-    anchor_id: u64,
-    incoming: &[f32; 9],
-    frame_w: f32,
-    frame_h: f32,
-) -> [f32; 9] {
-    if sm.anchor_id != anchor_id || sm.h.is_none() {
-        sm.h = Some(*incoming);
-        sm.anchor_id = anchor_id;
-        return *incoming;
-    }
-    let prev = sm.h.expect("checked above");
-    let corners = [
-        (0.0_f32, 0.0_f32),
-        (frame_w, 0.0),
-        (frame_w, frame_h),
-        (0.0, frame_h),
-    ];
-    let mut max_delta = 0.0_f32;
-    for &(cx, cy) in &corners {
-        let pn = homography::project(incoming, cx, cy);
-        let pp = homography::project(&prev, cx, cy);
-        if let (Some(pn), Some(pp)) = (pn, pp) {
-            let dx = pn.0 - pp.0;
-            let dy = pn.1 - pp.1;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d > max_delta {
-                max_delta = d;
-            }
-        }
-    }
-    let alpha = if max_delta <= SMOOTH_LOW_PX {
-        SMOOTH_MIN_ALPHA
-    } else if max_delta >= SMOOTH_HIGH_PX {
-        1.0
-    } else {
-        let t = (max_delta - SMOOTH_LOW_PX) / (SMOOTH_HIGH_PX - SMOOTH_LOW_PX);
-        SMOOTH_MIN_ALPHA + t * (1.0 - SMOOTH_MIN_ALPHA)
-    };
-    let mut out = [0.0_f32; 9];
-    for i in 0..9 {
-        out[i] = alpha * incoming[i] + (1.0 - alpha) * prev[i];
-    }
-    sm.h = Some(out);
-    sm.anchor_id = anchor_id;
-    out
 }
 
 /// Scale a `DetectedTextBox` from detector-image coords up to
