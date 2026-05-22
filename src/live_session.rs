@@ -2526,14 +2526,12 @@ pub fn render_block_bitmap(
     let mut bg_rgba = vec![0u8; pixels * 4];
     let text_rgba = vec![0u8; pixels * 4];
     let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
-        // Debug palette keeps its translucent alpha (each block is
-        // distinguishable). In debug mode overlapping bgs are
-        // intentionally visible.
         DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
     } else {
-        // Opaque dark bg. Two adjacent blocks' bgs that land on the
-        // same viewport pixel write the same colour; no double-dark.
-        [0x10, 0x10, 0x10, 0xFF]
+        // Semi-transparent dark bg. The compositor's bg-pass uses a
+        // first-write-wins mask so overlapping bgs do *not* stack to
+        // 2× as dark even though alpha is < 0xFF.
+        [0x10, 0x10, 0x10, 0xC8]
     };
     let visuals_local: Vec<OrientedRect> = visuals
         .iter()
@@ -2551,12 +2549,6 @@ pub fn render_block_bitmap(
             .and_then(|m| m.as_ref())
             .and_then(|m| m.bg_uniform_argb)
             .map(argb_to_rgba_bytes)
-            .map(|mut rgba| {
-                // Force opaque even when matted: same rationale as
-                // the default bg, just with the matted colour.
-                rgba[3] = 0xFF;
-                rgba
-            })
             .unwrap_or(default_bg);
         crate::planar_engine::fill_oriented_rect_blended(
             &mut bg_rgba,

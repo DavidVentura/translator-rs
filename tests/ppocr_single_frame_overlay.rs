@@ -400,6 +400,7 @@ fn composite_overlay(
                 bitmap_origin_surface_x: it.surface_origin_x,
                 bitmap_origin_surface_y: it.surface_origin_y,
                 row_extents: &it.bg_row_extents,
+                is_bg_layer: true,
             });
         }
         for it in &live {
@@ -410,6 +411,7 @@ fn composite_overlay(
                 bitmap_origin_surface_x: it.surface_origin_x,
                 bitmap_origin_surface_y: it.surface_origin_y,
                 row_extents: &it.text_row_extents,
+                is_bg_layer: false,
             });
         }
         out

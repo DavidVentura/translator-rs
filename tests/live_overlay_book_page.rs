@@ -202,6 +202,7 @@ fn book_page_grouping_dump() {
             bitmap_origin_surface_x: r.surface_origin_x,
             bitmap_origin_surface_y: r.surface_origin_y,
             row_extents: &[],
+            is_bg_layer: true,
         });
     }
     for r in &rasters {
@@ -212,6 +213,7 @@ fn book_page_grouping_dump() {
             bitmap_origin_surface_x: r.surface_origin_x,
             bitmap_origin_surface_y: r.surface_origin_y,
             row_extents: &[],
+            is_bg_layer: false,
         });
     }
 

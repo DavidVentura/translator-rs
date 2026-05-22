@@ -31,7 +31,9 @@ use image::{Rgba, RgbaImage, codecs::jpeg::JpegEncoder};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect as ImpRect;
 use translator::font_provider::{FontHandle, FontProvider, FontRequest};
-use translator::live_compositor::{OverlayItem as CompositeOverlayItem, composite_frame_into};
+use translator::live_compositor::{
+    OverlayItem as CompositeOverlayItem, composite_frame_into_with_bg_mask,
+};
 use translator::live_frame::OrientedImage;
 use translator::live_session::{
     LiveRecognizer, LiveSession, NoopTranslator, PostDetectInput, h_view_to_surface_from,
@@ -743,6 +745,7 @@ fn render_outputs(
                 bitmap_origin_surface_x: it.surface_origin_x,
                 bitmap_origin_surface_y: it.surface_origin_y,
                 row_extents: &it.bg_row_extents,
+                is_bg_layer: true,
             });
         }
         for it in &live {
@@ -753,18 +756,21 @@ fn render_outputs(
                 bitmap_origin_surface_x: it.surface_origin_x,
                 bitmap_origin_surface_y: it.surface_origin_y,
                 row_extents: &it.text_row_extents,
+                is_bg_layer: false,
             });
         }
         out
     };
     let item_count = items.len();
-    composite_frame_into(
+    let mut bg_mask = vec![0u8; (w as usize) * (h as usize)];
+    composite_frame_into_with_bg_mask(
         &mut composite,
         w,
         h,
         camera_bytes,
         &h_surface_to_view,
         &items,
+        Some(bg_mask.as_mut_slice()),
     )
     .expect("composite camera");
     (composite, item_count)

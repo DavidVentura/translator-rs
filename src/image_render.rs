@@ -1107,6 +1107,15 @@ fn blit_mask(
                 let blended = fg_bytes[c] as f32 * a + canvas[buf_idx + c] as f32 * inv;
                 canvas[buf_idx + c] = blended.round().clamp(0.0, 255.0) as u8;
             }
+            // Source-over alpha. Previously this loop only blended
+            // RGB and left the alpha channel untouched, which worked
+            // when the canvas was pre-filled with an opaque bg
+            // rectangle but produced fully-transparent glyph pixels
+            // (RGB set, A=0) when painted onto a transparent canvas
+            // (the text-only layer of the bg/text split).
+            let dst_a = canvas[buf_idx + 3] as f32 / 255.0;
+            let out_a = a + dst_a * inv;
+            canvas[buf_idx + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
 }

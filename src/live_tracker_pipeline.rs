@@ -341,6 +341,12 @@ pub struct LiveTrackerPipeline {
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
     worker: Mutex<Option<Worker>>,
     timing: Mutex<TimingStats>,
+    /// Per-pixel "bg has been drawn here" mask, reused across frames.
+    /// Reset to zeros at the start of each `composite_into_slice` call;
+    /// during the bg pass, each pixel is blended at most once so
+    /// overlapping bg layers preserve their semi-transparent alpha
+    /// without stacking to a darker shade in the overlap.
+    bg_drawn_mask: Mutex<Vec<u8>>,
 }
 
 impl LiveTrackerPipeline {
@@ -366,6 +372,7 @@ impl LiveTrackerPipeline {
             last_telemetry: Mutex::new(None),
             worker: Mutex::new(None),
             timing: Mutex::new(TimingStats::default()),
+            bg_drawn_mask: Mutex::new(Vec::new()),
         });
         let worker = Worker::spawn(Arc::clone(&pipeline));
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
@@ -680,10 +687,11 @@ impl LiveTrackerPipeline {
         let src_offset_x = sensor_w.saturating_sub(bitmap_w) / 2;
         let src_offset_y = sensor_h.saturating_sub(bitmap_h) / 2;
         let overlay_guard = self.session.overlay_items.lock().ok();
-        // Two-pass layout: all bg layers first (so overlapping bgs
-        // overwrite to the same opaque dark colour without stacking
-        // 2× as dark), then all text layers on top (so each block's
-        // text remains visible even where another block's bg lands).
+        // Two-pass layout: all bg layers first (with a first-write-
+        // wins mask so overlapping bgs preserve their semi-transparent
+        // alpha without stacking to 2× as dark), then all text layers
+        // on top (so each block's text remains visible even where
+        // another block's bg lands).
         let items_vec: Vec<OverlayItem<'_>> = match (&overlay_guard, h_surface_to_viewport) {
             (Some(items), Some(_)) => {
                 let mut out: Vec<OverlayItem<'_>> = Vec::with_capacity(items.len() * 2);
@@ -695,6 +703,7 @@ impl LiveTrackerPipeline {
                         bitmap_origin_surface_x: it.surface_origin_x,
                         bitmap_origin_surface_y: it.surface_origin_y,
                         row_extents: &it.bg_row_extents,
+                        is_bg_layer: true,
                     });
                 }
                 for it in items.iter().filter(|it| it.anchor_id == active_anchor_id) {
@@ -705,6 +714,7 @@ impl LiveTrackerPipeline {
                         bitmap_origin_surface_x: it.surface_origin_x,
                         bitmap_origin_surface_y: it.surface_origin_y,
                         row_extents: &it.text_row_extents,
+                        is_bg_layer: false,
                     });
                 }
                 out
@@ -726,7 +736,15 @@ impl LiveTrackerPipeline {
         ];
         let h_translated = homography::mat3_mul(&translate, &h_for_call);
         let overlay_count = items_vec.len() as u32;
-        live_compositor::composite_frame_into_cropped(
+        let mask_len = (bitmap_w as usize) * (bitmap_h as usize);
+        let mut bg_mask = if let Ok(mut buf) = self.bg_drawn_mask.lock() {
+            buf.clear();
+            buf.resize(mask_len, 0);
+            std::mem::take(&mut *buf)
+        } else {
+            vec![0u8; mask_len]
+        };
+        let result = live_compositor::composite_frame_into_cropped_with_bg_mask(
             dst,
             bitmap_w,
             bitmap_h,
@@ -737,8 +755,12 @@ impl LiveTrackerPipeline {
             src_offset_y,
             &h_translated,
             &items_vec,
-        )
-        .map(|()| overlay_count)
+            Some(bg_mask.as_mut_slice()),
+        );
+        if let Ok(mut slot) = self.bg_drawn_mask.lock() {
+            *slot = bg_mask;
+        }
+        result.map(|()| overlay_count)
     }
 
     fn update_refresh_trigger(

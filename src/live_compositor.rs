@@ -41,6 +41,13 @@ pub struct OverlayItem<'a> {
     /// differs from `bitmap_height`) to disable the optimisation
     /// and fall back to the per-pixel alpha-check inside the loop.
     pub row_extents: &'a [(u32, u32)],
+    /// True for bg-layer items. When `bg_drawn_mask` is also passed
+    /// to the composite call, the compositor consults the mask for
+    /// each viewport pixel of a bg item and blends only when the
+    /// mask is zero (first-write-wins). This preserves the bg's
+    /// semi-transparent alpha across overlapping items without
+    /// double-darkening the overlap region.
+    pub is_bg_layer: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +71,31 @@ pub fn composite_frame_into(
     h_surface_to_viewport: &[f32; 9],
     items: &[OverlayItem<'_>],
 ) -> Result<(), CompositeError> {
+    composite_frame_into_with_bg_mask(
+        dst_rgba,
+        sensor_w,
+        sensor_h,
+        camera_rgba,
+        h_surface_to_viewport,
+        items,
+        None,
+    )
+}
+
+/// As [`composite_frame_into`], but with a caller-supplied per-pixel
+/// mask used to enforce first-write-wins on bg-layer items. Pass a
+/// freshly-zeroed `[u8]` of length `sensor_w * sensor_h` to enable
+/// the mask; pass `None` for normal source-over behaviour on every
+/// item.
+pub fn composite_frame_into_with_bg_mask(
+    dst_rgba: &mut [u8],
+    sensor_w: u32,
+    sensor_h: u32,
+    camera_rgba: &[u8],
+    h_surface_to_viewport: &[f32; 9],
+    items: &[OverlayItem<'_>],
+    bg_drawn_mask: Option<&mut [u8]>,
+) -> Result<(), CompositeError> {
     // Dst and src share dims now — no per-frame rotation. The Kotlin
     // side hands the sensor-orient bitmap straight to the SurfaceView,
     // which rotates it for display via its drawMatrix (GPU-composited
@@ -81,8 +113,21 @@ pub fn composite_frame_into(
     // Camera blit: sensor-orient → sensor-orient sequential copy.
     // LLVM should turn this into a memcpy.
     dst_rgba.copy_from_slice(camera_rgba);
+    let mut mask_storage = bg_drawn_mask;
     for item in items {
-        warp_item_onto_display(dst_rgba, sensor_w, sensor_h, item, h_surface_to_viewport);
+        let mask_slice = if item.is_bg_layer {
+            mask_storage.as_deref_mut()
+        } else {
+            None
+        };
+        warp_item_onto_display(
+            dst_rgba,
+            sensor_w,
+            sensor_h,
+            item,
+            h_surface_to_viewport,
+            mask_slice,
+        );
     }
     Ok(())
 }
@@ -109,6 +154,36 @@ pub fn composite_frame_into_cropped(
     src_offset_y: u32,
     h_surface_to_viewport: &[f32; 9],
     items: &[OverlayItem<'_>],
+) -> Result<(), CompositeError> {
+    composite_frame_into_cropped_with_bg_mask(
+        dst_rgba,
+        dst_w,
+        dst_h,
+        camera_rgba,
+        src_full_w,
+        src_full_h,
+        src_offset_x,
+        src_offset_y,
+        h_surface_to_viewport,
+        items,
+        None,
+    )
+}
+
+/// As [`composite_frame_into_cropped`], with the same per-pixel
+/// first-write-wins bg mask as [`composite_frame_into_with_bg_mask`].
+pub fn composite_frame_into_cropped_with_bg_mask(
+    dst_rgba: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    camera_rgba: &[u8],
+    src_full_w: u32,
+    src_full_h: u32,
+    src_offset_x: u32,
+    src_offset_y: u32,
+    h_surface_to_viewport: &[f32; 9],
+    items: &[OverlayItem<'_>],
+    bg_drawn_mask: Option<&mut [u8]>,
 ) -> Result<(), CompositeError> {
     let dst_bytes = (dst_w as usize)
         .checked_mul(dst_h as usize)
@@ -137,8 +212,21 @@ pub fn composite_frame_into_cropped(
         dst_rgba[dst_row..dst_row + dst_stride]
             .copy_from_slice(&camera_rgba[src_row..src_row + dst_stride]);
     }
+    let mut mask_storage = bg_drawn_mask;
     for item in items {
-        warp_item_onto_display(dst_rgba, dst_w, dst_h, item, h_surface_to_viewport);
+        let mask_slice = if item.is_bg_layer {
+            mask_storage.as_deref_mut()
+        } else {
+            None
+        };
+        warp_item_onto_display(
+            dst_rgba,
+            dst_w,
+            dst_h,
+            item,
+            h_surface_to_viewport,
+            mask_slice,
+        );
     }
     Ok(())
 }
@@ -157,6 +245,7 @@ fn warp_item_onto_display(
     dst_h: u32,
     item: &OverlayItem<'_>,
     h_surface_to_viewport: &[f32; 9],
+    mut bg_drawn_mask: Option<&mut [u8]>,
 ) {
     let src_w = item.bitmap_width;
     let src_h = item.bitmap_height;
@@ -352,6 +441,17 @@ fn warp_item_onto_display(
                 w_br,
             );
             let dst_idx = ((y * dst_w + x) * 4) as usize;
+            let pixel_idx = (y * dst_w + x) as usize;
+            if let Some(mask) = bg_drawn_mask.as_deref_mut() {
+                // First-write-wins on the bg layer: skip if a prior
+                // bg already wrote here. Preserves the bg's semi-
+                // transparent alpha across overlapping items without
+                // stacking to a darker shade in the overlap.
+                if mask[pixel_idx] != 0 {
+                    continue;
+                }
+                mask[pixel_idx] = 1;
+            }
             blend_source_over(&mut dst[dst_idx..dst_idx + 4], [r, g, b, a]);
         }
     }
@@ -422,6 +522,7 @@ mod tests {
             bitmap_origin_surface_x: 1.0,
             bitmap_origin_surface_y: 1.0,
             row_extents: &[],
+            is_bg_layer: false,
         };
         composite_frame_into(
             &mut dst,
@@ -463,6 +564,7 @@ mod tests {
             bitmap_origin_surface_x: 4.0,
             bitmap_origin_surface_y: 4.0,
             row_extents: &[],
+            is_bg_layer: false,
         };
         // Translation + mild perspective.
         let h = [1.05, -0.03, 1.5, 0.02, 0.97, -0.7, 1.0e-3, -5.0e-4, 1.0];
