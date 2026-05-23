@@ -36,7 +36,7 @@ use crate::homography::project;
 pub const EKF_Q_DEFAULT: [f64; 8] = [
     1.0e-4, 1.0e-4, 4.0, // h0, h1, h2 (h2 = tx, fast)
     1.0e-4, 1.0e-4, 4.0, // h3, h4, h5 (h5 = ty, fast)
-    1.0e-9, 1.0e-9,      // h6, h7 (perspective, slow)
+    1.0e-9, 1.0e-9, // h6, h7 (perspective, slow)
 ];
 
 /// Initial covariance diagonal `P0` for a fresh filter.
@@ -44,11 +44,7 @@ pub const EKF_Q_DEFAULT: [f64; 8] = [
 /// Sized so the first one or two RANSAC frames dominate the state;
 /// after that the steady-state covariance is set by the ratio of `Q`
 /// to the per-inlier information contribution.
-pub const EKF_P0_DEFAULT: [f64; 8] = [
-    1.0e-2, 1.0e-2, 1.0e2,
-    1.0e-2, 1.0e-2, 1.0e2,
-    1.0e-7, 1.0e-7,
-];
+pub const EKF_P0_DEFAULT: [f64; 8] = [1.0e-2, 1.0e-2, 1.0e2, 1.0e-2, 1.0e-2, 1.0e2, 1.0e-7, 1.0e-7];
 
 /// Default per-inlier measurement variance in pixel² units.
 ///
@@ -312,7 +308,12 @@ mod tests {
     }
 
     fn corner_error(a: &[f32; 9], b: &[f32; 9]) -> f32 {
-        let pts = [(0.0_f32, 0.0_f32), (640.0, 0.0), (640.0, 480.0), (0.0, 480.0)];
+        let pts = [
+            (0.0_f32, 0.0_f32),
+            (640.0, 0.0),
+            (640.0, 480.0),
+            (0.0, 480.0),
+        ];
         let mut worst = 0.0_f32;
         for &(x, y) in &pts {
             let (ax, ay) = project_pt(a, x, y);
@@ -438,7 +439,10 @@ mod tests {
         assert_eq!(applied, pairs.len());
         let dh6 = (ekf.h[6] - truth[6]).abs();
         let dh7 = (ekf.h[7] - truth[7]).abs();
-        assert!(dh7 < 5.0e-5, "h7 drift {dh7} should stay small (no y-spread)");
+        assert!(
+            dh7 < 5.0e-5,
+            "h7 drift {dh7} should stay small (no y-spread)"
+        );
         assert!(dh6 < 5.0e-5, "h6 drift {dh6}");
     }
 
@@ -510,10 +514,7 @@ mod tests {
 
     #[test]
     fn reset_clears_history() {
-        let mut ekf = HomographyEkf::new([
-            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
-        ])
-        .unwrap();
+        let mut ekf = HomographyEkf::new([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]).unwrap();
         for _ in 0..5 {
             let pairs = make_pairs(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
             ekf.update_pairs(&pairs, EKF_R_DEFAULT);
@@ -523,7 +524,10 @@ mod tests {
         assert!((ekf.h[2] - 5.0).abs() < 1e-6);
         let reset_sigmas = ekf.sigmas();
         for i in 0..8 {
-            assert!(reset_sigmas[i] >= shrunk[i], "reset should re-inflate sigma[{i}]");
+            assert!(
+                reset_sigmas[i] >= shrunk[i],
+                "reset should re-inflate sigma[{i}]"
+            );
         }
     }
 }

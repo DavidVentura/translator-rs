@@ -232,8 +232,7 @@ fn warp_item_onto_display(
     // when the overlay was rasterised; used here to skip the bilinear
     // sample + blend for any inverse-projected pixel that lands in a
     // guaranteed-transparent source region.
-    let extents_active =
-        !item.row_extents.is_empty() && item.row_extents.len() == src_h as usize;
+    let extents_active = !item.row_extents.is_empty() && item.row_extents.len() == src_h as usize;
 
     for y in y0..y1 {
         let dy = y as f32 + 0.5;
@@ -301,14 +300,7 @@ fn warp_item_onto_display(
                 continue;
             }
             let r = bilinear_sample(
-                src[i_tl],
-                src[i_tr],
-                src[i_bl],
-                src[i_br],
-                w_tl,
-                w_tr,
-                w_bl,
-                w_br,
+                src[i_tl], src[i_tr], src[i_bl], src[i_br], w_tl, w_tr, w_bl, w_br,
             );
             let g = bilinear_sample(
                 src[i_tl + 1],
@@ -337,7 +329,16 @@ fn warp_item_onto_display(
 }
 
 #[inline]
-fn bilinear_sample(tl: u8, tr: u8, bl: u8, br: u8, w_tl: f32, w_tr: f32, w_bl: f32, w_br: f32) -> u8 {
+fn bilinear_sample(
+    tl: u8,
+    tr: u8,
+    bl: u8,
+    br: u8,
+    w_tl: f32,
+    w_tr: f32,
+    w_bl: f32,
+    w_br: f32,
+) -> u8 {
     let v = (tl as f32) * w_tl + (tr as f32) * w_tr + (bl as f32) * w_bl + (br as f32) * w_br;
     v.round().clamp(0.0, 255.0) as u8
 }
@@ -433,8 +434,7 @@ mod tests {
         let h = [1.05, -0.03, 1.5, 0.02, 0.97, -0.7, 1.0e-3, -5.0e-4, 1.0];
 
         let mut dst = vec![0u8; 16 * 16 * 4];
-        composite_frame_into(&mut dst, 16, 16, &cam, &h, std::slice::from_ref(&item))
-            .unwrap();
+        composite_frame_into(&mut dst, 16, 16, &cam, &h, std::slice::from_ref(&item)).unwrap();
 
         let mut painted = 0usize;
         for y in 0..16 {
@@ -450,7 +450,13 @@ mod tests {
                 }
             }
         }
-        assert!(painted >= 8, "perspective overlay covered only {painted} pixels");
-        assert!(painted <= 64, "perspective overlay covered too many ({painted}) pixels");
+        assert!(
+            painted >= 8,
+            "perspective overlay covered only {painted} pixels"
+        );
+        assert!(
+            painted <= 64,
+            "perspective overlay covered too many ({painted}) pixels"
+        );
     }
 }

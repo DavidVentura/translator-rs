@@ -845,8 +845,7 @@ impl LivePlanarEngine {
                 // doubling FAST+BRIEF cost on every refining frame.
                 let t_features = std::time::Instant::now();
                 let features = compute_frame_features(gray, &self.config.tracker);
-                self.last_step_timings.features_ms =
-                    t_features.elapsed().as_secs_f64() * 1000.0;
+                self.last_step_timings.features_ms = t_features.elapsed().as_secs_f64() * 1000.0;
                 let t_track = std::time::Instant::now();
                 let (brute_result, dims) = match (self.cache.get(anchor_id), features.as_ref()) {
                     (Some(a), Some(features)) => {
@@ -873,8 +872,12 @@ impl LivePlanarEngine {
                     Some(t) => {
                         let raw_inliers = t.inliers;
                         let h_ok = homography_is_sane(&t.homography, dims.0, dims.1);
-                        let delta_ok =
-                            homography_delta_is_sane(&t.homography, &last_homography, dims.0, dims.1);
+                        let delta_ok = homography_delta_is_sane(
+                            &t.homography,
+                            &last_homography,
+                            dims.0,
+                            dims.1,
+                        );
                         if !h_ok {
                             self.gate_counters.h_sanity_reject =
                                 self.gate_counters.h_sanity_reject.saturating_add(1);
@@ -904,8 +907,8 @@ impl LivePlanarEngine {
                 let result = result.and_then(|r| self.apply_sanity_gate(r));
                 if let Some(mut r) = result {
                     if self.config.use_h_ekf {
-                        let frozen = pre_gate_h
-                            .map_or(false, |pre| !h_elementwise_eq(&pre, &r.homography));
+                        let frozen =
+                            pre_gate_h.map_or(false, |pre| !h_elementwise_eq(&pre, &r.homography));
                         let new_h = if frozen {
                             self.apply_h_ekf(anchor_id, r.homography, &[])
                         } else {
@@ -1448,7 +1451,6 @@ impl LivePlanarEngine {
         tracker.ekf.homography()
     }
 
-
     /// Seed chain-composition refinement for a newly-spawned handoff
     /// anchor. The cached anchor's `h_root_to_canonical` was computed
     /// from a single RANSAC fit at the spawn frame; the refinement
@@ -1575,7 +1577,10 @@ impl LivePlanarEngine {
                 return;
             }
         };
-        let candidate_raw = mat3_mul(&h_inv, &mat3_mul(&parent_r.homography, &s.parent_h_root_to_canonical));
+        let candidate_raw = mat3_mul(
+            &h_inv,
+            &mat3_mul(&parent_r.homography, &s.parent_h_root_to_canonical),
+        );
         let candidate = canonicalize_h(&candidate_raw);
         if !candidate.iter().all(|v| v.is_finite()) {
             if s.frames_remaining == 0 {
@@ -2417,7 +2422,9 @@ fn lerp_h(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {
 /// here precisely because the gate does not arithmetic-transform the
 /// value.
 fn h_elementwise_eq(a: &[f32; 9], b: &[f32; 9]) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 fn canonicalize_h(h: &[f32; 9]) -> [f32; 9] {

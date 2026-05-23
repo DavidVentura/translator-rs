@@ -751,8 +751,12 @@ fn h_ekf_first_frame_after_acquire_is_passthrough() {
     let gray = load_gray("book.jpg", 480);
     let translated = warp_with_h(&gray, &[1.0, 0.0, 7.0, 0.0, 1.0, -3.0, 0.0, 0.0, 1.0]);
 
-    baseline.acquire_now(&gray, 1_000_000).expect("baseline acquire");
-    ekf_engine.acquire_now(&gray, 1_000_000).expect("ekf acquire");
+    baseline
+        .acquire_now(&gray, 1_000_000)
+        .expect("baseline acquire");
+    ekf_engine
+        .acquire_now(&gray, 1_000_000)
+        .expect("ekf acquire");
     let baseline_cmd = baseline.process_frame(&translated, true, 2_000_000);
     let ekf_cmd = ekf_engine.process_frame(&translated, true, 2_000_000);
     let baseline_h = match baseline_cmd {
@@ -792,7 +796,12 @@ fn h_ekf_steady_state_tracks_constant_h() {
     // assertion is in display-space pixels rather than raw matrix
     // entries (which obscures whether the drift is geometrically
     // meaningful).
-    let quad = [(140.0_f32, 220.0), (260.0, 220.0), (260.0, 270.0), (140.0, 270.0)];
+    let quad = [
+        (140.0_f32, 220.0),
+        (260.0, 220.0),
+        (260.0, 270.0),
+        (140.0, 270.0),
+    ];
     let overlay = CanonicalOverlay {
         id: 1,
         quad,
@@ -853,7 +862,11 @@ fn h_ekf_resets_on_anchor_change() {
     // anchor A's filter state.
     let cmd_a = engine.process_frame(&translated, true, 60_000_000);
     let h_a = match cmd_a {
-        TrackerCommand::Locked { homography, anchor_id, .. } => {
+        TrackerCommand::Locked {
+            homography,
+            anchor_id,
+            ..
+        } => {
             assert_eq!(anchor_id, root_b);
             homography
         }

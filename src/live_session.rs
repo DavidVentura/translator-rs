@@ -2712,8 +2712,7 @@ pub fn render_anchor_canvas(
                 let text_box = OrientedRect {
                     cx: v.cx,
                     cy: v.cy,
-                    width: (v.width
-                        - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX)
+                    width: (v.width - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX)
                         .max(1.0),
                     height: v.height,
                     angle_radians: v.angle_radians,
