@@ -167,40 +167,81 @@ fn viewport_surface_quad_area(
     area.is_finite().then_some(area)
 }
 
-/// One rasterized overlay item resident across composite calls. The
-/// caller hashes the source content (strips + texts + language) and
-/// only re-rasterizes items whose hash changed, so dense pages with
-/// stable content stay cheap to render.
-#[derive(Clone)]
-pub struct OverlayItem {
-    pub id: u64,
-    /// Anchor whose canonical frame this overlay lives in. The
-    /// compositor warps the bitmap by *that anchor's*
-    /// `H_root→view`; items for inactive anchors are skipped at
-    /// compose time so cached state for a cached anchor doesn't
-    /// render at the wrong place under the current anchor's H.
+/// Per-anchor overlay state. Holds the source spec for each OCR
+/// block on that anchor (paragraph strips + translated text + matting
+/// hints) and the cached anchor-wide RGBA canvas built from them.
+///
+/// The canvas merges *all* of an anchor's blocks — bg fills and
+/// translated glyphs — into a single surface-space bitmap, so the
+/// per-frame compositor needs only one warp per anchor and bg /
+/// cross-block overlap is resolved once at build time. The canvas is
+/// rebuilt eagerly when blocks change; between rebuilds, the
+/// compositor reads it verbatim with no per-block work.
+pub struct AnchorOverlay {
     pub anchor_id: AnchorId,
-    /// Background layer (opaque dark fill behind text). Separate
-    /// from `text_bitmap` so the compositor can draw all blocks'
-    /// bgs first (no overlap stacking) and all blocks' text on
-    /// top in a second pass. Both layers share dimensions.
-    pub bg_bitmap: Vec<u8>,
-    /// Text-glyphs layer on a transparent canvas. Rendered second
-    /// so each block's text lands on top of every block's bg.
-    pub text_bitmap: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    /// Where the bitmap's top-left sits in surface coords. The
-    /// compositor warps from this origin through the per-frame H.
-    pub surface_origin_x: f32,
-    pub surface_origin_y: f32,
-    /// Hash of (strips + display text + language). Used to skip
-    /// re-raster when content is unchanged across acquires.
+    /// Per-block source specs keyed by stable_block_id. `BTreeMap`
+    /// gives a deterministic iteration order so canvas content is
+    /// reproducible across upserts.
+    pub blocks: std::collections::BTreeMap<u64, BlockSpec>,
+    /// Currently-mounted canvas. Kept live across content updates —
+    /// the rebuild path renders a new canvas off the lock and only
+    /// swaps it in once the new canvas is ready, so the compositor
+    /// never sees a "no canvas" window between a block update and
+    /// its rebuild. The old canvas keeps rendering until the new one
+    /// replaces it.
+    pub canvas: Option<AnchorRaster>,
+    /// Content fingerprint of `blocks` at the time `canvas` was
+    /// built. `Some(x)` when the canvas reflects fingerprint `x`;
+    /// `None` when nothing has been rendered yet. The rebuild path
+    /// triggers on `Some(self.content_fingerprint()) !=
+    /// rendered_fingerprint`, so block updates make the canvas
+    /// "stale" without dropping it.
+    pub rendered_fingerprint: Option<u64>,
+}
+
+impl AnchorOverlay {
+    pub fn new(anchor_id: AnchorId) -> Self {
+        Self {
+            anchor_id,
+            blocks: std::collections::BTreeMap::new(),
+            canvas: None,
+            rendered_fingerprint: None,
+        }
+    }
+
+    /// Composite content hash across all blocks. Compared against
+    /// `rendered_fingerprint` to decide whether a rebuild is needed
+    /// and, after rendering, to detect "snapshot still current" so a
+    /// stale render doesn't clobber a fresher one.
+    pub fn content_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.blocks.len() as u64).hash(&mut h);
+        for (id, spec) in &self.blocks {
+            id.hash(&mut h);
+            spec.content_hash.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn is_canvas_current(&self) -> bool {
+        self.rendered_fingerprint == Some(self.content_fingerprint())
+    }
+}
+
+/// Source spec for a single OCR block, owned by its `AnchorOverlay`.
+/// Carries everything the anchor canvas builder needs to render this
+/// block's bg fills + translated glyphs into the shared bitmap.
+#[derive(Clone)]
+pub struct BlockSpec {
+    pub strips: Vec<OrientedRect>,
+    pub matted_strips: Vec<Option<MattedStrip>>,
+    pub display_text: String,
+    pub language: String,
+    /// Hash of (strips + display_text + language). The upsert path
+    /// compares against the previous value to skip canvas rebuilds
+    /// when the same content arrives twice.
     pub content_hash: u64,
-    /// Per-source-row non-transparent column extents for `bg_bitmap`.
-    pub bg_row_extents: Vec<(u32, u32)>,
-    /// Per-source-row non-transparent column extents for `text_bitmap`.
-    pub text_row_extents: Vec<(u32, u32)>,
 }
 
 /// Scan an RGBA bitmap and return, per row, the half-open
@@ -341,11 +382,12 @@ pub struct LiveSession {
     /// `engine.cached_root_ids()` to drop state for roots the
     /// engine has evicted.
     pub anchor_states: Mutex<HashMap<AnchorId, AnchorState>>,
-    /// Resident rasterized overlays. Each item carries the
-    /// `anchor_id` it belongs to; the compositor filters to only the
-    /// currently-active anchor so cached anchors' overlays don't
-    /// render at wrong positions under another anchor's H.
-    pub overlay_items: Mutex<Vec<OverlayItem>>,
+    /// Resident rasterized overlays, keyed by anchor id. Each anchor
+    /// owns one merged bitmap covering all of its blocks; the
+    /// compositor selects the active anchor's canvas for the per-
+    /// frame warp. Cached anchors' canvases sit untouched until
+    /// either evicted or re-activated.
+    pub overlay_anchors: Mutex<HashMap<AnchorId, AnchorOverlay>>,
     /// Frame counter that ticks on every Locked frame the caller
     /// observes after the most recent acquire. Drives the
     /// detect-on-tracking-frame trigger ([`Self::should_refresh_now`]).
@@ -377,7 +419,7 @@ impl LiveSession {
     pub fn new() -> Self {
         Self {
             anchor_states: Mutex::new(HashMap::new()),
-            overlay_items: Mutex::new(Vec::new()),
+            overlay_anchors: Mutex::new(HashMap::new()),
             locked_frames_since_acquire: AtomicU64::new(0),
             last_refresh_locked_frame: AtomicU64::new(0),
             refresh_every_n_locked_frames: AtomicU32::new(DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES),
@@ -390,8 +432,8 @@ impl LiveSession {
         if let Ok(mut states) = self.anchor_states.lock() {
             states.clear();
         }
-        if let Ok(mut items) = self.overlay_items.lock() {
-            items.clear();
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            anchors.clear();
         }
         self.locked_frames_since_acquire.store(0, Ordering::SeqCst);
         self.last_refresh_locked_frame.store(0, Ordering::SeqCst);
@@ -411,8 +453,8 @@ impl LiveSession {
         if let Ok(mut states) = self.anchor_states.lock() {
             states.remove(&anchor_id);
         }
-        if let Ok(mut items) = self.overlay_items.lock() {
-            items.retain(|it| it.anchor_id != anchor_id);
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            anchors.remove(&anchor_id);
         }
     }
 
@@ -427,8 +469,8 @@ impl LiveSession {
         if let Ok(mut states) = self.anchor_states.lock() {
             states.retain(|id, _| keep_set.contains(id));
         }
-        if let Ok(mut items) = self.overlay_items.lock() {
-            items.retain(|it| keep_set.contains(&it.anchor_id));
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            anchors.retain(|id, _| keep_set.contains(id));
         }
     }
 
@@ -618,14 +660,14 @@ impl LiveSession {
                 state.map = SurfaceMap::new();
             }
         }
-        if let Ok(mut items) = self.overlay_items.lock() {
-            items.retain(|it| it.anchor_id != anchor_id);
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            anchors.remove(&anchor_id);
         }
     }
 
     pub fn clear_overlays(&self) {
-        if let Ok(mut items) = self.overlay_items.lock() {
-            items.clear();
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            anchors.clear();
         }
     }
 
@@ -801,12 +843,12 @@ impl LiveSession {
         }
     }
 
-    /// Upsert one resident overlay item. Re-rasters only when the
-    /// content hash (strips + display text + language) changed since
-    /// the previous upsert for `id`; otherwise this is a no-op and
-    /// the cached bitmap survives. `matted_strips` is indexed parallel
-    /// to `strips` and may be empty to fall back to the legacy pill
-    /// rendering for every strip.
+    /// Upsert one resident overlay block on an anchor. Stores the
+    /// block's source spec under the anchor's `AnchorOverlay` and
+    /// rebuilds the anchor canvas if this block's content hash
+    /// changed. Otherwise it's a no-op — the cached canvas survives.
+    /// `matted_strips` is indexed parallel to `strips` and may be
+    /// empty to fall back to the default-bg pill rendering.
     pub fn upsert_block(
         &self,
         anchor_id: AnchorId,
@@ -823,78 +865,120 @@ impl LiveSession {
         }
         let display_text = pick_display_text(&source_text, &translated_text);
         let hash = block_content_hash(&strips, &display_text, &language);
-        // Fast path: same content → keep the cached bitmap.
-        if let Ok(items) = self.overlay_items.lock() {
-            if let Some(existing) = items.iter().find(|it| it.id == id) {
+        {
+            let mut anchors = match self.overlay_anchors.lock() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let anchor = anchors
+                .entry(anchor_id)
+                .or_insert_with(|| AnchorOverlay::new(anchor_id));
+            if let Some(existing) = anchor.blocks.get(&id) {
                 if existing.content_hash == hash {
                     return;
                 }
             }
-        }
-        let raster = match render_block_bitmap(
-            id,
-            &strips,
-            &matted_strips,
-            &display_text,
-            &language,
-            font_provider,
-        ) {
-            Some(r) => r,
-            None => return,
-        };
-        if let Ok(mut items) = self.overlay_items.lock() {
-            let bg_row_extents =
-                compute_row_extents(&raster.bg_bitmap, raster.width, raster.height);
-            let text_row_extents =
-                compute_row_extents(&raster.text_bitmap, raster.width, raster.height);
-            let new_item = OverlayItem {
+            anchor.blocks.insert(
                 id,
-                anchor_id,
-                bg_bitmap: raster.bg_bitmap,
-                text_bitmap: raster.text_bitmap,
-                width: raster.width,
-                height: raster.height,
-                surface_origin_x: raster.surface_origin_x,
-                surface_origin_y: raster.surface_origin_y,
-                content_hash: hash,
-                bg_row_extents,
-                text_row_extents,
-            };
-            // NB: we used to try a bbox-overlap "displace stale
-            // duplicates" pass here (IoU + containment in surface
-            // coords) so the clear-before-refresh wipe could be
-            // dropped (which would eliminate the flash). It worked
-            // for in-place duplicates but broke on re-segmentation:
-            // when the detector merges a 9-line paragraph into one
-            // box at frame A and then sees it as 1 line at frame B,
-            // the new 1-line bbox is 1/9 of the old paragraph's area
-            // — containment = 1/9 ≈ 0.11, well below any usable
-            // threshold — and the old 9-line overlay stays stacked.
-            // No purely-geometric heuristic over (old_bbox, new_bbox)
-            // distinguishes "stale duplicate of the same physical
-            // text" from "legitimate sub-region of a larger block",
-            // so we now rely on `clear_anchor_state_for_relock` to
-            // wipe the slate on each refresh. The flash that creates
-            // is the price of correctness until the staged-atomic-
-            // swap refactor lands. See `analysis.md` § "Overlay swap
-            // on refresh" for context.
-            if let Some(slot) = items.iter_mut().find(|it| it.id == id) {
-                *slot = new_item;
-            } else {
-                items.push(new_item);
+                BlockSpec {
+                    strips,
+                    matted_strips,
+                    display_text,
+                    language,
+                    content_hash: hash,
+                },
+            );
+            // Deliberately *don't* drop `anchor.canvas` — the next
+            // `ensure_anchor_canvas` call will build the new canvas
+            // off the lock and swap it in atomically once ready, so
+            // the compositor keeps showing the old canvas (e.g. with
+            // a "pending" placeholder for this block) until the new
+            // one is finished. Detecting staleness is the fingerprint
+            // mismatch between `content_fingerprint()` and
+            // `rendered_fingerprint`.
+        }
+        // NB: we used to keep a per-block "displace stale duplicates"
+        // pass here (IoU + containment in surface coords) so the
+        // clear-before-refresh wipe could be dropped (which would
+        // eliminate the flash). It worked for in-place duplicates
+        // but broke on re-segmentation: when the detector merges a
+        // 9-line paragraph into one box at frame A and then sees it
+        // as 1 line at frame B, the new 1-line bbox is 1/9 of the
+        // old paragraph's area — containment = 1/9 ≈ 0.11, well
+        // below any usable threshold — and the old 9-line overlay
+        // stayed stacked. No purely-geometric heuristic over
+        // (old_bbox, new_bbox) distinguishes "stale duplicate of the
+        // same physical text" from "legitimate sub-region of a
+        // larger block", so we now rely on
+        // `clear_anchor_state_for_relock` to wipe the slate on each
+        // refresh. The flash that creates is the price of correctness
+        // until the staged-atomic-swap refactor lands. See
+        // `analysis.md` § "Overlay swap on refresh" for context.
+        self.ensure_anchor_canvas(anchor_id, font_provider);
+    }
+
+    /// Drop blocks from `anchor_id` whose id isn't in `ids`. Used
+    /// when an acquire / refresh finishes (final block id set known)
+    /// so stale overlays from a prior pipeline run on the same anchor
+    /// don't linger. Blocks on *other* anchors are untouched.
+    pub fn retain_blocks(&self, anchor_id: AnchorId, ids: &[u64]) {
+        let keep: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            if let Some(anchor) = anchors.get_mut(&anchor_id) {
+                anchor.blocks.retain(|id, _| keep.contains(id));
+                // Canvas stays mounted; the fingerprint mismatch
+                // will trigger a rebuild on the next
+                // `ensure_anchor_canvas` (typically driven by the
+                // subsequent upsert in production). No font provider
+                // available here, so we can't rebuild eagerly.
             }
         }
     }
 
-    /// Drop overlay items for `anchor_id` whose id isn't in `ids`.
-    /// Used when an acquire / refresh finishes (final block id set
-    /// known) so stale overlays from a prior pipeline run on the
-    /// same anchor don't linger. Items for *other* anchors are
-    /// untouched.
-    pub fn retain_blocks(&self, anchor_id: AnchorId, ids: &[u64]) {
-        let keep: std::collections::HashSet<u64> = ids.iter().copied().collect();
-        if let Ok(mut items) = self.overlay_items.lock() {
-            items.retain(|it| it.anchor_id != anchor_id || keep.contains(&it.id));
+    /// Rebuild the anchor canvas from its current block specs.
+    /// Idempotent — if the canvas is already populated for the
+    /// current block-spec fingerprint, returns immediately. Renders
+    /// outside the session lock; if a racing upsert produced a
+    /// different fingerprint before this returns, the freshly
+    /// rendered canvas is discarded and the racing upsert's own
+    /// rebuild call (always sequenced with its mutation) wins.
+    pub fn ensure_anchor_canvas(
+        &self,
+        anchor_id: AnchorId,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) {
+        let (snapshot_fp, blocks_snapshot) = {
+            let anchors = match self.overlay_anchors.lock() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let anchor = match anchors.get(&anchor_id) {
+                Some(a) => a,
+                None => return,
+            };
+            if anchor.is_canvas_current() {
+                return;
+            }
+            (anchor.content_fingerprint(), anchor.blocks.clone())
+        };
+        // Render outside the lock so the compositor (on another
+        // thread) keeps reading the *old* `canvas` while glyph
+        // rasterization runs. Only the final pointer-swap below
+        // takes the lock again, and that swap is instantaneous.
+        let canvas = render_anchor_canvas(&blocks_snapshot, font_provider);
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            if let Some(anchor) = anchors.get_mut(&anchor_id) {
+                // If a racing upsert mutated `blocks` while we were
+                // rendering, our canvas is stale relative to the
+                // current state — discard it and let the racing
+                // caller's own `ensure_anchor_canvas` produce a
+                // newer one. The old canvas stays mounted in the
+                // meantime, so no flash either way.
+                if anchor.content_fingerprint() == snapshot_fp {
+                    anchor.canvas = canvas;
+                    anchor.rendered_fingerprint = Some(snapshot_fp);
+                }
+            }
         }
     }
 }
@@ -1815,8 +1899,11 @@ impl LiveSession {
         // later is a visible flash; the translated overlay from a
         // prior acquire is the right thing to keep on screen until
         // the new translation arrives.
-        let existing_ids: std::collections::HashSet<u64> = match self.overlay_items.lock() {
-            Ok(items) => items.iter().map(|it| it.id).collect(),
+        let existing_ids: std::collections::HashSet<u64> = match self.overlay_anchors.lock() {
+            Ok(anchors) => anchors
+                .values()
+                .flat_map(|a| a.blocks.keys().copied())
+                .collect(),
             Err(_) => std::collections::HashSet::new(),
         };
         for (i, &id) in block_ids.iter().enumerate() {
@@ -2077,8 +2164,20 @@ impl LiveSession {
         if !failed_block_ids.is_empty() {
             let failed_set: std::collections::HashSet<u64> =
                 failed_block_ids.iter().copied().collect();
-            if let Ok(mut items) = self.overlay_items.lock() {
-                items.retain(|it| it.anchor_id != input.anchor_id || !failed_set.contains(&it.id));
+            let mut needs_rebuild = false;
+            if let Ok(mut anchors) = self.overlay_anchors.lock() {
+                if let Some(anchor) = anchors.get_mut(&input.anchor_id) {
+                    let before = anchor.blocks.len();
+                    anchor.blocks.retain(|id, _| !failed_set.contains(id));
+                    // Canvas stays mounted; rebuild below (driven by
+                    // fingerprint mismatch) will swap in the new one
+                    // once ready, so the placeholder pills don't
+                    // visibly disappear before the survivors land.
+                    needs_rebuild = anchor.blocks.len() != before && !anchor.blocks.is_empty();
+                }
+            }
+            if needs_rebuild {
+                self.ensure_anchor_canvas(input.anchor_id, input.font_provider);
             }
         }
 
@@ -2355,24 +2454,26 @@ pub const HORIZONTAL_PAD_PX: f32 = 8.0;
 /// antialiasing room.
 pub const ITEM_BITMAP_PAD_PX: f32 = 4.0;
 
-/// Per-item raster result: an RGBA bitmap with bounded dimensions
-/// plus the surface-coord position of its top-left pixel.
+/// Pre-composed RGBA canvas covering one anchor's full overlay
+/// (background fills + translated glyphs already blended in surface
+/// space). The per-frame compositor warps this single bitmap with one
+/// bilinear pass; bg-vs-text ordering and cross-block bg overlap are
+/// resolved at build time, not per frame.
 ///
-/// Holds the bg and text as **separate** RGBA layers so the compositor
-/// can warp all bgs across all overlay items first, then all texts on
-/// top. Without this split, two overlapping blocks' bgs stack their
-/// translucent alpha (visible "2× as dark" overlap region) AND the
-/// later-drawn block's bg occludes the earlier-drawn block's text in
-/// the overlap area. Drawing bgs together (opaque, no stacking) and
-/// then texts together fixes both at once.
+/// `bitmap` is `width * height * 4` bytes RGBA8888. Its pixel (0, 0)
+/// corresponds to surface coordinate `(surface_origin_x,
+/// surface_origin_y)`. `row_extents` is a per-row half-open
+/// `[first, last)` column range of non-zero alpha pixels, computed
+/// once at build time and consulted by the warp inner loop to skip
+/// guaranteed-transparent regions.
 #[derive(Clone, Debug)]
-pub struct ItemRaster {
-    pub bg_bitmap: Vec<u8>,
-    pub text_bitmap: Vec<u8>,
+pub struct AnchorRaster {
+    pub bitmap: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub surface_origin_x: f32,
     pub surface_origin_y: f32,
+    pub row_extents: Vec<(u32, u32)>,
 }
 
 /// Unpack a `0xAARRGGBB` value into the `[r, g, b, a]` byte tuple the
@@ -2453,63 +2554,85 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
     }
 }
 
-/// Rasterize a *block*: N per-line strips share one bitmap, one
-/// `translated_text`, and one set of background fills (one per strip).
-/// The text gets reflowed across the strips by `image_render` using
-/// the strips' widths as target line widths.
+/// Rasterize one anchor's overlay into a single RGBA canvas.
 ///
-/// `strips` must be ordered top-to-bottom. `display_text` is the
-/// translation; when empty, the block renders as a "pending"
-/// placeholder (per-strip bg fills, no glyphs). `font_provider`
+/// Builds the union AABB across *all* blocks, paints each block's
+/// background strips into the shared canvas (relying on
+/// `fill_oriented_rect_blended`'s "only write when new alpha > old"
+/// semantic to prevent stacking when strips from different blocks
+/// overlap), then renders every block's translated glyphs on top via
+/// a single `image_render::render_overlay` call carrying one
+/// `PreparedTextBlock` per OCR block. The result is the canvas plus
+/// its surface-coord origin and pre-computed `row_extents` for the
+/// per-frame warp.
+///
+/// Returns `None` when no block has any usable strip. `font_provider`
 /// supplies typefaces — Android passes `AndroidFontProvider`, the
-/// simulator can pass any `FontProvider` impl (or a stub if it
-/// doesn't need text rendering yet).
-pub fn render_block_bitmap(
-    block_id: u64,
-    strips: &[OrientedRect],
-    matted_strips: &[Option<crate::color_matting::MattedStrip>],
-    display_text: &str,
-    language: &str,
+/// simulator can pass any `FontProvider` impl.
+pub fn render_anchor_canvas(
+    blocks: &std::collections::BTreeMap<u64, BlockSpec>,
     font_provider: &dyn crate::font_provider::FontProvider,
-) -> Option<ItemRaster> {
+) -> Option<AnchorRaster> {
     use crate::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
         PreparedTextLine, Rect,
     };
-    if strips.is_empty() {
+    if blocks.is_empty() {
         return None;
     }
 
-    let mut visuals: Vec<OrientedRect> = strips
-        .iter()
-        .filter_map(|s| {
-            let v = OrientedRect {
-                cx: s.cx,
-                cy: s.cy,
-                width: s.width + 2.0 * HORIZONTAL_PAD_PX,
-                height: s.height * TIGHT_VERTICAL_INFLATE,
-                angle_radians: s.angle_radians,
-            };
-            if v.width <= 0.0 || v.height <= 0.0 {
-                None
-            } else {
-                Some(v)
-            }
-        })
-        .collect();
-    if visuals.is_empty() {
+    // 1. Per-block: inflate strips into visuals, normalize basis,
+    //    collect for later AABB + paint passes.
+    struct PreparedBlock<'a> {
+        block_id: u64,
+        visuals: Vec<OrientedRect>,
+        spec: &'a BlockSpec,
+    }
+    let mut prepared: Vec<PreparedBlock<'_>> = Vec::with_capacity(blocks.len());
+    for (block_id, spec) in blocks {
+        let mut visuals: Vec<OrientedRect> = spec
+            .strips
+            .iter()
+            .filter_map(|s| {
+                let v = OrientedRect {
+                    cx: s.cx,
+                    cy: s.cy,
+                    width: s.width + 2.0 * HORIZONTAL_PAD_PX,
+                    height: s.height * TIGHT_VERTICAL_INFLATE,
+                    angle_radians: s.angle_radians,
+                };
+                if v.width <= 0.0 || v.height <= 0.0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            })
+            .collect();
+        if visuals.is_empty() {
+            continue;
+        }
+        normalize_block_visuals_rotated_basis(&mut visuals);
+        prepared.push(PreparedBlock {
+            block_id: *block_id,
+            visuals,
+            spec,
+        });
+    }
+    if prepared.is_empty() {
         return None;
     }
-    normalize_block_visuals_rotated_basis(&mut visuals);
 
+    // 2. Union AABB across all blocks' visuals.
     let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
     let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for v in &visuals {
-        for (x, y) in v.corners() {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
+    for pb in &prepared {
+        for v in &pb.visuals {
+            for (x, y) in v.corners() {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
         }
     }
     let pad = ITEM_BITMAP_PAD_PX;
@@ -2517,142 +2640,180 @@ pub fn render_block_bitmap(
     let origin_y = (min_y - pad).max(0.0);
     let bitmap_w = ((max_x + pad - origin_x).ceil() as i32).max(1) as u32;
     let bitmap_h = ((max_y + pad - origin_y).ceil() as i32).max(1) as u32;
-
     let pixels = (bitmap_w as usize) * (bitmap_h as usize);
-    // Two separate layers — see `ItemRaster` doc. `bg_rgba` is the
-    // dark fill behind each strip; `text_rgba` is the translated text
-    // on a transparent canvas. Both are bitmap_w × bitmap_h and share
-    // `surface_origin_*`.
-    let mut bg_rgba = vec![0u8; pixels * 4];
-    let text_rgba = vec![0u8; pixels * 4];
-    let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
-        DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
-    } else {
-        // Semi-transparent dark bg. The compositor's bg-pass uses a
-        // first-write-wins mask so overlapping bgs do *not* stack to
-        // 2× as dark even though alpha is < 0xFF.
-        [0x10, 0x10, 0x10, 0xC8]
-    };
-    let visuals_local: Vec<OrientedRect> = visuals
-        .iter()
-        .map(|v| OrientedRect {
-            cx: v.cx - origin_x,
-            cy: v.cy - origin_y,
-            width: v.width,
-            height: v.height,
-            angle_radians: v.angle_radians,
-        })
-        .collect();
-    for (i, v) in visuals_local.iter().enumerate() {
-        let strip_color = matted_strips
-            .get(i)
-            .and_then(|m| m.as_ref())
-            .and_then(|m| m.bg_uniform_argb)
-            .map(argb_to_rgba_bytes)
-            .unwrap_or(default_bg);
-        crate::planar_engine::fill_oriented_rect_blended(
-            &mut bg_rgba,
-            bitmap_w,
-            bitmap_h,
-            v,
-            strip_color,
-        );
-    }
-    let foreground_argb: u32 = matted_strips
-        .iter()
-        .find_map(|m| m.as_ref().map(|s| s.ink_is_dark))
-        .map(|dark| if dark { 0xFF10_1010 } else { 0xFFFF_FFFF })
-        .unwrap_or(0xFFFF_FFFF);
+    let mut canvas = vec![0u8; pixels * 4];
 
-    if display_text.trim().is_empty() {
-        return Some(ItemRaster {
-            bg_bitmap: bg_rgba,
-            text_bitmap: text_rgba,
-            width: bitmap_w,
-            height: bitmap_h,
-            surface_origin_x: origin_x,
-            surface_origin_y: origin_y,
+    // 3. Translate each block's visuals into canvas-local coords and
+    //    paint backgrounds. Within a block, strips paint normally.
+    //    Between blocks, `fill_oriented_rect_blended` skips writes
+    //    where the existing canvas alpha is ≥ the candidate alpha —
+    //    so a second block's 0xC8 bg can't darken pixels a previous
+    //    block already covered at 0xC8.
+    let mut local_visuals: Vec<Vec<OrientedRect>> = Vec::with_capacity(prepared.len());
+    for pb in &prepared {
+        let local: Vec<OrientedRect> = pb
+            .visuals
+            .iter()
+            .map(|v| OrientedRect {
+                cx: v.cx - origin_x,
+                cy: v.cy - origin_y,
+                width: v.width,
+                height: v.height,
+                angle_radians: v.angle_radians,
+            })
+            .collect();
+        let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
+            DEBUG_BG_PALETTE[(pb.block_id as usize) % DEBUG_BG_PALETTE.len()]
+        } else {
+            [0x10, 0x10, 0x10, 0xC8]
+        };
+        for (i, v) in local.iter().enumerate() {
+            let strip_color = pb
+                .spec
+                .matted_strips
+                .get(i)
+                .and_then(|m| m.as_ref())
+                .and_then(|m| m.bg_uniform_argb)
+                .map(argb_to_rgba_bytes)
+                .unwrap_or(default_bg);
+            crate::planar_engine::fill_oriented_rect_blended(
+                &mut canvas,
+                bitmap_w,
+                bitmap_h,
+                v,
+                strip_color,
+            );
+        }
+        local_visuals.push(local);
+    }
+
+    // 4. Build a `PreparedTextBlock` per OCR block that has text.
+    //    Empty-text blocks (pending placeholders) keep their bg-only
+    //    contribution from step 3 and don't appear in the text pass.
+    let mut prepared_text_blocks: Vec<PreparedTextBlock> = Vec::new();
+    let mut anchor_lang = String::new();
+    for (pb, local) in prepared.iter().zip(local_visuals.iter()) {
+        if pb.spec.display_text.trim().is_empty() {
+            continue;
+        }
+        if anchor_lang.is_empty() {
+            anchor_lang = pb.spec.language.clone();
+        }
+        let foreground_argb: u32 = pb
+            .spec
+            .matted_strips
+            .iter()
+            .find_map(|m| m.as_ref().map(|s| s.ink_is_dark))
+            .map(|dark| if dark { 0xFF10_1010 } else { 0xFFFF_FFFF })
+            .unwrap_or(0xFFFF_FFFF);
+        let lines: Vec<PreparedTextLine> = local
+            .iter()
+            .map(|v| {
+                let text_box = OrientedRect {
+                    cx: v.cx,
+                    cy: v.cy,
+                    width: (v.width
+                        - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX)
+                        .max(1.0),
+                    height: v.height,
+                    angle_radians: v.angle_radians,
+                };
+                let aabb = text_box.to_aabb();
+                let bbox = Rect {
+                    left: aabb.left.min(bitmap_w.saturating_sub(1)),
+                    top: aabb.top.min(bitmap_h.saturating_sub(1)),
+                    right: aabb.right.min(bitmap_w),
+                    bottom: aabb.bottom.min(bitmap_h),
+                };
+                PreparedTextLine {
+                    text: String::new(),
+                    bounding_box: bbox.clone(),
+                    oriented_box: text_box,
+                    word_rects: vec![bbox],
+                    background_argb: 0,
+                    foreground_argb,
+                }
+            })
+            .collect();
+        let suggested_font_px = pb
+            .visuals
+            .iter()
+            .map(|v| v.height)
+            .fold(0.0_f32, f32::max)
+            .clamp(10.0, 120.0);
+        let block_bbox = block_aabb_within_canvas(local, bitmap_w, bitmap_h);
+        prepared_text_blocks.push(PreparedTextBlock {
+            source_text: String::new(),
+            translated_text: pb.spec.display_text.clone(),
+            bounding_box: block_bbox,
+            lines,
+            layout_hints: OverlayLayoutHints {
+                layout_mode: OverlayLayoutMode::PerLine,
+                suggested_font_size_px: suggested_font_px,
+            },
+            background_argb: 0,
+            foreground_argb,
         });
     }
 
-    let lines: Vec<PreparedTextLine> = visuals_local
-        .iter()
-        .map(|v| {
-            let text_box = OrientedRect {
-                cx: v.cx,
-                cy: v.cy,
-                width: (v.width - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX)
-                    .max(1.0),
-                height: v.height,
-                angle_radians: v.angle_radians,
-            };
-            let aabb = text_box.to_aabb();
-            let bbox = Rect {
-                left: aabb.left.min(bitmap_w.saturating_sub(1)),
-                top: aabb.top.min(bitmap_h.saturating_sub(1)),
-                right: aabb.right.min(bitmap_w),
-                bottom: aabb.bottom.min(bitmap_h),
-            };
-            PreparedTextLine {
-                text: String::new(),
-                bounding_box: bbox.clone(),
-                oriented_box: text_box,
-                word_rects: vec![bbox],
-                background_argb: 0,
-                foreground_argb,
-            }
-        })
-        .collect();
-    let suggested_font_px = visuals
-        .iter()
-        .map(|v| v.height)
-        .fold(0.0_f32, f32::max)
-        .clamp(10.0, 120.0);
-    let block_bbox = Rect {
-        left: 0,
-        top: 0,
-        right: bitmap_w,
-        bottom: bitmap_h,
+    let final_bitmap = if prepared_text_blocks.is_empty() {
+        canvas
+    } else {
+        let prepared = PreparedImageOverlay {
+            rgba_bytes: canvas,
+            width: bitmap_w,
+            height: bitmap_h,
+            extracted_text: String::new(),
+            translated_text: String::new(),
+            blocks: prepared_text_blocks,
+        };
+        let opts = crate::image_render::RenderOptions {
+            language: anchor_lang,
+            min_font_size_px: 6.0,
+        };
+        crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?
     };
-    let block = PreparedTextBlock {
-        source_text: String::new(),
-        translated_text: display_text.to_string(),
-        bounding_box: block_bbox,
-        lines,
-        layout_hints: OverlayLayoutHints {
-            layout_mode: OverlayLayoutMode::PerLine,
-            suggested_font_size_px: suggested_font_px,
-        },
-        background_argb: 0,
-        foreground_argb,
-    };
-
-    // Render the text onto a *transparent* canvas (not the bg layer).
-    // `render_overlay` clones `prepared.rgba_bytes` and paints glyphs
-    // onto the clone, so passing `text_rgba` (all zeros) gives us a
-    // text-only bitmap. The compositor then warps bg layer + text
-    // layer in two passes.
-    let prepared = PreparedImageOverlay {
-        rgba_bytes: text_rgba,
-        width: bitmap_w,
-        height: bitmap_h,
-        extracted_text: String::new(),
-        translated_text: String::new(),
-        blocks: vec![block],
-    };
-    let opts = crate::image_render::RenderOptions {
-        language: language.to_string(),
-        min_font_size_px: 6.0,
-    };
-    let text_only = crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?;
-    Some(ItemRaster {
-        bg_bitmap: bg_rgba,
-        text_bitmap: text_only,
+    let row_extents = compute_row_extents(&final_bitmap, bitmap_w, bitmap_h);
+    Some(AnchorRaster {
+        bitmap: final_bitmap,
         width: bitmap_w,
         height: bitmap_h,
         surface_origin_x: origin_x,
         surface_origin_y: origin_y,
+        row_extents,
     })
+}
+
+fn block_aabb_within_canvas(
+    local: &[OrientedRect],
+    canvas_w: u32,
+    canvas_h: u32,
+) -> crate::ocr::Rect {
+    let mut min_l = u32::MAX;
+    let mut min_t = u32::MAX;
+    let mut max_r: u32 = 0;
+    let mut max_b: u32 = 0;
+    for v in local {
+        let aabb = v.to_aabb();
+        if aabb.left < min_l {
+            min_l = aabb.left;
+        }
+        if aabb.top < min_t {
+            min_t = aabb.top;
+        }
+        if aabb.right > max_r {
+            max_r = aabb.right;
+        }
+        if aabb.bottom > max_b {
+            max_b = aabb.bottom;
+        }
+    }
+    crate::ocr::Rect {
+        left: min_l.min(canvas_w.saturating_sub(1)),
+        top: min_t.min(canvas_h.saturating_sub(1)),
+        right: max_r.min(canvas_w),
+        bottom: max_b.min(canvas_h),
+    }
 }
 
 /// Group `SurfaceLine`s into translation blocks (paragraphs) via the

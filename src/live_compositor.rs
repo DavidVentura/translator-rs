@@ -5,11 +5,9 @@
 //! different rates and the overlay could visibly drift from the camera
 //! pixels under motion.
 //!
-//! Phase 1 callers pass a single item — a pre-rasterized text-overlay
-//! bitmap covering the union of all overlay quads of the currently
-//! locked anchor. The API takes a `Vec<OverlayItem>` so phase 2's
-//! sliding-window content map can ship per-block items in surface
-//! coordinates without an API churn.
+//! Each item is a single pre-composed RGBA bitmap covering an
+//! anchor's full overlay (bg + text already blended in surface space).
+//! Phase 1 callers pass one item per active anchor.
 //!
 //! All "surface coords" in this module mean the planar tracker's
 //! canonical-frame coords (== display-orient crop coords as long as
@@ -41,13 +39,6 @@ pub struct OverlayItem<'a> {
     /// differs from `bitmap_height`) to disable the optimisation
     /// and fall back to the per-pixel alpha-check inside the loop.
     pub row_extents: &'a [(u32, u32)],
-    /// True for bg-layer items. When `bg_drawn_mask` is also passed
-    /// to the composite call, the compositor consults the mask for
-    /// each viewport pixel of a bg item and blends only when the
-    /// mask is zero (first-write-wins). This preserves the bg's
-    /// semi-transparent alpha across overlapping items without
-    /// double-darkening the overlap region.
-    pub is_bg_layer: bool,
 }
 
 #[derive(Debug)]
@@ -71,35 +62,6 @@ pub fn composite_frame_into(
     h_surface_to_viewport: &[f32; 9],
     items: &[OverlayItem<'_>],
 ) -> Result<(), CompositeError> {
-    composite_frame_into_with_bg_mask(
-        dst_rgba,
-        sensor_w,
-        sensor_h,
-        camera_rgba,
-        h_surface_to_viewport,
-        items,
-        None,
-    )
-}
-
-/// As [`composite_frame_into`], but with a caller-supplied per-pixel
-/// mask used to enforce first-write-wins on bg-layer items. Pass a
-/// freshly-zeroed `[u8]` of length `sensor_w * sensor_h` to enable
-/// the mask; pass `None` for normal source-over behaviour on every
-/// item.
-pub fn composite_frame_into_with_bg_mask(
-    dst_rgba: &mut [u8],
-    sensor_w: u32,
-    sensor_h: u32,
-    camera_rgba: &[u8],
-    h_surface_to_viewport: &[f32; 9],
-    items: &[OverlayItem<'_>],
-    bg_drawn_mask: Option<&mut [u8]>,
-) -> Result<(), CompositeError> {
-    // Dst and src share dims now — no per-frame rotation. The Kotlin
-    // side hands the sensor-orient bitmap straight to the SurfaceView,
-    // which rotates it for display via its drawMatrix (GPU-composited
-    // for free at scanout).
     let frame_bytes = (sensor_w as usize)
         .checked_mul(sensor_h as usize)
         .and_then(|n| n.checked_mul(4))
@@ -110,24 +72,9 @@ pub fn composite_frame_into_with_bg_mask(
     if camera_rgba.len() != frame_bytes {
         return Err(CompositeError::SrcBufferSize);
     }
-    // Camera blit: sensor-orient → sensor-orient sequential copy.
-    // LLVM should turn this into a memcpy.
     dst_rgba.copy_from_slice(camera_rgba);
-    let mut mask_storage = bg_drawn_mask;
     for item in items {
-        let mask_slice = if item.is_bg_layer {
-            mask_storage.as_deref_mut()
-        } else {
-            None
-        };
-        warp_item_onto_display(
-            dst_rgba,
-            sensor_w,
-            sensor_h,
-            item,
-            h_surface_to_viewport,
-            mask_slice,
-        );
+        warp_item_onto_display(dst_rgba, sensor_w, sensor_h, item, h_surface_to_viewport);
     }
     Ok(())
 }
@@ -154,36 +101,6 @@ pub fn composite_frame_into_cropped(
     src_offset_y: u32,
     h_surface_to_viewport: &[f32; 9],
     items: &[OverlayItem<'_>],
-) -> Result<(), CompositeError> {
-    composite_frame_into_cropped_with_bg_mask(
-        dst_rgba,
-        dst_w,
-        dst_h,
-        camera_rgba,
-        src_full_w,
-        src_full_h,
-        src_offset_x,
-        src_offset_y,
-        h_surface_to_viewport,
-        items,
-        None,
-    )
-}
-
-/// As [`composite_frame_into_cropped`], with the same per-pixel
-/// first-write-wins bg mask as [`composite_frame_into_with_bg_mask`].
-pub fn composite_frame_into_cropped_with_bg_mask(
-    dst_rgba: &mut [u8],
-    dst_w: u32,
-    dst_h: u32,
-    camera_rgba: &[u8],
-    src_full_w: u32,
-    src_full_h: u32,
-    src_offset_x: u32,
-    src_offset_y: u32,
-    h_surface_to_viewport: &[f32; 9],
-    items: &[OverlayItem<'_>],
-    bg_drawn_mask: Option<&mut [u8]>,
 ) -> Result<(), CompositeError> {
     let dst_bytes = (dst_w as usize)
         .checked_mul(dst_h as usize)
@@ -212,21 +129,8 @@ pub fn composite_frame_into_cropped_with_bg_mask(
         dst_rgba[dst_row..dst_row + dst_stride]
             .copy_from_slice(&camera_rgba[src_row..src_row + dst_stride]);
     }
-    let mut mask_storage = bg_drawn_mask;
     for item in items {
-        let mask_slice = if item.is_bg_layer {
-            mask_storage.as_deref_mut()
-        } else {
-            None
-        };
-        warp_item_onto_display(
-            dst_rgba,
-            dst_w,
-            dst_h,
-            item,
-            h_surface_to_viewport,
-            mask_slice,
-        );
+        warp_item_onto_display(dst_rgba, dst_w, dst_h, item, h_surface_to_viewport);
     }
     Ok(())
 }
@@ -245,7 +149,6 @@ fn warp_item_onto_display(
     dst_h: u32,
     item: &OverlayItem<'_>,
     h_surface_to_viewport: &[f32; 9],
-    mut bg_drawn_mask: Option<&mut [u8]>,
 ) {
     let src_w = item.bitmap_width;
     let src_h = item.bitmap_height;
@@ -267,8 +170,6 @@ fn warp_item_onto_display(
         None => return,
     };
 
-    // Forward-project the bitmap's pixel corners to find the AABB of the
-    // affected region in the viewport. Clip to the buffer.
     let src_corners = [
         (0.0_f32, 0.0_f32),
         (src_w as f32, 0.0),
@@ -330,9 +231,7 @@ fn warp_item_onto_display(
     // Per-source-row non-transparent column extents. Computed once
     // when the overlay was rasterised; used here to skip the bilinear
     // sample + blend for any inverse-projected pixel that lands in a
-    // guaranteed-transparent source region. On dense text overlays
-    // typically 40-60% of the bbox is transparent inter-glyph / inter-
-    // line space — that work was previously paid in full.
+    // guaranteed-transparent source region.
     let extents_active =
         !item.row_extents.is_empty() && item.row_extents.len() == src_h as usize;
 
@@ -342,8 +241,6 @@ fn warp_item_onto_display(
         let mut num_sy = m3 * row_start_x + m4 * dy + m5;
         let mut den = m6 * row_start_x + m7 * dy + m8;
         for x in x0..x1 {
-            // Advance happens at end of iter so the first iteration
-            // uses the row-start values computed above.
             if den.abs() < 1e-9 || !den.is_finite() {
                 num_sx += m0;
                 num_sy += m3;
@@ -369,10 +266,6 @@ fn warp_item_onto_display(
             let y0_i = sy.floor() as u32;
             let x1_i = (x0_i + 1).min(src_w - 1);
             let y1_i = (y0_i + 1).min(src_h - 1);
-            // Cheap guaranteed-transparent skip: if neither of the two
-            // source rows touched by this bilinear sample has any non-
-            // zero alpha within [x0_i, x1_i], all four corners are
-            // transparent and the output cannot be visible.
             if extents_active {
                 let r0 = item.row_extents[y0_i as usize];
                 let r1 = item.row_extents[y1_i as usize];
@@ -388,9 +281,6 @@ fn warp_item_onto_display(
             let i_tr = ((y0_i * src_w + x1_i) * 4) as usize;
             let i_bl = ((y1_i * src_w + x0_i) * 4) as usize;
             let i_br = ((y1_i * src_w + x1_i) * 4) as usize;
-            // Compute bilinear weights once and reuse for all 4
-            // channels. The previous code recomputed `1 - fx` and
-            // `1 - fy` inside each `bilinear_u8` call.
             let one_minus_fx = 1.0 - fx;
             let one_minus_fy = 1.0 - fy;
             let w_tl = one_minus_fx * one_minus_fy;
@@ -441,17 +331,6 @@ fn warp_item_onto_display(
                 w_br,
             );
             let dst_idx = ((y * dst_w + x) * 4) as usize;
-            let pixel_idx = (y * dst_w + x) as usize;
-            if let Some(mask) = bg_drawn_mask.as_deref_mut() {
-                // First-write-wins on the bg layer: skip if a prior
-                // bg already wrote here. Preserves the bg's semi-
-                // transparent alpha across overlapping items without
-                // stacking to a darker shade in the overlap.
-                if mask[pixel_idx] != 0 {
-                    continue;
-                }
-                mask[pixel_idx] = 1;
-            }
             blend_source_over(&mut dst[dst_idx..dst_idx + 4], [r, g, b, a]);
         }
     }
@@ -508,10 +387,6 @@ mod tests {
 
     #[test]
     fn overlay_with_identity_h_lands_at_surface_origin() {
-        // 6x6 camera. Opaque uniform-red overlay 4x4 at surface
-        // origin (1, 1). With identity H, the overlay should occupy
-        // viewport pixels [1..5) × [1..5). Pixels outside should keep
-        // the camera grey.
         let cam = solid_rgba(6, 6, 50, 50, 50);
         let overlay = solid_rgba(4, 4, 200, 0, 0);
         let mut dst = vec![0u8; 6 * 6 * 4];
@@ -522,7 +397,6 @@ mod tests {
             bitmap_origin_surface_x: 1.0,
             bitmap_origin_surface_y: 1.0,
             row_extents: &[],
-            is_bg_layer: false,
         };
         composite_frame_into(
             &mut dst,
@@ -533,13 +407,9 @@ mod tests {
             std::slice::from_ref(&item),
         )
         .unwrap();
-        // Centre of overlay region: pixel (2, 2). Uniform-red overlay
-        // → bilinear sampling still gives pure red.
         let inside = ((2 * 6 + 2) * 4) as usize;
         assert_eq!(&dst[inside..inside + 3], &[200, 0, 0]);
-        // Camera-only corner: pixel (0, 0).
         assert_eq!(&dst[0..3], &[50, 50, 50]);
-        // Camera-only outside the overlay region: pixel (5, 5).
         let outside = ((5 * 6 + 5) * 4) as usize;
         assert_eq!(&dst[outside..outside + 3], &[50, 50, 50]);
     }
@@ -548,13 +418,8 @@ mod tests {
 
     /// Verify the row-incremental projective sampling matches a
     /// straightforward per-pixel reference under a non-identity H.
-    /// Catches sign / increment-direction bugs in the scan-line
-    /// implementation that the identity-H test wouldn't trip.
     #[test]
     fn overlay_under_perspective_h_matches_reference() {
-        // 16x16 camera (uniform grey). 6x6 opaque red overlay at
-        // surface origin (4, 4). Apply a small perspective H that
-        // shifts + tilts the overlay across the viewport.
         let cam = solid_rgba(16, 16, 50, 50, 50);
         let overlay = solid_rgba(6, 6, 200, 0, 0);
         let item = OverlayItem {
@@ -564,20 +429,13 @@ mod tests {
             bitmap_origin_surface_x: 4.0,
             bitmap_origin_surface_y: 4.0,
             row_extents: &[],
-            is_bg_layer: false,
         };
-        // Translation + mild perspective.
         let h = [1.05, -0.03, 1.5, 0.02, 0.97, -0.7, 1.0e-3, -5.0e-4, 1.0];
 
         let mut dst = vec![0u8; 16 * 16 * 4];
         composite_frame_into(&mut dst, 16, 16, &cam, &h, std::slice::from_ref(&item))
             .unwrap();
 
-        // Uniform-red overlay → wherever the warp lands inside the
-        // bitmap, the bilinear result must be either pure (50,50,50)
-        // camera or some blend toward (200,0,0). G and B channels
-        // must never exceed 50, and R must equal G when no overlay
-        // covered the pixel.
         let mut painted = 0usize;
         for y in 0..16 {
             for x in 0..16 {
@@ -592,7 +450,6 @@ mod tests {
                 }
             }
         }
-        // Non-degenerate: the overlay covered *some* pixels.
         assert!(painted >= 8, "perspective overlay covered only {painted} pixels");
         assert!(painted <= 64, "perspective overlay covered too many ({painted}) pixels");
     }

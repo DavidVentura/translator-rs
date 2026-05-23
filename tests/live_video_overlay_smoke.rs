@@ -31,9 +31,7 @@ use image::{Rgba, RgbaImage, codecs::jpeg::JpegEncoder};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect as ImpRect;
 use translator::font_provider::{FontHandle, FontProvider, FontRequest};
-use translator::live_compositor::{
-    OverlayItem as CompositeOverlayItem, composite_frame_into_with_bg_mask,
-};
+use translator::live_compositor::{OverlayItem as CompositeOverlayItem, composite_frame_into};
 use translator::live_frame::OrientedImage;
 use translator::live_session::{
     LiveRecognizer, LiveSession, NoopTranslator, PostDetectInput, h_view_to_surface_from,
@@ -728,49 +726,31 @@ fn render_outputs(
     let camera_bytes = camera.as_raw();
     let mut composite = vec![0u8; camera_bytes.len()];
 
-    let Ok(items_guard) = session.overlay_items.lock() else {
+    let Ok(anchors_guard) = session.overlay_anchors.lock() else {
         return (composite, 0);
     };
-    let items: Vec<CompositeOverlayItem<'_>> = {
-        let live = items_guard
-            .iter()
-            .filter(|it| Some(it.anchor_id) == active_anchor)
-            .collect::<Vec<_>>();
-        let mut out: Vec<CompositeOverlayItem<'_>> = Vec::with_capacity(live.len() * 2);
-        for it in &live {
-            out.push(CompositeOverlayItem {
-                bitmap_rgba: &it.bg_bitmap,
-                bitmap_width: it.width,
-                bitmap_height: it.height,
-                bitmap_origin_surface_x: it.surface_origin_x,
-                bitmap_origin_surface_y: it.surface_origin_y,
-                row_extents: &it.bg_row_extents,
-                is_bg_layer: true,
-            });
-        }
-        for it in &live {
-            out.push(CompositeOverlayItem {
-                bitmap_rgba: &it.text_bitmap,
-                bitmap_width: it.width,
-                bitmap_height: it.height,
-                bitmap_origin_surface_x: it.surface_origin_x,
-                bitmap_origin_surface_y: it.surface_origin_y,
-                row_extents: &it.text_row_extents,
-                is_bg_layer: false,
-            });
-        }
-        out
-    };
+    let items: Vec<CompositeOverlayItem<'_>> = active_anchor
+        .and_then(|id| anchors_guard.get(&id))
+        .and_then(|a| a.canvas.as_ref())
+        .map(|c| {
+            vec![CompositeOverlayItem {
+                bitmap_rgba: &c.bitmap,
+                bitmap_width: c.width,
+                bitmap_height: c.height,
+                bitmap_origin_surface_x: c.surface_origin_x,
+                bitmap_origin_surface_y: c.surface_origin_y,
+                row_extents: &c.row_extents,
+            }]
+        })
+        .unwrap_or_default();
     let item_count = items.len();
-    let mut bg_mask = vec![0u8; (w as usize) * (h as usize)];
-    composite_frame_into_with_bg_mask(
+    composite_frame_into(
         &mut composite,
         w,
         h,
         camera_bytes,
         &h_surface_to_view,
         &items,
-        Some(bg_mask.as_mut_slice()),
     )
     .expect("composite camera");
     (composite, item_count)

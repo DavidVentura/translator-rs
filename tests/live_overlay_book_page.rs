@@ -17,7 +17,7 @@ use image::ImageReader;
 use translator::DetectedTextBox;
 use translator::live_compositor::{OverlayItem, composite_frame_into};
 use translator::live_frame::OrientedImage;
-use translator::live_session::render_block_bitmap;
+use translator::live_session::{BlockSpec, render_anchor_canvas};
 use translator::ocr::{
     OrientedRect, Rect, TextLine, group_live_lines_into_blocks, live_lines_should_merge,
 };
@@ -162,10 +162,10 @@ fn book_page_grouping_dump() {
         }
     }
 
-    // -- Render each block's bg bitmap and composite onto the page. --
-    // Use empty `display_text` so render_block_bitmap returns just the
-    // bg fill (no glyph rendering) — that's all we need to see whether
-    // grouping + the per-block colours look right on the actual page.
+    // -- Render the anchor's full overlay (bg-only here — empty
+    // display_text per block) and composite onto the page. The
+    // anchor canvas merges all blocks' bg fills into one bitmap so
+    // overlapping pills don't darken at the overlap.
     eprintln!("\n--- Rendering composite ---");
     struct FontProviderStub;
     impl translator::font_provider::FontProvider for FontProviderStub {
@@ -177,45 +177,46 @@ fn book_page_grouping_dump() {
         }
     }
     let font_provider = FontProviderStub;
-    let mut rasters: Vec<translator::live_session::ItemRaster> = Vec::new();
+    let mut block_specs: std::collections::BTreeMap<u64, BlockSpec> =
+        std::collections::BTreeMap::new();
     for (bi, block) in blocks.iter().enumerate() {
         let strips: Vec<OrientedRect> = block.lines.iter().map(|l| l.tight_box.clone()).collect();
+        if strips.is_empty() {
+            continue;
+        }
         let matted_strips: Vec<Option<translator::color_matting::MattedStrip>> =
             vec![None; strips.len()];
-        let block_id = bi as u64;
-        if let Some(raster) =
-            render_block_bitmap(block_id, &strips, &matted_strips, "", "en", &font_provider)
-        {
-            eprintln!(
-                "  block {} raster: {}x{} at ({}, {})",
-                bi, raster.width, raster.height, raster.surface_origin_x, raster.surface_origin_y,
-            );
-            rasters.push(raster);
-        }
+        block_specs.insert(
+            bi as u64,
+            BlockSpec {
+                strips,
+                matted_strips,
+                display_text: String::new(),
+                language: "en".to_string(),
+                content_hash: bi as u64,
+            },
+        );
     }
-    let mut items: Vec<OverlayItem<'_>> = Vec::with_capacity(rasters.len() * 2);
-    for r in &rasters {
-        items.push(OverlayItem {
-            bitmap_rgba: &r.bg_bitmap,
-            bitmap_width: r.width,
-            bitmap_height: r.height,
-            bitmap_origin_surface_x: r.surface_origin_x,
-            bitmap_origin_surface_y: r.surface_origin_y,
-            row_extents: &[],
-            is_bg_layer: true,
-        });
+    let canvas = render_anchor_canvas(&block_specs, &font_provider);
+    if let Some(c) = &canvas {
+        eprintln!(
+            "  anchor canvas: {}x{} at ({}, {})",
+            c.width, c.height, c.surface_origin_x, c.surface_origin_y,
+        );
     }
-    for r in &rasters {
-        items.push(OverlayItem {
-            bitmap_rgba: &r.text_bitmap,
-            bitmap_width: r.width,
-            bitmap_height: r.height,
-            bitmap_origin_surface_x: r.surface_origin_x,
-            bitmap_origin_surface_y: r.surface_origin_y,
-            row_extents: &[],
-            is_bg_layer: false,
-        });
-    }
+    let items: Vec<OverlayItem<'_>> = canvas
+        .as_ref()
+        .map(|c| {
+            vec![OverlayItem {
+                bitmap_rgba: &c.bitmap,
+                bitmap_width: c.width,
+                bitmap_height: c.height,
+                bitmap_origin_surface_x: c.surface_origin_x,
+                bitmap_origin_surface_y: c.surface_origin_y,
+                row_extents: &c.row_extents,
+            }]
+        })
+        .unwrap_or_default();
 
     // Camera RGBA in display orientation = the rotated `rgb` from
     // OrientedImage. Pad to 4 bytes per pixel (RGB → RGBA with α=255).
