@@ -153,6 +153,9 @@ const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// resolution, so 24 px = ~2-3% of typical viewport extent.
 const COVERAGE_PAD_PX: f32 = 24.0;
 const ENABLE_COLOR_MATTING: bool = false;
+/// Worker threads the overlay warp fans out over. Matches the tracker
+/// pool size; the two run sequentially so total live threads peak at 2.
+const COMPOSITE_POOL_THREADS: usize = 2;
 
 /// What kind of async job the per-frame fast path needs to dispatch.
 #[derive(Clone)]
@@ -341,6 +344,11 @@ pub struct LiveTrackerPipeline {
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
     worker: Mutex<Option<Worker>>,
     timing: Mutex<TimingStats>,
+    /// Fixed-size pool the per-frame overlay warp fans out over. Separate
+    /// from the engine's tracker pool because composite runs after the
+    /// tracker step (sequentially), so the two never contend; a dedicated
+    /// pool keeps the warp off the global rayon pool the OCR worker uses.
+    composite_pool: rayon::ThreadPool,
 }
 
 impl LiveTrackerPipeline {
@@ -351,6 +359,11 @@ impl LiveTrackerPipeline {
         catalog: Arc<TranslatorSession>,
         font_provider: Arc<dyn FontProvider + Send + Sync>,
     ) -> Arc<Self> {
+        let composite_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(COMPOSITE_POOL_THREADS)
+            .thread_name(|i| format!("planar-comp-{i}"))
+            .build()
+            .expect("failed to build composite thread pool");
         let pipeline = Arc::new(Self {
             engine: Mutex::new(LivePlanarEngine::new(EngineConfig::default())),
             session: Arc::new(LiveSession::new()),
@@ -366,6 +379,7 @@ impl LiveTrackerPipeline {
             last_telemetry: Mutex::new(None),
             worker: Mutex::new(None),
             timing: Mutex::new(TimingStats::default()),
+            composite_pool,
         });
         let worker = Worker::spawn(Arc::clone(&pipeline));
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
@@ -716,19 +730,23 @@ impl LiveTrackerPipeline {
         ];
         let h_translated = homography::mat3_mul(&translate, &h_for_call);
         let overlay_count = items_vec.len() as u32;
-        live_compositor::composite_frame_into_cropped(
-            dst,
-            bitmap_w,
-            bitmap_h,
-            state.rgba_bytes(),
-            sensor_w,
-            sensor_h,
-            src_offset_x,
-            src_offset_y,
-            &h_translated,
-            &items_vec,
-        )
-        .map(|()| overlay_count)
+        let camera = state.rgba_bytes();
+        self.composite_pool
+            .install(|| {
+                live_compositor::composite_frame_into_cropped(
+                    dst,
+                    bitmap_w,
+                    bitmap_h,
+                    camera,
+                    sensor_w,
+                    sensor_h,
+                    src_offset_x,
+                    src_offset_y,
+                    &h_translated,
+                    &items_vec,
+                )
+            })
+            .map(|()| overlay_count)
     }
 
     fn update_refresh_trigger(

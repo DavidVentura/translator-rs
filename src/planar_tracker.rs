@@ -11,6 +11,7 @@
 //! than AKAZE).
 
 use image::GrayImage;
+use rayon::prelude::*;
 
 use crate::homography::{fit_affine, fit_homography, fit_similarity, invert, mat3_mul, project};
 
@@ -542,33 +543,41 @@ pub fn match_descriptors(
     frame: &[Descriptor],
     lowe_ratio: f32,
 ) -> Vec<Match> {
-    let mut out = Vec::new();
     if frame.len() < 2 {
-        return out;
+        return Vec::new();
     }
-    for (a_idx, a_desc) in anchor.iter().enumerate() {
-        let mut best = u32::MAX;
-        let mut best_idx = 0usize;
-        let mut second = u32::MAX;
-        for (f_idx, f_desc) in frame.iter().enumerate() {
-            let d = a_desc.hamming(f_desc);
-            if d < best {
-                second = best;
-                best = d;
-                best_idx = f_idx;
-            } else if d < second {
-                second = d;
+    // Each anchor descriptor's best/second-best search is independent,
+    // so fan out over the active pool. Indexed par-iter preserves anchor
+    // order, so the result matches the serial scan before the caller's
+    // distance sort.
+    anchor
+        .par_iter()
+        .enumerate()
+        .filter_map(|(a_idx, a_desc)| {
+            let mut best = u32::MAX;
+            let mut best_idx = 0usize;
+            let mut second = u32::MAX;
+            for (f_idx, f_desc) in frame.iter().enumerate() {
+                let d = a_desc.hamming(f_desc);
+                if d < best {
+                    second = best;
+                    best = d;
+                    best_idx = f_idx;
+                } else if d < second {
+                    second = d;
+                }
             }
-        }
-        if (best as f32) < lowe_ratio * (second as f32) {
-            out.push(Match {
-                anchor_idx: a_idx,
-                frame_idx: best_idx,
-                distance: best,
-            });
-        }
-    }
-    out
+            if (best as f32) < lowe_ratio * (second as f32) {
+                Some(Match {
+                    anchor_idx: a_idx,
+                    frame_idx: best_idx,
+                    distance: best,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Guided Hamming matcher. Uses `h_prior` (typically the last-frame
@@ -594,50 +603,56 @@ pub fn match_descriptors_guided(
     h_prior: &[f32; 9],
     search_radius_px: f32,
 ) -> Vec<Match> {
-    let mut out = Vec::new();
     if frame_kps.len() < 2 {
-        return out;
+        return Vec::new();
     }
     let r_sq = search_radius_px * search_radius_px;
-    for (a_idx, (a_desc, a_pos)) in anchor_descs.iter().zip(anchor_positions.iter()).enumerate() {
-        let Some(predicted) = project(h_prior, a_pos.0, a_pos.1) else {
-            continue;
-        };
-        let mut best = u32::MAX;
-        let mut best_idx = 0usize;
-        let mut second = u32::MAX;
-        let mut window_count = 0usize;
-        for (f_idx, fkp) in frame_kps.iter().enumerate() {
-            let dx = fkp.x - predicted.0;
-            let dy = fkp.y - predicted.1;
-            if dx * dx + dy * dy > r_sq {
-                continue;
+    // Per-anchor windowed search is independent; fan out over the pool.
+    // Indexed par-iter preserves anchor order, matching the serial scan
+    // before the caller's distance sort.
+    (0..anchor_descs.len())
+        .into_par_iter()
+        .filter_map(|a_idx| {
+            let a_desc = &anchor_descs[a_idx];
+            let a_pos = anchor_positions[a_idx];
+            let predicted = project(h_prior, a_pos.0, a_pos.1)?;
+            let mut best = u32::MAX;
+            let mut best_idx = 0usize;
+            let mut second = u32::MAX;
+            let mut window_count = 0usize;
+            for (f_idx, fkp) in frame_kps.iter().enumerate() {
+                let dx = fkp.x - predicted.0;
+                let dy = fkp.y - predicted.1;
+                if dx * dx + dy * dy > r_sq {
+                    continue;
+                }
+                window_count += 1;
+                let d = a_desc.hamming(&frame_descs[f_idx]);
+                if d < best {
+                    second = best;
+                    best = d;
+                    best_idx = f_idx;
+                } else if d < second {
+                    second = d;
+                }
             }
-            window_count += 1;
-            let d = a_desc.hamming(&frame_descs[f_idx]);
-            if d < best {
-                second = best;
-                best = d;
-                best_idx = f_idx;
-            } else if d < second {
-                second = d;
+            // Need at least 2 candidates for the Lowe ratio test to be
+            // meaningful; with only 1 in-window candidate we can't measure
+            // ambiguity vs the second-best.
+            if window_count < 2 {
+                return None;
             }
-        }
-        // Need at least 2 candidates for the Lowe ratio test to be
-        // meaningful; with only 1 in-window candidate we can't measure
-        // ambiguity vs the second-best.
-        if window_count < 2 {
-            continue;
-        }
-        if (best as f32) < lowe_ratio * (second as f32) {
-            out.push(Match {
-                anchor_idx: a_idx,
-                frame_idx: best_idx,
-                distance: best,
-            });
-        }
-    }
-    out
+            if (best as f32) < lowe_ratio * (second as f32) {
+                Some(Match {
+                    anchor_idx: a_idx,
+                    frame_idx: best_idx,
+                    distance: best,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// RANSAC over `(canonical_x, canonical_y, frame_x, frame_y)` pairs.
@@ -821,54 +836,64 @@ pub fn detect_fast(
         return Vec::new();
     }
     let buf = gray.as_raw();
-    let mut raw = Vec::with_capacity(4096);
     let t = threshold as i16;
-    for y in KEYPOINT_BORDER..(h_i - KEYPOINT_BORDER) {
-        let row = (y as u32 * w) as usize;
-        for x in KEYPOINT_BORDER..(w_i - KEYPOINT_BORDER) {
-            let c = buf[row + x as usize] as i16;
-            let hi = c + t;
-            let lo = c - t;
-            let p =
-                |dx: i32, dy: i32| buf[((y + dy) as u32 * w) as usize + (x + dx) as usize] as i16;
-            // Bresenham circle of radius 3 (clockwise from top).
-            let p1 = p(0, -3);
-            let p5 = p(3, 0);
-            let p9 = p(0, 3);
-            let p13 = p(-3, 0);
-            let n_hi = (p1 > hi) as u8 + (p5 > hi) as u8 + (p9 > hi) as u8 + (p13 > hi) as u8;
-            let n_lo = (p1 < lo) as u8 + (p5 < lo) as u8 + (p9 < lo) as u8 + (p13 < lo) as u8;
-            if n_hi < 3 && n_lo < 3 {
-                continue;
+    // Per-row FAST scan is independent across rows, so fan the row
+    // sweep out over the active rayon pool (the engine installs a
+    // fixed-size pool around the per-frame feature call). `flat_map_iter`
+    // preserves row order, so the resulting `raw` is identical to the
+    // serial scan and NMS stays deterministic.
+    let raw: Vec<KeyPoint> = (KEYPOINT_BORDER..(h_i - KEYPOINT_BORDER))
+        .into_par_iter()
+        .flat_map_iter(|y| {
+            let row = (y as u32 * w) as usize;
+            let mut row_kps = Vec::new();
+            for x in KEYPOINT_BORDER..(w_i - KEYPOINT_BORDER) {
+                let c = buf[row + x as usize] as i16;
+                let hi = c + t;
+                let lo = c - t;
+                let p = |dx: i32, dy: i32| {
+                    buf[((y + dy) as u32 * w) as usize + (x + dx) as usize] as i16
+                };
+                // Bresenham circle of radius 3 (clockwise from top).
+                let p1 = p(0, -3);
+                let p5 = p(3, 0);
+                let p9 = p(0, 3);
+                let p13 = p(-3, 0);
+                let n_hi = (p1 > hi) as u8 + (p5 > hi) as u8 + (p9 > hi) as u8 + (p13 > hi) as u8;
+                let n_lo = (p1 < lo) as u8 + (p5 < lo) as u8 + (p9 < lo) as u8 + (p13 < lo) as u8;
+                if n_hi < 3 && n_lo < 3 {
+                    continue;
+                }
+                let pix = [
+                    p1,
+                    p(1, -3),
+                    p(2, -2),
+                    p(3, -1),
+                    p5,
+                    p(3, 1),
+                    p(2, 2),
+                    p(1, 3),
+                    p9,
+                    p(-1, 3),
+                    p(-2, 2),
+                    p(-3, 1),
+                    p13,
+                    p(-3, -1),
+                    p(-2, -2),
+                    p(-1, -3),
+                ];
+                let (is_corner, score) = fast9_test(&pix, c, t);
+                if is_corner {
+                    row_kps.push(KeyPoint {
+                        x: x as f32,
+                        y: y as f32,
+                        score,
+                    });
+                }
             }
-            let pix = [
-                p1,
-                p(1, -3),
-                p(2, -2),
-                p(3, -1),
-                p5,
-                p(3, 1),
-                p(2, 2),
-                p(1, 3),
-                p9,
-                p(-1, 3),
-                p(-2, 2),
-                p(-3, 1),
-                p13,
-                p(-3, -1),
-                p(-2, -2),
-                p(-1, -3),
-            ];
-            let (is_corner, score) = fast9_test(&pix, c, t);
-            if is_corner {
-                raw.push(KeyPoint {
-                    x: x as f32,
-                    y: y as f32,
-                    score,
-                });
-            }
-        }
-    }
+            row_kps
+        })
+        .collect();
     let mut kps = nms_filter(raw, nms_radius, max_features);
     // Sub-pixel refinement: each FAST keypoint comes out at an
     // integer pixel because the corner test runs at integer pixel
@@ -1076,54 +1101,58 @@ pub fn describe_brief(gray: &GrayImage, kps: &[KeyPoint]) -> (Vec<KeyPoint>, Vec
     let h_i = h as i32;
     let buf = gray.as_raw();
     let pattern = &BRIEF_PATTERN;
-    let mut kept_kps = Vec::with_capacity(kps.len());
-    let mut descs = Vec::with_capacity(kps.len());
+    // Each keypoint's descriptor is independent, so describe in parallel
+    // on the active rayon pool. `par_iter().filter_map().collect()`
+    // preserves keypoint order, so the kept/descriptor pairing is
+    // identical to the serial path.
     // Sample pairs at distance ≤ R from the keypoint, plus the 3x3 box-blur
     // neighbourhood; KEYPOINT_BORDER already accounts for both.
-    for kp in kps {
-        let cx = kp.x.round() as i32;
-        let cy = kp.y.round() as i32;
-        if cx < KEYPOINT_BORDER
-            || cy < KEYPOINT_BORDER
-            || cx >= w_i - KEYPOINT_BORDER
-            || cy >= h_i - KEYPOINT_BORDER
-        {
-            continue;
-        }
-        let angle = patch_orientation(buf, w, cx, cy);
-        let (sin_a, cos_a) = angle.sin_cos();
-        // 3x3 box-blur of the gray patch at integer offsets — matches the
-        // smoothing the original BRIEF paper prescribes. Bounds are
-        // guaranteed by KEYPOINT_BORDER + cap on rotated radius.
-        let sample = |dx: i32, dy: i32| -> u8 {
-            let mut acc = 0u32;
-            for oy in -1..=1 {
-                let row = ((cy + dy + oy) as u32 * w) as usize;
-                for ox in -1..=1 {
-                    acc += buf[row + (cx + dx + ox) as usize] as u32;
+    let pairs: Vec<(KeyPoint, Descriptor)> = kps
+        .par_iter()
+        .filter_map(|kp| {
+            let cx = kp.x.round() as i32;
+            let cy = kp.y.round() as i32;
+            if cx < KEYPOINT_BORDER
+                || cy < KEYPOINT_BORDER
+                || cx >= w_i - KEYPOINT_BORDER
+                || cy >= h_i - KEYPOINT_BORDER
+            {
+                return None;
+            }
+            let angle = patch_orientation(buf, w, cx, cy);
+            let (sin_a, cos_a) = angle.sin_cos();
+            // 3x3 box-blur of the gray patch at integer offsets — matches the
+            // smoothing the original BRIEF paper prescribes. Bounds are
+            // guaranteed by KEYPOINT_BORDER + cap on rotated radius.
+            let sample = |dx: i32, dy: i32| -> u8 {
+                let mut acc = 0u32;
+                for oy in -1..=1 {
+                    let row = ((cy + dy + oy) as u32 * w) as usize;
+                    for ox in -1..=1 {
+                        acc += buf[row + (cx + dx + ox) as usize] as u32;
+                    }
+                }
+                (acc / 9) as u8
+            };
+            let mut bytes = [0u8; DESCRIPTOR_BYTES];
+            for (i, &(ax, ay, bx, by)) in pattern.iter().enumerate() {
+                // Rotate the sample offsets by the keypoint's dominant angle.
+                // Rotation magnitudes are bounded by BRIEF_PATCH_RADIUS, well
+                // inside KEYPOINT_BORDER.
+                let rax = (cos_a * ax as f32 - sin_a * ay as f32).round() as i32;
+                let ray = (sin_a * ax as f32 + cos_a * ay as f32).round() as i32;
+                let rbx = (cos_a * bx as f32 - sin_a * by as f32).round() as i32;
+                let rby = (sin_a * bx as f32 + cos_a * by as f32).round() as i32;
+                let a_val = sample(rax, ray);
+                let b_val = sample(rbx, rby);
+                if a_val < b_val {
+                    bytes[i / 8] |= 1 << (i % 8);
                 }
             }
-            (acc / 9) as u8
-        };
-        let mut bytes = [0u8; DESCRIPTOR_BYTES];
-        for (i, &(ax, ay, bx, by)) in pattern.iter().enumerate() {
-            // Rotate the sample offsets by the keypoint's dominant angle.
-            // Rotation magnitudes are bounded by BRIEF_PATCH_RADIUS, well
-            // inside KEYPOINT_BORDER.
-            let rax = (cos_a * ax as f32 - sin_a * ay as f32).round() as i32;
-            let ray = (sin_a * ax as f32 + cos_a * ay as f32).round() as i32;
-            let rbx = (cos_a * bx as f32 - sin_a * by as f32).round() as i32;
-            let rby = (sin_a * bx as f32 + cos_a * by as f32).round() as i32;
-            let a_val = sample(rax, ray);
-            let b_val = sample(rbx, rby);
-            if a_val < b_val {
-                bytes[i / 8] |= 1 << (i % 8);
-            }
-        }
-        kept_kps.push(*kp);
-        descs.push(Descriptor(bytes));
-    }
-    (kept_kps, descs)
+            Some((*kp, Descriptor(bytes)))
+        })
+        .collect();
+    pairs.into_iter().unzip()
 }
 
 /// ORB-style intensity centroid. Compute first-order moments of a

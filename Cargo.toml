@@ -57,7 +57,7 @@ pdf-image-translate = [
 ]
 doc-align = ["dep:ort", "dep:ndarray"]
 ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon"]
-planar-tracker = ["dep:image", "dep:imageproc", "image-render"]
+planar-tracker = ["dep:image", "dep:imageproc", "image-render", "dep:rayon"]
 surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]

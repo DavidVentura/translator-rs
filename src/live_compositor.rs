@@ -14,6 +14,8 @@
 //! CENTER_CROP_FRACTION_PLANAR is 1.0). `h_surface_to_viewport` is the
 //! row-major 3x3 mapping surface points to current-frame pixel coords.
 
+use rayon::prelude::*;
+
 use crate::homography::{invert, mat3_mul, project};
 
 /// One overlay payload to be drawn onto the camera frame.
@@ -234,98 +236,110 @@ fn warp_item_onto_display(
     // guaranteed-transparent source region.
     let extents_active = !item.row_extents.is_empty() && item.row_extents.len() == src_h as usize;
 
-    for y in y0..y1 {
-        let dy = y as f32 + 0.5;
-        let mut num_sx = m0 * row_start_x + m1 * dy + m2;
-        let mut num_sy = m3 * row_start_x + m4 * dy + m5;
-        let mut den = m6 * row_start_x + m7 * dy + m8;
-        for x in x0..x1 {
-            if den.abs() < 1e-9 || !den.is_finite() {
+    // Each destination row in the projected AABB writes a disjoint slice
+    // of `dst`, so warp the band row-parallel on the active pool. The
+    // caller (`composite_into_slice`) installs a fixed-size pool; items
+    // are still composited sequentially so overlapping overlays blend in
+    // order.
+    let dst_stride = (dst_w * 4) as usize;
+    let band_start = y0 as usize * dst_stride;
+    let band_end = y1 as usize * dst_stride;
+    dst[band_start..band_end]
+        .par_chunks_mut(dst_stride)
+        .enumerate()
+        .for_each(|(row_off, row)| {
+            let y = y0 + row_off as u32;
+            let dy = y as f32 + 0.5;
+            let mut num_sx = m0 * row_start_x + m1 * dy + m2;
+            let mut num_sy = m3 * row_start_x + m4 * dy + m5;
+            let mut den = m6 * row_start_x + m7 * dy + m8;
+            for x in x0..x1 {
+                if den.abs() < 1e-9 || !den.is_finite() {
+                    num_sx += m0;
+                    num_sy += m3;
+                    den += m6;
+                    continue;
+                }
+                let inv_den = 1.0 / den;
+                let sx = num_sx * inv_den;
+                let sy = num_sy * inv_den;
                 num_sx += m0;
                 num_sy += m3;
                 den += m6;
-                continue;
-            }
-            let inv_den = 1.0 / den;
-            let sx = num_sx * inv_den;
-            let sy = num_sy * inv_den;
-            num_sx += m0;
-            num_sy += m3;
-            den += m6;
-            if !sx.is_finite()
-                || !sy.is_finite()
-                || sx < 0.0
-                || sy < 0.0
-                || sx > src_max_x
-                || sy > src_max_y
-            {
-                continue;
-            }
-            let x0_i = sx.floor() as u32;
-            let y0_i = sy.floor() as u32;
-            let x1_i = (x0_i + 1).min(src_w - 1);
-            let y1_i = (y0_i + 1).min(src_h - 1);
-            if extents_active {
-                let r0 = item.row_extents[y0_i as usize];
-                let r1 = item.row_extents[y1_i as usize];
-                let r0_overlaps = r0.0 <= x1_i && x0_i < r0.1;
-                let r1_overlaps = r1.0 <= x1_i && x0_i < r1.1;
-                if !r0_overlaps && !r1_overlaps {
+                if !sx.is_finite()
+                    || !sy.is_finite()
+                    || sx < 0.0
+                    || sy < 0.0
+                    || sx > src_max_x
+                    || sy > src_max_y
+                {
                     continue;
                 }
+                let x0_i = sx.floor() as u32;
+                let y0_i = sy.floor() as u32;
+                let x1_i = (x0_i + 1).min(src_w - 1);
+                let y1_i = (y0_i + 1).min(src_h - 1);
+                if extents_active {
+                    let r0 = item.row_extents[y0_i as usize];
+                    let r1 = item.row_extents[y1_i as usize];
+                    let r0_overlaps = r0.0 <= x1_i && x0_i < r0.1;
+                    let r1_overlaps = r1.0 <= x1_i && x0_i < r1.1;
+                    if !r0_overlaps && !r1_overlaps {
+                        continue;
+                    }
+                }
+                let fx = sx - x0_i as f32;
+                let fy = sy - y0_i as f32;
+                let i_tl = ((y0_i * src_w + x0_i) * 4) as usize;
+                let i_tr = ((y0_i * src_w + x1_i) * 4) as usize;
+                let i_bl = ((y1_i * src_w + x0_i) * 4) as usize;
+                let i_br = ((y1_i * src_w + x1_i) * 4) as usize;
+                let one_minus_fx = 1.0 - fx;
+                let one_minus_fy = 1.0 - fy;
+                let w_tl = one_minus_fx * one_minus_fy;
+                let w_tr = fx * one_minus_fy;
+                let w_bl = one_minus_fx * fy;
+                let w_br = fx * fy;
+                let a = bilinear_sample(
+                    src[i_tl + 3],
+                    src[i_tr + 3],
+                    src[i_bl + 3],
+                    src[i_br + 3],
+                    w_tl,
+                    w_tr,
+                    w_bl,
+                    w_br,
+                );
+                if a == 0 {
+                    continue;
+                }
+                let r = bilinear_sample(
+                    src[i_tl], src[i_tr], src[i_bl], src[i_br], w_tl, w_tr, w_bl, w_br,
+                );
+                let g = bilinear_sample(
+                    src[i_tl + 1],
+                    src[i_tr + 1],
+                    src[i_bl + 1],
+                    src[i_br + 1],
+                    w_tl,
+                    w_tr,
+                    w_bl,
+                    w_br,
+                );
+                let b = bilinear_sample(
+                    src[i_tl + 2],
+                    src[i_tr + 2],
+                    src[i_bl + 2],
+                    src[i_br + 2],
+                    w_tl,
+                    w_tr,
+                    w_bl,
+                    w_br,
+                );
+                let px = (x * 4) as usize;
+                blend_source_over(&mut row[px..px + 4], [r, g, b, a]);
             }
-            let fx = sx - x0_i as f32;
-            let fy = sy - y0_i as f32;
-            let i_tl = ((y0_i * src_w + x0_i) * 4) as usize;
-            let i_tr = ((y0_i * src_w + x1_i) * 4) as usize;
-            let i_bl = ((y1_i * src_w + x0_i) * 4) as usize;
-            let i_br = ((y1_i * src_w + x1_i) * 4) as usize;
-            let one_minus_fx = 1.0 - fx;
-            let one_minus_fy = 1.0 - fy;
-            let w_tl = one_minus_fx * one_minus_fy;
-            let w_tr = fx * one_minus_fy;
-            let w_bl = one_minus_fx * fy;
-            let w_br = fx * fy;
-            let a = bilinear_sample(
-                src[i_tl + 3],
-                src[i_tr + 3],
-                src[i_bl + 3],
-                src[i_br + 3],
-                w_tl,
-                w_tr,
-                w_bl,
-                w_br,
-            );
-            if a == 0 {
-                continue;
-            }
-            let r = bilinear_sample(
-                src[i_tl], src[i_tr], src[i_bl], src[i_br], w_tl, w_tr, w_bl, w_br,
-            );
-            let g = bilinear_sample(
-                src[i_tl + 1],
-                src[i_tr + 1],
-                src[i_bl + 1],
-                src[i_br + 1],
-                w_tl,
-                w_tr,
-                w_bl,
-                w_br,
-            );
-            let b = bilinear_sample(
-                src[i_tl + 2],
-                src[i_tr + 2],
-                src[i_bl + 2],
-                src[i_br + 2],
-                w_tl,
-                w_tr,
-                w_bl,
-                w_br,
-            );
-            let dst_idx = ((y * dst_w + x) * 4) as usize;
-            blend_source_over(&mut dst[dst_idx..dst_idx + 4], [r, g, b, a]);
-        }
-    }
+        });
 }
 
 #[inline]

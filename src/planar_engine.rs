@@ -9,6 +9,8 @@
 //!
 //! See `FUTURE_PLANAR_TRACKER.md` for the design rationale.
 
+use std::sync::Arc;
+
 use image::GrayImage;
 
 use crate::coords::Quadrant;
@@ -371,6 +373,14 @@ pub struct LivePlanarEngine {
     /// Reset at the start of each call; populated for the Locked
     /// branch (other branches are cheap and leave it at zeros).
     last_step_timings: StepTimings,
+    /// Fixed-size pool the per-frame tracker work runs on. The whole
+    /// `process_frame_inner` is wrapped in `tracker_pool.install`, so
+    /// every `par_iter` it reaches (FAST detect, BRIEF describe,
+    /// descriptor matching) fans out over these threads. Sized small on
+    /// purpose: the steady-state tracking loop wants a couple of big
+    /// cores, not the whole machine (the async OCR worker and the rest
+    /// of the device need headroom).
+    tracker_pool: Arc<rayon::ThreadPool>,
 }
 
 /// Sub-step timings from the most recent `process_frame` call.
@@ -469,6 +479,11 @@ struct KltFrameState {
 }
 
 const KLT_MAX_SEEDS: usize = 80;
+
+/// Worker threads in the per-frame tracker pool (FAST/BRIEF + matching).
+/// Two is enough to roughly halve the parallel sub-steps without
+/// starving the async OCR worker or the rest of the device.
+const TRACKER_POOL_THREADS: usize = 2;
 
 /// Single-step history of accepted `H_anchor→view` for the active anchor,
 /// plus a running EMA of accepted inlier counts. Drives the inlier-
@@ -648,6 +663,13 @@ impl LivePlanarEngine {
     pub fn new(config: EngineConfig) -> Self {
         let cache_size = config.anchor_cache_size;
         let default_quadrant = config.default_canonical_quadrant;
+        let tracker_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(TRACKER_POOL_THREADS)
+                .thread_name(|i| format!("planar-trk-{i}"))
+                .build()
+                .expect("failed to build planar tracker thread pool"),
+        );
         Self {
             config,
             cache: AnchorCache::new(cache_size),
@@ -667,6 +689,7 @@ impl LivePlanarEngine {
             last_process_ns: None,
             gate_counters: GateCounters::default(),
             last_step_timings: StepTimings::default(),
+            tracker_pool,
         }
     }
 
@@ -730,7 +753,11 @@ impl LivePlanarEngine {
             }
         }
         self.last_process_ns = Some(timestamp_ns);
-        let cmd = self.process_frame_inner(gray, imu_stable, timestamp_ns, None);
+        // Run the whole per-frame pipeline inside the fixed-size pool so
+        // every `par_iter` it reaches (detect/describe/match) fans out
+        // over the tracker threads rather than the global rayon pool.
+        let pool = Arc::clone(&self.tracker_pool);
+        let cmd = pool.install(|| self.process_frame_inner(gray, imu_stable, timestamp_ns, None));
         let kind = match &cmd {
             TrackerCommand::Idle => "Idle",
             TrackerCommand::Acquiring => "Acquiring",
