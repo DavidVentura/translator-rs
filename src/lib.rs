@@ -16,6 +16,8 @@ pub mod doc_align_refine;
 pub mod font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_provider;
+#[cfg(feature = "gpu")]
+pub mod gl_renderer;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod homography;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]

@@ -38,7 +38,7 @@ use crate::color_matting::MattedStrip;
 use crate::coords::Quadrant;
 use crate::font_provider::FontProvider;
 use crate::homography;
-use crate::live_compositor::{self, CompositeError, OverlayItem, Renderer};
+use crate::live_compositor::{self, ComposeTarget, CompositeError, OverlayItem};
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
     LiveSession, PostDetectInput, h_view_to_surface_from, viewport_surface_aabb,
@@ -153,9 +153,6 @@ const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// resolution, so 24 px = ~2-3% of typical viewport extent.
 const COVERAGE_PAD_PX: f32 = 24.0;
 const ENABLE_COLOR_MATTING: bool = false;
-/// Worker threads the overlay warp fans out over. Matches the tracker
-/// pool size; the two run sequentially so total live threads peak at 2.
-const COMPOSITE_POOL_THREADS: usize = 2;
 
 /// What kind of async job the per-frame fast path needs to dispatch.
 #[derive(Clone)]
@@ -344,11 +341,6 @@ pub struct LiveTrackerPipeline {
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
     worker: Mutex<Option<Worker>>,
     timing: Mutex<TimingStats>,
-    /// Fixed-size pool the per-frame overlay warp fans out over. Separate
-    /// from the engine's tracker pool because composite runs after the
-    /// tracker step (sequentially), so the two never contend; a dedicated
-    /// pool keeps the warp off the global rayon pool the OCR worker uses.
-    composite_pool: rayon::ThreadPool,
 }
 
 impl LiveTrackerPipeline {
@@ -359,11 +351,6 @@ impl LiveTrackerPipeline {
         catalog: Arc<TranslatorSession>,
         font_provider: Arc<dyn FontProvider + Send + Sync>,
     ) -> Arc<Self> {
-        let composite_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(COMPOSITE_POOL_THREADS)
-            .thread_name(|i| format!("planar-comp-{i}"))
-            .build()
-            .expect("failed to build composite thread pool");
         let pipeline = Arc::new(Self {
             engine: Mutex::new(LivePlanarEngine::new(EngineConfig::default())),
             session: Arc::new(LiveSession::new()),
@@ -379,7 +366,6 @@ impl LiveTrackerPipeline {
             last_telemetry: Mutex::new(None),
             worker: Mutex::new(None),
             timing: Mutex::new(TimingStats::default()),
-            composite_pool,
         });
         let worker = Worker::spawn(Arc::clone(&pipeline));
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
@@ -437,11 +423,15 @@ impl LiveTrackerPipeline {
     }
 
     /// One-shot per-frame entry. Locks the engine + frame state
-    /// internally, runs the tracker step, writes the composited
-    /// camera+overlay into `dst`, and (when needed) materializes the
+    /// internally, runs the tracker step, sends the composited
+    /// camera+overlay to `target`, and (when needed) materializes the
     /// frame bytes + dispatches an async acquire/refresh job.
     ///
-    /// `dst` is the output RGBA buffer (`dst_w * dst_h * 4` bytes).
+    /// `target` is where the composite goes — a CPU RGBA slice
+    /// ([`SliceTarget`](crate::live_compositor::SliceTarget)) or a GPU
+    /// surface. It is driven while the frame + overlay locks are held, so
+    /// a GPU target's GL calls must run on the thread that owns the
+    /// context (i.e. `process_frame` must be called on the render thread).
     /// `visible_sensor_w/h` are the visible-region dims in sensor
     /// coords (typically equal to `dst_w/h` when the SurfaceView uses
     /// FILL_CENTER on the sensor frame).
@@ -453,7 +443,7 @@ impl LiveTrackerPipeline {
         &self,
         frame: &Arc<LiveFrame>,
         display_crop: Rect,
-        dst: &mut [u8],
+        target: &mut dyn ComposeTarget,
         dst_w: u32,
         dst_h: u32,
         visible_sensor_w: u32,
@@ -494,9 +484,9 @@ impl LiveTrackerPipeline {
         }
 
         let t_composite = Instant::now();
-        let (composite_bytes, overlay_count) = match self.composite_into_slice(
+        let (composite_bytes, overlay_count) = match self.composite_to_target(
             frame,
-            dst,
+            target,
             visible_sensor_w,
             visible_sensor_h,
             h_for_compose,
@@ -679,10 +669,10 @@ impl LiveTrackerPipeline {
         }
     }
 
-    fn composite_into_slice(
+    fn composite_to_target(
         &self,
         frame: &Arc<LiveFrame>,
-        dst: &mut [u8],
+        target: &mut dyn ComposeTarget,
         bitmap_w: u32,
         bitmap_h: u32,
         h_surface_to_viewport: Option<[f32; 9]>,
@@ -742,12 +732,7 @@ impl LiveTrackerPipeline {
             h_surface_to_viewport: &h_translated,
             items: &items_vec,
         };
-        self.composite_pool
-            .install(|| {
-                let mut renderer = live_compositor::CpuRenderer;
-                renderer.composite(&input, dst)
-            })
-            .map(|()| overlay_count)
+        target.compose(&input).map(|()| overlay_count)
     }
 
     fn update_refresh_trigger(

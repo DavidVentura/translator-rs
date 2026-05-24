@@ -1,0 +1,473 @@
+//! GLES2 composite backend: the GPU counterpart to the CPU bilinear warp
+//! in [`crate::live_compositor`]. Same per-frame contract
+//! ([`Renderer`]/[`CompositeInput`]), but the camera passthrough and each
+//! overlay are drawn as textured quads and the homography is applied in
+//! the vertex shader, so the perspective warp + blend run on the GPU.
+//!
+//! The crate never creates a GL context: the app owns EGL and the render
+//! thread, and hands in a loader (`eglGetProcAddress`-style) at
+//! construction. The shader is GLSL ES 1.00 / GLES2 — the universal floor
+//! across Android 5+ and Ubuntu Touch — and runs unchanged on GLES3
+//! contexts. `GlesRenderer` holds a `glow::Context`, which is `!Send`, so
+//! it is bound to its owning thread at compile time.
+//!
+//! Two output paths share one `draw`:
+//! - [`GlesRenderer::composite`] (the [`Renderer`] trait) renders into an
+//!   owned FBO and reads the result back into a CPU buffer. Free on CPU,
+//!   expensive on GPU — it exists for tests and the pre-present migration
+//!   step, not the hot path.
+//! - [`GlesRenderer::present`] renders into whatever framebuffer the
+//!   caller bound (the window surface / scene-graph FBO). This is the
+//!   production path; there is no readback.
+
+use glow::HasContext;
+
+use crate::homography::mat3_mul;
+use crate::live_compositor::{ComposeTarget, CompositeError, CompositeInput, Renderer};
+
+#[derive(Debug)]
+pub enum GlError {
+    ShaderCompile(String),
+    ProgramLink(String),
+    MissingLocation(&'static str),
+}
+
+const VERT_SRC: &str = r#"#version 100
+attribute vec2 a_pos;
+uniform mat3 u_transform;
+uniform mat3 u_uv_xform;
+varying vec2 v_uv;
+void main() {
+    vec3 clip = u_transform * vec3(a_pos, 1.0);
+    vec3 uv = u_uv_xform * vec3(a_pos, 1.0);
+    v_uv = uv.xy;
+    gl_Position = vec4(clip.xy, 0.0, clip.z);
+}
+"#;
+
+const FRAG_SRC: &str = r#"#version 100
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D u_tex;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_tex, v_uv);
+}
+"#;
+
+/// Row-major identity-affine helpers, matching the convention of
+/// [`crate::homography`] (`mat3_mul` is row-major, `a * b`).
+fn translate(tx: f32, ty: f32) -> [f32; 9] {
+    [1.0, 0.0, tx, 0.0, 1.0, ty, 0.0, 0.0, 1.0]
+}
+
+fn scale(sx: f32, sy: f32) -> [f32; 9] {
+    [sx, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// Maps top-left-origin viewport pixels to clip space, flipping y so the
+/// image's top row lands at the top of the framebuffer. Affine (`w` row
+/// is `[0,0,1]`), so it leaves the homography's perspective divide intact.
+fn ndc_from_viewport(w: f32, h: f32) -> [f32; 9] {
+    [2.0 / w, 0.0, -1.0, 0.0, -2.0 / h, 1.0, 0.0, 0.0, 1.0]
+}
+
+/// GLES2 `glUniformMatrix3fv` forbids the transpose flag, so we transpose
+/// our row-major matrices into the column-major order GL expects.
+fn to_column_major(m: &[f32; 9]) -> [f32; 9] {
+    [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
+}
+
+pub struct GlesRenderer {
+    gl: glow::Context,
+    program: glow::Program,
+    u_transform: glow::UniformLocation,
+    u_uv_xform: glow::UniformLocation,
+    u_tex: glow::UniformLocation,
+    a_pos: u32,
+    quad_vbo: glow::Buffer,
+    camera_tex: glow::Texture,
+    overlay_tex: glow::Texture,
+    fbo: Option<glow::Framebuffer>,
+    fbo_tex: Option<glow::Texture>,
+    fbo_size: Option<(u32, u32)>,
+}
+
+impl GlesRenderer {
+    /// `loader` resolves GL function pointers (e.g. `eglGetProcAddress`).
+    /// The caller must have created and made-current a GLES2 (or newer)
+    /// context on the calling thread before this runs.
+    pub fn new(loader: impl FnMut(&str) -> *const std::ffi::c_void) -> Result<Self, GlError> {
+        let gl = unsafe { glow::Context::from_loader_function(loader) };
+        unsafe {
+            let max_tex = gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE);
+            log::debug!("GlesRenderer: GL_MAX_TEXTURE_SIZE={max_tex}");
+
+            let program = link_program(&gl)?;
+            let u_transform = gl
+                .get_uniform_location(program, "u_transform")
+                .ok_or(GlError::MissingLocation("u_transform"))?;
+            let u_uv_xform = gl
+                .get_uniform_location(program, "u_uv_xform")
+                .ok_or(GlError::MissingLocation("u_uv_xform"))?;
+            let u_tex = gl
+                .get_uniform_location(program, "u_tex")
+                .ok_or(GlError::MissingLocation("u_tex"))?;
+            let a_pos = gl
+                .get_attrib_location(program, "a_pos")
+                .ok_or(GlError::MissingLocation("a_pos"))?;
+
+            let quad_vbo = gl.create_buffer().map_err(GlError::ProgramLink)?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
+            let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+            let verts_bytes = std::slice::from_raw_parts(
+                verts.as_ptr() as *const u8,
+                std::mem::size_of_val(&verts),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, verts_bytes, glow::STATIC_DRAW);
+
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            let camera_tex = new_texture(&gl)?;
+            let overlay_tex = new_texture(&gl)?;
+
+            Ok(Self {
+                gl,
+                program,
+                u_transform,
+                u_uv_xform,
+                u_tex,
+                a_pos,
+                quad_vbo,
+                camera_tex,
+                overlay_tex,
+                fbo: None,
+                fbo_tex: None,
+                fbo_size: None,
+            })
+        }
+    }
+
+    /// Render the composite into whatever framebuffer is currently bound;
+    /// the caller owns FBO binding, viewport, and buffer swap. No
+    /// readback — this is the production present path.
+    pub fn present(&mut self, input: &CompositeInput<'_>) {
+        self.draw(input);
+    }
+
+    fn draw(&self, input: &CompositeInput<'_>) {
+        let gl = &self.gl;
+        let dst_w = input.dst_w as f32;
+        let dst_h = input.dst_h as f32;
+        let ndc = ndc_from_viewport(dst_w, dst_h);
+        unsafe {
+            gl.use_program(Some(self.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.enable_vertex_attrib_array(self.a_pos);
+            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.uniform_1_i32(Some(&self.u_tex), 0);
+
+            // Camera passthrough: opaque base layer. Upload the full sensor
+            // frame and sample the cropped sub-rect via the uv transform, so
+            // the GPU never needs a strided sub-image upload (absent in GLES2).
+            gl.disable(glow::BLEND);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
+            upload_rgba(gl, input.camera_rgba, input.src_full_w, input.src_full_h);
+            let cam_transform = mat3_mul(&ndc, &scale(dst_w, dst_h));
+            let cam_uv = [
+                dst_w / input.src_full_w as f32,
+                0.0,
+                input.src_offset_x as f32 / input.src_full_w as f32,
+                0.0,
+                dst_h / input.src_full_h as f32,
+                input.src_offset_y as f32 / input.src_full_h as f32,
+                0.0,
+                0.0,
+                1.0,
+            ];
+            gl.uniform_matrix_3_f32_slice(
+                Some(&self.u_transform),
+                false,
+                &to_column_major(&cam_transform),
+            );
+            gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &to_column_major(&cam_uv));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+            // Overlays: source-over with straight (non-premultiplied) alpha,
+            // matching the CPU blend. Each item warped by the same H the CPU
+            // path uses, composed with its surface origin and pixel size.
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+            for item in input.items {
+                if item.bitmap_rgba.is_empty() || item.bitmap_width == 0 || item.bitmap_height == 0
+                {
+                    continue;
+                }
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.overlay_tex));
+                upload_rgba(gl, item.bitmap_rgba, item.bitmap_width, item.bitmap_height);
+                let to_surface =
+                    translate(item.bitmap_origin_surface_x, item.bitmap_origin_surface_y);
+                let bitmap_to_viewport = mat3_mul(input.h_surface_to_viewport, &to_surface);
+                let sized = mat3_mul(
+                    &bitmap_to_viewport,
+                    &scale(item.bitmap_width as f32, item.bitmap_height as f32),
+                );
+                let transform = mat3_mul(&ndc, &sized);
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&self.u_transform),
+                    false,
+                    &to_column_major(&transform),
+                );
+                gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &identity_uv);
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
+        }
+    }
+
+    /// (Re)create the readback FBO + color texture to match `w*h`.
+    /// FBO incompleteness with an RGBA8 attachment is a driver/setup
+    /// invariant, not a runtime input error, so it panics loudly.
+    fn ensure_fbo(&mut self, w: u32, h: u32) {
+        if self.fbo_size == Some((w, h)) {
+            return;
+        }
+        let gl = &self.gl;
+        unsafe {
+            if let Some(t) = self.fbo_tex.take() {
+                gl.delete_texture(t);
+            }
+            let tex = new_texture(gl).expect("create fbo texture");
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let fbo = match self.fbo {
+                Some(f) => f,
+                None => {
+                    let f = gl.create_framebuffer().expect("create framebuffer");
+                    self.fbo = Some(f);
+                    f
+                }
+            };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            assert_eq!(
+                status,
+                glow::FRAMEBUFFER_COMPLETE,
+                "readback FBO incomplete: status=0x{status:x}"
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.fbo_tex = Some(tex);
+            self.fbo_size = Some((w, h));
+        }
+    }
+}
+
+impl Renderer for GlesRenderer {
+    fn composite(
+        &mut self,
+        input: &CompositeInput<'_>,
+        out: &mut [u8],
+    ) -> Result<(), CompositeError> {
+        validate_sizes(input, out)?;
+        self.ensure_fbo(input.dst_w, input.dst_h);
+        let (w, h) = (input.dst_w, input.dst_h);
+        let mut flipped = vec![0u8; out.len()];
+        unsafe {
+            let gl = &self.gl;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
+            gl.viewport(0, 0, w as i32, h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            self.draw(input);
+            self.gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut flipped)),
+            );
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        // glReadPixels is bottom-up; the CPU contract is top-down.
+        let stride = (w as usize) * 4;
+        for y in 0..h as usize {
+            let src = (h as usize - 1 - y) * stride;
+            let dst = y * stride;
+            out[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GlesRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            self.gl.delete_program(self.program);
+            self.gl.delete_buffer(self.quad_vbo);
+            self.gl.delete_texture(self.camera_tex);
+            self.gl.delete_texture(self.overlay_tex);
+            if let Some(fbo) = self.fbo {
+                self.gl.delete_framebuffer(fbo);
+            }
+            if let Some(t) = self.fbo_tex {
+                self.gl.delete_texture(t);
+            }
+        }
+    }
+}
+
+/// GPU production target: presents into the framebuffer the caller bound
+/// (window surface / scene-graph FBO). No readback — the display consumes
+/// the result directly. `process_frame` must be called on the thread that
+/// owns the GL context.
+pub struct PresentTarget<'a> {
+    pub renderer: &'a mut GlesRenderer,
+}
+
+impl ComposeTarget for PresentTarget<'_> {
+    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+        self.renderer.present(input);
+        Ok(())
+    }
+}
+
+/// GPU readback target: renders into the renderer's own FBO and copies
+/// the result into a CPU slice. Lets the GPU path drive `process_frame`
+/// while still producing the same `&mut [u8]` the CPU path does — used by
+/// tests and the pre-present migration step, not the hot path.
+pub struct ReadbackTarget<'a> {
+    pub renderer: &'a mut GlesRenderer,
+    pub dst: &'a mut [u8],
+}
+
+impl ComposeTarget for ReadbackTarget<'_> {
+    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+        self.renderer.composite(input, self.dst)
+    }
+}
+
+/// Mirrors the size/bounds checks of
+/// [`crate::live_compositor::composite_frame_into_cropped`] so both
+/// backends reject identical inputs identically.
+fn validate_sizes(input: &CompositeInput<'_>, out: &[u8]) -> Result<(), CompositeError> {
+    let dst_bytes = (input.dst_w as usize)
+        .checked_mul(input.dst_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(CompositeError::DstBufferSize)?;
+    if out.len() != dst_bytes {
+        return Err(CompositeError::DstBufferSize);
+    }
+    let src_full_bytes = (input.src_full_w as usize)
+        .checked_mul(input.src_full_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(CompositeError::SrcBufferSize)?;
+    if input.camera_rgba.len() != src_full_bytes {
+        return Err(CompositeError::SrcBufferSize);
+    }
+    if input.src_offset_x.saturating_add(input.dst_w) > input.src_full_w
+        || input.src_offset_y.saturating_add(input.dst_h) > input.src_full_h
+    {
+        return Err(CompositeError::SrcBufferSize);
+    }
+    Ok(())
+}
+
+fn new_texture(gl: &glow::Context) -> Result<glow::Texture, GlError> {
+    unsafe {
+        let tex = gl.create_texture().map_err(GlError::ProgramLink)?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        Ok(tex)
+    }
+}
+
+fn upload_rgba(gl: &glow::Context, data: &[u8], w: u32, h: u32) {
+    unsafe {
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            w as i32,
+            h as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(data)),
+        );
+    }
+}
+
+fn link_program(gl: &glow::Context) -> Result<glow::Program, GlError> {
+    unsafe {
+        let program = gl.create_program().map_err(GlError::ProgramLink)?;
+        let shaders = [
+            compile_shader(gl, glow::VERTEX_SHADER, VERT_SRC)?,
+            compile_shader(gl, glow::FRAGMENT_SHADER, FRAG_SRC)?,
+        ];
+        for s in shaders {
+            gl.attach_shader(program, s);
+        }
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            return Err(GlError::ProgramLink(gl.get_program_info_log(program)));
+        }
+        for s in shaders {
+            gl.detach_shader(program, s);
+            gl.delete_shader(s);
+        }
+        Ok(program)
+    }
+}
+
+fn compile_shader(gl: &glow::Context, kind: u32, src: &str) -> Result<glow::Shader, GlError> {
+    unsafe {
+        let shader = gl.create_shader(kind).map_err(GlError::ShaderCompile)?;
+        gl.shader_source(shader, src);
+        gl.compile_shader(shader);
+        if !gl.get_shader_compile_status(shader) {
+            return Err(GlError::ShaderCompile(gl.get_shader_info_log(shader)));
+        }
+        Ok(shader)
+    }
+}

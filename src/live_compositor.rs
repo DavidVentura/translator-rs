@@ -14,8 +14,6 @@
 //! CENTER_CROP_FRACTION_PLANAR is 1.0). `h_surface_to_viewport` is the
 //! row-major 3x3 mapping surface points to current-frame pixel coords.
 
-use rayon::prelude::*;
-
 use crate::homography::{invert, mat3_mul, project};
 
 /// One overlay payload to be drawn onto the camera frame.
@@ -192,6 +190,26 @@ impl Renderer for CpuRenderer {
     }
 }
 
+/// Where a per-frame composite is sent. The pipeline builds the
+/// [`CompositeInput`] once (under the frame + overlay locks) and hands it
+/// to the target, so the same `process_frame` path drives either a CPU
+/// buffer or a GPU surface without knowing which.
+pub trait ComposeTarget {
+    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError>;
+}
+
+/// CPU target: warps into a caller-owned RGBA slice (Android `Bitmap`
+/// pixels, the Linux QImage buffer). The default output.
+pub struct SliceTarget<'a> {
+    pub dst: &'a mut [u8],
+}
+
+impl ComposeTarget for SliceTarget<'_> {
+    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+        CpuRenderer.composite(input, self.dst)
+    }
+}
+
 /// Perspective-warp an item's bitmap onto the display buffer with
 /// bilinear sampling and source-over alpha compositing.
 ///
@@ -291,16 +309,11 @@ fn warp_item_onto_display(
     // guaranteed-transparent source region.
     let extents_active = !item.row_extents.is_empty() && item.row_extents.len() == src_h as usize;
 
-    // Each destination row in the projected AABB writes a disjoint slice
-    // of `dst`, so warp the band row-parallel on the active pool. The
-    // caller (`composite_into_slice`) installs a fixed-size pool; items
-    // are still composited sequentially so overlapping overlays blend in
-    // order.
     let dst_stride = (dst_w * 4) as usize;
     let band_start = y0 as usize * dst_stride;
     let band_end = y1 as usize * dst_stride;
     dst[band_start..band_end]
-        .par_chunks_mut(dst_stride)
+        .chunks_mut(dst_stride)
         .enumerate()
         .for_each(|(row_off, row)| {
             let y = y0 + row_off as u32;
