@@ -153,15 +153,21 @@ impl GlesRenderer {
     /// Render the composite into whatever framebuffer is currently bound;
     /// the caller owns FBO binding, viewport, and buffer swap. No
     /// readback — this is the production present path.
-    pub fn present(&mut self, input: &CompositeInput<'_>) {
-        self.draw(input);
+    ///
+    /// `display_xform` maps dst-pixel coords (top-left origin, y-down,
+    /// `dst_w`×`dst_h`) to clip space. The caller folds surface size +
+    /// display rotation + FILL_CENTER scale into it — the GL equivalent
+    /// of the old Canvas `drawMatrix`. For an unrotated surface-sized
+    /// blit it is just `ndc_from_viewport(surface_w, surface_h)` times the
+    /// dst→surface fit.
+    pub fn present(&mut self, input: &CompositeInput<'_>, display_xform: &[f32; 9]) {
+        self.draw(input, display_xform);
     }
 
-    fn draw(&self, input: &CompositeInput<'_>) {
+    fn draw(&self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
         let gl = &self.gl;
         let dst_w = input.dst_w as f32;
         let dst_h = input.dst_h as f32;
-        let ndc = ndc_from_viewport(dst_w, dst_h);
         unsafe {
             gl.use_program(Some(self.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
@@ -176,7 +182,7 @@ impl GlesRenderer {
             gl.disable(glow::BLEND);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
             upload_rgba(gl, input.camera_rgba, input.src_full_w, input.src_full_h);
-            let cam_transform = mat3_mul(&ndc, &scale(dst_w, dst_h));
+            let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
             let cam_uv = [
                 dst_w / input.src_full_w as f32,
                 0.0,
@@ -216,7 +222,7 @@ impl GlesRenderer {
                     &bitmap_to_viewport,
                     &scale(item.bitmap_width as f32, item.bitmap_height as f32),
                 );
-                let transform = mat3_mul(&ndc, &sized);
+                let transform = mat3_mul(dst_to_clip, &sized);
                 gl.uniform_matrix_3_f32_slice(
                     Some(&self.u_transform),
                     false,
@@ -282,10 +288,17 @@ impl GlesRenderer {
     }
 }
 
-impl Renderer for GlesRenderer {
-    fn composite(
+impl GlesRenderer {
+    /// Render into the owned FBO with an explicit dst→clip transform and
+    /// read the result back (row-flipped to top-down). [`composite`] is
+    /// the `ndc_from_viewport` special case; exposed so the display-xform
+    /// path `present` uses can be exercised under readback in tests.
+    ///
+    /// [`composite`]: Renderer::composite
+    pub fn render_to_buffer(
         &mut self,
         input: &CompositeInput<'_>,
+        dst_to_clip: &[f32; 9],
         out: &mut [u8],
     ) -> Result<(), CompositeError> {
         validate_sizes(input, out)?;
@@ -298,7 +311,7 @@ impl Renderer for GlesRenderer {
             gl.viewport(0, 0, w as i32, h as i32);
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
-            self.draw(input);
+            self.draw(input, dst_to_clip);
             self.gl.read_pixels(
                 0,
                 0,
@@ -318,6 +331,17 @@ impl Renderer for GlesRenderer {
             out[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
         }
         Ok(())
+    }
+}
+
+impl Renderer for GlesRenderer {
+    fn composite(
+        &mut self,
+        input: &CompositeInput<'_>,
+        out: &mut [u8],
+    ) -> Result<(), CompositeError> {
+        let ndc = ndc_from_viewport(input.dst_w as f32, input.dst_h as f32);
+        self.render_to_buffer(input, &ndc, out)
     }
 }
 
@@ -341,14 +365,16 @@ impl Drop for GlesRenderer {
 /// GPU production target: presents into the framebuffer the caller bound
 /// (window surface / scene-graph FBO). No readback — the display consumes
 /// the result directly. `process_frame` must be called on the thread that
-/// owns the GL context.
+/// owns the GL context. `display_xform` is the dst→clip transform (see
+/// [`GlesRenderer::present`]).
 pub struct PresentTarget<'a> {
     pub renderer: &'a mut GlesRenderer,
+    pub display_xform: [f32; 9],
 }
 
 impl ComposeTarget for PresentTarget<'_> {
     fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
-        self.renderer.present(input);
+        self.renderer.present(input, &self.display_xform);
         Ok(())
     }
 }
