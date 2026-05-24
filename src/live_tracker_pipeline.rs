@@ -38,7 +38,7 @@ use crate::color_matting::MattedStrip;
 use crate::coords::Quadrant;
 use crate::font_provider::FontProvider;
 use crate::homography;
-use crate::live_compositor::{self, CompositeError, OverlayItem};
+use crate::live_compositor::{self, CompositeError, OverlayItem, Renderer};
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
     LiveSession, PostDetectInput, h_view_to_surface_from, viewport_surface_aabb,
@@ -731,20 +731,21 @@ impl LiveTrackerPipeline {
         let h_translated = homography::mat3_mul(&translate, &h_for_call);
         let overlay_count = items_vec.len() as u32;
         let camera = state.rgba_bytes();
+        let input = live_compositor::CompositeInput {
+            dst_w: bitmap_w,
+            dst_h: bitmap_h,
+            camera_rgba: camera,
+            src_full_w: sensor_w,
+            src_full_h: sensor_h,
+            src_offset_x,
+            src_offset_y,
+            h_surface_to_viewport: &h_translated,
+            items: &items_vec,
+        };
         self.composite_pool
             .install(|| {
-                live_compositor::composite_frame_into_cropped(
-                    dst,
-                    bitmap_w,
-                    bitmap_h,
-                    camera,
-                    sensor_w,
-                    sensor_h,
-                    src_offset_x,
-                    src_offset_y,
-                    &h_translated,
-                    &items_vec,
-                )
+                let mut renderer = live_compositor::CpuRenderer;
+                renderer.composite(&input, dst)
             })
             .map(|()| overlay_count)
     }

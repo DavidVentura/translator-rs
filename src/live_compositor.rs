@@ -137,6 +137,61 @@ pub fn composite_frame_into_cropped(
     Ok(())
 }
 
+/// Per-frame inputs to a [`Renderer::composite`] call, bundled into one
+/// borrowed struct so the trait stays object-safe and the backend
+/// retains no per-frame state: the large camera buffer and the overlay
+/// items are handed in by reference each frame, never held across calls.
+/// Mirrors the argument list of [`composite_frame_into_cropped`].
+pub struct CompositeInput<'a> {
+    pub dst_w: u32,
+    pub dst_h: u32,
+    pub camera_rgba: &'a [u8],
+    pub src_full_w: u32,
+    pub src_full_h: u32,
+    pub src_offset_x: u32,
+    pub src_offset_y: u32,
+    pub h_surface_to_viewport: &'a [f32; 9],
+    pub items: &'a [OverlayItem<'a>],
+}
+
+/// The composite backend the live pipeline drives once per frame. Exists
+/// to make the camera+overlay warp swappable: the CPU bilinear warp is
+/// the reference backend ([`CpuRenderer`]), and a GLES backend can be
+/// dropped in behind the same call site. `&mut self` because GPU
+/// backends own mutable state (GL context, cached textures).
+pub trait Renderer {
+    fn composite(
+        &mut self,
+        input: &CompositeInput<'_>,
+        out: &mut [u8],
+    ) -> Result<(), CompositeError>;
+}
+
+/// Reference backend: the bilinear CPU warp + source-over blend. New
+/// backends are pinned against this for output equivalence.
+pub struct CpuRenderer;
+
+impl Renderer for CpuRenderer {
+    fn composite(
+        &mut self,
+        input: &CompositeInput<'_>,
+        out: &mut [u8],
+    ) -> Result<(), CompositeError> {
+        composite_frame_into_cropped(
+            out,
+            input.dst_w,
+            input.dst_h,
+            input.camera_rgba,
+            input.src_full_w,
+            input.src_full_h,
+            input.src_offset_x,
+            input.src_offset_y,
+            input.h_surface_to_viewport,
+            input.items,
+        )
+    }
+}
+
 /// Perspective-warp an item's bitmap onto the display buffer with
 /// bilinear sampling and source-over alpha compositing.
 ///
@@ -430,6 +485,61 @@ mod tests {
     }
 
     const IDENTITY_H: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+    /// The `Renderer` seam must be a pure pass-through to the existing
+    /// cropped warp under a non-trivial H: same inputs, byte-identical
+    /// output. Pins the Phase-1 refactor against accidental divergence
+    /// and is the equivalence baseline future backends are held to.
+    #[test]
+    fn cpu_renderer_matches_direct_cropped_composite() {
+        let (full_w, full_h) = (16u32, 16u32);
+        let cam = solid_rgba(full_w, full_h, 30, 60, 90);
+        let overlay = solid_rgba(5, 5, 220, 10, 10);
+        let item = OverlayItem {
+            bitmap_rgba: &overlay,
+            bitmap_width: 5,
+            bitmap_height: 5,
+            bitmap_origin_surface_x: 2.0,
+            bitmap_origin_surface_y: 3.0,
+            row_extents: &[],
+        };
+        let h = [1.03, -0.02, 1.0, 0.01, 0.98, -0.5, 5.0e-4, -3.0e-4, 1.0];
+        let (dst_w, dst_h) = (10u32, 12u32);
+        let off_x = (full_w - dst_w) / 2;
+        let off_y = (full_h - dst_h) / 2;
+
+        let mut expected = vec![0u8; (dst_w * dst_h * 4) as usize];
+        composite_frame_into_cropped(
+            &mut expected,
+            dst_w,
+            dst_h,
+            &cam,
+            full_w,
+            full_h,
+            off_x,
+            off_y,
+            &h,
+            std::slice::from_ref(&item),
+        )
+        .unwrap();
+
+        let input = CompositeInput {
+            dst_w,
+            dst_h,
+            camera_rgba: &cam,
+            src_full_w: full_w,
+            src_full_h: full_h,
+            src_offset_x: off_x,
+            src_offset_y: off_y,
+            h_surface_to_viewport: &h,
+            items: std::slice::from_ref(&item),
+        };
+        let mut got = vec![0u8; (dst_w * dst_h * 4) as usize];
+        let mut renderer = CpuRenderer;
+        renderer.composite(&input, &mut got).unwrap();
+
+        assert_eq!(got, expected);
+    }
 
     /// Verify the row-incremental projective sampling matches a
     /// straightforward per-pixel reference under a non-identity H.
