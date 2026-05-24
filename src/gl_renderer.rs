@@ -91,6 +91,15 @@ pub struct GlesRenderer {
     quad_vbo: glow::Buffer,
     camera_tex: glow::Texture,
     overlay_tex: glow::Texture,
+    /// Allocated size of each texture, so a same-size frame updates in
+    /// place with `glTexSubImage2D` instead of reallocating storage.
+    camera_size: Option<(u32, u32)>,
+    overlay_size: Option<(u32, u32)>,
+    /// Identity (data ptr + len) of the last overlay uploaded. The
+    /// overlay bitmap only changes when the OCR worker rebuilds the
+    /// canvas (new `Vec`, new ptr); unchanged between refreshes, so we
+    /// skip the per-frame re-upload while it matches.
+    overlay_id: Option<(usize, usize)>,
     fbo: Option<glow::Framebuffer>,
     fbo_tex: Option<glow::Texture>,
     fbo_size: Option<(u32, u32)>,
@@ -143,6 +152,9 @@ impl GlesRenderer {
                 quad_vbo,
                 camera_tex,
                 overlay_tex,
+                camera_size: None,
+                overlay_size: None,
+                overlay_id: None,
                 fbo: None,
                 fbo_tex: None,
                 fbo_size: None,
@@ -164,24 +176,37 @@ impl GlesRenderer {
         self.draw(input, display_xform);
     }
 
-    fn draw(&self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
-        let gl = &self.gl;
+    fn draw(&mut self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
         let dst_w = input.dst_w as f32;
         let dst_h = input.dst_h as f32;
         unsafe {
+            let gl = &self.gl;
+            // Fast-clear so tiled GPUs skip loading the previous
+            // framebuffer; the opaque camera quad then covers it.
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
             gl.use_program(Some(self.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
             gl.enable_vertex_attrib_array(self.a_pos);
             gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.active_texture(glow::TEXTURE0);
             gl.uniform_1_i32(Some(&self.u_tex), 0);
-
-            // Camera passthrough: opaque base layer. Upload the full sensor
-            // frame and sample the cropped sub-rect via the uv transform, so
-            // the GPU never needs a strided sub-image upload (absent in GLES2).
             gl.disable(glow::BLEND);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
-            upload_rgba(gl, input.camera_rgba, input.src_full_w, input.src_full_h);
+        }
+
+        // Camera passthrough: opaque base layer. Upload the full sensor
+        // frame and sample the cropped sub-rect via the uv transform, so
+        // the GPU never needs a strided sub-image upload (absent in GLES2).
+        upload_tex(
+            &self.gl,
+            self.camera_tex,
+            &mut self.camera_size,
+            input.camera_rgba,
+            input.src_full_w,
+            input.src_full_h,
+        );
+        unsafe {
+            let gl = &self.gl;
             let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
             let cam_uv = [
                 dst_w / input.src_full_w as f32,
@@ -213,8 +238,23 @@ impl GlesRenderer {
                 {
                     continue;
                 }
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.overlay_tex));
-                upload_rgba(gl, item.bitmap_rgba, item.bitmap_width, item.bitmap_height);
+                // Skip the upload while the overlay bitmap is unchanged
+                // (same `Vec` ptr+len) — it only changes when the OCR
+                // worker rebuilds the canvas on acquire/refresh.
+                let id = (item.bitmap_rgba.as_ptr() as usize, item.bitmap_rgba.len());
+                if self.overlay_id == Some(id) {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(self.overlay_tex));
+                } else {
+                    upload_tex(
+                        &self.gl,
+                        self.overlay_tex,
+                        &mut self.overlay_size,
+                        item.bitmap_rgba,
+                        item.bitmap_width,
+                        item.bitmap_height,
+                    );
+                    self.overlay_id = Some(id);
+                }
                 let to_surface =
                     translate(item.bitmap_origin_surface_x, item.bitmap_origin_surface_y);
                 let bitmap_to_viewport = mat3_mul(input.h_surface_to_viewport, &to_surface);
@@ -309,9 +349,11 @@ impl GlesRenderer {
             let gl = &self.gl;
             gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
             gl.viewport(0, 0, w as i32, h as i32);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            self.draw(input, dst_to_clip);
+        }
+        // `draw` clears + renders; it needs `&mut self`, so it can't run
+        // inside the `&self.gl` borrow above.
+        self.draw(input, dst_to_clip);
+        unsafe {
             self.gl.read_pixels(
                 0,
                 0,
@@ -448,19 +490,45 @@ fn new_texture(gl: &glow::Context) -> Result<glow::Texture, GlError> {
     }
 }
 
-fn upload_rgba(gl: &glow::Context, data: &[u8], w: u32, h: u32) {
+/// Bind `tex` and upload `data`. Reuses the existing GL storage with
+/// `glTexSubImage2D` when the size is unchanged (the common per-frame
+/// case), only reallocating via `glTexImage2D` when the size differs.
+fn upload_tex(
+    gl: &glow::Context,
+    tex: glow::Texture,
+    cached_size: &mut Option<(u32, u32)>,
+    data: &[u8],
+    w: u32,
+    h: u32,
+) {
     unsafe {
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RGBA as i32,
-            w as i32,
-            h as i32,
-            0,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(data)),
-        );
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        if *cached_size == Some((w, h)) {
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(data)),
+            );
+        } else {
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(data)),
+            );
+            *cached_size = Some((w, h));
+        }
     }
 }
 
