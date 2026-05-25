@@ -28,6 +28,11 @@ name = "surface_sim"
 path = "src/bin/surface_sim.rs"
 required-features = ["surface-sim"]
 
+[[bin]]
+name = "viz_pipeline"
+path = "src/bin/viz_pipeline.rs"
+required-features = ["viz"]
+
 [features]
 default = []
 translate-cli = ["dep:toml"]
@@ -60,6 +65,7 @@ ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon"
 planar-tracker = ["dep:image", "dep:imageproc", "image-render", "dep:rayon"]
 gpu = ["dep:glow", "planar-tracker"]
 surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
+viz = ["ppocr", "doc-align", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }

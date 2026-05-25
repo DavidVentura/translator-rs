@@ -291,7 +291,6 @@ impl Drop for Worker {
 struct TrackerRequest {
     gray: image::GrayImage,
     det_to_full: f32,
-    imu_stable: bool,
     timestamp_ns: u64,
 }
 
@@ -336,12 +335,7 @@ impl TrackerCompute {
                     let Some(pipeline) = pipeline_weak.upgrade() else {
                         return;
                     };
-                    let result = pipeline.run_engine(
-                        &req.gray,
-                        req.det_to_full,
-                        req.imu_stable,
-                        req.timestamp_ns,
-                    );
+                    let result = pipeline.run_engine(&req.gray, req.det_to_full, req.timestamp_ns);
                     // Drop the upgraded Arc before blocking on the next
                     // `recv`, so a concurrent pipeline drop isn't deadlocked
                     // behind this thread holding the last reference.
@@ -383,8 +377,16 @@ impl TrackerCompute {
 struct TimingStats {
     window_count: u32,
     total_ms_sum: f64,
+    /// CPU crop+downscale+RGBA→luma for the tracker gray
+    /// (`prepare_tracker_gray`). Measured *outside* `tracker_ms_sum` (it
+    /// runs before the engine step), so it's logged as a sibling of
+    /// `tracker`/`composite` — this is the full-res CPU pass that Deferred B
+    /// (zero-copy GPU camera) would move onto the GPU, so it's the number
+    /// that justifies or kills that change.
+    gray_build_ms_sum: f64,
     tracker_ms_sum: f64,
     tracker_pyramid_ms_sum: f64,
+    tracker_klt_extras_ms_sum: f64,
     tracker_features_ms_sum: f64,
     tracker_track_ms_sum: f64,
     tracker_chain_refine_ms_sum: f64,
@@ -398,8 +400,10 @@ impl Default for TimingStats {
         Self {
             window_count: 0,
             total_ms_sum: 0.0,
+            gray_build_ms_sum: 0.0,
             tracker_ms_sum: 0.0,
             tracker_pyramid_ms_sum: 0.0,
+            tracker_klt_extras_ms_sum: 0.0,
             tracker_features_ms_sum: 0.0,
             tracker_track_ms_sum: 0.0,
             tracker_chain_refine_ms_sum: 0.0,
@@ -547,7 +551,6 @@ impl LiveTrackerPipeline {
         visible_sensor_h: u32,
         full_view_w: u32,
         full_view_h: u32,
-        imu_stable: bool,
         timestamp_ns: u64,
     ) -> Result<ProcessFrameResult, TranslatorError> {
         let cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
@@ -571,7 +574,9 @@ impl LiveTrackerPipeline {
         // drop the lock so the heavy engine step can run lock-free. This is
         // what lets the camera upload (which also reads the frame's RGBA)
         // proceed concurrently with the tracker on this thread.
+        let t_gray = Instant::now();
         let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
+        let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
 
         // Overlap the H-independent camera upload with the tracker: hand the
         // engine step to the long-lived compute thread, run `upload_camera`
@@ -587,7 +592,6 @@ impl LiveTrackerPipeline {
             tc.submit(TrackerRequest {
                 gray: tracker_gray,
                 det_to_full,
-                imu_stable,
                 timestamp_ns,
             });
             let upload_result = self.upload_camera_to_target(frame, target);
@@ -669,8 +673,10 @@ impl LiveTrackerPipeline {
         if let Ok(mut t) = self.timing.lock() {
             t.window_count += 1;
             t.total_ms_sum += total_ms;
+            t.gray_build_ms_sum += gray_build_ms;
             t.tracker_ms_sum += tracker_ms;
             t.tracker_pyramid_ms_sum += step_timings.pyramid_ms;
+            t.tracker_klt_extras_ms_sum += step_timings.klt_extras_ms;
             t.tracker_features_ms_sum += step_timings.features_ms;
             t.tracker_track_ms_sum += step_timings.track_ms;
             t.tracker_chain_refine_ms_sum += step_timings.chain_refine_ms;
@@ -681,12 +687,14 @@ impl LiveTrackerPipeline {
                 let wall_s = t.window_start.elapsed().as_secs_f64();
                 let fps = if wall_s > 1e-6 { n / wall_s } else { 0.0 };
                 log::info!(
-                    "[lt] {} frames fps={:.1} total={:.1}ms tracker={:.1}ms (pyr={:.1} feat={:.1} match={:.1} chain={:.1}) composite={:.1}ms (overlays={:.1})",
+                    "[lt] {} frames fps={:.1} total={:.1}ms gray={:.1}ms tracker={:.1}ms (pyr={:.1} kltx={:.1} feat={:.1} match={:.1} chain={:.1}) composite={:.1}ms (overlays={:.1})",
                     t.window_count,
                     fps,
                     t.total_ms_sum / n,
+                    t.gray_build_ms_sum / n,
                     t.tracker_ms_sum / n,
                     t.tracker_pyramid_ms_sum / n,
+                    t.tracker_klt_extras_ms_sum / n,
                     t.tracker_features_ms_sum / n,
                     t.tracker_track_ms_sum / n,
                     t.tracker_chain_refine_ms_sum / n,
@@ -752,7 +760,6 @@ impl LiveTrackerPipeline {
         &self,
         gray: &image::GrayImage,
         det_to_full: f32,
-        imu_stable: bool,
         timestamp_ns: u64,
     ) -> Result<
         (
@@ -765,7 +772,7 @@ impl LiveTrackerPipeline {
         TranslatorError,
     > {
         let mut engine = self.engine.lock().map_err(|_| poisoned())?;
-        let cmd = engine.process_frame(gray, imu_stable, timestamp_ns);
+        let cmd = engine.process_frame(gray, timestamp_ns);
         let step_timings = engine.last_step_timings();
         drop(engine);
         let (state_kind, anchor_id, h, inliers) = match cmd {
@@ -1679,7 +1686,6 @@ mod tests {
                         h,
                         w,
                         h,
-                        true,
                         (i + 1) * 1_000_000,
                     )
                     .expect("process_frame ok");

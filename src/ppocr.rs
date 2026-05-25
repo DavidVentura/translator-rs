@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use image::{DynamicImage, GenericImageView, GrayImage, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, GrayImage, Rgb, RgbImage, imageops::FilterType};
 use imageproc::contours::find_contours;
 use imageproc::point::Point;
 use rayon::ThreadPool;
@@ -404,6 +404,15 @@ impl PpocrEngine {
             })
             .collect();
         Ok(out)
+    }
+
+    /// Run the detector and return its raw probability map resampled to the
+    /// original image resolution: `0` = no text, `255` = highest text
+    /// probability. Unlike `detect_only_image`, this exposes the
+    /// pre-threshold heatmap (no thresholding or box extraction), for
+    /// visualization and debugging.
+    pub fn detect_heatmap(&self, image: &DynamicImage) -> Result<GrayImage, TranslatorError> {
+        self.detector.probability_map(image)
     }
 
     pub fn classify_text_boxes_image(
@@ -1140,6 +1149,49 @@ impl PpocrDetector {
             post_ms,
         );
         Ok(boxes)
+    }
+
+    fn probability_map(&self, image: &DynamicImage) -> Result<GrayImage, TranslatorError> {
+        let (orig_w, orig_h) = image.dimensions();
+        let scaled = resize_to_max_side(image, DET_MAX_SIDE);
+        let (scaled_w, scaled_h) = scaled.dimensions();
+        let pad_w = pad_to_multiple(scaled_w, 32);
+        let pad_h = pad_to_multiple(scaled_h, 32);
+        let tensor_buf = preprocess_for_det(&scaled, pad_w, pad_h);
+        let (mask, out_shape) = self
+            .session
+            .run(&tensor_buf, &[1, 3, pad_h as usize, pad_w as usize])?;
+        if out_shape.len() < 4 {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                format!("ppocr det output shape unexpected: {:?}", out_shape),
+            ));
+        }
+        let out_h = out_shape[out_shape.len() - 2] as u32;
+        let out_w = out_shape[out_shape.len() - 1] as u32;
+        // The content sits at the top-left of the padded canvas and the model
+        // keeps that padding in its output, so crop back to the content region
+        // before resampling to the caller's original resolution.
+        let content_w =
+            (((out_w as f32) * (scaled_w as f32) / (pad_w as f32)).round() as u32).clamp(1, out_w);
+        let content_h =
+            (((out_h as f32) * (scaled_h as f32) / (pad_h as f32)).round() as u32).clamp(1, out_h);
+        let mut buf = vec![0u8; (content_w * content_h) as usize];
+        for y in 0..content_h {
+            for x in 0..content_w {
+                let v = mask[(y * out_w + x) as usize].clamp(0.0, 1.0);
+                buf[(y * content_w + x) as usize] = (v * 255.0).round() as u8;
+            }
+        }
+        let content = GrayImage::from_raw(content_w, content_h, buf).ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                "failed to build heatmap image",
+            )
+        })?;
+        Ok(DynamicImage::ImageLuma8(content)
+            .resize_exact(orig_w, orig_h, FilterType::Triangle)
+            .to_luma8())
     }
 }
 
@@ -1983,11 +2035,31 @@ pub fn contour_principal_axis_angle(contour: &[(f32, f32)]) -> Option<f32> {
     Some(uy.atan2(ux))
 }
 
-pub fn dewarp_contour_to_strip(
-    gray: &GrayImage,
+struct ContourStripWarp {
+    width: u32,
+    height: u32,
+    mean_x: f32,
+    mean_y: f32,
+    ux: f32,
+    uy: f32,
+    vx: f32,
+    vy: f32,
+    u_center: f32,
+    u_half_span: f32,
+    padded_u_min: f32,
+    padded_u_span: f32,
+    top_fit: (f32, f32, f32),
+    bot_fit: (f32, f32, f32),
+    global_thickness: f32,
+}
+
+/// PCA principal axis + per-edge quadratic fit for `contour`, plus the output
+/// strip dimensions. Factored out so the gray (recognizer) and rgb (viz) dewarps
+/// share identical geometry and differ only in how they sample source pixels.
+fn contour_strip_warp(
     contour: &[(f32, f32)],
     canonical_quadrant: Option<crate::coords::Quadrant>,
-) -> Option<GrayImage> {
+) -> Option<ContourStripWarp> {
     if contour.len() < 8 {
         return None;
     }
@@ -2111,28 +2183,80 @@ pub fn dewarp_contour_to_strip(
     let strip_h = (global_thickness.round() as u32).clamp(8, 256);
     let strip_w = (padded_u_span.round() as u32).clamp(16, 4096);
 
-    // 5. Inverse warp: sample image along the curving spine, output to a rectangular strip.
-    let mut out_buf = vec![0u8; (strip_w * strip_h) as usize];
+    Some(ContourStripWarp {
+        width: strip_w,
+        height: strip_h,
+        mean_x,
+        mean_y,
+        ux,
+        uy,
+        vx,
+        vy,
+        u_center,
+        u_half_span,
+        padded_u_min,
+        padded_u_span,
+        top_fit,
+        bot_fit,
+        global_thickness,
+    })
+}
+
+/// Source `(x, y)` in the original image for output strip pixel `(sx, sy)`.
+fn strip_source_coord(w: &ContourStripWarp, sx: u32, sy: u32) -> (f32, f32) {
+    let u_local = w.padded_u_min + (sx as f32 + 0.5) * (w.padded_u_span / w.width as f32);
+    let un = (u_local - w.u_center) / w.u_half_span;
+    let t = eval_quadratic(w.top_fit, un);
+    let b = eval_quadratic(w.bot_fit, un);
+    let spine_v = (t + b) * 0.5;
+    let v_norm = (sy as f32 + 0.5) / w.height as f32 - 0.5;
+    let v_local = spine_v + v_norm * w.global_thickness;
+    (
+        w.mean_x + u_local * w.ux + v_local * w.vx,
+        w.mean_y + u_local * w.uy + v_local * w.vy,
+    )
+}
+
+/// Inverse-warp a tilted/curving text contour into a flat grayscale strip by
+/// sampling luma along the fitted spine. This is the recognizer's input.
+pub fn dewarp_contour_to_strip(
+    gray: &GrayImage,
+    contour: &[(f32, f32)],
+    canonical_quadrant: Option<crate::coords::Quadrant>,
+) -> Option<GrayImage> {
+    let warp = contour_strip_warp(contour, canonical_quadrant)?;
     let gray_w = gray.width() as f32;
     let gray_h = gray.height() as f32;
     let gray_raw = gray.as_raw();
     let stride = gray.width() as usize;
-    for x in 0..strip_w {
-        let u_local = padded_u_min + (x as f32 + 0.5) * (padded_u_span / strip_w as f32);
-        let un = (u_local - u_center) / u_half_span;
-        let t = eval_quadratic(top_fit, un);
-        let b = eval_quadratic(bot_fit, un);
-        let spine_v = (t + b) * 0.5;
-        for y in 0..strip_h {
-            let v_norm = (y as f32 + 0.5) / strip_h as f32 - 0.5;
-            let v_local = spine_v + v_norm * global_thickness;
-            let src_x = mean_x + u_local * ux + v_local * vx;
-            let src_y = mean_y + u_local * uy + v_local * vy;
-            let sample = bilinear_luma(gray_raw, stride, gray_w, gray_h, src_x, src_y);
-            out_buf[(y * strip_w + x) as usize] = sample;
+    let mut out_buf = vec![0u8; (warp.width * warp.height) as usize];
+    for x in 0..warp.width {
+        for y in 0..warp.height {
+            let (src_x, src_y) = strip_source_coord(&warp, x, y);
+            out_buf[(y * warp.width + x) as usize] =
+                bilinear_luma(gray_raw, stride, gray_w, gray_h, src_x, src_y);
         }
     }
-    GrayImage::from_raw(strip_w, strip_h, out_buf)
+    GrayImage::from_raw(warp.width, warp.height, out_buf)
+}
+
+/// Color counterpart of [`dewarp_contour_to_strip`]: identical geometry, but
+/// samples the RGB image so the strip keeps its original colors. Not used by the
+/// recognizer (which works on luma) — exposed for visualization/debugging.
+pub fn dewarp_contour_to_strip_rgb(
+    rgb: &RgbImage,
+    contour: &[(f32, f32)],
+    canonical_quadrant: Option<crate::coords::Quadrant>,
+) -> Option<RgbImage> {
+    let warp = contour_strip_warp(contour, canonical_quadrant)?;
+    let mut out = RgbImage::new(warp.width, warp.height);
+    for x in 0..warp.width {
+        for y in 0..warp.height {
+            let (src_x, src_y) = strip_source_coord(&warp, x, y);
+            out.put_pixel(x, y, bilinear_rgb(rgb, src_x, src_y));
+        }
+    }
+    Some(out)
 }
 
 fn fit_quadratic(points: &[(f32, f32)]) -> Option<(f32, f32, f32)> {
@@ -2215,6 +2339,31 @@ fn bilinear_luma(raw: &[u8], stride: usize, w: f32, h: f32, x: f32, y: f32) -> u
     let top = v00 + (v10 - v00) * dx;
     let bot = v01 + (v11 - v01) * dx;
     (top + (bot - top) * dy).clamp(0.0, 255.0) as u8
+}
+
+fn bilinear_rgb(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    if x < 0.0 || y < 0.0 || x > w - 1.0 || y > h - 1.0 {
+        return Rgb([0, 0, 0]);
+    }
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let x1 = (x0 + 1.0).min(w - 1.0);
+    let y1 = (y0 + 1.0).min(h - 1.0);
+    let dx = x - x0;
+    let dy = y - y0;
+    let p00 = img.get_pixel(x0 as u32, y0 as u32).0;
+    let p10 = img.get_pixel(x1 as u32, y0 as u32).0;
+    let p01 = img.get_pixel(x0 as u32, y1 as u32).0;
+    let p11 = img.get_pixel(x1 as u32, y1 as u32).0;
+    let mut out = [0u8; 3];
+    for c in 0..3 {
+        let top = p00[c] as f32 + (p10[c] as f32 - p00[c] as f32) * dx;
+        let bot = p01[c] as f32 + (p11[c] as f32 - p01[c] as f32) * dx;
+        out[c] = (top + (bot - top) * dy).clamp(0.0, 255.0) as u8;
+    }
+    Rgb(out)
 }
 
 #[cfg(test)]

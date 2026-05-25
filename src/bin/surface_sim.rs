@@ -482,7 +482,7 @@ impl SimPipeline {
 
     fn step(&mut self, rgba: &RgbaImage, gray: &GrayImage) {
         let timestamp_ns = self.frame_idx * 33_333_333; // ~30 fps
-        let cmd = self.engine.process_frame(gray, true, timestamp_ns);
+        let cmd = self.engine.process_frame(gray, timestamp_ns);
         match cmd {
             TrackerCommand::Idle => {
                 self.last_cmd = TrackerCommandSummary::Idle;

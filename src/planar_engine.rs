@@ -62,8 +62,8 @@ pub struct OverlayProjection {
 /// What the engine wants Kotlin to do this frame.
 #[derive(Clone, Debug)]
 pub enum TrackerCommand {
-    /// No anchor; nothing to draw. Wait for `imu_stable && stable_required_ns`
-    /// to elapse, then call `acquire_now`.
+    /// No anchor; nothing to draw. Wait for `stable_required_ns` to
+    /// elapse, then call `acquire_now`.
     Idle,
     /// We're inside the stable-frame quiet window. Same render hint as
     /// `Idle` (no overlays to project yet); useful to display a
@@ -732,12 +732,7 @@ impl LivePlanarEngine {
     /// Process one camera frame. Decides whether to track against the
     /// current anchor, fall back to a cached anchor, declare loss, or
     /// stay idle waiting for an acquire.
-    pub fn process_frame(
-        &mut self,
-        gray: &GrayImage,
-        imu_stable: bool,
-        timestamp_ns: u64,
-    ) -> TrackerCommand {
+    pub fn process_frame(&mut self, gray: &GrayImage, timestamp_ns: u64) -> TrackerCommand {
         // Surface long gaps between calls — the engine being silent
         // for many frames usually means Kotlin paused the pipeline
         // (AF scan, surface lifecycle, etc.) and is the most likely
@@ -757,7 +752,7 @@ impl LivePlanarEngine {
         // every `par_iter` it reaches (detect/describe/match) fans out
         // over the tracker threads rather than the global rayon pool.
         let pool = Arc::clone(&self.tracker_pool);
-        let cmd = pool.install(|| self.process_frame_inner(gray, imu_stable, timestamp_ns, None));
+        let cmd = pool.install(|| self.process_frame_inner(gray, timestamp_ns, None));
         let kind = match &cmd {
             TrackerCommand::Idle => "Idle",
             TrackerCommand::Acquiring => "Acquiring",
@@ -778,11 +773,12 @@ impl LivePlanarEngine {
     fn process_frame_inner(
         &mut self,
         gray: &GrayImage,
-        imu_stable: bool,
         timestamp_ns: u64,
         prior: Option<[f32; 9]>,
     ) -> TrackerCommand {
-        self.tick_stable(imu_stable, timestamp_ns);
+        if self.stable_since_ns.is_none() {
+            self.stable_since_ns = Some(timestamp_ns);
+        }
         self.last_track_result = None;
         self.last_step_timings = StepTimings::default();
         match self.state.clone() {
@@ -2120,16 +2116,6 @@ impl LivePlanarEngine {
         );
         self.last_spawn_ns = timestamp_ns;
         Some(new_id)
-    }
-
-    fn tick_stable(&mut self, imu_stable: bool, timestamp_ns: u64) {
-        if imu_stable {
-            if self.stable_since_ns.is_none() {
-                self.stable_since_ns = Some(timestamp_ns);
-            }
-        } else {
-            self.stable_since_ns = None;
-        }
     }
 
     fn is_stable_enough(&self, now_ns: u64) -> bool {

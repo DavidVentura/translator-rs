@@ -159,7 +159,7 @@ fn run_case(
     let session = LiveSession::new();
 
     // One tick to leave Idle; we don't care about the command, then force-acquire.
-    let _ = engine.process_frame(&oriented.gray, true, 1_000_000);
+    let _ = engine.process_frame(&oriented.gray, 1_000_000);
 
     let rgb_det = oriented
         .rgb_det

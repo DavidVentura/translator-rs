@@ -177,7 +177,7 @@ fn video_frames_drive_live_overlay_pipeline() {
         let mut tracker_inliers: Option<usize> = None;
         let mut lost_anchor: Option<u64> = None;
         let t_track_start = std::time::Instant::now();
-        let cmd = engine.process_frame(&oriented.gray, true, timestamp_ns);
+        let cmd = engine.process_frame(&oriented.gray, timestamp_ns);
         let t_track = t_track_start.elapsed();
         t_track_sum += t_track;
         let last_fit = engine.last_track_result().cloned();

@@ -123,7 +123,7 @@ fn acquire_then_track_same_frame() {
 
     let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
     assert!(matches!(
-        engine.process_frame(&gray, true, 2_000_000),
+        engine.process_frame(&gray, 2_000_000),
         TrackerCommand::Locked {
             anchor_id, is_new: false, ..
         } if anchor_id == id
@@ -138,7 +138,7 @@ fn locked_through_known_translation() {
 
     let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
     let translated = warp_with_h(&gray, &[1.0, 0.0, 8.0, 0.0, 1.0, -4.0, 0.0, 0.0, 1.0]);
-    let cmd = engine.process_frame(&translated, true, 2_000_000);
+    let cmd = engine.process_frame(&translated, 2_000_000);
     match cmd {
         TrackerCommand::Locked {
             anchor_id,
@@ -163,7 +163,7 @@ fn lost_then_recovered_via_same_anchor() {
     let id = engine.acquire_now(&gray, 1_000_000).expect("acquire");
     // Three lost frames → Lost.
     for i in 0..test_engine_config().lost_after_frames {
-        let cmd = engine.process_frame(&other, false, 2_000_000 + i as u64 * 1_000_000);
+        let cmd = engine.process_frame(&other, 2_000_000 + i as u64 * 1_000_000);
         if i == test_engine_config().lost_after_frames - 1 {
             assert!(
                 matches!(cmd, TrackerCommand::Lost { last_anchor_id } if last_anchor_id == id),
@@ -174,7 +174,7 @@ fn lost_then_recovered_via_same_anchor() {
         }
     }
     // Re-show original frame → should re-lock via cached anchor.
-    let cmd = engine.process_frame(&gray, true, 10_000_000);
+    let cmd = engine.process_frame(&gray, 10_000_000);
     assert!(
         matches!(cmd, TrackerCommand::Locked { anchor_id, .. } if anchor_id == id),
         "expected re-lock onto cached anchor; got {:?}",
@@ -193,34 +193,12 @@ fn lost_to_idle_after_give_up() {
     let total = test_engine_config().lost_after_frames + test_engine_config().give_up_after_frames;
     let mut last_cmd = TrackerCommand::Idle;
     for i in 0..(total + 1) {
-        last_cmd = engine.process_frame(&other, false, 2_000_000 + i as u64 * 1_000_000);
+        last_cmd = engine.process_frame(&other, 2_000_000 + i as u64 * 1_000_000);
     }
     assert!(
         matches!(last_cmd, TrackerCommand::Idle),
         "expected Idle after give-up; got {:?}",
         last_cmd
-    );
-}
-
-#[test]
-fn idle_waits_for_imu_stability() {
-    let mut engine = LivePlanarEngine::new(test_engine_config());
-    let gray = load_gray("book.jpg", 480);
-
-    // Moving camera → Idle, never Acquiring.
-    let cmd = engine.process_frame(&gray, false, 1_000_000);
-    assert!(matches!(cmd, TrackerCommand::Idle));
-
-    // Stable but not long enough.
-    let cmd = engine.process_frame(&gray, true, 2_000_000);
-    assert!(matches!(cmd, TrackerCommand::Idle));
-
-    // Now stable long enough — engine reports Acquiring.
-    let cmd = engine.process_frame(&gray, true, 200_000_000);
-    assert!(
-        matches!(cmd, TrackerCommand::Acquiring),
-        "expected Acquiring, got {:?}",
-        cmd
     );
 }
 
@@ -244,7 +222,7 @@ fn lru_page_flip_returns_same_anchor() {
 
     // Flip back to scene A. Process_frame should match the cached A
     // anchor and report Locked with id_a.
-    let cmd = engine.process_frame(&scene_a, true, 3_000_000);
+    let cmd = engine.process_frame(&scene_a, 3_000_000);
     match cmd {
         TrackerCommand::Locked {
             anchor_id, is_new, ..
@@ -350,10 +328,10 @@ fn force_acquire_during_lost_state() {
 
     engine.acquire_now(&gray, 1_000_000).expect("acquire 1");
     for i in 0..30 {
-        engine.process_frame(&other, false, 2_000_000 + i * 1_000_000);
+        engine.process_frame(&other, 2_000_000 + i * 1_000_000);
     }
     let new_id = engine.acquire_now(&gray, 1_000_000_000).expect("acquire 2");
-    let cmd = engine.process_frame(&gray, true, 1_001_000_000);
+    let cmd = engine.process_frame(&gray, 1_001_000_000);
     assert!(
         matches!(cmd, TrackerCommand::Locked { anchor_id, .. } if anchor_id == new_id),
         "expected new lock, got {:?}",
@@ -437,7 +415,7 @@ fn bitmap_pipeline_round_trip_under_translation() {
 
     let known = [1.0, 0.0, 11.0, 0.0, 1.0, -7.0, 0.0, 0.0, 1.0];
     let warped = warp_with_h(&gray, &known);
-    let cmd = engine.process_frame(&warped, true, 2_000);
+    let cmd = engine.process_frame(&warped, 2_000);
     let recovered = match cmd {
         TrackerCommand::Locked { homography, .. } => homography,
         other => panic!("expected Locked, got {:?}", other),
@@ -535,7 +513,7 @@ fn anchor_chain_persists_overlays_across_handoffs() {
     let mut t_ns = 2_000_000_u64;
     for (i, h_known) in translations.iter().enumerate() {
         let warped = warp_with_h(&gray, h_known);
-        let cmd = engine.process_frame(&warped, true, t_ns);
+        let cmd = engine.process_frame(&warped, t_ns);
         let (anchor_id, homography) = match cmd {
             TrackerCommand::Locked {
                 anchor_id,
@@ -584,7 +562,7 @@ fn anchor_chain_persists_overlays_across_handoffs() {
     // Now pan all the way back to the original frame. The engine
     // should re-lock on the root anchor (potentially via fallback
     // through cached anchors). No re-acquire.
-    let cmd = engine.process_frame(&gray, true, t_ns + 100_000_000);
+    let cmd = engine.process_frame(&gray, t_ns + 100_000_000);
     match cmd {
         TrackerCommand::Locked {
             anchor_id,
@@ -628,7 +606,7 @@ fn handoff_children_inherit_root_quadrant() {
     let mut t_ns = 2_000_000_u64;
     for h_known in translations {
         let warped = warp_with_h(&gray, &h_known);
-        let cmd = engine.process_frame(&warped, true, t_ns);
+        let cmd = engine.process_frame(&warped, t_ns);
         match cmd {
             TrackerCommand::Locked {
                 anchor_id,
@@ -665,7 +643,7 @@ fn acquire_with_orientation_stores_quadrant_on_root() {
     let id = engine
         .acquire_now_with_orientation(&gray, &[], 0, 1_000_000, Some(Quadrant::R270))
         .expect("acquire with orientation");
-    let cmd = engine.process_frame(&gray, true, 2_000_000);
+    let cmd = engine.process_frame(&gray, 2_000_000);
     match cmd {
         TrackerCommand::Locked {
             anchor_id,
@@ -690,7 +668,7 @@ fn no_estimator_consensus_falls_back_to_default() {
     let id = engine
         .acquire_now_with_orientation(&gray, &[], 0, 1_000_000, None)
         .expect("acquire without consensus");
-    let cmd = engine.process_frame(&gray, true, 2_000_000);
+    let cmd = engine.process_frame(&gray, 2_000_000);
     match cmd {
         TrackerCommand::Locked {
             anchor_id,
@@ -718,7 +696,7 @@ fn no_consensus_falls_back_to_previous_known() {
     let second = engine
         .acquire_now_with_orientation(&gray, &[], 0, 2_000_000, None)
         .expect("second acquire");
-    let cmd = engine.process_frame(&gray, true, 3_000_000);
+    let cmd = engine.process_frame(&gray, 3_000_000);
     match cmd {
         TrackerCommand::Locked {
             anchor_id,
@@ -757,8 +735,8 @@ fn h_ekf_first_frame_after_acquire_is_passthrough() {
     ekf_engine
         .acquire_now(&gray, 1_000_000)
         .expect("ekf acquire");
-    let baseline_cmd = baseline.process_frame(&translated, true, 2_000_000);
-    let ekf_cmd = ekf_engine.process_frame(&translated, true, 2_000_000);
+    let baseline_cmd = baseline.process_frame(&translated, 2_000_000);
+    let ekf_cmd = ekf_engine.process_frame(&translated, 2_000_000);
     let baseline_h = match baseline_cmd {
         TrackerCommand::Locked { homography, .. } => homography,
         other => panic!("baseline expected Locked, got {:?}", other),
@@ -811,7 +789,7 @@ fn h_ekf_steady_state_tracks_constant_h() {
 
     let mut worst_after_warmup = 0.0_f32;
     for frame in 1..=20 {
-        let cmd = engine.process_frame(&warped, true, (1 + frame) * 1_000_000);
+        let cmd = engine.process_frame(&warped, (1 + frame) * 1_000_000);
         let h = match cmd {
             TrackerCommand::Locked { homography, .. } => homography,
             other => panic!("frame {} expected Locked, got {:?}", frame, other),
@@ -853,14 +831,14 @@ fn h_ekf_resets_on_anchor_change() {
 
     let root_a = engine.acquire_now(&gray, 1_000_000).expect("acquire A");
     for frame in 1..=6 {
-        let _ = engine.process_frame(&translated, true, (1 + frame) * 1_000_000);
+        let _ = engine.process_frame(&translated, (1 + frame) * 1_000_000);
     }
     // Force a fresh acquire — anchor changes.
     let root_b = engine.acquire_now(&gray, 50_000_000).expect("acquire B");
     assert_ne!(root_a, root_b, "force-acquire must produce a new anchor id");
     // First frame on new anchor: EKF must re-init, not blend with
     // anchor A's filter state.
-    let cmd_a = engine.process_frame(&translated, true, 60_000_000);
+    let cmd_a = engine.process_frame(&translated, 60_000_000);
     let h_a = match cmd_a {
         TrackerCommand::Locked {
             homography,
@@ -882,10 +860,10 @@ fn h_ekf_resets_on_anchor_change() {
     let mut baseline = LivePlanarEngine::new(baseline_cfg);
     baseline.acquire_now(&gray, 1_000_000).expect("baseline A");
     for frame in 1..=6 {
-        let _ = baseline.process_frame(&translated, true, (1 + frame) * 1_000_000);
+        let _ = baseline.process_frame(&translated, (1 + frame) * 1_000_000);
     }
     baseline.acquire_now(&gray, 50_000_000).expect("baseline B");
-    let cmd_b = baseline.process_frame(&translated, true, 60_000_000);
+    let cmd_b = baseline.process_frame(&translated, 60_000_000);
     let h_b = match cmd_b {
         TrackerCommand::Locked { homography, .. } => homography,
         other => panic!("baseline expected Locked, got {:?}", other),
