@@ -2048,8 +2048,7 @@ struct ContourStripWarp {
     u_half_span: f32,
     padded_u_min: f32,
     padded_u_span: f32,
-    top_fit: (f32, f32, f32),
-    bot_fit: (f32, f32, f32),
+    spine_fit: (f32, f32, f32),
     global_thickness: f32,
 }
 
@@ -2146,38 +2145,39 @@ fn contour_strip_warp(
         return None;
     }
 
-    // 3. Split contour by top/bottom half, fit quadratics. u normalized to [-1, 1] for
-    //    numerical stability before fitting.
+    // 3. Fit one quadratic spine through all contour points. u normalized to
+    //    [-1, 1] for numerical stability before fitting. Splitting the contour
+    //    into a top edge (v <= 0) and bottom edge (v >= 0) by each point's offset
+    //    from the centroid only works while the line is flatter than it is thick:
+    //    once it bows by more than ~half the text thickness, the bowed ends of
+    //    both edges cross the centroid, so each edge-set is polluted by the
+    //    other's points and both fits flatten toward the chord — averaging them
+    //    recovers only a fraction of the real curvature. A single least-squares
+    //    quadratic over every point is the centerline directly: the two edges sit
+    //    symmetrically at ±thickness/2, so those offsets cancel and the spine
+    //    tracks the full bow no matter how sharply the line curves.
     let u_half_span = u_span * 0.5;
     let u_center = (u_min + u_max) * 0.5;
     let normalized: Vec<(f32, f32, f32)> = projected
         .iter()
         .map(|&(u, v)| ((u - u_center) / u_half_span, u, v))
         .collect();
-    let top_pts: Vec<(f32, f32)> = normalized
-        .iter()
-        .filter(|&&(_, _, v)| v <= 0.0)
-        .map(|&(un, _, v)| (un, v))
-        .collect();
-    let bot_pts: Vec<(f32, f32)> = normalized
-        .iter()
-        .filter(|&&(_, _, v)| v >= 0.0)
-        .map(|&(un, _, v)| (un, v))
-        .collect();
-    let top_fit = fit_quadratic(&top_pts)?;
-    let bot_fit = fit_quadratic(&bot_pts)?;
+    let all_pts: Vec<(f32, f32)> = normalized.iter().map(|&(un, _, v)| (un, v)).collect();
+    let spine_fit = fit_quadratic(&all_pts)?;
 
-    // 4. Mean thickness for strip height; 2.4x inflation to give margin above ascenders /
-    //    below descenders (PP-OCR was trained with whitespace padding around text).
-    let n_samples = 32usize;
-    let mut total_thickness = 0.0f32;
-    for i in 0..n_samples {
-        let un = -1.0 + 2.0 * (i as f32 / (n_samples - 1) as f32);
-        total_thickness += eval_quadratic(bot_fit, un) - eval_quadratic(top_fit, un);
-    }
-    let mean_thickness = (total_thickness / n_samples as f32).max(1.0);
-    let global_thickness = mean_thickness * 2.4;
-    let u_pad = mean_thickness;
+    // 4. Text-band thickness from the spread of points about the spine. A robust
+    //    5th–95th-percentile band ignores stray contour points and the odd
+    //    ascender/descender; 2.4x inflation gives the whitespace margin PP-OCR was
+    //    trained with around the glyphs.
+    let mut residuals: Vec<f32> = normalized
+        .iter()
+        .map(|&(un, _, v)| v - eval_quadratic(spine_fit, un))
+        .collect();
+    residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let percentile = |p: f32| residuals[(((residuals.len() - 1) as f32) * p).round() as usize];
+    let band_thickness = (percentile(0.95) - percentile(0.05)).max(1.0);
+    let global_thickness = band_thickness * 2.4;
+    let u_pad = band_thickness;
     let padded_u_min = u_min - u_pad;
     let padded_u_span = u_span + 2.0 * u_pad;
     let strip_h = (global_thickness.round() as u32).clamp(8, 256);
@@ -2196,8 +2196,7 @@ fn contour_strip_warp(
         u_half_span,
         padded_u_min,
         padded_u_span,
-        top_fit,
-        bot_fit,
+        spine_fit,
         global_thickness,
     })
 }
@@ -2206,9 +2205,7 @@ fn contour_strip_warp(
 fn strip_source_coord(w: &ContourStripWarp, sx: u32, sy: u32) -> (f32, f32) {
     let u_local = w.padded_u_min + (sx as f32 + 0.5) * (w.padded_u_span / w.width as f32);
     let un = (u_local - w.u_center) / w.u_half_span;
-    let t = eval_quadratic(w.top_fit, un);
-    let b = eval_quadratic(w.bot_fit, un);
-    let spine_v = (t + b) * 0.5;
+    let spine_v = eval_quadratic(w.spine_fit, un);
     let v_norm = (sy as f32 + 0.5) / w.height as f32 - 0.5;
     let v_local = spine_v + v_norm * w.global_thickness;
     (
@@ -2368,7 +2365,30 @@ fn bilinear_rgb(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::oriented_boxes_from_contour;
+    use super::{contour_strip_warp, eval_quadratic, oriented_boxes_from_contour};
+
+    /// Closed-polygon contour of a curved text band: a centerline that bows by
+    /// `bow` pixels (parabolic, minimum at the centre) across width `w`, with a
+    /// constant `thickness` between the top and bottom edges. Mimics what
+    /// `find_contours` returns for a strongly arced line on a bottle/page.
+    fn curved_band(w: f32, thickness: f32, bow: f32) -> Vec<(f32, f32)> {
+        let center = |x: f32| {
+            let n = (x - w * 0.5) / (w * 0.5);
+            bow * n * n
+        };
+        let half = thickness * 0.5;
+        let mut out = Vec::new();
+        let n = w.round() as i32;
+        for i in 0..=n {
+            let x = i as f32;
+            out.push((x, center(x) - half));
+        }
+        for i in (0..=n).rev() {
+            let x = i as f32;
+            out.push((x, center(x) + half));
+        }
+        out
+    }
 
     /// Build a closed polygon contour by sampling each edge at 1-pixel steps. Mimics what
     /// `imageproc::contours::find_contours` returns for a mask of the given outline shape.
@@ -2506,5 +2526,35 @@ mod tests {
             "expected near-horizontal angle for word with one descender, got {:.2}°",
             angle_deg,
         );
+    }
+
+    #[test]
+    fn dewarp_spine_recovers_full_bow_of_strongly_curved_line() {
+        // A 200 px-wide band bowing by 40 px — four times its 10 px thickness. The
+        // old top/bottom-edge split breaks down well before this: the bowed ends of
+        // both edges cross the centroid, each fit is polluted by the other edge, and
+        // the averaged spine recovers only ~half the bow. The single all-points fit
+        // must land on the true curvature.
+        let (w, thickness, bow) = (200.0f32, 10.0f32, 40.0f32);
+        let contour = curved_band(w, thickness, bow);
+        let warp = contour_strip_warp(&contour, None).expect("warp");
+
+        // The spine is v = a·un² + b·un + c over un ∈ [-1, 1]; `a` is the bow
+        // amplitude in pixels. un maps linearly onto the band width, so it should
+        // recover `bow`, not the old half-corrected ~20.
+        let recovered = eval_quadratic(warp.spine_fit, 1.0) - eval_quadratic(warp.spine_fit, 0.0);
+        assert!(
+            (recovered - bow).abs() < 4.0,
+            "expected spine to recover full {bow} px bow, got {recovered:.1} px",
+        );
+    }
+
+    #[test]
+    fn dewarp_spine_stays_flat_for_straight_line() {
+        // A straight band must not invent curvature.
+        let contour = curved_band(200.0, 10.0, 0.0);
+        let warp = contour_strip_warp(&contour, None).expect("warp");
+        let bow = eval_quadratic(warp.spine_fit, 1.0) - eval_quadratic(warp.spine_fit, 0.0);
+        assert!(bow.abs() < 1.0, "expected flat spine, got {bow:.2} px bow");
     }
 }
