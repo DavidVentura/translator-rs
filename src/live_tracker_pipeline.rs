@@ -1582,3 +1582,119 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
         score: b.score,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{CatalogSnapshot, CatalogSourcesV2, LanguageCatalog};
+    use crate::font_provider::{FontHandle, FontProvider, FontRequest};
+    use crate::live_compositor::SliceTarget;
+    use crate::live_frame::LiveFrame;
+    use crate::ocr::Rect;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    struct NoFonts;
+    impl FontProvider for NoFonts {
+        fn locate(&self, _request: &FontRequest) -> Vec<FontHandle> {
+            Vec::new()
+        }
+    }
+
+    /// Minimal catalog-less session. The per-frame tracker path never reads
+    /// the catalog (only async acquire/refresh do), and the test runs in
+    /// `Suppressed` mode which dispatches neither, so an empty snapshot is
+    /// enough to stand the pipeline up.
+    fn empty_session() -> Arc<TranslatorSession> {
+        let catalog = LanguageCatalog {
+            format_version: 0,
+            generated_at: 0,
+            dictionary_version: 0,
+            sources: CatalogSourcesV2 {
+                language_index_version: 0,
+                language_index_updated_at: 0,
+                dictionary_index_version: 0,
+                dictionary_index_updated_at: 0,
+            },
+            languages: HashMap::new(),
+            packs: HashMap::new(),
+            translation_pack_ids: HashMap::new(),
+            dictionary_pack_ids_by_code: HashMap::new(),
+            root_pack_ids_by_language_feature: HashMap::new(),
+        };
+        Arc::new(TranslatorSession::from_snapshot(CatalogSnapshot {
+            catalog,
+            base_dir: String::new(),
+            pack_statuses: HashMap::new(),
+            availability_by_code: HashMap::new(),
+        }))
+    }
+
+    /// Drives a few frames through the real pipeline and then drops it, all
+    /// on a worker thread, while the test thread enforces a deadline. This
+    /// guards the concurrency contract introduced by the persistent compute
+    /// thread:
+    ///   * the submit→engine→`wait` rendezvous must round-trip every frame
+    ///     (a broken handoff hangs `wait`);
+    ///   * dropping the pipeline must let the compute thread exit (a botched
+    ///     `Weak`/channel lifecycle hangs the drop).
+    /// Either failure manifests as the deadline elapsing — a deterministic
+    /// `panic`, not a silently hung suite. `Suppressed` mode keeps the
+    /// engine cleared each frame, so the result is a deterministic `Idle`
+    /// with a full-frame camera-only composite and no async dispatch.
+    #[test]
+    fn process_frame_rendezvous_and_clean_shutdown() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let pipeline = LiveTrackerPipeline::new(empty_session(), Arc::new(NoFonts));
+            pipeline.set_target_mode(TargetMode::Suppressed);
+
+            let (w, h) = (128u32, 96u32);
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            // A mild gradient so the CV path has non-degenerate input.
+            for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                let v = (i % 251) as u8;
+                px.copy_from_slice(&[v, v, v, 255]);
+            }
+            let frame = Arc::new(LiveFrame::new((w * h * 4) as usize));
+            let crop = Rect {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let mut dst = vec![0u8; (w * h * 4) as usize];
+
+            for i in 0..3u64 {
+                frame.reset_owned(rgba.clone(), w, h, 0);
+                let mut target = SliceTarget { dst: &mut dst };
+                let r = pipeline
+                    .process_frame(
+                        &frame,
+                        crop,
+                        &mut target,
+                        w,
+                        h,
+                        w,
+                        h,
+                        w,
+                        h,
+                        true,
+                        (i + 1) * 1_000_000,
+                    )
+                    .expect("process_frame ok");
+                assert_eq!(r.state, PlanarTrackerState::Idle);
+                assert_eq!(r.composite_bytes, w * h * 4);
+                assert!(!r.started_acquire && !r.started_refresh);
+            }
+            // Implicitly shuts down the compute thread via channel close.
+            drop(pipeline);
+            done_tx.send(()).expect("done channel send");
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => worker.join().expect("worker thread panicked"),
+            Err(_) => panic!("pipeline rendezvous/shutdown did not finish in 15s (deadlock?)"),
+        }
+    }
+}
