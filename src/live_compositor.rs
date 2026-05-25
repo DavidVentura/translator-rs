@@ -190,12 +190,33 @@ impl Renderer for CpuRenderer {
     }
 }
 
-/// Where a per-frame composite is sent. The pipeline builds the
-/// [`CompositeInput`] once (under the frame + overlay locks) and hands it
-/// to the target, so the same `process_frame` path drives either a CPU
-/// buffer or a GPU surface without knowing which.
+/// The H-independent camera payload for [`ComposeTarget::upload_camera`].
+/// Carved out of [`CompositeInput`] so the camera frame can be handed to a
+/// GPU target (and uploaded to a texture) before the homography is known,
+/// letting the upload overlap the tracker on another thread.
+pub struct CameraFrame<'a> {
+    pub camera_rgba: &'a [u8],
+    pub src_full_w: u32,
+    pub src_full_h: u32,
+}
+
+/// Where a per-frame composite is sent. The pipeline drives the same
+/// `process_frame` path for either a CPU buffer or a GPU surface without
+/// knowing which.
+///
+/// The frame is delivered in two phases so the H-independent camera upload
+/// can run concurrently with the tracker (which produces the homography):
+///   * [`upload_camera`](ComposeTarget::upload_camera) — push the camera
+///     frame. On GPU targets this is the CPU→GPU texture upload; on CPU
+///     targets it's a no-op (the camera copy is folded into `draw`). It has
+///     no dependency on H, so the pipeline runs it on the render thread
+///     while the tracker computes H on another thread.
+///   * [`draw`](ComposeTarget::draw) — composite + present using the
+///     homography (`input.h_surface_to_viewport`) and the overlay items. On
+///     GPU targets this assumes `upload_camera` already ran for this frame.
 pub trait ComposeTarget {
-    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError>;
+    fn upload_camera(&mut self, camera: &CameraFrame<'_>) -> Result<(), CompositeError>;
+    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError>;
 }
 
 /// CPU target: warps into a caller-owned RGBA slice (Android `Bitmap`
@@ -205,7 +226,13 @@ pub struct SliceTarget<'a> {
 }
 
 impl ComposeTarget for SliceTarget<'_> {
-    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+    /// No-op: the CPU warp reads the camera straight from `CompositeInput`
+    /// in `draw`, so there's nothing to pre-upload.
+    fn upload_camera(&mut self, _camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
+        Ok(())
+    }
+
+    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
         CpuRenderer.composite(input, self.dst)
     }
 }

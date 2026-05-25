@@ -38,7 +38,7 @@ use crate::color_matting::MattedStrip;
 use crate::coords::Quadrant;
 use crate::font_provider::FontProvider;
 use crate::homography;
-use crate::live_compositor::{self, ComposeTarget, CompositeError, OverlayItem};
+use crate::live_compositor::{self, CameraFrame, ComposeTarget, CompositeError, OverlayItem};
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
     LiveSession, PostDetectInput, h_view_to_surface_from, viewport_surface_aabb,
@@ -285,6 +285,93 @@ impl Drop for Worker {
     }
 }
 
+/// One per-frame engine job handed to the [`TrackerCompute`] thread. Owns
+/// the cloned tracker gray so the caller can run the camera upload (which
+/// reads the same frame's RGBA) concurrently without sharing the buffer.
+struct TrackerRequest {
+    gray: image::GrayImage,
+    det_to_full: f32,
+    imu_stable: bool,
+    timestamp_ns: u64,
+}
+
+/// What [`LiveTrackerPipeline::run_engine`] produces: tracker state, anchor,
+/// inliers, the (full-coord) homography, and the engine sub-step timings.
+type TrackerComputeResult = Result<
+    (
+        PlanarTrackerState,
+        u64,
+        u32,
+        Option<[f32; 9]>,
+        crate::planar_engine::StepTimings,
+    ),
+    TranslatorError,
+>;
+
+/// Long-lived thread that runs the (lock-free) engine step, so the camera
+/// upload can overlap it without spawning a fresh OS thread every frame.
+/// One frame is in flight at a time — `process_frame` is synchronous, so
+/// `submit` then `wait` form a rendezvous: the engine runs on this thread
+/// while the caller uploads the camera, then the caller blocks for the
+/// result.
+///
+/// Shutdown is implicit: the channel ends live on the pipeline, so when the
+/// pipeline is dropped `req_rx.recv()` returns `Err` and the thread exits.
+/// The worker holds only a `Weak` ref, upgraded per frame and dropped before
+/// it blocks on `recv`, so it never keeps the pipeline alive.
+struct TrackerCompute {
+    req_tx: std::sync::mpsc::Sender<TrackerRequest>,
+    resp_rx: std::sync::mpsc::Receiver<TrackerComputeResult>,
+}
+
+impl TrackerCompute {
+    fn spawn(pipeline: Arc<LiveTrackerPipeline>) -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<TrackerRequest>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<TrackerComputeResult>();
+        let pipeline_weak = Arc::downgrade(&pipeline);
+        std::thread::Builder::new()
+            .name("LiveTrackerCompute".into())
+            .spawn(move || {
+                while let Ok(req) = req_rx.recv() {
+                    let Some(pipeline) = pipeline_weak.upgrade() else {
+                        return;
+                    };
+                    let result = pipeline.run_engine(
+                        &req.gray,
+                        req.det_to_full,
+                        req.imu_stable,
+                        req.timestamp_ns,
+                    );
+                    // Drop the upgraded Arc before blocking on the next
+                    // `recv`, so a concurrent pipeline drop isn't deadlocked
+                    // behind this thread holding the last reference.
+                    drop(pipeline);
+                    if resp_tx.send(result).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("failed to spawn LiveTrackerCompute");
+        TrackerCompute { req_tx, resp_rx }
+    }
+
+    /// Hand the engine job to the compute thread. Returns immediately; the
+    /// engine runs on the compute thread while the caller does other work.
+    fn submit(&self, req: TrackerRequest) {
+        self.req_tx
+            .send(req)
+            .expect("tracker compute thread died before submit");
+    }
+
+    /// Block for the result of the most recently [`submit`](Self::submit)ted
+    /// job.
+    fn wait(&self) -> TrackerComputeResult {
+        self.resp_rx
+            .recv()
+            .expect("tracker compute thread died before result")
+    }
+}
+
 /// Rolling per-frame timing for `process_frame`. Reset every
 /// `TIMING_WINDOW_FRAMES` calls; emits one log line per window so the
 /// caller can spot regressions or pauses without per-frame chatter.
@@ -340,6 +427,10 @@ pub struct LiveTrackerPipeline {
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
     worker: Mutex<Option<Worker>>,
+    /// Long-lived engine-step thread. `Option` because, like `worker`, it's
+    /// spawned after the `Arc<Self>` exists. Driven only by `process_frame`,
+    /// so the outer mutex is uncontended.
+    tracker_compute: Mutex<Option<TrackerCompute>>,
     timing: Mutex<TimingStats>,
 }
 
@@ -365,10 +456,16 @@ impl LiveTrackerPipeline {
             font_provider,
             last_telemetry: Mutex::new(None),
             worker: Mutex::new(None),
+            tracker_compute: Mutex::new(None),
             timing: Mutex::new(TimingStats::default()),
         });
         let worker = Worker::spawn(Arc::clone(&pipeline));
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
+        let tracker_compute = TrackerCompute::spawn(Arc::clone(&pipeline));
+        *pipeline
+            .tracker_compute
+            .lock()
+            .expect("tracker compute slot poisoned") = Some(tracker_compute);
         pipeline
     }
 
@@ -469,9 +566,38 @@ impl LiveTrackerPipeline {
         }
 
         let t_frame = Instant::now();
+
+        // Build the small downscaled tracker gray under the frame lock, then
+        // drop the lock so the heavy engine step can run lock-free. This is
+        // what lets the camera upload (which also reads the frame's RGBA)
+        // proceed concurrently with the tracker on this thread.
+        let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
+
+        // Overlap the H-independent camera upload with the tracker: hand the
+        // engine step to the long-lived compute thread, run `upload_camera`
+        // on this (render/GL) thread, then block for the engine result. On
+        // the CPU target `upload_camera` is a no-op, so the upload simply
+        // returns immediately and we wait out the engine.
         let t_tracker = Instant::now();
+        let (tracker_outcome, upload_result) = {
+            let tc_guard = self.tracker_compute.lock().map_err(|_| poisoned())?;
+            let tc = tc_guard
+                .as_ref()
+                .expect("tracker compute thread not spawned");
+            tc.submit(TrackerRequest {
+                gray: tracker_gray,
+                det_to_full,
+                imu_stable,
+                timestamp_ns,
+            });
+            let upload_result = self.upload_camera_to_target(frame, target);
+            (tc.wait(), upload_result)
+        };
         let (tracker_state, tracker_anchor, tracker_inliers, tracker_h, step_timings) =
-            self.step_tracker(frame, cfg.det_max_pixels, imu_stable, timestamp_ns)?;
+            tracker_outcome?;
+        if let Err(e) = upload_result {
+            log::warn!("camera upload failed: {e:?}");
+        }
         let tracker_ms = t_tracker.elapsed().as_secs_f64() * 1000.0;
         let frame_state_dims = {
             let state = frame.state().lock().map_err(|_| poisoned())?;
@@ -583,10 +709,49 @@ impl LiveTrackerPipeline {
 
     // ---- internal helpers ----
 
-    fn step_tracker(
+    /// Build (or reuse) the downscaled tracker gray and clone it out, so the
+    /// caller can drop the `frame.state` lock before the heavy engine step.
+    /// The clone is small (~300 KB) — far cheaper than holding the frame
+    /// mutex across `engine.process_frame` (which would serialize the
+    /// concurrent camera upload against the tracker).
+    fn prepare_tracker_gray(
         &self,
         frame: &Arc<LiveFrame>,
         det_max_pixels: u32,
+    ) -> Result<(image::GrayImage, f32), TranslatorError> {
+        let mut state = frame.state().lock().map_err(|_| poisoned())?;
+        state.ensure_tracker_oriented(det_max_pixels)?;
+        let oriented = state
+            .cached_tracker
+            .as_ref()
+            .expect("ensure_tracker filled cache");
+        Ok((oriented.gray.clone(), oriented.det_to_full_scale))
+    }
+
+    /// Read the frame's RGBA and hand it to the target's H-independent
+    /// camera upload. Holds only the frame lock (not the engine lock), so it
+    /// runs concurrently with [`run_engine`](Self::run_engine).
+    fn upload_camera_to_target(
+        &self,
+        frame: &Arc<LiveFrame>,
+        target: &mut dyn ComposeTarget,
+    ) -> Result<(), CompositeError> {
+        let state = frame.state().lock().expect("frame mutex poisoned");
+        let camera = CameraFrame {
+            camera_rgba: state.rgba_bytes(),
+            src_full_w: state.width,
+            src_full_h: state.height,
+        };
+        target.upload_camera(&camera)
+    }
+
+    /// Run the engine on the pre-built gray. Takes only the engine lock, so
+    /// it can run on a scoped thread while the camera upload proceeds on the
+    /// render thread.
+    fn run_engine(
+        &self,
+        gray: &image::GrayImage,
+        det_to_full: f32,
         imu_stable: bool,
         timestamp_ns: u64,
     ) -> Result<
@@ -599,18 +764,10 @@ impl LiveTrackerPipeline {
         ),
         TranslatorError,
     > {
-        let mut state = frame.state().lock().map_err(|_| poisoned())?;
-        state.ensure_tracker_oriented(det_max_pixels)?;
-        let oriented = state
-            .cached_tracker
-            .as_ref()
-            .expect("ensure_tracker filled cache");
-        let det_to_full = oriented.det_to_full_scale;
         let mut engine = self.engine.lock().map_err(|_| poisoned())?;
-        let cmd = engine.process_frame(&oriented.gray, imu_stable, timestamp_ns);
+        let cmd = engine.process_frame(gray, imu_stable, timestamp_ns);
         let step_timings = engine.last_step_timings();
         drop(engine);
-        drop(state);
         let (state_kind, anchor_id, h, inliers) = match cmd {
             TrackerCommand::Idle => (PlanarTrackerState::Idle, 0u64, None, 0u32),
             TrackerCommand::Acquiring => (PlanarTrackerState::Acquiring, 0, None, 0),
@@ -732,7 +889,7 @@ impl LiveTrackerPipeline {
             h_surface_to_viewport: &h_translated,
             items: &items_vec,
         };
-        target.compose(&input).map(|()| overlay_count)
+        target.draw(&input).map(|()| overlay_count)
     }
 
     fn update_refresh_trigger(

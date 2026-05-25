@@ -23,7 +23,9 @@
 use glow::HasContext;
 
 use crate::homography::mat3_mul;
-use crate::live_compositor::{ComposeTarget, CompositeError, CompositeInput, Renderer};
+use crate::live_compositor::{
+    CameraFrame, ComposeTarget, CompositeError, CompositeInput, Renderer,
+};
 
 #[derive(Debug)]
 pub enum GlError {
@@ -162,9 +164,27 @@ impl GlesRenderer {
         }
     }
 
+    /// Upload the camera frame into the camera texture. Split out of
+    /// [`draw`](Self::draw) so the pipeline can run this ~3 ms CPU→GPU copy
+    /// concurrently with the (H-independent) tracker; `draw`/`present` then
+    /// sample the already-resident texture. Reuses GL storage in place via
+    /// `glTexSubImage2D` when the frame size is unchanged.
+    pub fn upload_camera_tex(&mut self, camera: &CameraFrame<'_>) {
+        upload_tex(
+            &self.gl,
+            self.camera_tex,
+            &mut self.camera_size,
+            camera.camera_rgba,
+            camera.src_full_w,
+            camera.src_full_h,
+        );
+    }
+
     /// Render the composite into whatever framebuffer is currently bound;
     /// the caller owns FBO binding, viewport, and buffer swap. No
-    /// readback — this is the production present path.
+    /// readback — this is the production present path. Assumes the camera
+    /// frame was already uploaded via [`upload_camera_tex`](Self::upload_camera_tex)
+    /// for this frame.
     ///
     /// `display_xform` maps dst-pixel coords (top-left origin, y-down,
     /// `dst_w`×`dst_h`) to clip space. The caller folds surface size +
@@ -176,6 +196,10 @@ impl GlesRenderer {
         self.draw(input, display_xform);
     }
 
+    /// Composite the (already-uploaded) camera texture + overlays into the
+    /// bound framebuffer. The camera upload is the caller's responsibility
+    /// (via [`upload_camera_tex`](Self::upload_camera_tex)); overlay uploads
+    /// stay here because they depend on the per-anchor overlay items.
     fn draw(&mut self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
         let dst_w = input.dst_w as f32;
         let dst_h = input.dst_h as f32;
@@ -194,19 +218,13 @@ impl GlesRenderer {
             gl.disable(glow::BLEND);
         }
 
-        // Camera passthrough: opaque base layer. Upload the full sensor
-        // frame and sample the cropped sub-rect via the uv transform, so
+        // Camera passthrough: opaque base layer. The full sensor frame was
+        // uploaded ahead of `draw` (overlapping the tracker); here we just
+        // bind it and sample the cropped sub-rect via the uv transform, so
         // the GPU never needs a strided sub-image upload (absent in GLES2).
-        upload_tex(
-            &self.gl,
-            self.camera_tex,
-            &mut self.camera_size,
-            input.camera_rgba,
-            input.src_full_w,
-            input.src_full_h,
-        );
         unsafe {
             let gl = &self.gl;
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
             let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
             let cam_uv = [
                 dst_w / input.src_full_w as f32,
@@ -341,6 +359,24 @@ impl GlesRenderer {
         dst_to_clip: &[f32; 9],
         out: &mut [u8],
     ) -> Result<(), CompositeError> {
+        self.upload_camera_tex(&CameraFrame {
+            camera_rgba: input.camera_rgba,
+            src_full_w: input.src_full_w,
+            src_full_h: input.src_full_h,
+        });
+        self.render_to_buffer_prepared(input, dst_to_clip, out)
+    }
+
+    /// [`render_to_buffer`](Self::render_to_buffer) without the camera
+    /// upload — assumes the camera texture is already resident. The
+    /// readback counterpart of [`present`](Self::present) for the split
+    /// (upload-then-draw) target path.
+    fn render_to_buffer_prepared(
+        &mut self,
+        input: &CompositeInput<'_>,
+        dst_to_clip: &[f32; 9],
+        out: &mut [u8],
+    ) -> Result<(), CompositeError> {
         validate_sizes(input, out)?;
         self.ensure_fbo(input.dst_w, input.dst_h);
         let (w, h) = (input.dst_w, input.dst_h);
@@ -415,7 +451,12 @@ pub struct PresentTarget<'a> {
 }
 
 impl ComposeTarget for PresentTarget<'_> {
-    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+    fn upload_camera(&mut self, camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
+        self.renderer.upload_camera_tex(camera);
+        Ok(())
+    }
+
+    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
         self.renderer.present(input, &self.display_xform);
         Ok(())
     }
@@ -431,8 +472,15 @@ pub struct ReadbackTarget<'a> {
 }
 
 impl ComposeTarget for ReadbackTarget<'_> {
-    fn compose(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
-        self.renderer.composite(input, self.dst)
+    fn upload_camera(&mut self, camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
+        self.renderer.upload_camera_tex(camera);
+        Ok(())
+    }
+
+    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+        let ndc = ndc_from_viewport(input.dst_w as f32, input.dst_h as f32);
+        self.renderer
+            .render_to_buffer_prepared(input, &ndc, self.dst)
     }
 }
 
