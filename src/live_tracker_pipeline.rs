@@ -124,6 +124,13 @@ pub struct ProcessFrameResult {
     pub state: PlanarTrackerState,
     pub anchor_id: u64,
     pub inliers: u32,
+    /// Approximate linear magnification of the tracked plane relative
+    /// to the chain root's acquire frame (`approx_scale` of the emitted
+    /// root→view homography). `1.0` at acquire, grows as the camera
+    /// nears the plane. `0.0` when not Locked. The camera layer turns
+    /// this into a focus-distance estimate so it can drive
+    /// `LENS_FOCUS_DISTANCE` without running autofocus.
+    pub scale: f32,
     /// Number of bytes the compositor wrote into the destination
     /// slice. `0` means no composite happened (display dims zero,
     /// frame buffer empty, etc.).
@@ -602,6 +609,9 @@ impl LiveTrackerPipeline {
         if let Err(e) = upload_result {
             log::warn!("camera upload failed: {e:?}");
         }
+        let tracker_scale = tracker_h
+            .map(|h| (h[0] * h[4] - h[1] * h[3]).abs().sqrt())
+            .unwrap_or(0.0);
         let tracker_ms = t_tracker.elapsed().as_secs_f64() * 1000.0;
         let frame_state_dims = {
             let state = frame.state().lock().map_err(|_| poisoned())?;
@@ -709,6 +719,7 @@ impl LiveTrackerPipeline {
             state: tracker_state,
             anchor_id: tracker_anchor,
             inliers: tracker_inliers,
+            scale: tracker_scale,
             composite_bytes,
             started_acquire,
             started_refresh,
