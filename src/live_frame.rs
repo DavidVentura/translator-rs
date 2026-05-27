@@ -457,6 +457,11 @@ pub struct LiveFrameState {
     /// separate so the OCR path can downscale aggressively for detect
     /// while the tracker keeps every feature.
     pub(crate) cached_tracker: Option<OrientedImage>,
+    /// Set when the frame carries a pre-oriented gray buffer (GPU readback)
+    /// and no RGBA: the per-frame tracker consumes `cached_tracker` directly,
+    /// and acquire/refresh must be fed a separate RGBA frame via the pipeline's
+    /// rgb-request seam rather than reading this frame's (empty) `rgba`.
+    pub(crate) gray_only: bool,
 }
 
 impl LiveFrameState {
@@ -593,6 +598,7 @@ impl LiveFrame {
                 rotation_degrees: 0,
                 cached: None,
                 cached_tracker: None,
+                gray_only: false,
             }),
         }
     }
@@ -625,6 +631,45 @@ impl LiveFrame {
         state.rotation_degrees = rotation_degrees;
         state.cached = None;
         state.cached_tracker = None;
+        state.gray_only = false;
+    }
+
+    /// Whether this frame is gray-only (GPU readback, no RGBA). The pipeline
+    /// uses this to decide between dispatching acquire from this frame's RGBA
+    /// (normal) and returning an rgb-request for the caller to satisfy.
+    pub fn is_gray_only(&self) -> bool {
+        self.state.lock().expect("frame mutex poisoned").gray_only
+    }
+
+    /// Install a pre-oriented gray buffer straight from a GPU luma readback as
+    /// the tracker's input. `gray` is `width*height` bytes, already upright; the
+    /// frame carries no RGBA, so an acquire/refresh is fed a separate RGBA frame
+    /// via [`LiveTrackerPipeline::provide_acquire_rgb`].
+    pub fn reset_gray(&self, gray: Vec<u8>, width: u32, height: u32) {
+        let crop = Rect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let gray_img = image::GrayImage::from_raw(width, height, gray)
+            .expect("gray buffer length must equal width*height");
+        let mut state = self.state.lock().expect("frame mutex poisoned");
+        state.rgba = Vec::new();
+        state.external_rgba = None;
+        state.width = width;
+        state.height = height;
+        state.rotation_degrees = 0;
+        state.cached = None;
+        state.cached_tracker = Some(OrientedImage {
+            gray: gray_img,
+            display_crop: crop,
+            sensor_crop: crop,
+            rgb: None,
+            rgb_det: None,
+            det_to_full_scale: 1.0,
+        });
+        state.gray_only = true;
     }
 
     /// Memcpy `len` bytes from `src` into the owned RGBA buffer and

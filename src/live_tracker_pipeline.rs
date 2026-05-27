@@ -68,7 +68,7 @@ pub enum TargetMode {
     Suppressed,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct PipelineConfig {
     from_lang: String,
     to_lang: String,
@@ -139,6 +139,32 @@ pub struct ProcessFrameResult {
     pub started_acquire: bool,
     /// `true` when this call spawned an async refresh pipeline job.
     pub started_refresh: bool,
+    /// Set on a gray-only frame when the tracker wants to acquire/refresh but
+    /// the per-frame frame carries no RGBA. The caller reads back a full-res
+    /// RGBA frame and hands both back via
+    /// [`LiveTrackerPipeline::provide_acquire_rgb`]; nothing was dispatched.
+    pub rgb_request: Option<AcquireRequest>,
+}
+
+/// Which heavy pipeline a deferred RGB request will run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncKind {
+    Acquire,
+    Refresh,
+}
+
+/// Opaque token returned by `process_frame` on a gray-only frame when an
+/// acquire/refresh is due. The caller supplies the matching RGBA frame to
+/// [`LiveTrackerPipeline::provide_acquire_rgb`]; carries the per-frame context
+/// (crop, config, timestamp, generation) so the dispatch matches what the
+/// tracker decided.
+#[derive(Debug, Clone)]
+pub struct AcquireRequest {
+    kind: AsyncKind,
+    display_crop: Rect,
+    config: PipelineConfig,
+    timestamp_ns: u64,
+    generation: u64,
 }
 
 /// Per-anchor record of the last emitted homography. Used so the
@@ -652,22 +678,47 @@ impl LiveTrackerPipeline {
                 full_view_h,
             );
 
-        // Mode decision: Acquiring → maybe spawn acquire. Locked +
-        // should_refresh → maybe spawn refresh. Both gated by worker
-        // backpressure (only one in-flight at a time).
-        let (started_acquire, started_refresh) =
-            if matches!(cfg.target_mode, TargetMode::Suppressed) {
-                (false, false)
-            } else {
-                self.maybe_dispatch_async(
+        // Mode decision: Acquiring → acquire, Locked+should_refresh → refresh.
+        let async_kind = if matches!(cfg.target_mode, TargetMode::Suppressed) {
+            None
+        } else {
+            match tracker_state {
+                PlanarTrackerState::Acquiring => Some(AsyncKind::Acquire),
+                PlanarTrackerState::Locked if should_refresh => Some(AsyncKind::Refresh),
+                _ => None,
+            }
+        };
+
+        // A gray-only frame (GPU readback) carries no RGBA, so the heavy
+        // det/rec can't run from it. Instead of dispatching, hand the caller an
+        // `rgb_request`; it reads back a full-res RGBA frame and feeds it to
+        // `provide_acquire_rgb`. Frames that carry RGBA (Android) dispatch
+        // inline as before. Both gated by worker backpressure.
+        let (started_acquire, started_refresh, rgb_request) = match async_kind {
+            None => (false, false, None),
+            Some(kind) if frame.is_gray_only() => (
+                false,
+                false,
+                Some(AcquireRequest {
+                    kind,
+                    display_crop,
+                    config: cfg.clone(),
+                    timestamp_ns,
+                    generation: self.generation.load(Ordering::SeqCst),
+                }),
+            ),
+            Some(kind) => {
+                let (a, r) = self.dispatch_async(
                     frame,
+                    kind,
                     display_crop,
                     &cfg,
                     timestamp_ns,
-                    tracker_state,
-                    should_refresh,
-                )
-            };
+                    self.generation.load(Ordering::SeqCst),
+                );
+                (a, r, None)
+            }
+        };
 
         // Materialize bytes if any async work was dispatched, else
         // drop the borrow. Cheap (~3 ms memcpy at 1.2 MP) and avoided
@@ -727,6 +778,7 @@ impl LiveTrackerPipeline {
             composite_bytes,
             started_acquire,
             started_refresh,
+            rgb_request,
         })
     }
 
@@ -979,42 +1031,59 @@ impl LiveTrackerPipeline {
         }
     }
 
-    fn maybe_dispatch_async(
+    /// Dispatch the heavy acquire/refresh job for `kind` against `frame` (which
+    /// must carry RGBA — either an Android per-frame frame or the RGBA frame the
+    /// caller supplied via [`provide_acquire_rgb`]). Returns
+    /// `(started_acquire, started_refresh)`; gated by worker backpressure.
+    fn dispatch_async(
         &self,
         frame: &Arc<LiveFrame>,
+        kind: AsyncKind,
         display_crop: Rect,
         cfg: &PipelineConfig,
         timestamp_ns: u64,
-        state: PlanarTrackerState,
-        should_refresh: bool,
+        generation: u64,
     ) -> (bool, bool) {
         let worker_guard = self.worker.lock().ok();
         let Some(worker) = worker_guard.as_ref().and_then(|w| w.as_ref()) else {
             return (false, false);
         };
-        let current_gen = self.generation.load(Ordering::SeqCst);
-        match state {
-            PlanarTrackerState::Acquiring => {
+        match kind {
+            AsyncKind::Acquire => {
                 let started = worker.try_dispatch(PendingJob::Acquire {
                     frame: Arc::clone(frame),
                     display_crop,
                     config: cfg.clone(),
                     timestamp_ns,
-                    generation: current_gen,
+                    generation,
                 });
                 (started, false)
             }
-            PlanarTrackerState::Locked if should_refresh => {
+            AsyncKind::Refresh => {
                 let started = worker.try_dispatch(PendingJob::Refresh {
                     frame: Arc::clone(frame),
                     display_crop,
                     config: cfg.clone(),
-                    generation: current_gen,
+                    generation,
                 });
                 (false, started)
             }
-            _ => (false, false),
         }
+    }
+
+    /// Satisfy an [`AcquireRequest`] from a gray-only `process_frame`: dispatch
+    /// the heavy det/rec against the caller-supplied full-res RGBA `frame`.
+    /// Returns whether a job was started (worker backpressure may drop it).
+    pub fn provide_acquire_rgb(&self, req: AcquireRequest, frame: &Arc<LiveFrame>) -> bool {
+        let (a, r) = self.dispatch_async(
+            frame,
+            req.kind,
+            req.display_crop,
+            &req.config,
+            req.timestamp_ns,
+            req.generation,
+        );
+        a || r
     }
 
     // ---- async stages (run on the worker thread) ----

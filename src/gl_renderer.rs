@@ -80,8 +80,29 @@ void main() {
 }
 "#;
 
+/// Like [`EXT_FRAG_SRC`] but outputs luminance (Rec. 601) instead of colour,
+/// for the per-frame tracker readback into an R8 framebuffer. Writing luma to
+/// all channels keeps it correct whether the attachment is R8 or RGBA.
+const EXT_LUMA_FRAG_SRC: &str = r#"#version 100
+#extension GL_OES_EGL_image_external : require
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform samplerExternalOES u_tex;
+varying vec2 v_uv;
+void main() {
+    vec3 c = texture2D(u_tex, v_uv).rgb;
+    float y = dot(c, vec3(0.299, 0.587, 0.114));
+    gl_FragColor = vec4(y, y, y, 1.0);
+}
+"#;
+
 /// `GL_TEXTURE_EXTERNAL_OES` (not in glow's constant set).
 const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+/// `GL_R8` sized internal format (GLES3) for the single-channel gray FBO.
+const R8: u32 = 0x8229;
 
 /// Row-major identity-affine helpers, matching the convention of
 /// [`crate::homography`] (`mat3_mul` is row-major, `a * b`).
@@ -130,6 +151,13 @@ pub struct GlesRenderer {
     fbo_size: Option<(u32, u32)>,
     /// Lazily-built program for a borrowed external-OES camera source.
     ext: Option<ExtProgram>,
+    /// Lazily-built external-OES program that outputs luminance, for the
+    /// single-channel tracker-gray readback.
+    ext_luma: Option<ExtProgram>,
+    /// R8 FBO for the gray readback (separate from the RGBA `fbo`).
+    gray_fbo: Option<glow::Framebuffer>,
+    gray_fbo_tex: Option<glow::Texture>,
+    gray_fbo_size: Option<(u32, u32)>,
     /// `(external texture id, canonical uv transform row-major)` when the
     /// camera source is a borrowed `GL_TEXTURE_EXTERNAL_OES` (zero-copy) rather
     /// than the uploaded 2D `camera_tex`. The uv transform carries the
@@ -202,6 +230,10 @@ impl GlesRenderer {
                 fbo: None,
                 fbo_tex: None,
                 fbo_size: None,
+                ext_luma: None,
+                gray_fbo: None,
+                gray_fbo_tex: None,
+                gray_fbo_size: None,
                 ext: None,
                 camera_external: None,
             })
@@ -243,8 +275,12 @@ impl GlesRenderer {
     }
 
     fn build_ext_program(&self) -> Option<ExtProgram> {
+        self.build_ext_program_frag(EXT_FRAG_SRC)
+    }
+
+    fn build_ext_program_frag(&self, frag_src: &str) -> Option<ExtProgram> {
         let gl = &self.gl;
-        let program = match link_program_frag(gl, EXT_FRAG_SRC) {
+        let program = match link_program_frag(gl, frag_src) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("GlesRenderer: external-OES program link failed: {e:?}");
@@ -260,6 +296,119 @@ impl GlesRenderer {
                 program,
             })
         }
+    }
+
+    /// (Re)create the R8 gray readback FBO + texture to match `w*h`.
+    fn ensure_gray_fbo(&mut self, w: u32, h: u32) {
+        if self.gray_fbo_size == Some((w, h)) {
+            return;
+        }
+        let gl = &self.gl;
+        unsafe {
+            if let Some(t) = self.gray_fbo_tex.take() {
+                gl.delete_texture(t);
+            }
+            let tex = new_texture(gl).expect("create gray fbo texture");
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                R8 as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let fbo = match self.gray_fbo {
+                Some(f) => f,
+                None => {
+                    let f = gl.create_framebuffer().expect("create gray framebuffer");
+                    self.gray_fbo = Some(f);
+                    f
+                }
+            };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            assert_eq!(
+                status,
+                glow::FRAMEBUFFER_COMPLETE,
+                "gray readback FBO incomplete: status=0x{status:x}"
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gray_fbo_tex = Some(tex);
+            self.gray_fbo_size = Some((w, h));
+        }
+    }
+
+    /// Render the borrowed external camera as **luminance** into the R8 FBO at
+    /// `w×h` and read it back top-down — the per-frame tracker gray, produced on
+    /// the GPU so the readback transfers one channel and the CPU skips the
+    /// RGBA→luma pass. `dst_to_clip` must match [`read_camera_rgba`] / the
+    /// present so the gray is oriented exactly like the displayed frame.
+    pub fn read_camera_gray(&mut self, w: u32, h: u32, dst_to_clip: &[f32; 9]) -> Option<Vec<u8>> {
+        let (id, uv) = self.camera_external?;
+        let id = NonZeroU32::new(id)?;
+        if self.ext_luma.is_none() {
+            self.ext_luma = self.build_ext_program_frag(EXT_LUMA_FRAG_SRC);
+        }
+        self.ext_luma.as_ref()?;
+        self.ensure_gray_fbo(w, h);
+        let cam_transform = mat3_mul(dst_to_clip, &scale(w as f32, h as f32));
+        let mut flipped = vec![0u8; (w as usize) * (h as usize)];
+        unsafe {
+            let gl = &self.gl;
+            let e = self.ext_luma.as_ref().expect("ext_luma program present");
+            gl.bind_framebuffer(glow::FRAMEBUFFER, self.gray_fbo);
+            gl.viewport(0, 0, w as i32, h as i32);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(e.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.enable_vertex_attrib_array(e.a_pos);
+            gl.vertex_attrib_pointer_f32(e.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(glow::NativeTexture(id)));
+            gl.uniform_1_i32(Some(&e.u_tex), 0);
+            gl.uniform_matrix_3_f32_slice(
+                Some(&e.u_transform),
+                false,
+                &to_column_major(&cam_transform),
+            );
+            gl.uniform_matrix_3_f32_slice(Some(&e.u_uv_xform), false, &to_column_major(&uv));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            // GL_RED is 1 byte/px; the default GL_PACK_ALIGNMENT of 4 pads each
+            // row up to a 4-byte boundary, overrunning a tightly-packed w*h
+            // buffer when w isn't a multiple of 4. Pack tight.
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut flipped)),
+            );
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        // glReadPixels is bottom-up; the pipeline wants top-down. Flip rows.
+        let stride = w as usize;
+        let mut gray = vec![0u8; flipped.len()];
+        for y in 0..h as usize {
+            let src = (h as usize - 1 - y) * stride;
+            let dst = y * stride;
+            gray[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
+        }
+        Some(gray)
     }
 
     /// Render the borrowed external camera (canonical transform, no overlays)
