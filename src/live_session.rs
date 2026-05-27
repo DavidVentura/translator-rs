@@ -1963,6 +1963,11 @@ impl LiveSession {
             .map(|idxs| idxs.iter().filter(|&&i| !entries[i].rec_attempted).count())
             .collect();
         let mut block_translated = vec![false; block_ids.len()];
+        // Blocks that rec'd fine but whose translation came back empty.
+        // Marked translated (so we don't retry them every batch) yet
+        // excluded from the survivors, so their placeholder bg is dropped
+        // rather than left as an opaque, text-less box over the original.
+        let mut block_dropped = vec![false; block_ids.len()];
 
         let mut start = 0;
         while start < total {
@@ -2089,6 +2094,18 @@ impl LiveSession {
                             };
                         }
                         let translated = by_src.get(&src).cloned().unwrap_or_default();
+                        if translated.trim().is_empty() {
+                            // Recognized fine, but translation came back
+                            // empty (untranslatable input, or missing from
+                            // the batch result). Mark handled so it isn't
+                            // retried each batch, and drop it so its
+                            // placeholder bg is removed below — the sharp
+                            // original beneath beats an opaque, text-less
+                            // box pinned over it.
+                            block_translated[bi] = true;
+                            block_dropped[bi] = true;
+                            continue;
+                        }
                         let kept_indices: Vec<usize> = block_strip_indices[bi]
                             .iter()
                             .copied()
@@ -2147,10 +2164,18 @@ impl LiveSession {
         let surviving_block_ids: Vec<u64> = block_ids
             .iter()
             .enumerate()
-            .filter_map(|(bi, &id)| if block_translated[bi] { Some(id) } else { None })
+            .filter_map(|(bi, &id)| {
+                if block_translated[bi] && !block_dropped[bi] {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
             .collect();
-        // Drop *only* the blocks that were observed AND failed
-        // (placeholder upserted, rec returned empty). Blocks not in
+        // Drop *only* the blocks that were observed AND failed —
+        // either rec returned empty, or rec succeeded but translation
+        // came back empty (`block_dropped`). Either way the placeholder
+        // bg is removed so the original shows through. Blocks not in
         // this run's set are untouched — see the comment up top
         // explaining why "blocks the detector missed this frame
         // shouldn't get evicted." `failed_block_ids` is the
