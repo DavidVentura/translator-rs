@@ -488,7 +488,7 @@ const KLT_MAX_SEEDS: usize = 80;
 /// Worker threads in the per-frame tracker pool (FAST/BRIEF + matching).
 /// Two is enough to roughly halve the parallel sub-steps without
 /// starving the async OCR worker or the rest of the device.
-const TRACKER_POOL_THREADS: usize = 2;
+const TRACKER_POOL_THREADS: usize = 4;
 
 /// Single-step history of accepted `H_anchor→view` for the active anchor,
 /// plus a running EMA of accepted inlier counts. Drives the inlier-

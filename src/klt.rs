@@ -23,6 +23,7 @@
 //!     2×2 Hessian is degenerate.
 
 use image::GrayImage;
+use rayon::prelude::*;
 
 /// Default pyramid depth used by the engine. Each level halves the
 /// resolution; the coarse-to-fine search extends KLT's tractable
@@ -153,11 +154,15 @@ pub fn track_points(
 ) -> Vec<TrackOut> {
     debug_assert_eq!(prev.levels.len(), cur.levels.len());
     let num_levels = prev.levels.len();
-    let mut out = Vec::with_capacity(points.len());
-    for &(px, py) in points {
-        out.push(track_one(prev, cur, px, py, num_levels, cfg));
-    }
-    out
+    // Per-point pyramidal LK solves are independent and read-only over the
+    // pyramids, so fan them out over the active (tracker) pool. `map`+`collect`
+    // preserves input order, which the caller relies on to zip back to its
+    // inlier pairs. The whole engine step runs inside `tracker_pool.install`,
+    // so this uses those threads rather than the global pool.
+    points
+        .par_iter()
+        .map(|&(px, py)| track_one(prev, cur, px, py, num_levels, cfg))
+        .collect()
 }
 
 fn track_one(
