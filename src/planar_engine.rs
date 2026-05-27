@@ -400,6 +400,11 @@ pub struct StepTimings {
     pub track_ms: f64,
     /// `step_chain_refine`: re-track parent for chain-mean averaging.
     pub chain_refine_ms: f64,
+    /// `try_cached_anchors`: FAST+BRIEF + descriptor match against cached
+    /// anchors on non-Locked frames (Idle/Lost/handoff-alt). Lives outside
+    /// the Locked-path timers above, so without this a frame spent here
+    /// shows `tracker=` wall time with every sub-part at zero.
+    pub cached_match_ms: f64,
 }
 
 /// Read-only snapshot of the engine's bandaid-gate fire counts.
@@ -787,7 +792,7 @@ impl LivePlanarEngine {
                 // anchors. If the user picked up a previously-seen scene,
                 // we want to snap back to it without forcing a new acquire.
                 if !self.cache.is_empty() {
-                    if let Some((id, result)) = self.try_cached_anchors(gray, None) {
+                    if let Some((id, result)) = self.try_cached_anchors_timed(gray, None) {
                         self.last_track_result = Some(result.clone());
                         self.refresh_klt_state(
                             id,
@@ -1159,7 +1164,7 @@ impl LivePlanarEngine {
                     );
                 }
                 // Current anchor lost the frame — try cached siblings.
-                if let Some((id, alt)) = self.try_cached_anchors(gray, Some(anchor_id)) {
+                if let Some((id, alt)) = self.try_cached_anchors_timed(gray, Some(anchor_id)) {
                     self.last_track_result = Some(alt.clone());
                     self.refresh_klt_state(id, &cur_pyramid, &alt.inlier_pairs);
                     log::debug!(
@@ -1227,7 +1232,7 @@ impl LivePlanarEngine {
                 last_anchor_id,
                 frames_lost,
             } => {
-                if let Some((id, result)) = self.try_cached_anchors(gray, None) {
+                if let Some((id, result)) = self.try_cached_anchors_timed(gray, None) {
                     self.last_track_result = Some(result.clone());
                     self.refresh_klt_state(
                         id,
@@ -2123,6 +2128,20 @@ impl LivePlanarEngine {
             Some(t) => now_ns.saturating_sub(t) >= self.config.stable_required_ns,
             None => false,
         }
+    }
+
+    /// Timed wrapper so the FAST+BRIEF + cached-anchor match cost on
+    /// non-Locked frames lands in `last_step_timings.cached_match_ms`
+    /// instead of being invisible in the per-step breakdown.
+    fn try_cached_anchors_timed(
+        &mut self,
+        gray: &GrayImage,
+        skip_id: Option<AnchorId>,
+    ) -> Option<(AnchorId, TrackResult)> {
+        let t = std::time::Instant::now();
+        let r = self.try_cached_anchors(gray, skip_id);
+        self.last_step_timings.cached_match_ms = t.elapsed().as_secs_f64() * 1000.0;
+        r
     }
 
     fn try_cached_anchors(

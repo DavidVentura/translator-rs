@@ -397,6 +397,7 @@ struct TimingStats {
     tracker_features_ms_sum: f64,
     tracker_track_ms_sum: f64,
     tracker_chain_refine_ms_sum: f64,
+    tracker_cached_ms_sum: f64,
     composite_ms_sum: f64,
     composite_overlay_count_sum: u64,
     window_start: Instant,
@@ -414,6 +415,7 @@ impl Default for TimingStats {
             tracker_features_ms_sum: 0.0,
             tracker_track_ms_sum: 0.0,
             tracker_chain_refine_ms_sum: 0.0,
+            tracker_cached_ms_sum: 0.0,
             composite_ms_sum: 0.0,
             composite_overlay_count_sum: 0,
             window_start: Instant::now(),
@@ -690,6 +692,7 @@ impl LiveTrackerPipeline {
             t.tracker_features_ms_sum += step_timings.features_ms;
             t.tracker_track_ms_sum += step_timings.track_ms;
             t.tracker_chain_refine_ms_sum += step_timings.chain_refine_ms;
+            t.tracker_cached_ms_sum += step_timings.cached_match_ms;
             t.composite_ms_sum += composite_ms;
             t.composite_overlay_count_sum += overlay_count as u64;
             if t.window_count >= TIMING_WINDOW_FRAMES {
@@ -697,7 +700,7 @@ impl LiveTrackerPipeline {
                 let wall_s = t.window_start.elapsed().as_secs_f64();
                 let fps = if wall_s > 1e-6 { n / wall_s } else { 0.0 };
                 log::info!(
-                    "[lt] {} frames fps={:.1} total={:.1}ms gray={:.1}ms tracker={:.1}ms (pyr={:.1} kltx={:.1} feat={:.1} match={:.1} chain={:.1}) composite={:.1}ms (overlays={:.1})",
+                    "[lt] {} frames fps={:.1} total={:.1}ms gray={:.1}ms tracker={:.1}ms (pyr={:.1} kltx={:.1} feat={:.1} match={:.1} chain={:.1} cached={:.1}) composite={:.1}ms (overlays={:.1})",
                     t.window_count,
                     fps,
                     t.total_ms_sum / n,
@@ -708,6 +711,7 @@ impl LiveTrackerPipeline {
                     t.tracker_features_ms_sum / n,
                     t.tracker_track_ms_sum / n,
                     t.tracker_chain_refine_ms_sum / n,
+                    t.tracker_cached_ms_sum / n,
                     t.composite_ms_sum / n,
                     t.composite_overlay_count_sum as f64 / n,
                 );
