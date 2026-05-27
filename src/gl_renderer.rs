@@ -263,19 +263,19 @@ impl GlesRenderer {
     }
 
     /// Render the borrowed external camera (canonical transform, no overlays)
-    /// into the owned FBO at `w×h` and read it back as top-down grayscale — the
-    /// tracker's input, replacing the CPU map + downscale. Returns `None` if no
-    /// external camera source is set.
-    pub fn read_camera_gray(&mut self, w: u32, h: u32) -> Option<Vec<u8>> {
+    /// into the owned FBO at `w×h` and read it back as **top-down RGBA** — the
+    /// canonical frame the pipeline's `LiveFrame` carries (replacing the CPU
+    /// `map` + `transform_frame`). `None` if no external camera source is set.
+    ///
+    /// `dst_to_clip` must be the **same** transform used to present, so the
+    /// frame the OCR sees is exactly what's displayed (no divergent orientation).
+    pub fn read_camera_rgba(&mut self, w: u32, h: u32, dst_to_clip: &[f32; 9]) -> Option<Vec<u8>> {
         let (id, uv) = self.camera_external?;
         let id = NonZeroU32::new(id)?;
         self.ext.as_ref()?;
         self.ensure_fbo(w, h);
-        let cam_transform = mat3_mul(
-            &ndc_from_viewport(w as f32, h as f32),
-            &scale(w as f32, h as f32),
-        );
-        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        let cam_transform = mat3_mul(dst_to_clip, &scale(w as f32, h as f32));
+        let mut flipped = vec![0u8; (w as usize) * (h as usize) * 4];
         unsafe {
             let gl = &self.gl;
             let e = self.ext.as_ref().expect("ext program present");
@@ -303,24 +303,19 @@ impl GlesRenderer {
                 h as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut rgba)),
+                glow::PixelPackData::Slice(Some(&mut flipped)),
             );
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-        // glReadPixels is bottom-up; the tracker wants top-down. Convert
-        // RGBA→luma (Rec.601-ish integer weights) and flip rows in one pass.
-        let stride = w as usize;
-        let mut gray = vec![0u8; stride * h as usize];
+        // glReadPixels is bottom-up; the pipeline wants top-down. Flip rows.
+        let stride = (w as usize) * 4;
+        let mut rgba = vec![0u8; flipped.len()];
         for y in 0..h as usize {
-            let src = (h as usize - 1 - y) * stride * 4;
+            let src = (h as usize - 1 - y) * stride;
             let dst = y * stride;
-            for x in 0..stride {
-                let p = src + x * 4;
-                let (r, g, b) = (rgba[p] as u32, rgba[p + 1] as u32, rgba[p + 2] as u32);
-                gray[dst + x] = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
-            }
+            rgba[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
         }
-        Some(gray)
+        Some(rgba)
     }
 
     /// Render the composite into whatever framebuffer is currently bound;
@@ -422,8 +417,33 @@ impl GlesRenderer {
             gl.enable_vertex_attrib_array(self.a_pos);
             gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.uniform_1_i32(Some(&self.u_tex), 0);
+            // The external-camera pass left a GL_TEXTURE_EXTERNAL_OES bound on
+            // unit 0. Adreno/Mali return nothing when a sampler2D reads a unit
+            // that still has an external texture bound, so clear it before
+            // sampling the 2D overlay texture.
+            if self.camera_external.is_some() {
+                gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+            }
+            // The scene graph hands us its pipeline state; depth test in
+            // particular is left enabled and rejects the overlay quad (same z=0
+            // as the camera quad under GL_LESS). Establish our own 2D state.
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
             gl.enable(glow::BLEND);
+            gl.blend_equation(glow::FUNC_ADD);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            // On the external path `read_camera_rgba` row-flips the readback to
+            // give the pipeline a top-down canonical frame, so overlays are
+            // authored vertically mirrored relative to the (non-flipped) on-screen
+            // camera. Undo that flip in canonical space here. The CPU path uploads
+            // an already-top-down frame, so its overlays need no flip.
+            let overlay_to_clip = if self.camera_external.is_some() {
+                let flip_y = [1.0, 0.0, 0.0, 0.0, -1.0, input.dst_h as f32, 0.0, 0.0, 1.0];
+                mat3_mul(dst_to_clip, &flip_y)
+            } else {
+                *dst_to_clip
+            };
             let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
             for item in input.items {
                 if item.bitmap_rgba.is_empty() || item.bitmap_width == 0 || item.bitmap_height == 0
@@ -454,7 +474,7 @@ impl GlesRenderer {
                     &bitmap_to_viewport,
                     &scale(item.bitmap_width as f32, item.bitmap_height as f32),
                 );
-                let transform = mat3_mul(dst_to_clip, &sized);
+                let transform = mat3_mul(&overlay_to_clip, &sized);
                 gl.uniform_matrix_3_f32_slice(
                     Some(&self.u_transform),
                     false,
@@ -627,6 +647,26 @@ pub struct PresentTarget<'a> {
 impl ComposeTarget for PresentTarget<'_> {
     fn upload_camera(&mut self, camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
         self.renderer.upload_camera_tex(camera);
+        Ok(())
+    }
+
+    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
+        self.renderer.present(input, &self.display_xform);
+        Ok(())
+    }
+}
+
+/// Like [`PresentTarget`] but the camera is a borrowed external-OES texture
+/// (set via [`GlesRenderer::set_camera_external`] before `process_frame`), so
+/// `upload_camera` is a no-op — there's no CPU camera buffer to upload. `draw`
+/// presents the external camera + overlays into the bound framebuffer.
+pub struct ExternalPresentTarget<'a> {
+    pub renderer: &'a mut GlesRenderer,
+    pub display_xform: [f32; 9],
+}
+
+impl ComposeTarget for ExternalPresentTarget<'_> {
+    fn upload_camera(&mut self, _camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
         Ok(())
     }
 
