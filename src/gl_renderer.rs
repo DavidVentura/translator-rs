@@ -20,6 +20,8 @@
 //!   caller bound (the window surface / scene-graph FBO). This is the
 //!   production path; there is no readback.
 
+use std::num::NonZeroU32;
+
 use glow::HasContext;
 
 use crate::homography::mat3_mul;
@@ -59,6 +61,27 @@ void main() {
     gl_FragColor = texture2D(u_tex, v_uv);
 }
 "#;
+
+/// Camera fragment shader for a borrowed `GL_TEXTURE_EXTERNAL_OES` source
+/// (e.g. an Android/UT SurfaceTexture). Shares [`VERT_SRC`]; the only
+/// difference from [`FRAG_SRC`] is the external sampler. `#extension` must
+/// precede the `precision` block.
+const EXT_FRAG_SRC: &str = r#"#version 100
+#extension GL_OES_EGL_image_external : require
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform samplerExternalOES u_tex;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_tex, v_uv);
+}
+"#;
+
+/// `GL_TEXTURE_EXTERNAL_OES` (not in glow's constant set).
+const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 
 /// Row-major identity-affine helpers, matching the convention of
 /// [`crate::homography`] (`mat3_mul` is row-major, `a * b`).
@@ -105,6 +128,25 @@ pub struct GlesRenderer {
     fbo: Option<glow::Framebuffer>,
     fbo_tex: Option<glow::Texture>,
     fbo_size: Option<(u32, u32)>,
+    /// Lazily-built program for a borrowed external-OES camera source.
+    ext: Option<ExtProgram>,
+    /// `(external texture id, canonical uv transform row-major)` when the
+    /// camera source is a borrowed `GL_TEXTURE_EXTERNAL_OES` (zero-copy) rather
+    /// than the uploaded 2D `camera_tex`. The uv transform carries the
+    /// upright/crop/flip from sensor space into the canonical frame.
+    camera_external: Option<(u32, [f32; 9])>,
+}
+
+/// The external-OES camera program (shares [`VERT_SRC`] with the 2D program;
+/// only the fragment sampler differs). Built lazily on first external use so
+/// contexts that never use it (Android's uploaded path) don't require the
+/// `GL_OES_EGL_image_external` extension.
+struct ExtProgram {
+    program: glow::Program,
+    u_transform: glow::UniformLocation,
+    u_uv_xform: glow::UniformLocation,
+    u_tex: glow::UniformLocation,
+    a_pos: u32,
 }
 
 impl GlesRenderer {
@@ -160,6 +202,8 @@ impl GlesRenderer {
                 fbo: None,
                 fbo_tex: None,
                 fbo_size: None,
+                ext: None,
+                camera_external: None,
             })
         }
     }
@@ -178,6 +222,105 @@ impl GlesRenderer {
             camera.src_full_w,
             camera.src_full_h,
         );
+    }
+
+    /// Use a borrowed `GL_TEXTURE_EXTERNAL_OES` as the camera source (zero-copy)
+    /// instead of the uploaded 2D texture. `uv` is the row-major canonical uv
+    /// transform (unit-quad → sensor uv, encoding upright/crop/flip). Lazily
+    /// builds the external-OES program; if that fails (no extension) the source
+    /// is left unchanged. Cleared with [`clear_camera_external`](Self::clear_camera_external).
+    pub fn set_camera_external(&mut self, id: u32, uv: [f32; 9]) {
+        if self.ext.is_none() {
+            self.ext = self.build_ext_program();
+        }
+        if self.ext.is_some() {
+            self.camera_external = Some((id, uv));
+        }
+    }
+
+    pub fn clear_camera_external(&mut self) {
+        self.camera_external = None;
+    }
+
+    fn build_ext_program(&self) -> Option<ExtProgram> {
+        let gl = &self.gl;
+        let program = match link_program_frag(gl, EXT_FRAG_SRC) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("GlesRenderer: external-OES program link failed: {e:?}");
+                return None;
+            }
+        };
+        unsafe {
+            Some(ExtProgram {
+                u_transform: gl.get_uniform_location(program, "u_transform")?,
+                u_uv_xform: gl.get_uniform_location(program, "u_uv_xform")?,
+                u_tex: gl.get_uniform_location(program, "u_tex")?,
+                a_pos: gl.get_attrib_location(program, "a_pos")?,
+                program,
+            })
+        }
+    }
+
+    /// Render the borrowed external camera (canonical transform, no overlays)
+    /// into the owned FBO at `w×h` and read it back as top-down grayscale — the
+    /// tracker's input, replacing the CPU map + downscale. Returns `None` if no
+    /// external camera source is set.
+    pub fn read_camera_gray(&mut self, w: u32, h: u32) -> Option<Vec<u8>> {
+        let (id, uv) = self.camera_external?;
+        let id = NonZeroU32::new(id)?;
+        self.ext.as_ref()?;
+        self.ensure_fbo(w, h);
+        let cam_transform = mat3_mul(
+            &ndc_from_viewport(w as f32, h as f32),
+            &scale(w as f32, h as f32),
+        );
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        unsafe {
+            let gl = &self.gl;
+            let e = self.ext.as_ref().expect("ext program present");
+            gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
+            gl.viewport(0, 0, w as i32, h as i32);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(e.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.enable_vertex_attrib_array(e.a_pos);
+            gl.vertex_attrib_pointer_f32(e.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(glow::NativeTexture(id)));
+            gl.uniform_1_i32(Some(&e.u_tex), 0);
+            gl.uniform_matrix_3_f32_slice(
+                Some(&e.u_transform),
+                false,
+                &to_column_major(&cam_transform),
+            );
+            gl.uniform_matrix_3_f32_slice(Some(&e.u_uv_xform), false, &to_column_major(&uv));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut rgba)),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        // glReadPixels is bottom-up; the tracker wants top-down. Convert
+        // RGBA→luma (Rec.601-ish integer weights) and flip rows in one pass.
+        let stride = w as usize;
+        let mut gray = vec![0u8; stride * h as usize];
+        for y in 0..h as usize {
+            let src = (h as usize - 1 - y) * stride * 4;
+            let dst = y * stride;
+            for x in 0..stride {
+                let p = src + x * 4;
+                let (r, g, b) = (rgba[p] as u32, rgba[p + 1] as u32, rgba[p + 2] as u32);
+                gray[dst + x] = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
+            }
+        }
+        Some(gray)
     }
 
     /// Render the composite into whatever framebuffer is currently bound;
@@ -203,51 +346,82 @@ impl GlesRenderer {
     fn draw(&mut self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
         let dst_w = input.dst_w as f32;
         let dst_h = input.dst_h as f32;
+        // Fast-clear so tiled GPUs skip loading the previous framebuffer; the
+        // opaque camera quad then covers it.
         unsafe {
             let gl = &self.gl;
-            // Fast-clear so tiled GPUs skip loading the previous
-            // framebuffer; the opaque camera quad then covers it.
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.use_program(Some(self.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
-            gl.enable_vertex_attrib_array(self.a_pos);
-            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.active_texture(glow::TEXTURE0);
-            gl.uniform_1_i32(Some(&self.u_tex), 0);
             gl.disable(glow::BLEND);
         }
 
-        // Camera passthrough: opaque base layer. The full sensor frame was
-        // uploaded ahead of `draw` (overlapping the tracker); here we just
-        // bind it and sample the cropped sub-rect via the uv transform, so
-        // the GPU never needs a strided sub-image upload (absent in GLES2).
+        // Camera passthrough (opaque base). Either a borrowed external-OES
+        // texture (zero-copy, sampled through the canonical uv transform that
+        // carries upright/crop/flip) or the uploaded 2D texture sampled through
+        // the sensor-crop uv.
+        let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
+        match self.camera_external {
+            Some((id, uv)) if self.ext.is_some() => unsafe {
+                let gl = &self.gl;
+                let e = self.ext.as_ref().expect("ext program present");
+                gl.use_program(Some(e.program));
+                gl.enable_vertex_attrib_array(e.a_pos);
+                gl.vertex_attrib_pointer_f32(e.a_pos, 2, glow::FLOAT, false, 0, 0);
+                gl.uniform_1_i32(Some(&e.u_tex), 0);
+                if let Some(id) = NonZeroU32::new(id) {
+                    gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(glow::NativeTexture(id)));
+                }
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&e.u_transform),
+                    false,
+                    &to_column_major(&cam_transform),
+                );
+                gl.uniform_matrix_3_f32_slice(Some(&e.u_uv_xform), false, &to_column_major(&uv));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            },
+            _ => unsafe {
+                let gl = &self.gl;
+                gl.use_program(Some(self.program));
+                gl.enable_vertex_attrib_array(self.a_pos);
+                gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+                gl.uniform_1_i32(Some(&self.u_tex), 0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
+                let cam_uv = [
+                    dst_w / input.src_full_w as f32,
+                    0.0,
+                    input.src_offset_x as f32 / input.src_full_w as f32,
+                    0.0,
+                    dst_h / input.src_full_h as f32,
+                    input.src_offset_y as f32 / input.src_full_h as f32,
+                    0.0,
+                    0.0,
+                    1.0,
+                ];
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&self.u_transform),
+                    false,
+                    &to_column_major(&cam_transform),
+                );
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&self.u_uv_xform),
+                    false,
+                    &to_column_major(&cam_uv),
+                );
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            },
+        }
+
+        // Overlays: source-over with straight (non-premultiplied) alpha,
+        // matching the CPU blend. Always the 2D program. Each item warped by the
+        // same H the CPU path uses, composed with its surface origin and size.
         unsafe {
             let gl = &self.gl;
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
-            let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
-            let cam_uv = [
-                dst_w / input.src_full_w as f32,
-                0.0,
-                input.src_offset_x as f32 / input.src_full_w as f32,
-                0.0,
-                dst_h / input.src_full_h as f32,
-                input.src_offset_y as f32 / input.src_full_h as f32,
-                0.0,
-                0.0,
-                1.0,
-            ];
-            gl.uniform_matrix_3_f32_slice(
-                Some(&self.u_transform),
-                false,
-                &to_column_major(&cam_transform),
-            );
-            gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &to_column_major(&cam_uv));
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-
-            // Overlays: source-over with straight (non-premultiplied) alpha,
-            // matching the CPU blend. Each item warped by the same H the CPU
-            // path uses, composed with its surface origin and pixel size.
+            gl.use_program(Some(self.program));
+            gl.enable_vertex_attrib_array(self.a_pos);
+            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&self.u_tex), 0);
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
             let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
@@ -581,11 +755,15 @@ fn upload_tex(
 }
 
 fn link_program(gl: &glow::Context) -> Result<glow::Program, GlError> {
+    link_program_frag(gl, FRAG_SRC)
+}
+
+fn link_program_frag(gl: &glow::Context, frag_src: &str) -> Result<glow::Program, GlError> {
     unsafe {
         let program = gl.create_program().map_err(GlError::ProgramLink)?;
         let shaders = [
             compile_shader(gl, glow::VERTEX_SHADER, VERT_SRC)?,
-            compile_shader(gl, glow::FRAGMENT_SHADER, FRAG_SRC)?,
+            compile_shader(gl, glow::FRAGMENT_SHADER, frag_src)?,
         ];
         for s in shaders {
             gl.attach_shader(program, s);
