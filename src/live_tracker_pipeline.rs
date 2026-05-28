@@ -781,28 +781,38 @@ impl LiveTrackerPipeline {
 
         // Track on the post-apply state. KLT picks up whatever seeds the
         // Correction (if any) just installed; on success `ring[frame_idx]` is
-        // pushed and is consistent with the dispatch prior emitted below.
-        let _ = self
-            .coarse
-            .lock()
-            .map_err(|_| poisoned())?
-            .track(&tracker_gray, frame_idx);
+        // pushed and is therefore consistent with the dispatch prior emitted
+        // below. On failure no ring entry exists for this frame_idx — read
+        // both states under one lock so the dispatch gate below has them.
+        let (coarse_tracked, coarse_was_tracking) = {
+            let mut c = self.coarse.lock().map_err(|_| poisoned())?;
+            let tracked = c.track(&tracker_gray, frame_idx).is_some();
+            // `current_h.is_some()` after `track` means either KLT succeeded
+            // *or* a previous frame had set it. Combined with `!tracked` this
+            // distinguishes "transient KLT failure during continuous tracking"
+            // from "bootstrap / post-Lost, never had a pose".
+            let was_tracking = c.current_h().is_some();
+            (tracked, was_tracking)
+        };
 
         if let Err(e) = self.upload_camera_to_target(frame, target) {
             log::warn!("camera upload failed: {e:?}");
         }
 
-        // Dispatch a fresh engine job at cadence boundaries, unconditionally.
-        // An earlier version skipped dispatch when `track()` failed mid-
-        // tracking, on the theory that `weave` would fall through to `snap`
-        // (no ring entry → discontinuity). Reviewer's correct counter: a
-        // skipped dispatch denies the relocalizer the chance to *rescue* the
-        // coarse exactly when it's stuck. Snap on a track-failure frame is
-        // the right recovery, not something to avoid. With the per-frame
-        // `prev_pyramid` invariant fixed in `CoarseTracker::track`, transient
-        // failures are also less likely to compound, so the gate's protective
-        // value is smaller than the recovery it was blocking.
-        let engine_frame = frame_idx % RELOCALIZER_CADENCE == 0;
+        // Dispatch a fresh engine job at cadence boundaries. The worker only
+        // accepts one outstanding job, so this returns false (silently drops)
+        // if the worker hasn't finished the previous one yet; the next cadence
+        // tick retries. The gray is moved into the request only on dispatch.
+        //
+        // Skip the dispatch ONLY when `track()` failed *and* the coarse was
+        // mid-tracking. In that case there's no `ring[frame_idx]` entry, the
+        // eventual Correction would fall through `weave` into `snap` and wipe
+        // the accumulated continuity. In the bootstrap / post-Lost case
+        // (`!coarse_was_tracking`), a Correction is *required* to seed the
+        // coarse (ReAcquire → acquire pipeline, or Locked → snap into the
+        // first anchor); skipping there deadlocks the system in Lost.
+        let coarse_continuity_break = !coarse_tracked && coarse_was_tracking;
+        let engine_frame = !coarse_continuity_break && frame_idx % RELOCALIZER_CADENCE == 0;
         let dispatch_ok = if engine_frame {
             let (coarse_prior, coarse_seeds) = {
                 let c = self.coarse.lock().map_err(|_| poisoned())?;
@@ -837,7 +847,11 @@ impl LiveTrackerPipeline {
         // `select_compose_h`'s loss-hide grace handle the brief gap until the
         // next Locked Correction snaps in. Coarse is reset by `apply` on
         // Lost/ReAcquire, so `current_h` is already None then anyway.
-        let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.current_h();
+        // Read the EMA-smoothed compose pose (per-frame low-pass on top of the
+        // raw KLT+weave path), not the raw `current_h`. The engine's prior
+        // continues to read `current_h` further up so the matcher isn't fed
+        // delayed data.
+        let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.compose_h();
         let tracker_h = match lifecycle {
             Lifecycle::Locked => coarse_h.map(|h| {
                 if det_to_full != 1.0 {

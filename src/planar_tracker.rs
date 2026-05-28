@@ -958,33 +958,26 @@ pub fn ransac_homography_with_prior(
 }
 
 /// Coarse per-frame pose: LK-track each seed's previous view-point from
-/// `prev_pyr` into `cur_pyr`, then fit `H_root→view`.
+/// `prev_pyr` into `cur_pyr`, then update the prior by composing with a
+/// frame-to-frame similarity DELTA fit from `(prev_view, cur_view)`.
 ///
-/// Two-branch refit so the coarse tracks real perspective change when the
-/// data supports it and falls back to perspective-preservation when it
-/// doesn't:
+/// Why a delta and not an absolute root→view refit: the engine's adaptive
+/// model (similarity for 8-14 inliers, affine for 15-29, homography for 30+)
+/// is the right shape for descriptor relocalization — there the H is fit
+/// against fresh feature correspondences with no presumed prior. For the
+/// coarse, the *prior already encodes the correct perspective*; a low-inlier
+/// frame falling through to similarity-on-(root, cur_view) would replace
+/// the prior's 8-DoF estimate with a 4-DoF fit and erase the perspective
+/// entries (visible as transient "flatten" wobble during real motion).
+/// Composing a similarity delta preserves the prior's perspective and only
+/// updates translation/rotation/uniform-scale frame-to-frame; new perspective
+/// is introduced exclusively by the Relocalizer via `Correction` snap/weave.
 ///
-/// - **≥ 30 tracked survivors**: run prior-aware homography RANSAC on
-///   `(root, cur_view)` (the existing engine entry point). Full 8-DoF fit so
-///   real perspective change between Relocalizer ticks is followed by the
-///   coarse and shows up in the prior the engine sees on the next dispatch.
-///   This keeps the engine's guided-match window centered on actual
-///   descriptor positions during camera motion.
-///
-/// - **< 30 tracked survivors** with a prior available: fit a 4-DoF
-///   similarity DELTA over `(prev_view, cur_view)` and compose `delta · prior`.
-///   At sparse inlier counts the homography path would have fallen through
-///   to affine (15-29) or similarity-on-(root, cur_view) (8-14), both of
-///   which erase the prior's perspective entries (visible "flatten" pulse
-///   during real motion). The delta path preserves perspective so the
-///   transient sparse frame doesn't disturb the prior's h6/h7; new
-///   perspective comes from the next Relocalizer Correction.
-///
-/// `prior` is required for the delta fallback; without one, the < 30 path
-/// uses the absolute adaptive fit (this only arises on the very first coarse
-/// fit before any Correction has snapped in current_h, which doesn't happen
-/// on the current pipeline because `track` is only called after a snap has
-/// set `current_h`).
+/// `prior` is required for this path. If absent, falls back to the absolute
+/// adaptive fit (used only on the very first coarse fit before any anchor's
+/// `h_root_to_canonical` is known — which on the current pipeline doesn't
+/// arise, because the CoarseTracker only fits after a Correction snap has set
+/// `current_h`).
 pub fn klt_forward_fit(
     prev_pyr: &Pyramid,
     cur_pyr: &Pyramid,
@@ -999,82 +992,69 @@ pub fn klt_forward_fit(
     let prev_view_pts: Vec<(f32, f32)> = seeds.iter().map(|&(_, _, vx, vy)| (vx, vy)).collect();
     let tracked = track_points(prev_pyr, cur_pyr, &prev_view_pts, &KltConfig::default());
 
-    let mut root_pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
-    let mut view_pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
-    for (seed, t) in seeds.iter().zip(tracked.iter()) {
-        if t.success {
-            root_pairs.push((seed.0, seed.1, t.x, t.y));
-            view_pairs.push((seed.2, seed.3, t.x, t.y));
-        }
-    }
-
-    // High-inlier path: full prior-aware homography refit. The engine's
-    // adaptive model boundary at 30 inliers is the point beyond which 8-DoF
-    // is well-constrained and the homography fit reflects real geometry.
-    // Above the boundary, we let the coarse track perspective changes
-    // frame-to-frame.
-    const COARSE_HOMOGRAPHY_MIN_INLIERS: usize = 30;
-    let mut result = if root_pairs.len() >= COARSE_HOMOGRAPHY_MIN_INLIERS {
-        ransac_homography_with_prior(&root_pairs, cfg, min_inliers, prior)?
-    } else if let Some(prior_h) = prior {
-        // Sparse path: delta-similarity preserves the prior's perspective.
-        if view_pairs.len() < min_inliers {
-            return None;
-        }
-        let delta = ransac_similarity_with_min(&view_pairs, cfg, min_inliers)?;
-        let new_h = mat3_mul(&delta, &prior_h);
-        // Score residuals on (root, cur_view) for `median_residual_px`; the
-        // strict-inlier count is reported on the same residual gate so
-        // downstream engine logging stays consistent with the homography path.
-        let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
-        let mut residuals: Vec<f32> = Vec::with_capacity(root_pairs.len());
-        let mut strict_inliers = 0usize;
-        for &(rx, ry, vx, vy) in &root_pairs {
-            let Some((px, py)) = project(&new_h, rx, ry) else {
-                continue;
-            };
-            let dx = px - vx;
-            let dy = py - vy;
-            let r2 = dx * dx + dy * dy;
-            residuals.push(r2.sqrt());
-            if r2 <= r_thresh_sq {
-                strict_inliers += 1;
+    let Some(prior_h) = prior else {
+        let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+        for (seed, t) in seeds.iter().zip(tracked.iter()) {
+            if t.success {
+                pairs.push((seed.0, seed.1, t.x, t.y));
             }
         }
-        if strict_inliers < min_inliers {
-            return None;
-        }
-        residuals.sort_by(|a, b| a.total_cmp(b));
-        let median = if residuals.is_empty() {
-            f32::INFINITY
-        } else {
-            residuals[residuals.len() / 2]
-        };
-        TrackResult {
-            homography: new_h,
-            inliers: strict_inliers,
-            matches: view_pairs.len(),
-            median_residual_px: median,
-            inlier_pairs: Vec::new(),
-            descriptor_inliers: 0,
-        }
-    } else {
-        ransac_homography_with_prior(&root_pairs, cfg, min_inliers, None)?
+        return ransac_homography_with_prior(&pairs, cfg, min_inliers, None);
     };
 
-    // Override `inlier_pairs` with ALL KLT survivors (not the strict RANSAC
-    // inlier subset). The CoarseTracker stores these as next-frame's seeds,
-    // and shrinking the pool by the per-frame 4 px residual gate drains it
-    // over a few frames — KLT survivors at 5–10 px residual under this
-    // frame's H aren't bad tracks (KLT itself gated by min eigenvalue + max
-    // residual), they're just at the edge of *this frame's* basin and may be
-    // squarely inside the next frame's after the H drifts slightly. Keeping
-    // them as seeds preserves the homography path (≥30 survivors) for
-    // longer, instead of starving into delta-similarity within ~100 ms of
-    // each engine Correction. `inliers` field stays as the strict count so
-    // downstream gates and logs are unchanged.
-    result.inlier_pairs = root_pairs;
-    Some(result)
+    // Build the two parallel pair lists for the delta fit:
+    //   view_pairs:  (prev_view, cur_view)   — input to the similarity RANSAC
+    //   root_pairs:  (root,      cur_view)   — used for the returned TrackResult
+    let mut view_pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+    let mut root_pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+    for (seed, t) in seeds.iter().zip(tracked.iter()) {
+        if t.success {
+            view_pairs.push((seed.2, seed.3, t.x, t.y));
+            root_pairs.push((seed.0, seed.1, t.x, t.y));
+        }
+    }
+    if view_pairs.len() < min_inliers {
+        return None;
+    }
+    let delta = ransac_similarity_with_min(&view_pairs, cfg, min_inliers)?;
+    let new_h = mat3_mul(&delta, &prior_h);
+
+    // Re-score the composed H over (root, cur_view) for `inliers` /
+    // `median_residual_px` / `inlier_pairs`. These drive downstream gates
+    // (engine's degraded / handoff thresholds, the dispatch gate this caller
+    // uses to decide whether to enqueue a Relocalizer job).
+    let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
+    let mut inlier_pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut residuals: Vec<f32> = Vec::new();
+    for &(rx, ry, vx, vy) in &root_pairs {
+        let Some((px, py)) = project(&new_h, rx, ry) else {
+            continue;
+        };
+        let dx = px - vx;
+        let dy = py - vy;
+        let r2 = dx * dx + dy * dy;
+        if r2 <= r_thresh_sq {
+            inlier_pairs.push((rx, ry, vx, vy));
+            residuals.push(r2.sqrt());
+        }
+    }
+    if inlier_pairs.len() < min_inliers {
+        return None;
+    }
+    residuals.sort_by(|a, b| a.total_cmp(b));
+    let median = if residuals.is_empty() {
+        f32::INFINITY
+    } else {
+        residuals[residuals.len() / 2]
+    };
+    Some(TrackResult {
+        homography: new_h,
+        inliers: inlier_pairs.len(),
+        matches: view_pairs.len(),
+        median_residual_px: median,
+        inlier_pairs,
+        descriptor_inliers: 0,
+    })
 }
 
 /// RANSAC fit of a 4-DoF similarity (rotation + uniform scale + translation)
