@@ -197,7 +197,7 @@ fn book_page_grouping_dump() {
             },
         );
     }
-    let canvas = render_anchor_canvas(&block_specs, &font_provider);
+    let canvas = render_anchor_canvas(&block_specs, &[], &font_provider);
     if let Some(c) = &canvas {
         eprintln!(
             "  anchor canvas: {}x{} at ({}, {})",

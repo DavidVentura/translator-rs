@@ -183,6 +183,15 @@ pub struct AnchorOverlay {
     /// gives a deterministic iteration order so canvas content is
     /// reproducible across upserts.
     pub blocks: std::collections::BTreeMap<u64, BlockSpec>,
+    /// Pre-rec bbox-only strips painted as standalone bg pills.
+    /// Populated by `upsert_provisional_overlay` the moment detect
+    /// finishes (engine has flipped Locked but orient-rec hasn't
+    /// resolved yet), wholesale-cleared by `drop_provisional_overlay`
+    /// before `run_post_detect` upserts the real grouped blocks.
+    /// Separate from `blocks` because they have no identity, no
+    /// grouping, and a different lifecycle (clear-all on transition,
+    /// not retain-by-id).
+    pub provisional_strips: Vec<OrientedRect>,
     /// Currently-mounted canvas. Kept live across content updates —
     /// the rebuild path renders a new canvas off the lock and only
     /// swaps it in once the new canvas is ready, so the compositor
@@ -204,15 +213,17 @@ impl AnchorOverlay {
         Self {
             anchor_id,
             blocks: std::collections::BTreeMap::new(),
+            provisional_strips: Vec::new(),
             canvas: None,
             rendered_fingerprint: None,
         }
     }
 
-    /// Composite content hash across all blocks. Compared against
-    /// `rendered_fingerprint` to decide whether a rebuild is needed
-    /// and, after rendering, to detect "snapshot still current" so a
-    /// stale render doesn't clobber a fresher one.
+    /// Composite content hash across all blocks + provisional strips.
+    /// Compared against `rendered_fingerprint` to decide whether a
+    /// rebuild is needed and, after rendering, to detect "snapshot
+    /// still current" so a stale render doesn't clobber a fresher
+    /// one.
     pub fn content_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -220,6 +231,14 @@ impl AnchorOverlay {
         for (id, spec) in &self.blocks {
             id.hash(&mut h);
             spec.content_hash.hash(&mut h);
+        }
+        (self.provisional_strips.len() as u64).hash(&mut h);
+        for s in &self.provisional_strips {
+            s.cx.to_bits().hash(&mut h);
+            s.cy.to_bits().hash(&mut h);
+            s.width.to_bits().hash(&mut h);
+            s.height.to_bits().hash(&mut h);
+            s.angle_radians.to_bits().hash(&mut h);
         }
         h.finish()
     }
@@ -917,6 +936,46 @@ impl LiveSession {
         self.ensure_anchor_canvas(anchor_id, font_provider);
     }
 
+    /// Publish a provisional bbox-only overlay covering all
+    /// `surface_strips`. Called immediately after acquire (before
+    /// orient-rec/post-detect) so the user sees translucent pills the
+    /// instant the engine flips Locked. Strips come in *surface
+    /// coordinates* (== view coords at acquire time, modulo
+    /// `sensor_crop`). Stored as a dedicated field on the anchor
+    /// overlay so they share the canvas with real blocks but follow
+    /// their own clear-all lifecycle.
+    pub fn upsert_provisional_overlay(
+        &self,
+        anchor_id: AnchorId,
+        surface_strips: Vec<OrientedRect>,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) {
+        {
+            let mut anchors = match self.overlay_anchors.lock() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let anchor = anchors
+                .entry(anchor_id)
+                .or_insert_with(|| AnchorOverlay::new(anchor_id));
+            anchor.provisional_strips = surface_strips;
+        }
+        self.ensure_anchor_canvas(anchor_id, font_provider);
+    }
+
+    /// Drop the provisional bbox-only strips published by
+    /// [`Self::upsert_provisional_overlay`]. Does not eagerly rebuild
+    /// the canvas — the next real-block upsert inside
+    /// `run_post_detect` repaints without them via the existing
+    /// fingerprint-mismatch path.
+    pub fn drop_provisional_overlay(&self, anchor_id: AnchorId) {
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            if let Some(anchor) = anchors.get_mut(&anchor_id) {
+                anchor.provisional_strips.clear();
+            }
+        }
+    }
+
     /// Drop blocks from `anchor_id` whose id isn't in `ids`. Used
     /// when an acquire / refresh finishes (final block id set known)
     /// so stale overlays from a prior pipeline run on the same anchor
@@ -947,7 +1006,7 @@ impl LiveSession {
         anchor_id: AnchorId,
         font_provider: &dyn crate::font_provider::FontProvider,
     ) {
-        let (snapshot_fp, blocks_snapshot) = {
+        let (snapshot_fp, blocks_snapshot, provisional_snapshot) = {
             let anchors = match self.overlay_anchors.lock() {
                 Ok(a) => a,
                 Err(_) => return,
@@ -959,13 +1018,18 @@ impl LiveSession {
             if anchor.is_canvas_current() {
                 return;
             }
-            (anchor.content_fingerprint(), anchor.blocks.clone())
+            (
+                anchor.content_fingerprint(),
+                anchor.blocks.clone(),
+                anchor.provisional_strips.clone(),
+            )
         };
         // Render outside the lock so the compositor (on another
         // thread) keeps reading the *old* `canvas` while glyph
         // rasterization runs. Only the final pointer-swap below
         // takes the lock again, and that swap is instantaneous.
-        let canvas = render_anchor_canvas(&blocks_snapshot, font_provider);
+        let canvas =
+            render_anchor_canvas(&blocks_snapshot, &provisional_snapshot, font_provider);
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
                 // If a racing upsert mutated `blocks` while we were
@@ -2596,13 +2660,14 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
 /// simulator can pass any `FontProvider` impl.
 pub fn render_anchor_canvas(
     blocks: &std::collections::BTreeMap<u64, BlockSpec>,
+    provisional_strips: &[OrientedRect],
     font_provider: &dyn crate::font_provider::FontProvider,
 ) -> Option<AnchorRaster> {
     use crate::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
         PreparedTextLine, Rect,
     };
-    if blocks.is_empty() {
+    if blocks.is_empty() && provisional_strips.is_empty() {
         return None;
     }
 
@@ -2643,11 +2708,31 @@ pub fn render_anchor_canvas(
             spec,
         });
     }
-    if prepared.is_empty() {
+    // Provisional strips: same inflation as block strips, but no
+    // grouping or normalize — each strip stands on its own with its
+    // real geometry. Filtered through the same width/height guard.
+    let prepared_provisional: Vec<OrientedRect> = provisional_strips
+        .iter()
+        .filter_map(|s| {
+            let v = OrientedRect {
+                cx: s.cx,
+                cy: s.cy,
+                width: s.width + 2.0 * HORIZONTAL_PAD_PX,
+                height: s.height * TIGHT_VERTICAL_INFLATE,
+                angle_radians: s.angle_radians,
+            };
+            if v.width <= 0.0 || v.height <= 0.0 {
+                None
+            } else {
+                Some(v)
+            }
+        })
+        .collect();
+    if prepared.is_empty() && prepared_provisional.is_empty() {
         return None;
     }
 
-    // 2. Union AABB across all blocks' visuals.
+    // 2. Union AABB across all blocks' visuals + provisional strips.
     let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
     let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for pb in &prepared {
@@ -2658,6 +2743,14 @@ pub fn render_anchor_canvas(
                 max_x = max_x.max(x);
                 max_y = max_y.max(y);
             }
+        }
+    }
+    for v in &prepared_provisional {
+        for (x, y) in v.corners() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
         }
     }
     let pad = ITEM_BITMAP_PAD_PX;
@@ -2710,6 +2803,29 @@ pub fn render_anchor_canvas(
             );
         }
         local_visuals.push(local);
+    }
+
+    // 3b. Provisional strips paint with the same default bg as
+    //     empty-text real blocks. No matted overrides — they exist
+    //     only before rec runs. Each strip stands alone (no grouping)
+    //     so `fill_oriented_rect_blended`'s "only write when new
+    //     alpha > old" semantic keeps overlaps from stacking.
+    let provisional_bg = [0x10, 0x10, 0x10, 0xC8];
+    for v in &prepared_provisional {
+        let local = OrientedRect {
+            cx: v.cx - origin_x,
+            cy: v.cy - origin_y,
+            width: v.width,
+            height: v.height,
+            angle_radians: v.angle_radians,
+        };
+        crate::planar_engine::fill_oriented_rect_blended(
+            &mut canvas,
+            bitmap_w,
+            bitmap_h,
+            &local,
+            provisional_bg,
+        );
     }
 
     // 4. Build a `PreparedTextBlock` per OCR block that has text.

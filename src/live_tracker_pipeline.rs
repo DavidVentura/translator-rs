@@ -42,7 +42,8 @@ use crate::homography;
 use crate::live_compositor::{self, CameraFrame, ComposeTarget, CompositeError, OverlayItem};
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
-    LiveSession, PostDetectInput, h_view_to_surface_from, viewport_surface_aabb,
+    LiveSession, PostDetectInput, h_view_to_surface_from, project_oriented_rect,
+    viewport_surface_aabb,
 };
 use crate::ocr::{DetectedTextBox, OrientedRect, Rect};
 use crate::planar_engine::{EngineConfig, LivePlanarEngine};
@@ -1344,7 +1345,134 @@ impl LiveTrackerPipeline {
             };
         }
 
-        // Orientation estimate.
+        // Acquire anchor first — *before* orient-rec — so the engine
+        // flips Locked the moment detection has something to anchor
+        // to. orient-rec (~470 ms) only resolves reading direction;
+        // it isn't needed to track the plane. Pulling it out of the
+        // Locked gate lets the provisional bbox overlay below paint
+        // ~470 ms earlier, giving the user immediate "I see text
+        // here" feedback while rec + translate still run in the
+        // background.
+        let (anchor_id, h_view_to_sensor) = {
+            let mut state = match frame.state().lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    return AcquireTelemetry {
+                        error: Some("frame.state poisoned".into()),
+                        ..Default::default()
+                    };
+                }
+            };
+            if state.ensure_tracker_oriented(cfg.det_max_pixels).is_err() {
+                return AcquireTelemetry {
+                    error: Some("ensure_tracker failed".into()),
+                    ..Default::default()
+                };
+            }
+            let tracker_oriented = state
+                .cached_tracker
+                .as_ref()
+                .expect("ensure_tracker filled cache");
+            let cached_sensor_crop =
+                state
+                    .cached
+                    .as_ref()
+                    .map(|oi| oi.sensor_crop)
+                    .unwrap_or(Rect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    });
+            let h_view_to_sensor = [
+                1.0,
+                0.0,
+                cached_sensor_crop.left as f32,
+                0.0,
+                1.0,
+                cached_sensor_crop.top as f32,
+                0.0,
+                0.0,
+                1.0,
+            ];
+            let scale_down = if tracker_oriented.det_to_full_scale > 0.0 {
+                1.0 / tracker_oriented.det_to_full_scale
+            } else {
+                1.0
+            };
+            let regions: Vec<(u32, u32, u32, u32)> = detected
+                .iter()
+                .map(|d| {
+                    let scale_u32 = |v: u32| ((v as f32) * scale_down).round() as u32;
+                    (
+                        scale_u32(d.rect.left + cached_sensor_crop.left),
+                        scale_u32(d.rect.top + cached_sensor_crop.top),
+                        scale_u32(d.rect.right + cached_sensor_crop.left),
+                        scale_u32(d.rect.bottom + cached_sensor_crop.top),
+                    )
+                })
+                .collect();
+            let mut engine = match self.engine.lock() {
+                Ok(e) => e,
+                Err(_) => {
+                    return AcquireTelemetry {
+                        error: Some("engine poisoned".into()),
+                        ..Default::default()
+                    };
+                }
+            };
+            let id = engine
+                .acquire_now_in_regions(
+                    &tracker_oriented.gray,
+                    &regions,
+                    cfg.anchor_padding_px,
+                    timestamp_ns,
+                )
+                .unwrap_or(0);
+            (id, h_view_to_sensor)
+        };
+        if anchor_id == 0 {
+            return AcquireTelemetry {
+                error: Some("acquire_now returned 0".into()),
+                ..Default::default()
+            };
+        }
+        self.session.reset_anchor_state(anchor_id);
+
+        // Provisional bbox-only overlay. Surface coords at acquire
+        // time are view coords plus the sensor-crop offset (the same
+        // H run_post_detect uses below). Angles come straight from
+        // the detector — no reading-direction snap is needed because
+        // the canvas only paints translucent bg pills here; glyph
+        // raster waits for run_post_detect to fill display_text.
+        {
+            let surface_strips: Vec<OrientedRect> = detected
+                .iter()
+                .map(|d| {
+                    project_oriented_rect(&d.tight_box, &h_view_to_sensor)
+                        .unwrap_or_else(|| d.tight_box.clone())
+                })
+                .collect();
+            if !surface_strips.is_empty() {
+                self.session.upsert_provisional_overlay(
+                    anchor_id,
+                    surface_strips,
+                    &*self.font_provider,
+                );
+            }
+        }
+
+        if !gen_check() {
+            return AcquireTelemetry {
+                canceled: true,
+                ..Default::default()
+            };
+        }
+
+        // Orientation estimate. Runs after acquire so the engine is
+        // already Locked and the provisional canvas is up — we're only
+        // resolving reading direction here, which run_post_detect
+        // needs for its angle snap + block grouping below.
         let forced_script = if cfg.is_auto_source {
             None
         } else {
@@ -1379,82 +1507,12 @@ impl LiveTrackerPipeline {
                     .unwrap_or(None)
             }
         };
-
-        // Acquire anchor.
-        let anchor_id = {
-            let mut state = match frame.state().lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("frame.state poisoned".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            if state.ensure_tracker_oriented(cfg.det_max_pixels).is_err() {
-                return AcquireTelemetry {
-                    error: Some("ensure_tracker failed".into()),
-                    ..Default::default()
-                };
+        if let Some(q) = estimated_quadrant {
+            if let Ok(mut engine) = self.engine.lock() {
+                engine.set_canonical_rotation(anchor_id, q);
             }
-            let tracker_oriented = state
-                .cached_tracker
-                .as_ref()
-                .expect("ensure_tracker filled cache");
-            let cached_sensor_crop =
-                state
-                    .cached
-                    .as_ref()
-                    .map(|oi| oi.sensor_crop)
-                    .unwrap_or(Rect {
-                        left: 0,
-                        top: 0,
-                        right: 0,
-                        bottom: 0,
-                    });
-            let scale_down = if tracker_oriented.det_to_full_scale > 0.0 {
-                1.0 / tracker_oriented.det_to_full_scale
-            } else {
-                1.0
-            };
-            let regions: Vec<(u32, u32, u32, u32)> = detected
-                .iter()
-                .map(|d| {
-                    let scale_u32 = |v: u32| ((v as f32) * scale_down).round() as u32;
-                    (
-                        scale_u32(d.rect.left + cached_sensor_crop.left),
-                        scale_u32(d.rect.top + cached_sensor_crop.top),
-                        scale_u32(d.rect.right + cached_sensor_crop.left),
-                        scale_u32(d.rect.bottom + cached_sensor_crop.top),
-                    )
-                })
-                .collect();
-            let mut engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("engine poisoned".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            engine
-                .acquire_now_with_orientation(
-                    &tracker_oriented.gray,
-                    &regions,
-                    cfg.anchor_padding_px,
-                    timestamp_ns,
-                    estimated_quadrant,
-                )
-                .unwrap_or(0)
-        };
-        if anchor_id == 0 {
-            return AcquireTelemetry {
-                error: Some("acquire_now returned 0".into()),
-                ..Default::default()
-            };
         }
-        self.session.reset_anchor_state(anchor_id);
+        self.session.drop_provisional_overlay(anchor_id);
         if !gen_check() {
             return AcquireTelemetry {
                 canceled: true,

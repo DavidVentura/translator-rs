@@ -1822,6 +1822,26 @@ impl LivePlanarEngine {
         Some(id)
     }
 
+    /// Late-bind the reading-direction quadrant on an anchor's chain
+    /// root. Used by the acquire path when orient-rec finishes after
+    /// `acquire_inner` — we acquire first (so the engine flips to
+    /// Locked while detect alone is enough to draw bbox overlays) and
+    /// only later learn the canonical quadrant. Also updates
+    /// `last_known_quadrant` so a subsequent fresh acquire seeds from
+    /// the most recent observation.
+    /// Returns false if the anchor isn't cached anymore.
+    pub fn set_canonical_rotation(&mut self, anchor_id: AnchorId, q: Quadrant) -> bool {
+        let root_id = self.root_of(anchor_id);
+        match self.cache.get_mut(root_id) {
+            Some(entry) => {
+                entry.canonical_rotation = q;
+                self.last_known_quadrant = q;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Attach (or replace) the canonical overlay set for an anchor.
     /// Returns false if the anchor isn't cached anymore.
     pub fn set_overlays(&mut self, anchor_id: AnchorId, overlays: Vec<CanonicalOverlay>) -> bool {
