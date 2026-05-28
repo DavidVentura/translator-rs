@@ -333,10 +333,14 @@ pub struct LivePlanarEngine {
     /// `EngineConfig.default_canonical_quadrant`.
     last_known_quadrant: Quadrant,
     /// Most recent TrackResult produced by the per-frame fit (after
-    /// the sanity gate). Cleared whenever the frame did not produce a
-    /// usable fit (Idle/Lost/no-match). Read by diagnostics & smoke
-    /// harnesses; not used by the engine itself.
-    last_track_result: Option<TrackResult>,
+    /// the sanity gate), paired with the leaf anchor its `inlier_pairs`
+    /// are expressed in. The leaf id is captured here because
+    /// `self.state.anchor_id` can flip to a new leaf via handoff
+    /// *after* the fit lands, but the inlier pairs stay in the old
+    /// leaf's canonical frame; `root_coord_seeds` must project through
+    /// the source leaf's `h_root_to_canonical`, not the post-handoff
+    /// active leaf's.
+    last_track_result: Option<(AnchorId, TrackResult)>,
     /// Per-emission state used to blend `H_root→view` across leaf-
     /// anchor switches. Cleared on Lost/Idle so a re-acquire after
     /// loss doesn't lerp from a stale pre-loss H.
@@ -696,7 +700,7 @@ impl LivePlanarEngine {
     /// diagnostics & smoke harnesses log `matches`, `median_residual_px`
     /// alongside the inlier count already exposed via `TrackerCommand`.
     pub fn last_track_result(&self) -> Option<&TrackResult> {
-        self.last_track_result.as_ref()
+        self.last_track_result.as_ref().map(|(_, r)| r)
     }
 
     /// Coarse rotation the engine last committed to (most recent
@@ -742,20 +746,22 @@ impl LivePlanarEngine {
     }
 
     /// `(root_x, root_y, view_x, view_y)` for the last fit's inliers: the fit's
-    /// anchor side is in the active *leaf*'s canonical coords; map it to the
-    /// chain root via `inv(h_root_to_canonical)` so the CoarseTracker (which
-    /// works purely in root coords) can track them forward.
+    /// anchor side is in the *source* leaf's canonical coords (the leaf the fit
+    /// was computed against, captured when `last_track_result` was stored —
+    /// not necessarily the currently-active leaf, which may have moved on via
+    /// handoff). Map through that leaf's `inv(h_root_to_canonical)` so the
+    /// CoarseTracker (which works purely in root coords) can track them
+    /// forward.
     fn root_coord_seeds(&self) -> Vec<(f32, f32, f32, f32)> {
-        let Some(r) = self.last_track_result.as_ref() else {
+        let Some((source_leaf, r)) = self.last_track_result.as_ref() else {
             return Vec::new();
         };
-        let leaf = match self.state {
-            EngineState::Locked { anchor_id, .. } => anchor_id,
-            _ => return Vec::new(),
-        };
+        if !matches!(self.state, EngineState::Locked { .. }) {
+            return Vec::new();
+        }
         let h_rtc = self
             .cache
-            .get(leaf)
+            .get(*source_leaf)
             .map(|a| a.h_root_to_canonical)
             .unwrap_or(IDENTITY);
         let inv = invert(&h_rtc).unwrap_or(IDENTITY);
@@ -880,7 +886,7 @@ impl LivePlanarEngine {
                 // we want to snap back to it without forcing a new acquire.
                 if !self.cache.is_empty() {
                     if let Some((id, result)) = self.try_cached_anchors_timed(gray, None) {
-                        self.last_track_result = Some(result.clone());
+                        self.last_track_result = Some((id, result.clone()));
                         log::debug!(
                             "[engine] Idle → Locked via cached anchor leaf={id} (inliers={} desc={})",
                             result.inliers,
@@ -1037,7 +1043,11 @@ impl LivePlanarEngine {
                     self.step_chain_refine(features.as_ref(), anchor_id, &r.homography);
                     self.last_step_timings.chain_refine_ms =
                         t_chain.elapsed().as_secs_f64() * 1000.0;
-                    self.last_track_result = Some(r.clone());
+                    // Source leaf = `anchor_id` (the fit's anchor side is in
+                    // this leaf's canonical frame). A handoff later in this
+                    // branch can flip `self.state.anchor_id` to a child leaf,
+                    // but the inlier_pairs stay in `anchor_id`'s frame.
+                    self.last_track_result = Some((anchor_id, r.clone()));
                     // Sustained inlier decline: the anchor's
                     // descriptors are losing correspondences as
                     // perspective drifts, and RANSAC will start
@@ -1246,7 +1256,7 @@ impl LivePlanarEngine {
                 }
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors_timed(gray, Some(anchor_id)) {
-                    self.last_track_result = Some(alt.clone());
+                    self.last_track_result = Some((id, alt.clone()));
                     log::debug!(
                         "[engine] Locked active={anchor_id} produced no fit → cached sibling leaf={id} (inl={} desc={})",
                         alt.inliers,
@@ -1320,7 +1330,7 @@ impl LivePlanarEngine {
                 frames_lost,
             } => {
                 if let Some((id, result)) = self.try_cached_anchors_timed(gray, None) {
-                    self.last_track_result = Some(result.clone());
+                    self.last_track_result = Some((id, result.clone()));
                     log::debug!(
                         "[engine] Lost (last_active={last_anchor_id}) → Locked via cached leaf={id} (inl={} desc={})",
                         result.inliers,

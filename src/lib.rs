@@ -8,7 +8,7 @@ pub mod catalog;
 pub mod coarse_tracker;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod color_matting;
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+//#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod coords;
 #[cfg(feature = "doc-align")]
 pub mod doc_align;
@@ -20,7 +20,7 @@ pub mod font_metrics;
 pub mod font_provider;
 #[cfg(feature = "gpu")]
 pub mod gl_renderer;
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+//#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod homography;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod homography_ekf;

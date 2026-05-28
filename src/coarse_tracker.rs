@@ -61,15 +61,15 @@ const MAX_SEEDS: usize = 80;
 /// Element-wise EMA mix toward the latest `current_h` for the compose pose.
 /// `compose_h = α · current_h + (1-α) · prev_compose_h`. Smooths the residual
 /// per-frame perspective wobble from KLT sub-pixel jitter + descriptor refit
-/// noise on the same basin (~2 px at the far corner after the prior-aware
-/// RANSAC fix collapsed the 30 px cadence-N basin flip).
+/// noise on the same basin.
 ///
-/// At 30 fps, α = 0.4 gives a first-order low-pass corner near 2 Hz: per-frame
-/// (15 Hz) noise is attenuated ~18 dB (≈8×), while hand-held motion (typically
-/// < 5 Hz dominant) passes with sub-frame lag. Lower α (0.2) attenuates more
-/// but lags visible during real perspective change; higher α (0.6) lets the
-/// 2 px residual through more.
-const COMPOSE_EMA_ALPHA: f32 = 0.4;
+/// At 30 fps, α = 0.2 puts the first-order low-pass corner near 1 Hz: per-frame
+/// (15 Hz) noise is attenuated ~25 dB (≈18×). The async-seam reorder removed
+/// the cadence-locked basin flip that drove the visible perspective AB, so the
+/// residual to suppress here is the small per-tick refit jitter, and a
+/// stronger LPF is fine — hand-held perspective change is well below 1 Hz on
+/// device repro.
+const COMPOSE_EMA_ALPHA: f32 = 0.8;
 
 pub struct CoarseTracker {
     cfg: TrackerConfig,

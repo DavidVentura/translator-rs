@@ -724,22 +724,27 @@ impl LiveTrackerPipeline {
         let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
 
         // Async-H step 3: the Relocalizer runs on the worker fire-and-forget.
-        // The present thread polls for any completed Correction (the only
-        // thing that advances anchor/lifecycle state), then maybe dispatches a
-        // fresh job at cadence boundaries (gated by worker backpressure — only
-        // one outstanding job at a time). The CoarseTracker tracks every
-        // frame; its current pose is the compose pose between worker results.
+        // Order matters at the async seam — **apply → track → dispatch**:
+        //
+        // 1. Apply any completed Correction first. This updates `current_h`
+        //    and `seeds` to reflect the engine's latest verdict for an older
+        //    frame.
+        // 2. Then run `track()`, so KLT consumes the post-apply seeds and
+        //    `ring[frame_idx]` is pushed *after* the weave. The ring entry is
+        //    now identical to whatever the dispatch a few lines below would
+        //    see as `current_h`.
+        // 3. Then dispatch the new engine job carrying that same post-track
+        //    state. Whatever Correction comes back for this frame later, its
+        //    `weave` will compute `motion = h_now · inv(ring[frame_idx])`
+        //    against the matching temporal base — not a stale pre-apply KLT
+        //    pose. Without this order the ring entry at a cadence frame where
+        //    apply *and* dispatch fire is pre-apply while the dispatched
+        //    prior is post-apply, and the eventual weave mixes incompatible
+        //    bases (the previous correction's jump leaks into the next
+        //    correction's motion factor, creating a deterministic period-2
+        //    "KLT basin ↔ relocalizer basin" loop visible as cadence-locked
+        //    perspective wobble).
         let frame_idx = self.frame_counter.fetch_add(1, Ordering::Relaxed);
-        let _ = self
-            .coarse
-            .lock()
-            .map_err(|_| poisoned())?
-            .track(&tracker_gray, frame_idx);
-
-        if let Err(e) = self.upload_camera_to_target(frame, target) {
-            log::warn!("camera upload failed: {e:?}");
-        }
-
         let t_tracker = Instant::now();
         // Poll the worker for any completed Correction. This is the *only*
         // place anchor/lifecycle state advances; everything else is the
@@ -774,11 +779,40 @@ impl LiveTrackerPipeline {
             None => (None, crate::planar_engine::StepTimings::default()),
         };
 
+        // Track on the post-apply state. KLT picks up whatever seeds the
+        // Correction (if any) just installed; on success `ring[frame_idx]` is
+        // pushed and is therefore consistent with the dispatch prior emitted
+        // below. On failure no ring entry exists for this frame_idx — read
+        // both states under one lock so the dispatch gate below has them.
+        let (coarse_tracked, coarse_was_tracking) = {
+            let mut c = self.coarse.lock().map_err(|_| poisoned())?;
+            let tracked = c.track(&tracker_gray, frame_idx).is_some();
+            // `current_h.is_some()` after `track` means either KLT succeeded
+            // *or* a previous frame had set it. Combined with `!tracked` this
+            // distinguishes "transient KLT failure during continuous tracking"
+            // from "bootstrap / post-Lost, never had a pose".
+            let was_tracking = c.current_h().is_some();
+            (tracked, was_tracking)
+        };
+
+        if let Err(e) = self.upload_camera_to_target(frame, target) {
+            log::warn!("camera upload failed: {e:?}");
+        }
+
         // Dispatch a fresh engine job at cadence boundaries. The worker only
         // accepts one outstanding job, so this returns false (silently drops)
         // if the worker hasn't finished the previous one yet; the next cadence
         // tick retries. The gray is moved into the request only on dispatch.
-        let engine_frame = frame_idx % RELOCALIZER_CADENCE == 0;
+        //
+        // Skip the dispatch ONLY when `track()` failed *and* the coarse was
+        // mid-tracking. In that case there's no `ring[frame_idx]` entry, the
+        // eventual Correction would fall through `weave` into `snap` and wipe
+        // the accumulated continuity. In the bootstrap / post-Lost case
+        // (`!coarse_was_tracking`), a Correction is *required* to seed the
+        // coarse (ReAcquire → acquire pipeline, or Locked → snap into the
+        // first anchor); skipping there deadlocks the system in Lost.
+        let coarse_continuity_break = !coarse_tracked && coarse_was_tracking;
+        let engine_frame = !coarse_continuity_break && frame_idx % RELOCALIZER_CADENCE == 0;
         let dispatch_ok = if engine_frame {
             let (coarse_prior, coarse_seeds) = {
                 let c = self.coarse.lock().map_err(|_| poisoned())?;

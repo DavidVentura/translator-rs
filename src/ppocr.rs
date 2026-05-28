@@ -2030,6 +2030,7 @@ fn resolve_box_angle(est: &TiltEstimate, consensus: Option<f32>) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     // Estimate the line's tilt from the top *and* bottom edges of the contour separately, and
     // accept a non-zero angle only when both edges agree. PCA on all points (the previous
