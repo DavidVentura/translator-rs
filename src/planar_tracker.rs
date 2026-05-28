@@ -439,6 +439,20 @@ pub fn track_against_anchor_with_features(
         ),
         None => match_descriptors(&anchor.descriptors, frame_descs, cfg.lowe_ratio_locked),
     };
+    // Brute fallback. When the guided matcher returns few matches the prior
+    // is likely stale (perspective drift between engine ticks pushes real
+    // descriptor positions outside the 30 px window). Brute considers every
+    // frame keypoint and finds what the windowed search missed. The fit
+    // produced from these recovered matches propagates back to the prior
+    // via the coarse weave, so this fallback fires only on the frames where
+    // the prior went stale — steady state stays in guided.
+    const GUIDED_BRUTE_FALLBACK_THRESHOLD: usize = 75;
+    if prior.is_some() && matches.len() < GUIDED_BRUTE_FALLBACK_THRESHOLD {
+        let brute = match_descriptors(&anchor.descriptors, frame_descs, cfg.lowe_ratio_locked);
+        if brute.len() > matches.len() {
+            matches = brute;
+        }
+    }
     matches.sort_unstable_by_key(|m| m.distance);
     let t_match = t2.elapsed();
     let n_matches = matches.len();
