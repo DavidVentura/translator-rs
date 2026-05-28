@@ -133,6 +133,14 @@ pub struct KltConfig {
     pub convergence_epsilon: f32,
     pub max_residual: f32,
     pub min_eigenvalue: f32,
+    /// Forward-backward consistency tolerance in L0 pixels. After tracking
+    /// each point prev→cur, the track is re-run cur→prev from the forward
+    /// destination; if the round-trip endpoint differs from the original
+    /// start by more than this distance, the track is rejected. Catches
+    /// wrong-basin matches on repetitive content (text columns, brick
+    /// patterns, etc.) that the structure-tensor min-eigenvalue and
+    /// max-residual gates pass. Set to `0.0` to disable.
+    pub fb_check_eps: f32,
 }
 
 impl Default for KltConfig {
@@ -144,6 +152,11 @@ impl Default for KltConfig {
             convergence_epsilon: 0.03,
             max_residual: 12.0,
             min_eigenvalue: 1.0,
+            // 0.5 px round-trip error — bad tracks (wrong-basin) typically
+            // drift more than 1 px on the reverse pass, healthy ones stay
+            // well under a tenth. The cost is doubling per-point LK work
+            // on forward-successes only, which on ~80 seeds is sub-ms.
+            fb_check_eps: 0.5,
         }
     }
 }
@@ -173,9 +186,47 @@ pub fn track_points(
     // preserves input order, which the caller relies on to zip back to its
     // inlier pairs. The whole engine step runs inside `tracker_pool.install`,
     // so this uses those threads rather than the global pool.
-    points
+    let forward: Vec<TrackOut> = points
         .par_iter()
         .map(|&(px, py)| track_one(prev, cur, px, py, num_levels, cfg))
+        .collect();
+
+    if cfg.fb_check_eps <= 0.0 {
+        return forward;
+    }
+
+    // Forward-backward consistency. For each forward-successful track,
+    // re-track its destination cur→prev; drop if the round-trip endpoint
+    // misses the original start by more than `fb_check_eps`. Catches
+    // wrong-basin matches that the per-track min-eigenvalue and max-
+    // residual gates accept (common on repetitive text patterns where a
+    // window can find a self-consistent match a few characters over).
+    let fb_eps_sq = cfg.fb_check_eps * cfg.fb_check_eps;
+    forward
+        .into_par_iter()
+        .zip(points.par_iter())
+        .map(|(fwd, &(orig_x, orig_y))| {
+            if !fwd.success {
+                return fwd;
+            }
+            let bwd = track_one(cur, prev, fwd.x, fwd.y, num_levels, cfg);
+            if !bwd.success {
+                return TrackOut {
+                    success: false,
+                    ..fwd
+                };
+            }
+            let dx = bwd.x - orig_x;
+            let dy = bwd.y - orig_y;
+            if dx * dx + dy * dy > fb_eps_sq {
+                TrackOut {
+                    success: false,
+                    ..fwd
+                }
+            } else {
+                fwd
+            }
+        })
         .collect()
 }
 
