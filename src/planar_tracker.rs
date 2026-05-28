@@ -637,11 +637,30 @@ pub fn match_descriptors_guided(
                     second = d;
                 }
             }
-            // Need at least 2 candidates for the Lowe ratio test to be
-            // meaningful; with only 1 in-window candidate we can't measure
-            // ambiguity vs the second-best.
-            if window_count < 2 {
+            // The Lowe ratio test needs a second-best to measure ambiguity
+            // against. With exactly one in-window candidate there's nothing
+            // to compare to — but the geometric prior + tight guided window
+            // already vouch for the candidate's position, so fall back to an
+            // absolute Hamming threshold. Without this fallback, sparse FAST
+            // output or blur-degraded patches lose stable single-candidate
+            // matches that the prior trusts. Tight threshold to avoid
+            // admitting random matches: BRIEF-256 random distance is ~128
+            // bits, "clearly same patch" is typically < 40, so 60 bits
+            // (~23 % of the descriptor) is well inside the safe zone.
+            const SINGLE_CANDIDATE_HAMMING_THRESHOLD: u32 = 60;
+            if window_count == 0 {
                 return None;
+            }
+            if window_count == 1 {
+                return if best < SINGLE_CANDIDATE_HAMMING_THRESHOLD {
+                    Some(Match {
+                        anchor_idx: a_idx,
+                        frame_idx: best_idx,
+                        distance: best,
+                    })
+                } else {
+                    None
+                };
             }
             if (best as f32) < lowe_ratio * (second as f32) {
                 Some(Match {

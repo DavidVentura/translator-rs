@@ -82,6 +82,20 @@ fn downsample_2x(src: &GrayImage) -> GrayImage {
     out
 }
 
+/// `true` when a `(2·margin)`-wide window centered at `(cx, cy)` fits inside
+/// `img` with room for the bilinear-interpolation reads inside `sample()`.
+/// Used by `track_one` to skip points whose LK window would silently include
+/// out-of-bounds zero samples.
+#[inline]
+fn level_window_in_bounds(img: &GrayImage, cx: f32, cy: f32, margin: f32) -> bool {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    // `sample()` requires `floor(x) + 1 < w`, i.e. `x < w - 1`. We want the
+    // leftmost touched pixel (`cx - margin`) to be ≥ 0 and the rightmost
+    // (`cx + margin`) to satisfy that bound.
+    cx >= margin && cy >= margin && cx + margin < w - 1.0 && cy + margin < h - 1.0
+}
+
 /// Sub-pixel bilinear sample. Returns 0 for out-of-bounds; callers
 /// gate on the half-window border before invoking, so OOB sampling
 /// only happens at literal image edges.
@@ -184,11 +198,27 @@ fn track_one(
         let cur_l = &cur.levels[level];
         let px_l = px / scale;
         let py_l = py / scale;
+        let r = cfg.window_radius;
+
+        // Reject points whose prev window leaves the image. The structure-
+        // tensor loop below samples `sample(prev, sx ± 1, sy ± 1)` for the
+        // central differences, so the tightest pixel touched is at
+        // `±(r + 1)` from the center, and `sample()` itself needs
+        // `floor(x) + 1 < w`. Without this gate, OOB reads silently return
+        // 0 from `sample()` and bias the structure tensor / residual toward
+        // a low-eigenvalue direction.
+        if !level_window_in_bounds(prev_l, px_l, py_l, r as f32 + 1.0) {
+            return TrackOut {
+                x: px,
+                y: py,
+                residual: f32::INFINITY,
+                success: false,
+            };
+        }
 
         let mut gxx = 0.0_f32;
         let mut gxy = 0.0_f32;
         let mut gyy = 0.0_f32;
-        let r = cfg.window_radius;
         let mut grads = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
         let mut prev_vals = Vec::with_capacity(grads.capacity());
         for dy in -r..=r {
@@ -220,6 +250,19 @@ fn track_one(
 
         let inv_det = 1.0 / det;
         for _ in 0..cfg.max_iterations {
+            // Reject if the current-frame window (centered at
+            // `(px_l + d_x, py_l + d_y)`) has drifted outside the image
+            // during the LK iteration. No central-difference margin here —
+            // cur is only sampled, not differentiated — but `sample()` still
+            // needs `floor(x) + 1 < w`, hence the bare `r` margin.
+            if !level_window_in_bounds(cur_l, px_l + d_x, py_l + d_y, r as f32) {
+                return TrackOut {
+                    x: px,
+                    y: py,
+                    residual: f32::INFINITY,
+                    success: false,
+                };
+            }
             let mut bx = 0.0_f32;
             let mut by = 0.0_f32;
             let mut resid_acc = 0.0_f32;
