@@ -28,7 +28,7 @@
 #![cfg(feature = "planar-tracker")]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -180,17 +180,13 @@ struct LastEmittedH {
 
 const LOSS_HIDE_AFTER_FRAMES: u32 = 4;
 
-/// Run the Relocalizer (engine.relocalize) every Nth frame. The CoarseTracker
-/// still runs every frame; between Relocalizer ticks, the compose pose comes
-/// purely from KLT (drifting until the next Correction weaves in). At step 2 this
-/// is synchronous (still on the present thread via the compute-thread submit/wait
-/// rendezvous); step 3 moves it off-thread. The engine's frame-counted gates are
-/// rescaled by this value at pipeline init so wall-time hysteresis matches step 1.
-///
-/// Temporarily 1 for bisection: confirms the bounce seen at cadence=2 is the
-/// synchronous AB pattern (descriptor fit vs KLT-forwarded), not residue from
-/// stripping the engine's per-frame EKF. At cadence=1 every frame is an engine
-/// frame, so the alternation can't form.
+/// Dispatch the Relocalizer (`engine.relocalize`) to the async worker every
+/// Nth frame. The CoarseTracker tracks every frame; the worker runs
+/// fire-and-forget — its Correction arrives ~1 wall frame later and the weave
+/// composes the absolute fix with the view-space KLT motion since the frame
+/// the worker consumed (non-identity, unlike the synchronous step-2 weave
+/// which reduced to a snap). The engine's frame-counted gates are rescaled by
+/// this value at pipeline init so wall-time hysteresis matches cadence-1.
 const RELOCALIZER_CADENCE: u64 = 2;
 const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// Inflation around the viewport AABB when asking the session
@@ -371,12 +367,14 @@ struct TrackerRequest {
 type TrackerComputeResult =
     Result<(Correction, crate::planar_engine::StepTimings), TranslatorError>;
 
-/// Long-lived thread that runs the (lock-free) engine step, so the camera
-/// upload can overlap it without spawning a fresh OS thread every frame.
-/// One frame is in flight at a time — `process_frame` is synchronous, so
-/// `submit` then `wait` form a rendezvous: the engine runs on this thread
-/// while the caller uploads the camera, then the caller blocks for the
-/// result.
+/// Long-lived worker thread that runs `engine.relocalize` asynchronously
+/// (async-H step 3). The present thread no longer blocks on it: it
+/// `try_dispatch`es a fresh job at cadence boundaries (gated by a single
+/// `in_flight` slot — backpressure drops duplicate dispatches rather than
+/// queueing) and `try_take_result`s any completed Correction at the top of
+/// each frame. Corrections arrive ~1 wall frame after dispatch on this
+/// device, and the CoarseTracker's weave composes the absolute fix with the
+/// view-space KLT motion since the frame the worker consumed.
 ///
 /// Shutdown is implicit: the channel ends live on the pipeline, so when the
 /// pipeline is dropped `req_rx.recv()` returns `Err` and the thread exits.
@@ -385,6 +383,10 @@ type TrackerComputeResult =
 struct TrackerCompute {
     req_tx: std::sync::mpsc::Sender<TrackerRequest>,
     resp_rx: std::sync::mpsc::Receiver<TrackerComputeResult>,
+    /// `true` between a successful `try_dispatch` and the matching
+    /// `try_take_result`. Caps the worker queue at one outstanding job so a
+    /// slow tick can't pile up behind a fast camera cadence.
+    in_flight: AtomicBool,
 }
 
 impl TrackerCompute {
@@ -410,23 +412,47 @@ impl TrackerCompute {
                 }
             })
             .expect("failed to spawn LiveTrackerCompute");
-        TrackerCompute { req_tx, resp_rx }
+        TrackerCompute {
+            req_tx,
+            resp_rx,
+            in_flight: AtomicBool::new(false),
+        }
     }
 
-    /// Hand the engine job to the compute thread. Returns immediately; the
-    /// engine runs on the compute thread while the caller does other work.
-    fn submit(&self, req: TrackerRequest) {
-        self.req_tx
-            .send(req)
-            .expect("tracker compute thread died before submit");
+    /// Fire-and-forget dispatch. Returns `true` when the job was sent. Returns
+    /// `false` when a previous job is still in flight — the caller drops this
+    /// tick rather than queueing, so a slow worker can't pile up behind a fast
+    /// camera cadence. The caller MUST drain pending results via
+    /// [`try_take_result`](Self::try_take_result) before dispatching, otherwise
+    /// the in-flight slot stays set until the next poll.
+    fn try_dispatch(&self, req: TrackerRequest) -> bool {
+        if self.in_flight.swap(true, Ordering::Acquire) {
+            return false;
+        }
+        if let Err(e) = self.req_tx.send(req) {
+            // Worker died — unset so the caller can stop trying.
+            self.in_flight.store(false, Ordering::Release);
+            log::error!("tracker compute thread died on dispatch: {e:?}");
+            return false;
+        }
+        true
     }
 
-    /// Block for the result of the most recently [`submit`](Self::submit)ted
-    /// job.
-    fn wait(&self) -> TrackerComputeResult {
-        self.resp_rx
-            .recv()
-            .expect("tracker compute thread died before result")
+    /// Non-blocking poll. Returns `Some` when the most recently-dispatched job
+    /// has finished, clearing the in-flight slot so a fresh dispatch can fire.
+    fn try_take_result(&self) -> Option<TrackerComputeResult> {
+        match self.resp_rx.try_recv() {
+            Ok(r) => {
+                self.in_flight.store(false, Ordering::Release);
+                Some(r)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.in_flight.store(false, Ordering::Release);
+                log::error!("tracker compute thread disconnected");
+                None
+            }
+        }
     }
 }
 
@@ -681,81 +707,93 @@ impl LiveTrackerPipeline {
         let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
         let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
 
-        // Async-H step 2: CoarseTracker every frame; Relocalizer every Nth.
-        // On engine frames we submit + wait + apply; on the others we run only
-        // the camera upload and carry the previous engine verdict so the
-        // emitted state stays sensible between Relocalizer ticks. `frame_idx`
-        // tags the Correction so the CoarseTracker's ringbuffer can locate the
-        // matching `H_then` for the weave.
+        // Async-H step 3: the Relocalizer runs on the worker fire-and-forget.
+        // The present thread polls for any completed Correction (the only
+        // thing that advances anchor/lifecycle state), then maybe dispatches a
+        // fresh job at cadence boundaries (gated by worker backpressure — only
+        // one outstanding job at a time). The CoarseTracker tracks every
+        // frame; its current pose is the compose pose between worker results.
         let frame_idx = self.frame_counter.fetch_add(1, Ordering::Relaxed);
-        let coarse_pose = {
-            let mut c = self.coarse.lock().map_err(|_| poisoned())?;
-            c.track(&tracker_gray, frame_idx)
-        };
-        let engine_frame = frame_idx % RELOCALIZER_CADENCE == 0;
+        let _ = self
+            .coarse
+            .lock()
+            .map_err(|_| poisoned())?
+            .track(&tracker_gray, frame_idx);
+
+        if let Err(e) = self.upload_camera_to_target(frame, target) {
+            log::warn!("camera upload failed: {e:?}");
+        }
 
         let t_tracker = Instant::now();
-        let (lifecycle, tracker_anchor, tracker_inliers, step_timings) = if engine_frame {
-            let coarse_prior = self.coarse.lock().map_err(|_| poisoned())?.current_h();
-            let (tracker_outcome, upload_result) = {
-                let tc_guard = self.tracker_compute.lock().map_err(|_| poisoned())?;
-                let tc = tc_guard
-                    .as_ref()
-                    .expect("tracker compute thread not spawned");
-                tc.submit(TrackerRequest {
-                    gray: tracker_gray,
-                    timestamp_ns,
-                    coarse_prior,
-                    frame_idx,
-                });
-                let upload_result = self.upload_camera_to_target(frame, target);
-                (tc.wait(), upload_result)
-            };
-            let (correction, step_timings) = tracker_outcome?;
-            if let Err(e) = upload_result {
-                log::warn!("camera upload failed: {e:?}");
+        // Poll the worker for any completed Correction. This is the *only*
+        // place anchor/lifecycle state advances; everything else is the
+        // CoarseTracker's frame-by-frame KLT.
+        let polled = self
+            .tracker_compute
+            .lock()
+            .map_err(|_| poisoned())?
+            .as_ref()
+            .and_then(|tc| tc.try_take_result());
+        let (applied_correction, step_timings) = match polled {
+            Some(Ok((correction, st))) => {
+                let verdict = LastVerdict {
+                    lifecycle: correction.lifecycle,
+                    root_id: correction.root_id,
+                    inliers: correction.inliers as u32,
+                };
+                let lifecycle_for_dispatch = correction.lifecycle;
+                self.coarse
+                    .lock()
+                    .map_err(|_| poisoned())?
+                    .apply(correction);
+                if let Ok(mut slot) = self.last_verdict.lock() {
+                    *slot = verdict;
+                }
+                (Some(lifecycle_for_dispatch), st)
             }
-            let verdict = LastVerdict {
-                lifecycle: correction.lifecycle,
-                root_id: correction.root_id,
-                inliers: correction.inliers as u32,
-            };
-            self.coarse
-                .lock()
-                .map_err(|_| poisoned())?
-                .apply(correction);
-            if let Ok(mut slot) = self.last_verdict.lock() {
-                *slot = verdict;
+            Some(Err(e)) => {
+                log::warn!("engine relocalize failed: {e:?}");
+                (None, crate::planar_engine::StepTimings::default())
             }
-            (
-                verdict.lifecycle,
-                verdict.root_id,
-                verdict.inliers,
-                step_timings,
-            )
-        } else {
-            // Non-engine frame: upload inline (no compute-thread rendezvous);
-            // carry the last verdict so state/anchor stay consistent.
-            if let Err(e) = self.upload_camera_to_target(frame, target) {
-                log::warn!("camera upload failed: {e:?}");
-            }
-            let v = self.last_verdict.lock().map(|g| *g).unwrap_or_default();
-            (
-                v.lifecycle,
-                v.root_id,
-                v.inliers,
-                crate::planar_engine::StepTimings::default(),
-            )
+            None => (None, crate::planar_engine::StepTimings::default()),
         };
 
-        // Compose pose: `current_h` is the post-apply pose on engine frames,
-        // post-track on non-engine. On a brief mid-Locked KLT miss, `track`
-        // returns None but `current_h` is left at the previous frame's good
-        // pose — coast on it rather than hiding the overlay, since the next
-        // engine tick is at most one frame away and will either correct it or
-        // say Lost (whereupon `apply` resets and we fall into grace). Hiding
-        // on every transient KLT miss produced visible 1-frame flickers.
-        let _ = coarse_pose;
+        // Dispatch a fresh engine job at cadence boundaries. The worker only
+        // accepts one outstanding job, so this returns false (silently drops)
+        // if the worker hasn't finished the previous one yet; the next cadence
+        // tick retries. The gray is moved into the request only on dispatch.
+        let engine_frame = frame_idx % RELOCALIZER_CADENCE == 0;
+        let dispatch_ok = if engine_frame {
+            let coarse_prior = self.coarse.lock().map_err(|_| poisoned())?.current_h();
+            self.tracker_compute
+                .lock()
+                .map_err(|_| poisoned())?
+                .as_ref()
+                .map(|tc| {
+                    tc.try_dispatch(TrackerRequest {
+                        gray: tracker_gray,
+                        timestamp_ns,
+                        coarse_prior,
+                        frame_idx,
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            // tracker_gray drops here unused — coarse already borrowed it.
+            false
+        };
+        let _ = dispatch_ok;
+
+        let v = self.last_verdict.lock().map(|g| *g).unwrap_or_default();
+        let (lifecycle, tracker_anchor, tracker_inliers) = (v.lifecycle, v.root_id, v.inliers);
+
+        // Compose pose: `current_h` is the CoarseTracker's post-track and
+        // (when applied this frame) post-weave pose. On a brief mid-Locked
+        // KLT miss `track` returns None but `current_h` is left at the
+        // previous frame's good pose — coast on it rather than hiding the
+        // overlay; the worker's next Correction will either weave it back
+        // toward the absolute fix or say Lost (whereupon `apply` resets and
+        // we fall into grace).
         let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.current_h();
         let tracker_h = match lifecycle {
             Lifecycle::Locked => coarse_h.map(|h| {
@@ -814,19 +852,22 @@ impl LiveTrackerPipeline {
             );
 
         // Mode decision: Acquiring → acquire, Locked+should_refresh → refresh.
-        // At cadence > 1 we only dispatch on engine frames — between Relocalizer
-        // ticks the verdict is stale (carried from the last engine frame), and
-        // re-firing the same request adds nothing the worker isn't already
-        // handling (it's gated by backpressure either way).
-        let async_kind = if !engine_frame || matches!(cfg.target_mode, TargetMode::Suppressed) {
-            None
-        } else {
-            match tracker_state {
-                PlanarTrackerState::Acquiring => Some(AsyncKind::Acquire),
-                PlanarTrackerState::Locked if should_refresh => Some(AsyncKind::Refresh),
-                _ => None,
-            }
-        };
+        // At step 3 we dispatch only on frames where the worker actually
+        // delivered a fresh Correction (`applied_correction`). The verdict
+        // carries across non-apply frames untouched, so re-firing every frame
+        // would just spam the gray-only `rgb_request` path (one redundant RGB
+        // readback per non-apply frame); worker BP already keeps the OCR
+        // worker from overcommitting on the dispatch side.
+        let async_kind =
+            if applied_correction.is_none() || matches!(cfg.target_mode, TargetMode::Suppressed) {
+                None
+            } else {
+                match tracker_state {
+                    PlanarTrackerState::Acquiring => Some(AsyncKind::Acquire),
+                    PlanarTrackerState::Locked if should_refresh => Some(AsyncKind::Refresh),
+                    _ => None,
+                }
+            };
 
         // A gray-only frame (GPU readback) carries no RGBA, so the heavy
         // det/rec can't run from it. Instead of dispatching, hand the caller an
