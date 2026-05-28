@@ -618,6 +618,14 @@ impl LiveTrackerPipeline {
         }
     }
 
+    /// Set the overlay-canvas oversample factor (texels per surface
+    /// unit). The caller derives it from the display/canonical
+    /// resolution ratio so the overlay rasterizes near display res
+    /// while the OCR/tracker frame stays canonical-sized.
+    pub fn set_overlay_oversample(&self, factor: f32) {
+        self.session.set_overlay_oversample(factor);
+    }
+
     /// Bump generation, clear engine state + smoothed H + session
     /// state. Any in-flight worker job will observe the new generation
     /// and bail at its next gen-check.
@@ -1115,6 +1123,7 @@ impl LiveTrackerPipeline {
                         bitmap_rgba: &c.bitmap,
                         bitmap_width: c.width,
                         bitmap_height: c.height,
+                        oversample: c.oversample,
                         bitmap_origin_surface_x: c.surface_origin_x,
                         bitmap_origin_surface_y: c.surface_origin_y,
                         row_extents: &c.row_extents,

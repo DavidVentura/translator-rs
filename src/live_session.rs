@@ -419,6 +419,12 @@ pub struct LiveSession {
     /// refresh fires. ~15 frames is ~0.5s at 30fps. Configurable so
     /// the sim can run tighter cadence than production.
     refresh_every_n_locked_frames: AtomicU32,
+    /// Overlay-canvas oversample factor (f32 bits), set by the caller
+    /// from the display/canonical resolution ratio. `1.0` keeps the
+    /// legacy 1:1 surface rasterization; higher renders glyphs denser
+    /// so the per-frame warp upscales them less. See
+    /// [`render_anchor_canvas`].
+    overlay_oversample: AtomicU32,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -442,7 +448,22 @@ impl LiveSession {
             locked_frames_since_acquire: AtomicU64::new(0),
             last_refresh_locked_frame: AtomicU64::new(0),
             refresh_every_n_locked_frames: AtomicU32::new(DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES),
+            overlay_oversample: AtomicU32::new(1.0_f32.to_bits()),
         }
+    }
+
+    /// Set the overlay-canvas oversample factor (texels per surface
+    /// unit). Clamped to `[1.0, 4.0]`: below 1 would downsample the
+    /// overlay below the surface; above 4 buys nothing on real displays
+    /// and balloons the one-time canvas allocation.
+    pub fn set_overlay_oversample(&self, factor: f32) {
+        let clamped = factor.clamp(1.0, 4.0);
+        self.overlay_oversample
+            .store(clamped.to_bits(), Ordering::Relaxed);
+    }
+
+    fn overlay_oversample(&self) -> f32 {
+        f32::from_bits(self.overlay_oversample.load(Ordering::Relaxed))
     }
 
     /// Drop all session state. Caller invokes on tap-to-focus,
@@ -1028,7 +1049,12 @@ impl LiveSession {
         // thread) keeps reading the *old* `canvas` while glyph
         // rasterization runs. Only the final pointer-swap below
         // takes the lock again, and that swap is instantaneous.
-        let canvas = render_anchor_canvas(&blocks_snapshot, &provisional_snapshot, font_provider);
+        let canvas = render_anchor_canvas(
+            &blocks_snapshot,
+            &provisional_snapshot,
+            font_provider,
+            self.overlay_oversample(),
+        );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
                 // If a racing upsert mutated `blocks` while we were
@@ -2559,6 +2585,10 @@ pub struct AnchorRaster {
     pub bitmap: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Texture pixels per surface unit (see [`crate::live_compositor::OverlayItem::oversample`]).
+    /// `width`/`height` are the texel dims; the surface footprint is
+    /// those divided by `oversample`.
+    pub oversample: f32,
     pub surface_origin_x: f32,
     pub surface_origin_y: f32,
     pub row_extents: Vec<(u32, u32)>,
@@ -2661,6 +2691,7 @@ pub fn render_anchor_canvas(
     blocks: &std::collections::BTreeMap<u64, BlockSpec>,
     provisional_strips: &[OrientedRect],
     font_provider: &dyn crate::font_provider::FontProvider,
+    oversample: f32,
 ) -> Option<AnchorRaster> {
     use crate::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
@@ -2669,6 +2700,11 @@ pub fn render_anchor_canvas(
     if blocks.is_empty() && provisional_strips.is_empty() {
         return None;
     }
+    // Texels per surface unit. Geometry (AABB, origin) is computed in
+    // surface coords, then every canvas-local coordinate + the font size
+    // are scaled by `os` so glyphs rasterize denser than the surface;
+    // the compositor maps the result back onto the 1:1 surface footprint.
+    let os = oversample.max(1.0);
 
     // 1. Per-block: inflate strips into visuals, normalize basis,
     //    collect for later AABB + paint passes.
@@ -2755,8 +2791,8 @@ pub fn render_anchor_canvas(
     let pad = ITEM_BITMAP_PAD_PX;
     let origin_x = (min_x - pad).max(0.0);
     let origin_y = (min_y - pad).max(0.0);
-    let bitmap_w = ((max_x + pad - origin_x).ceil() as i32).max(1) as u32;
-    let bitmap_h = ((max_y + pad - origin_y).ceil() as i32).max(1) as u32;
+    let bitmap_w = (((max_x + pad - origin_x) * os).ceil() as i32).max(1) as u32;
+    let bitmap_h = (((max_y + pad - origin_y) * os).ceil() as i32).max(1) as u32;
     let pixels = (bitmap_w as usize) * (bitmap_h as usize);
     let mut canvas = vec![0u8; pixels * 4];
 
@@ -2772,10 +2808,10 @@ pub fn render_anchor_canvas(
             .visuals
             .iter()
             .map(|v| OrientedRect {
-                cx: v.cx - origin_x,
-                cy: v.cy - origin_y,
-                width: v.width,
-                height: v.height,
+                cx: (v.cx - origin_x) * os,
+                cy: (v.cy - origin_y) * os,
+                width: v.width * os,
+                height: v.height * os,
                 angle_radians: v.angle_radians,
             })
             .collect();
@@ -2812,10 +2848,10 @@ pub fn render_anchor_canvas(
     let provisional_bg = [0x10, 0x10, 0x10, 0xC8];
     for v in &prepared_provisional {
         let local = OrientedRect {
-            cx: v.cx - origin_x,
-            cy: v.cy - origin_y,
-            width: v.width,
-            height: v.height,
+            cx: (v.cx - origin_x) * os,
+            cy: (v.cy - origin_y) * os,
+            width: v.width * os,
+            height: v.height * os,
             angle_radians: v.angle_radians,
         };
         crate::planar_engine::fill_oriented_rect_blended(
@@ -2852,7 +2888,8 @@ pub fn render_anchor_canvas(
                 let text_box = OrientedRect {
                     cx: v.cx,
                     cy: v.cy,
-                    width: (v.width - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX)
+                    width: (v.width
+                        - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX * os)
                         .max(1.0),
                     height: v.height,
                     angle_radians: v.angle_radians,
@@ -2879,7 +2916,8 @@ pub fn render_anchor_canvas(
             .iter()
             .map(|v| v.height)
             .fold(0.0_f32, f32::max)
-            .clamp(10.0, 120.0);
+            .clamp(10.0, 120.0)
+            * os;
         let block_bbox = block_aabb_within_canvas(local, bitmap_w, bitmap_h);
         prepared_text_blocks.push(PreparedTextBlock {
             source_text: String::new(),
@@ -2908,7 +2946,7 @@ pub fn render_anchor_canvas(
         };
         let opts = crate::image_render::RenderOptions {
             language: anchor_lang,
-            min_font_size_px: 6.0,
+            min_font_size_px: 6.0 * os,
         };
         crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?
     };
@@ -2917,6 +2955,7 @@ pub fn render_anchor_canvas(
         bitmap: final_bitmap,
         width: bitmap_w,
         height: bitmap_h,
+        oversample: os,
         surface_origin_x: origin_x,
         surface_origin_y: origin_y,
         row_extents,

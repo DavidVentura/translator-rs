@@ -28,6 +28,15 @@ pub struct OverlayItem<'a> {
     pub bitmap_rgba: &'a [u8],
     pub bitmap_width: u32,
     pub bitmap_height: u32,
+    /// Texture pixels per surface unit. `1.0` means the bitmap is 1:1
+    /// with its surface footprint (the legacy assumption). Values > 1
+    /// mean the glyphs were rasterized denser than the surface so the
+    /// warp upscales them less — the bitmap covers a footprint of
+    /// `bitmap_width / oversample` × `bitmap_height / oversample`
+    /// surface units while carrying `bitmap_width × bitmap_height`
+    /// texels. Lets the overlay render near display resolution while
+    /// the OCR/tracker frame stays at the cheap canonical size.
+    pub oversample: f32,
     pub bitmap_origin_surface_x: f32,
     pub bitmap_origin_surface_y: f32,
     /// Per-source-row half-open `[first, last)` range of columns
@@ -265,7 +274,10 @@ fn warp_item_onto_display(
 
     let ox = item.bitmap_origin_surface_x;
     let oy = item.bitmap_origin_surface_y;
-    let bitmap_to_surface = [1.0, 0.0, ox, 0.0, 1.0, oy, 0.0, 0.0, 1.0];
+    // Bitmap texels map to surface units at 1/oversample, then translate
+    // to the surface origin: a denser bitmap covers the same footprint.
+    let inv_os = 1.0 / item.oversample.max(1e-3);
+    let bitmap_to_surface = [inv_os, 0.0, ox, 0.0, inv_os, oy, 0.0, 0.0, 1.0];
     let bitmap_to_viewport = mat3_mul(h_surface_to_viewport, &bitmap_to_surface);
     let viewport_to_bitmap = match invert(&bitmap_to_viewport) {
         Some(v) => v,
@@ -504,6 +516,7 @@ mod tests {
             bitmap_rgba: &overlay,
             bitmap_width: 4,
             bitmap_height: 4,
+            oversample: 1.0,
             bitmap_origin_surface_x: 1.0,
             bitmap_origin_surface_y: 1.0,
             row_extents: &[],
@@ -539,6 +552,7 @@ mod tests {
             bitmap_rgba: &overlay,
             bitmap_width: 5,
             bitmap_height: 5,
+            oversample: 1.0,
             bitmap_origin_surface_x: 2.0,
             bitmap_origin_surface_y: 3.0,
             row_extents: &[],
@@ -591,6 +605,7 @@ mod tests {
             bitmap_rgba: &overlay,
             bitmap_width: 6,
             bitmap_height: 6,
+            oversample: 1.0,
             bitmap_origin_surface_x: 4.0,
             bitmap_origin_surface_y: 4.0,
             row_extents: &[],

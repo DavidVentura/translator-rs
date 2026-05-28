@@ -1164,7 +1164,7 @@ impl PpocrDetector {
             &binary, &mask, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h, thresholds,
         );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
-        log::debug!(
+        log::info!(
             "ppocr det: input_pad={}x{} scaled={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{} — pre={:.1}ms infer={:.1}ms post={:.1}ms",
             pad_w,
             pad_h,

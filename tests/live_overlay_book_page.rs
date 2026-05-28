@@ -197,7 +197,7 @@ fn book_page_grouping_dump() {
             },
         );
     }
-    let canvas = render_anchor_canvas(&block_specs, &[], &font_provider);
+    let canvas = render_anchor_canvas(&block_specs, &[], &font_provider, 1.0);
     if let Some(c) = &canvas {
         eprintln!(
             "  anchor canvas: {}x{} at ({}, {})",
@@ -211,6 +211,7 @@ fn book_page_grouping_dump() {
                 bitmap_rgba: &c.bitmap,
                 bitmap_width: c.width,
                 bitmap_height: c.height,
+                oversample: c.oversample,
                 bitmap_origin_surface_x: c.surface_origin_x,
                 bitmap_origin_surface_y: c.surface_origin_y,
                 row_extents: &c.row_extents,

@@ -632,9 +632,17 @@ impl GlesRenderer {
                 let to_surface =
                     translate(item.bitmap_origin_surface_x, item.bitmap_origin_surface_y);
                 let bitmap_to_viewport = mat3_mul(input.h_surface_to_viewport, &to_surface);
+                // The texture carries `bitmap_width × bitmap_height` texels but
+                // only covers `.../oversample` surface units; scaling the quad to
+                // the surface footprint lets the sampler read the denser texture
+                // across a smaller area, so the warp upscales it less.
+                let inv_os = 1.0 / item.oversample.max(1e-3);
                 let sized = mat3_mul(
                     &bitmap_to_viewport,
-                    &scale(item.bitmap_width as f32, item.bitmap_height as f32),
+                    &scale(
+                        item.bitmap_width as f32 * inv_os,
+                        item.bitmap_height as f32 * inv_os,
+                    ),
                 );
                 let transform = mat3_mul(&overlay_to_clip, &sized);
                 gl.uniform_matrix_3_f32_slice(

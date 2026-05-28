@@ -197,6 +197,7 @@ fn gpu_overlay_identity_h_matches_cpu() {
     let overlay = bordered_overlay(16, 16, [220, 20, 30], 3);
     let item = OverlayItem {
         bitmap_rgba: &overlay,
+        oversample: 1.0,
         bitmap_width: 16,
         bitmap_height: 16,
         bitmap_origin_surface_x: 12.0,
@@ -243,6 +244,7 @@ fn gpu_overlay_perspective_h_matches_cpu() {
     let overlay = bordered_overlay(20, 20, [40, 210, 90], 4);
     let item = OverlayItem {
         bitmap_rgba: &overlay,
+        oversample: 1.0,
         bitmap_width: 20,
         bitmap_height: 20,
         bitmap_origin_surface_x: 10.0,
@@ -282,6 +284,7 @@ fn gpu_render_is_deterministic() {
     let overlay = bordered_overlay(18, 18, [10, 120, 240], 2);
     let item = OverlayItem {
         bitmap_rgba: &overlay,
+        oversample: 1.0,
         bitmap_width: 18,
         bitmap_height: 18,
         bitmap_origin_surface_x: 9.0,
@@ -318,6 +321,7 @@ fn gpu_display_transform_rotates_output() {
     let overlay = bordered_overlay(16, 16, [220, 20, 30], 3);
     let item = OverlayItem {
         bitmap_rgba: &overlay,
+        oversample: 1.0,
         bitmap_width: 16,
         bitmap_height: 16,
         bitmap_origin_surface_x: 12.0,
