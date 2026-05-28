@@ -958,11 +958,26 @@ pub fn ransac_homography_with_prior(
 }
 
 /// Coarse per-frame pose: LK-track each seed's previous view-point from
-/// `prev_pyr` into `cur_pyr`, then fit `model→view` from the survivors. The
-/// cheap every-frame step the CoarseTracker runs, with no descriptor matching —
-/// `model` is whatever frame the seeds are expressed in (root coords, here).
-/// Returns the fit plus the tracked `(model, cur_view)` inlier pairs (next
-/// frame's seeds). `None` if too few survive, or the pyramids disagree on size.
+/// `prev_pyr` into `cur_pyr`, then update the prior by composing with a
+/// frame-to-frame similarity DELTA fit from `(prev_view, cur_view)`.
+///
+/// Why a delta and not an absolute root→view refit: the engine's adaptive
+/// model (similarity for 8-14 inliers, affine for 15-29, homography for 30+)
+/// is the right shape for descriptor relocalization — there the H is fit
+/// against fresh feature correspondences with no presumed prior. For the
+/// coarse, the *prior already encodes the correct perspective*; a low-inlier
+/// frame falling through to similarity-on-(root, cur_view) would replace
+/// the prior's 8-DoF estimate with a 4-DoF fit and erase the perspective
+/// entries (visible as transient "flatten" wobble during real motion).
+/// Composing a similarity delta preserves the prior's perspective and only
+/// updates translation/rotation/uniform-scale frame-to-frame; new perspective
+/// is introduced exclusively by the Relocalizer via `Correction` snap/weave.
+///
+/// `prior` is required for this path. If absent, falls back to the absolute
+/// adaptive fit (used only on the very first coarse fit before any anchor's
+/// `h_root_to_canonical` is known — which on the current pipeline doesn't
+/// arise, because the CoarseTracker only fits after a Correction snap has set
+/// `current_h`).
 pub fn klt_forward_fit(
     prev_pyr: &Pyramid,
     cur_pyr: &Pyramid,
@@ -976,13 +991,121 @@ pub fn klt_forward_fit(
     }
     let prev_view_pts: Vec<(f32, f32)> = seeds.iter().map(|&(_, _, vx, vy)| (vx, vy)).collect();
     let tracked = track_points(prev_pyr, cur_pyr, &prev_view_pts, &KltConfig::default());
-    let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+
+    let Some(prior_h) = prior else {
+        let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+        for (seed, t) in seeds.iter().zip(tracked.iter()) {
+            if t.success {
+                pairs.push((seed.0, seed.1, t.x, t.y));
+            }
+        }
+        return ransac_homography_with_prior(&pairs, cfg, min_inliers, None);
+    };
+
+    // Build the two parallel pair lists for the delta fit:
+    //   view_pairs:  (prev_view, cur_view)   — input to the similarity RANSAC
+    //   root_pairs:  (root,      cur_view)   — used for the returned TrackResult
+    let mut view_pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+    let mut root_pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
     for (seed, t) in seeds.iter().zip(tracked.iter()) {
         if t.success {
-            pairs.push((seed.0, seed.1, t.x, t.y));
+            view_pairs.push((seed.2, seed.3, t.x, t.y));
+            root_pairs.push((seed.0, seed.1, t.x, t.y));
         }
     }
-    ransac_homography_with_prior(&pairs, cfg, min_inliers, prior)
+    if view_pairs.len() < min_inliers {
+        return None;
+    }
+    let delta = ransac_similarity_with_min(&view_pairs, cfg, min_inliers)?;
+    let new_h = mat3_mul(&delta, &prior_h);
+
+    // Re-score the composed H over (root, cur_view) for `inliers` /
+    // `median_residual_px` / `inlier_pairs`. These drive downstream gates
+    // (engine's degraded / handoff thresholds, the dispatch gate this caller
+    // uses to decide whether to enqueue a Relocalizer job).
+    let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
+    let mut inlier_pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut residuals: Vec<f32> = Vec::new();
+    for &(rx, ry, vx, vy) in &root_pairs {
+        let Some((px, py)) = project(&new_h, rx, ry) else {
+            continue;
+        };
+        let dx = px - vx;
+        let dy = py - vy;
+        let r2 = dx * dx + dy * dy;
+        if r2 <= r_thresh_sq {
+            inlier_pairs.push((rx, ry, vx, vy));
+            residuals.push(r2.sqrt());
+        }
+    }
+    if inlier_pairs.len() < min_inliers {
+        return None;
+    }
+    residuals.sort_by(|a, b| a.total_cmp(b));
+    let median = if residuals.is_empty() {
+        f32::INFINITY
+    } else {
+        residuals[residuals.len() / 2]
+    };
+    Some(TrackResult {
+        homography: new_h,
+        inliers: inlier_pairs.len(),
+        matches: view_pairs.len(),
+        median_residual_px: median,
+        inlier_pairs,
+        descriptor_inliers: 0,
+    })
+}
+
+/// RANSAC fit of a 4-DoF similarity (rotation + uniform scale + translation)
+/// over `(a_x, a_y, b_x, b_y)` pairs. Two-point minimal sample, residual gate
+/// from `cfg.ransac_residual_px`. Used by the CoarseTracker's per-frame
+/// delta fit. Strict `>` tie-break so deterministic samples don't flip the
+/// winning model on a tied inlier count.
+fn ransac_similarity_with_min(
+    pairs: &[(f32, f32, f32, f32)],
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+) -> Option<[f32; 9]> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let mut rng = SmallRng::from_seed(0xA5A5_5A5A_3C3C_C3C3);
+    let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
+    let n = pairs.len();
+    let mut best_inliers_idx: Vec<usize> = Vec::new();
+    for _ in 0..cfg.ransac_iters {
+        let i0 = (rng.next_u32() as usize) % n;
+        let mut i1 = (rng.next_u32() as usize) % n;
+        while i1 == i0 {
+            i1 = (rng.next_u32() as usize) % n;
+        }
+        let sample = [pairs[i0], pairs[i1]];
+        let h = match fit_similarity(&sample) {
+            Some(h) => h,
+            None => continue,
+        };
+        let mut inliers_idx: Vec<usize> = Vec::with_capacity(n);
+        for (i, &(ax, ay, bx, by)) in pairs.iter().enumerate() {
+            let Some((px, py)) = project(&h, ax, ay) else {
+                continue;
+            };
+            let dx = px - bx;
+            let dy = py - by;
+            if dx * dx + dy * dy <= r_thresh_sq {
+                inliers_idx.push(i);
+            }
+        }
+        if inliers_idx.len() > best_inliers_idx.len() {
+            best_inliers_idx = inliers_idx;
+        }
+    }
+    if best_inliers_idx.len() < min_inliers {
+        return None;
+    }
+    let inlier_pairs: Vec<(f32, f32, f32, f32)> =
+        best_inliers_idx.iter().map(|&i| pairs[i]).collect();
+    fit_similarity(&inlier_pairs)
 }
 
 /// FAST-9 corner detector with non-maximum suppression. Scans every
