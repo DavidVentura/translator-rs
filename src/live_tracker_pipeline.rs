@@ -179,6 +179,14 @@ struct LastEmittedH {
 }
 
 const LOSS_HIDE_AFTER_FRAMES: u32 = 4;
+
+/// Run the Relocalizer (engine.relocalize) every Nth frame. The CoarseTracker
+/// still runs every frame; between Relocalizer ticks, the compose pose comes
+/// purely from KLT (drifting until the next Correction weaves in). At step 2 this
+/// is synchronous (still on the present thread via the compute-thread submit/wait
+/// rendezvous); step 3 moves it off-thread. The engine's frame-counted gates are
+/// rescaled by this value at pipeline init so wall-time hysteresis matches step 1.
+const RELOCALIZER_CADENCE: u64 = 2;
 const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// Inflation around the viewport AABB when asking the session
 /// "is this view already covered?". A small pad swallows the
@@ -187,6 +195,24 @@ const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// resolution, so 24 px = ~2-3% of typical viewport extent.
 const COVERAGE_PAD_PX: f32 = 24.0;
 const ENABLE_COLOR_MATTING: bool = false;
+
+/// Defaults divided by [`RELOCALIZER_CADENCE`] so wall-time hysteresis matches
+/// step 1. The engine counts in frames *it sees*; at cadence N each engine tick
+/// is N wall frames, so a 5-frame Lost gate would otherwise become 10 wall
+/// frames. `handoff_cooldown_ns` and the loss-hide grace are ns- or wall-frame-
+/// counted and untouched.
+fn rescaled_engine_config() -> EngineConfig {
+    let mut cfg = EngineConfig::default();
+    let n = RELOCALIZER_CADENCE.max(1) as u32;
+    let div_ceil = |t: u32| t.div_ceil(n);
+    cfg.lost_after_frames = div_ceil(cfg.lost_after_frames);
+    cfg.give_up_after_frames = div_ceil(cfg.give_up_after_frames);
+    cfg.degraded_max_frames = div_ceil(cfg.degraded_max_frames);
+    // `anchor_switch_blend_frames` is engine-side emit-smoothing; it ticks at
+    // engine rate too, so rescale until the blend moves to CoarseTracker.
+    cfg.anchor_switch_blend_frames = div_ceil(cfg.anchor_switch_blend_frames);
+    cfg
+}
 
 /// What kind of async job the per-frame fast path needs to dispatch.
 #[derive(Clone)]
@@ -452,6 +478,28 @@ impl Default for TimingStats {
 const TIMING_WINDOW_FRAMES: u32 = 10;
 
 /// The pipeline itself.
+/// What the pipeline carries across non-engine frames at cadence > 1. The
+/// CoarseTracker holds the geometry (incl. canonical rotation); this carries
+/// only what downstream non-coarse code reads from the engine's last verdict so
+/// the pipeline keeps emitting the right `PlanarTrackerState` + `anchor_id`
+/// between Relocalizer ticks.
+#[derive(Clone, Copy)]
+struct LastVerdict {
+    lifecycle: Lifecycle,
+    root_id: u64,
+    inliers: u32,
+}
+
+impl Default for LastVerdict {
+    fn default() -> Self {
+        Self {
+            lifecycle: Lifecycle::Lost,
+            root_id: 0,
+            inliers: 0,
+        }
+    }
+}
+
 pub struct LiveTrackerPipeline {
     /// Async-H fast half: per-frame KLT pose owner. The present thread runs
     /// `track` to produce the compose pose + the prior the engine relocalizes
@@ -460,6 +508,9 @@ pub struct LiveTrackerPipeline {
     /// Monotonic per-frame counter — tags each Correction so the weave can find
     /// the matching ringbuffer entry.
     frame_counter: AtomicU64,
+    /// Last engine verdict — carried across non-engine frames at cadence > 1 so
+    /// the pipeline keeps emitting the right state between Relocalizer ticks.
+    last_verdict: Mutex<LastVerdict>,
     engine: Mutex<LivePlanarEngine>,
     session: Arc<LiveSession>,
     last_emitted_h: Mutex<LastEmittedH>,
@@ -488,11 +539,12 @@ impl LiveTrackerPipeline {
         catalog: Arc<TranslatorSession>,
         font_provider: Arc<dyn FontProvider + Send + Sync>,
     ) -> Arc<Self> {
-        let engine_cfg = EngineConfig::default();
+        let engine_cfg = rescaled_engine_config();
         let coarse = CoarseTracker::new(engine_cfg.tracker.clone());
         let pipeline = Arc::new(Self {
             coarse: Mutex::new(coarse),
             frame_counter: AtomicU64::new(0),
+            last_verdict: Mutex::new(LastVerdict::default()),
             engine: Mutex::new(LivePlanarEngine::new(engine_cfg)),
             session: Arc::new(LiveSession::new()),
             last_emitted_h: Mutex::new(LastEmittedH::default()),
@@ -624,56 +676,84 @@ impl LiveTrackerPipeline {
         let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
         let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
 
-        // Async-H step 1 (synchronous): run the CoarseTracker on the same
-        // tracker gray before submitting, so its KLT pose becomes the engine's
-        // guided-match prior. `frame_idx` tags the Correction so the weave can
-        // line it up with this frame's ringbuffer entry.
+        // Async-H step 2: CoarseTracker every frame; Relocalizer every Nth.
+        // On engine frames we submit + wait + apply; on the others we run only
+        // the camera upload and carry the previous engine verdict so the
+        // emitted state stays sensible between Relocalizer ticks. `frame_idx`
+        // tags the Correction so the CoarseTracker's ringbuffer can locate the
+        // matching `H_then` for the weave.
         let frame_idx = self.frame_counter.fetch_add(1, Ordering::Relaxed);
-        let coarse_prior = {
+        let coarse_pose = {
             let mut c = self.coarse.lock().map_err(|_| poisoned())?;
-            let _ = c.track(&tracker_gray, frame_idx);
-            c.current_h()
+            c.track(&tracker_gray, frame_idx)
         };
+        let engine_frame = frame_idx % RELOCALIZER_CADENCE == 0;
 
-        // Overlap the H-independent camera upload with the engine relocalize:
-        // hand the job to the long-lived compute thread, run `upload_camera` on
-        // this (render/GL) thread, then block for the result. On the CPU target
-        // `upload_camera` is a no-op, so the upload returns immediately.
         let t_tracker = Instant::now();
-        let (tracker_outcome, upload_result) = {
-            let tc_guard = self.tracker_compute.lock().map_err(|_| poisoned())?;
-            let tc = tc_guard
-                .as_ref()
-                .expect("tracker compute thread not spawned");
-            tc.submit(TrackerRequest {
-                gray: tracker_gray,
-                timestamp_ns,
-                coarse_prior,
-                frame_idx,
-            });
-            let upload_result = self.upload_camera_to_target(frame, target);
-            (tc.wait(), upload_result)
+        let (lifecycle, tracker_anchor, tracker_inliers, step_timings) = if engine_frame {
+            let coarse_prior = self.coarse.lock().map_err(|_| poisoned())?.current_h();
+            let (tracker_outcome, upload_result) = {
+                let tc_guard = self.tracker_compute.lock().map_err(|_| poisoned())?;
+                let tc = tc_guard
+                    .as_ref()
+                    .expect("tracker compute thread not spawned");
+                tc.submit(TrackerRequest {
+                    gray: tracker_gray,
+                    timestamp_ns,
+                    coarse_prior,
+                    frame_idx,
+                });
+                let upload_result = self.upload_camera_to_target(frame, target);
+                (tc.wait(), upload_result)
+            };
+            let (correction, step_timings) = tracker_outcome?;
+            if let Err(e) = upload_result {
+                log::warn!("camera upload failed: {e:?}");
+            }
+            let verdict = LastVerdict {
+                lifecycle: correction.lifecycle,
+                root_id: correction.root_id,
+                inliers: correction.inliers as u32,
+            };
+            self.coarse
+                .lock()
+                .map_err(|_| poisoned())?
+                .apply(correction);
+            if let Ok(mut slot) = self.last_verdict.lock() {
+                *slot = verdict;
+            }
+            (
+                verdict.lifecycle,
+                verdict.root_id,
+                verdict.inliers,
+                step_timings,
+            )
+        } else {
+            // Non-engine frame: upload inline (no compute-thread rendezvous);
+            // carry the last verdict so state/anchor stay consistent.
+            if let Err(e) = self.upload_camera_to_target(frame, target) {
+                log::warn!("camera upload failed: {e:?}");
+            }
+            let v = self.last_verdict.lock().map(|g| *g).unwrap_or_default();
+            (
+                v.lifecycle,
+                v.root_id,
+                v.inliers,
+                crate::planar_engine::StepTimings::default(),
+            )
         };
-        let (correction, step_timings) = tracker_outcome?;
-        if let Err(e) = upload_result {
-            log::warn!("camera upload failed: {e:?}");
-        }
 
-        // Apply the engine's Correction to the CoarseTracker, then read the
-        // (post-weave/snap) pose for compositing. Synchronous: `frame_idx`
-        // matches the just-tracked ring entry, so the weave reduces to adopting
-        // `refinement_h` modulo numerical drift — i.e. the compose pose ≈ the
-        // engine's emit, isolating the wiring change from any fit change.
-        let tracker_anchor = correction.root_id;
-        let tracker_inliers = correction.inliers as u32;
-        let lifecycle = correction.lifecycle;
-        let coarse_h = {
-            let mut c = self.coarse.lock().map_err(|_| poisoned())?;
-            c.apply(correction);
-            c.current_h()
-        };
+        // Compose pose: post-apply on engine frames; post-track on non-engine
+        // frames. Trust `current_h()` only when the per-frame KLT actually
+        // produced a fresh pose this frame, OR the engine apply just ran.
+        let coarse_h = self
+            .coarse
+            .lock()
+            .map_err(|_| poisoned())?
+            .current_h();
+        let fresh_pose = engine_frame || coarse_pose.is_some();
         let tracker_h = match lifecycle {
-            Lifecycle::Locked => coarse_h.map(|h| {
+            Lifecycle::Locked if fresh_pose => coarse_h.map(|h| {
                 if det_to_full != 1.0 {
                     scale_homography(&h, det_to_full)
                 } else {
@@ -729,7 +809,11 @@ impl LiveTrackerPipeline {
             );
 
         // Mode decision: Acquiring → acquire, Locked+should_refresh → refresh.
-        let async_kind = if matches!(cfg.target_mode, TargetMode::Suppressed) {
+        // At cadence > 1 we only dispatch on engine frames — between Relocalizer
+        // ticks the verdict is stale (carried from the last engine frame), and
+        // re-firing the same request adds nothing the worker isn't already
+        // handling (it's gated by backpressure either way).
+        let async_kind = if !engine_frame || matches!(cfg.target_mode, TargetMode::Suppressed) {
             None
         } else {
             match tracker_state {
