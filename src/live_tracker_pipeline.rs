@@ -746,11 +746,7 @@ impl LiveTrackerPipeline {
         // Compose pose: post-apply on engine frames; post-track on non-engine
         // frames. Trust `current_h()` only when the per-frame KLT actually
         // produced a fresh pose this frame, OR the engine apply just ran.
-        let coarse_h = self
-            .coarse
-            .lock()
-            .map_err(|_| poisoned())?
-            .current_h();
+        let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.current_h();
         let fresh_pose = engine_frame || coarse_pose.is_some();
         let tracker_h = match lifecycle {
             Lifecycle::Locked if fresh_pose => coarse_h.map(|h| {
