@@ -324,7 +324,6 @@ impl Drop for Worker {
 /// reads the same frame's RGBA) concurrently without sharing the buffer.
 struct TrackerRequest {
     gray: image::GrayImage,
-    det_to_full: f32,
     timestamp_ns: u64,
     /// CoarseTracker's current `H_root→view` (det-res), used as the engine's
     /// guided-match prior — replaces the engine's `last_homography` fallback so
@@ -648,7 +647,6 @@ impl LiveTrackerPipeline {
                 .expect("tracker compute thread not spawned");
             tc.submit(TrackerRequest {
                 gray: tracker_gray,
-                det_to_full,
                 timestamp_ns,
                 coarse_prior,
                 frame_idx,

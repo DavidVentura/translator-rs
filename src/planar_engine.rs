@@ -16,8 +16,6 @@ use image::GrayImage;
 use crate::coarse_tracker::{Correction, Lifecycle};
 use crate::coords::Quadrant;
 use crate::homography::{invert, mat3_mul, project};
-use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
-use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
     FrameFeatures, SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
     compute_frame_features, track_against_anchor_with_features,
@@ -201,25 +199,6 @@ pub struct EngineConfig {
     /// ratio is likely in a wrong basin even if the absolute inlier
     /// count is healthy — block it.
     pub handoff_min_inlier_ratio: f32,
-    /// Enable the Extended Kalman Filter on `H_anchor→view`. When
-    /// active, the per-frame RANSAC fit is treated as a noisy
-    /// observation instead of the final answer; the EKF carries
-    /// per-DoF covariance across frames so well-determined DoFs
-    /// respond promptly while under-determined ones (typically
-    /// `h6`/`h7` on clustered inliers) stay anchored to the prior.
-    /// See `analysis.md` § "EKF on H".
-    ///
-    /// Filtered only on the steady-state Locked → Locked branch.
-    /// Anchor-switch frames (fresh acquire, handoff spawn, cached-
-    /// snap) emit the raw RANSAC fit; the EKF re-initialises on the
-    /// first frame for the new anchor because `H` is expressed in
-    /// the active anchor's canonical frame and the covariance from
-    /// the previous anchor doesn't transfer through the chain.
-    pub use_h_ekf: bool,
-    /// Per-inlier measurement variance (σ² in pixel²) for the EKF.
-    /// Default matches the RANSAC inlier residual gate interpreted
-    /// as ≈ 2σ.
-    pub h_ekf_r_var: f64,
     /// Enable chain-composition refinement after a handoff. The
     /// spawn frame's `h_root_to_canonical_new` is fitted from one
     /// frame of RANSAC; on subsequent frames the engine re-tracks
@@ -302,8 +281,6 @@ impl Default for EngineConfig {
             // ratio ~0.2-0.3) we saw in earlier traces.
             handoff_max_median_residual_px: 1.5,
             handoff_min_inlier_ratio: 0.4,
-            use_h_ekf: true,
-            h_ekf_r_var: EKF_R_DEFAULT,
             use_chain_refine: true,
             chain_refine_frames: 10,
         }
@@ -335,20 +312,10 @@ pub struct LivePlanarEngine {
     /// usable fit (Idle/Lost/no-match). Read by diagnostics & smoke
     /// harnesses; not used by the engine itself.
     last_track_result: Option<TrackResult>,
-    /// KLT propagation state: previous-frame gray pyramid + the
-    /// `(anchor_pt, prev_view_pt)` correspondences we want to track
-    /// forward into the next frame. Reset on anchor change / Lost.
-    klt_state: Option<KltFrameState>,
     /// Per-emission state used to blend `H_root→view` across leaf-
     /// anchor switches. Cleared on Lost/Idle so a re-acquire after
     /// loss doesn't lerp from a stale pre-loss H.
     emit_smooth: EmitSmoothState,
-    /// EKF on `H_anchor→view` for the current active anchor. The
-    /// EKF's state is in the active anchor's canonical frame, so it
-    /// is dropped whenever the active anchor changes (handoff, cached
-    /// snap, Lost, Idle) and re-initialised from the next frame's
-    /// raw RANSAC fit.
-    h_ekf: Option<HomographyEkfTracker>,
     /// Running average of `h_root_to_canonical` for a freshly-spawned
     /// handoff anchor, populated from re-tracking the parent against
     /// the current view across the first N post-spawn frames. See
@@ -426,11 +393,6 @@ pub struct GateCounters {
     pub h_sanity_reject: u32,
 }
 
-struct HomographyEkfTracker {
-    anchor_id: AnchorId,
-    ekf: HomographyEkf,
-}
-
 /// Running mean of `h_root_to_canonical` for one freshly-spawned
 /// handoff anchor. The chain matrix is static (a property of the
 /// anchor's coordinate frame, not the current camera pose), so any
@@ -473,18 +435,6 @@ struct BlendState {
     /// 0-based, incremented after each emission within the blend.
     elapsed_frames: u32,
 }
-
-/// Per-anchor KLT propagation snapshot. Carried across frames so the
-/// next frame's tracker call can prepend sub-pixel correspondences to
-/// the descriptor-matched pairs before RANSAC.
-struct KltFrameState {
-    anchor_id: AnchorId,
-    prev_pyramid: Pyramid,
-    /// Bounded to the top-N inliers from the last accepted fit.
-    inlier_pairs: Vec<(f32, f32, f32, f32)>,
-}
-
-const KLT_MAX_SEEDS: usize = 80;
 
 /// Worker threads in the per-frame tracker pool (FAST/BRIEF + matching).
 /// Two is enough to roughly halve the parallel sub-steps without
@@ -687,9 +637,7 @@ impl LivePlanarEngine {
             track_quality: TrackQualityState::new(),
             last_known_quadrant: default_quadrant,
             last_track_result: None,
-            klt_state: None,
             emit_smooth: EmitSmoothState::default(),
-            h_ekf: None,
             chain_refine: None,
             last_cmd_kind: None,
             last_process_ns: None,
@@ -885,11 +833,6 @@ impl LivePlanarEngine {
                 if !self.cache.is_empty() {
                     if let Some((id, result)) = self.try_cached_anchors_timed(gray, None) {
                         self.last_track_result = Some(result.clone());
-                        self.refresh_klt_state(
-                            id,
-                            &Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS),
-                            &result.inlier_pairs,
-                        );
                         log::debug!(
                             "[engine] Idle → Locked via cached anchor leaf={id} (inliers={} desc={})",
                             result.inliers,
@@ -909,7 +852,6 @@ impl LivePlanarEngine {
                         );
                     }
                 }
-                self.clear_klt_state();
                 self.reset_emit_smooth();
                 if self.is_stable_enough(timestamp_ns) {
                     TrackerCommand::Acquiring
@@ -945,23 +887,10 @@ impl LivePlanarEngine {
                 // rotation is small.
                 let keep_min = self.config.tracker.min_inliers_keep_locked;
                 let seed_prior = prior.or(Some(last_homography));
-                // KLT propagation: track the previous frame's inliers
-                // forward into the current frame. The successful
-                // sub-pixel correspondences are prepended to the
-                // descriptor matches so PROSAC's early phases sample
-                // them first.
-                let t_pyramid = std::time::Instant::now();
-                let cur_pyramid = Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS);
-                self.last_step_timings.pyramid_ms = t_pyramid.elapsed().as_secs_f64() * 1000.0;
-                let t_klt_extras = std::time::Instant::now();
-                let klt_extras = self.collect_klt_extras(anchor_id, &cur_pyramid);
-                self.last_step_timings.klt_extras_ms =
-                    t_klt_extras.elapsed().as_secs_f64() * 1000.0;
-                // Compute features once and reuse them both for the
-                // main track and (if active) the chain-refinement
-                // parent re-track. The latter previously called
-                // `compute_frame_features` again over the same gray,
-                // doubling FAST+BRIEF cost on every refining frame.
+                // Per-frame KLT lives in the CoarseTracker (async-H split). The
+                // engine is now descriptor-only, guided by the CoarseTracker's
+                // pose as `seed_prior`. Compute features once and reuse them
+                // for both the main track and the chain-refinement re-track.
                 let t_features = std::time::Instant::now();
                 let features = compute_frame_features(gray, &self.config.tracker);
                 self.last_step_timings.features_ms = t_features.elapsed().as_secs_f64() * 1000.0;
@@ -975,7 +904,7 @@ impl LivePlanarEngine {
                             &self.config.tracker,
                             keep_min,
                             seed_prior,
-                            &klt_extras,
+                            &[],
                         );
                         (r, dims)
                     }
@@ -1016,25 +945,8 @@ impl LivePlanarEngine {
                         }
                     }
                 };
-                // Capture the raw H before the sanity gate so we can
-                // detect a freeze (gate substitutes `h_prev`) and skip
-                // the EKF measurement update on that frame — the
-                // substituted H is not a fresh observation, and the
-                // accompanying inlier pairs came from the bad fit that
-                // tripped the gate.
-                let pre_gate_h = result.as_ref().map(|r| r.homography);
                 let result = result.and_then(|r| self.apply_sanity_gate(r));
-                if let Some(mut r) = result {
-                    if self.config.use_h_ekf {
-                        let frozen =
-                            pre_gate_h.map_or(false, |pre| !h_elementwise_eq(&pre, &r.homography));
-                        let new_h = if frozen {
-                            self.apply_h_ekf(anchor_id, r.homography, &[])
-                        } else {
-                            self.apply_h_ekf(anchor_id, r.homography, &r.inlier_pairs)
-                        };
-                        r.homography = new_h;
-                    }
+                if let Some(r) = result {
                     // Chain-composition refinement: re-track the
                     // parent anchor against the current frame and
                     // fold the implied `h_root_to_canonical_new` into
@@ -1047,7 +959,6 @@ impl LivePlanarEngine {
                     self.last_step_timings.chain_refine_ms =
                         t_chain.elapsed().as_secs_f64() * 1000.0;
                     self.last_track_result = Some(r.clone());
-                    self.refresh_klt_state(anchor_id, &cur_pyramid, &r.inlier_pairs);
                     // Sustained inlier decline: the anchor's
                     // descriptors are losing correspondences as
                     // perspective drifts, and RANSAC will start
@@ -1257,7 +1168,6 @@ impl LivePlanarEngine {
                 // Current anchor lost the frame — try cached siblings.
                 if let Some((id, alt)) = self.try_cached_anchors_timed(gray, Some(anchor_id)) {
                     self.last_track_result = Some(alt.clone());
-                    self.refresh_klt_state(id, &cur_pyramid, &alt.inlier_pairs);
                     log::debug!(
                         "[engine] Locked active={anchor_id} produced no fit → cached sibling leaf={id} (inl={} desc={})",
                         alt.inliers,
@@ -1275,11 +1185,7 @@ impl LivePlanarEngine {
                         canonical_rotation,
                     );
                 }
-                // Matcher failed AND no cached sibling caught the frame:
-                // the previous anchor's KLT seeds are no longer reliable
-                // (we don't know where features are now). Clear to avoid
-                // poisoning the next frame's RANSAC pool.
-                self.clear_klt_state();
+                // Matcher failed AND no cached sibling caught the frame.
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(anchor_id);
                 log::info!(
@@ -1325,11 +1231,6 @@ impl LivePlanarEngine {
             } => {
                 if let Some((id, result)) = self.try_cached_anchors_timed(gray, None) {
                     self.last_track_result = Some(result.clone());
-                    self.refresh_klt_state(
-                        id,
-                        &Pyramid::build(gray, crate::klt::DEFAULT_PYRAMID_LEVELS),
-                        &result.inlier_pairs,
-                    );
                     log::debug!(
                         "[engine] Lost (last_active={last_anchor_id}) → Locked via cached leaf={id} (inl={} desc={})",
                         result.inliers,
@@ -1347,7 +1248,6 @@ impl LivePlanarEngine {
                         canonical_rotation,
                     );
                 }
-                self.clear_klt_state();
                 let new_frames_lost = frames_lost + 1;
                 let root = self.root_of(last_anchor_id);
                 if new_frames_lost >= self.config.give_up_after_frames {
@@ -1370,64 +1270,6 @@ impl LivePlanarEngine {
                 }
             }
         }
-    }
-
-    /// Track the previous frame's inlier view-positions into the
-    /// current frame using pyramidal LK. Returns sub-pixel
-    /// correspondences ready to feed RANSAC alongside the descriptor
-    /// matches. Returns empty when there's no prior state for this
-    /// anchor or the frame dimensions changed.
-    fn collect_klt_extras(
-        &self,
-        anchor_id: AnchorId,
-        cur_pyramid: &Pyramid,
-    ) -> Vec<(f32, f32, f32, f32)> {
-        let Some(state) = self.klt_state.as_ref() else {
-            return Vec::new();
-        };
-        if state.anchor_id != anchor_id || state.inlier_pairs.is_empty() {
-            return Vec::new();
-        }
-        if state.prev_pyramid.levels[0].dimensions() != cur_pyramid.levels[0].dimensions() {
-            return Vec::new();
-        }
-        let prev_view_pts: Vec<(f32, f32)> = state
-            .inlier_pairs
-            .iter()
-            .map(|&(_, _, vx, vy)| (vx, vy))
-            .collect();
-        let cfg = KltConfig::default();
-        let tracked = track_points(&state.prev_pyramid, cur_pyramid, &prev_view_pts, &cfg);
-        let mut out = Vec::with_capacity(state.inlier_pairs.len());
-        for (orig, t) in state.inlier_pairs.iter().zip(tracked.iter()) {
-            if t.success {
-                out.push((orig.0, orig.1, t.x, t.y));
-            }
-        }
-        out
-    }
-
-    fn refresh_klt_state(
-        &mut self,
-        anchor_id: AnchorId,
-        cur_pyramid: &Pyramid,
-        inlier_pairs: &[(f32, f32, f32, f32)],
-    ) {
-        if inlier_pairs.is_empty() {
-            self.klt_state = None;
-            return;
-        }
-        let seeds: Vec<(f32, f32, f32, f32)> =
-            inlier_pairs.iter().take(KLT_MAX_SEEDS).cloned().collect();
-        self.klt_state = Some(KltFrameState {
-            anchor_id,
-            prev_pyramid: cur_pyramid.clone(),
-            inlier_pairs: seeds,
-        });
-    }
-
-    fn clear_klt_state(&mut self) {
-        self.klt_state = None;
     }
 
     /// Build a `TrackerCommand::Locked` whose `homography` has been
@@ -1520,54 +1362,10 @@ impl LivePlanarEngine {
 
     fn reset_emit_smooth(&mut self) {
         self.emit_smooth = EmitSmoothState::default();
-        // The EKF state is anchor-relative; drop it whenever the
-        // pipeline returns to a state without an active anchor (Idle,
-        // Lost). It will re-initialise from the next accepted fit.
-        self.h_ekf = None;
         // Chain refinement is tied to the currently-active handoff
         // child. If we go Idle/Lost, that anchor's chain matrix is
         // frozen at whatever the running mean has accumulated so far.
         self.chain_refine = None;
-    }
-
-    /// Drive the per-anchor EKF on `H_anchor→view` and return the
-    /// filtered homography. Re-initialises from `raw_h` whenever the
-    /// active anchor changes or the EKF is empty (first frame after
-    /// acquire / handoff / cached-snap); otherwise predicts, folds
-    /// each correspondence in `pairs` into the state as a noisy
-    /// observation, and emits the filtered H. Passing an empty
-    /// `pairs` slice produces a predict-only step (no measurement
-    /// update) — use this on sanity-gate freeze frames, where the
-    /// upstream H is the substituted previous fit rather than a
-    /// fresh observation.
-    fn apply_h_ekf(
-        &mut self,
-        anchor_id: AnchorId,
-        raw_h: [f32; 9],
-        pairs: &[(f32, f32, f32, f32)],
-    ) -> [f32; 9] {
-        let same_anchor = self
-            .h_ekf
-            .as_ref()
-            .map_or(false, |s| s.anchor_id == anchor_id);
-        if !same_anchor {
-            match HomographyEkf::new(raw_h) {
-                Some(ekf) => {
-                    self.h_ekf = Some(HomographyEkfTracker { anchor_id, ekf });
-                }
-                None => {
-                    self.h_ekf = None;
-                }
-            }
-            return raw_h;
-        }
-        let tracker = self
-            .h_ekf
-            .as_mut()
-            .expect("same_anchor implies h_ekf is Some");
-        tracker.ekf.predict(&EKF_Q_DEFAULT);
-        tracker.ekf.update_pairs(pairs, self.config.h_ekf_r_var);
-        tracker.ekf.homography()
     }
 
     /// Seed chain-composition refinement for a newly-spawned handoff
@@ -2537,19 +2335,6 @@ fn lerp_h(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {
 /// (used by the P-EMA smoother) assumes h22 = 1 to keep S in
 /// 4-DoF similarity form. Degenerate matrices (h22 ≈ 0) are passed
 /// through unchanged — they were already broken.
-/// Bit-exact equality across all nine elements. Used to detect when
-/// the sanity gate substituted the freeze H for the raw RANSAC fit:
-/// the gate writes the substituted matrix bit-for-bit from `h_prev`,
-/// so any difference between pre- and post-gate H indicates a freeze
-/// rather than a normal accept. Float equality is the right tool
-/// here precisely because the gate does not arithmetic-transform the
-/// value.
-fn h_elementwise_eq(a: &[f32; 9], b: &[f32; 9]) -> bool {
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
 fn canonicalize_h(h: &[f32; 9]) -> [f32; 9] {
     let scale = h[8];
     if scale.abs() < 1e-9 {
