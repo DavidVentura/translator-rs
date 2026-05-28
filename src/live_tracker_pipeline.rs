@@ -42,7 +42,7 @@ use crate::homography;
 use crate::live_compositor::{self, CameraFrame, ComposeTarget, CompositeError, OverlayItem};
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
-    LiveSession, PostDetectInput, h_view_to_surface_from, project_oriented_rect,
+    LiveSession, PostDetectInput, PostDetectOutcome, h_view_to_surface_from, project_oriented_rect,
     viewport_surface_aabb,
 };
 use crate::ocr::{DetectedTextBox, OrientedRect, Rect};
@@ -1275,6 +1275,16 @@ impl LiveTrackerPipeline {
 
     // ---- async stages (run on the worker thread) ----
 
+    /// Top-level acquire orchestrator. Sequences the named stages
+    /// below; each stage owns its own lock acquisitions, error paths,
+    /// and side effects. Cancellation (`gen_check`) is checked
+    /// between stages so a navigate-away mid-acquire drops the work
+    /// at the next stage boundary instead of having to thread a
+    /// cancel signal into each stage. The Locked → bbox-overlay
+    /// → orient → rec/translate ordering encodes the user-visible
+    /// contract: the engine flips Locked after stage 2, the
+    /// provisional bbox canvas is up after stage 3, and only stage 6
+    /// pays the multi-hundred-ms rec/translate cost.
     fn run_acquire_inner(
         &self,
         frame: &Arc<LiveFrame>,
@@ -1284,266 +1294,316 @@ impl LiveTrackerPipeline {
         generation: u64,
     ) -> AcquireTelemetry {
         let gen_check = || self.generation.load(Ordering::SeqCst) == generation;
-        if !gen_check() {
-            return AcquireTelemetry {
-                canceled: true,
-                ..Default::default()
-            };
-        }
         let t_overall = Instant::now();
-
-        // Detect.
-        let detected: Vec<DetectedTextBox> = {
-            let mut state = match frame.state().lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("frame.state poisoned".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            if state
-                .ensure_oriented_with_rgb(display_crop, cfg.det_max_pixels)
-                .is_err()
-            {
-                return AcquireTelemetry {
-                    error: Some("ensure_oriented failed".into()),
-                    ..Default::default()
-                };
-            }
-            let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
-            let raw = match self.catalog.detect_text_in_oriented_image(oriented) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("detect failed: {e:?}");
-                    return AcquireTelemetry {
-                        error: Some("detect failed".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            let scale = oriented.det_to_full_scale;
-            let rgb = oriented.rgb.as_ref().expect("with_rgb path");
-            let max_w = rgb.width();
-            let max_h = rgb.height();
-            raw.into_iter()
-                .map(|b| scale_detected_box(b, scale, max_w, max_h))
-                .collect()
-        };
+        let elapsed_ms = || t_overall.elapsed().as_secs_f64() * 1000.0;
 
         if !gen_check() {
-            return AcquireTelemetry {
-                canceled: true,
-                ..Default::default()
-            };
+            return canceled_telemetry(0, 0.0);
+        }
+
+        // 1. Detect text boxes in the visible region.
+        let detected = match self.acquire_stage_detect(frame, display_crop, cfg) {
+            Ok(d) => d,
+            Err(msg) => return error_telemetry(msg),
+        };
+        if !gen_check() {
+            return canceled_telemetry(0, elapsed_ms());
         }
         if detected.is_empty() {
             return AcquireTelemetry {
-                total_ms: t_overall.elapsed().as_secs_f64() * 1000.0,
+                total_ms: elapsed_ms(),
                 ..Default::default()
             };
         }
 
-        // Acquire anchor first — *before* orient-rec — so the engine
-        // flips Locked the moment detection has something to anchor
-        // to. orient-rec (~470 ms) only resolves reading direction;
-        // it isn't needed to track the plane. Pulling it out of the
-        // Locked gate lets the provisional bbox overlay below paint
-        // ~470 ms earlier, giving the user immediate "I see text
-        // here" feedback while rec + translate still run in the
-        // background.
-        let (anchor_id, h_view_to_sensor) = {
-            let mut state = match frame.state().lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("frame.state poisoned".into()),
-                        ..Default::default()
-                    };
-                }
+        // 2. Register the anchor — engine flips Locked here. Doing
+        //    this before orient-rec is what cuts the user-perceived
+        //    "I see text" latency from ~870 ms to ~400 ms.
+        let (anchor_id, h_view_to_sensor) =
+            match self.acquire_stage_register(frame, cfg, &detected, timestamp_ns) {
+                Ok(r) => r,
+                Err(msg) => return error_telemetry(msg),
             };
-            if state.ensure_tracker_oriented(cfg.det_max_pixels).is_err() {
-                return AcquireTelemetry {
-                    error: Some("ensure_tracker failed".into()),
-                    ..Default::default()
-                };
-            }
-            let tracker_oriented = state
-                .cached_tracker
-                .as_ref()
-                .expect("ensure_tracker filled cache");
-            let cached_sensor_crop =
-                state
-                    .cached
-                    .as_ref()
-                    .map(|oi| oi.sensor_crop)
-                    .unwrap_or(Rect {
-                        left: 0,
-                        top: 0,
-                        right: 0,
-                        bottom: 0,
-                    });
-            let h_view_to_sensor = [
-                1.0,
-                0.0,
-                cached_sensor_crop.left as f32,
-                0.0,
-                1.0,
-                cached_sensor_crop.top as f32,
-                0.0,
-                0.0,
-                1.0,
-            ];
-            let scale_down = if tracker_oriented.det_to_full_scale > 0.0 {
-                1.0 / tracker_oriented.det_to_full_scale
-            } else {
-                1.0
-            };
-            let regions: Vec<(u32, u32, u32, u32)> = detected
-                .iter()
-                .map(|d| {
-                    let scale_u32 = |v: u32| ((v as f32) * scale_down).round() as u32;
-                    (
-                        scale_u32(d.rect.left + cached_sensor_crop.left),
-                        scale_u32(d.rect.top + cached_sensor_crop.top),
-                        scale_u32(d.rect.right + cached_sensor_crop.left),
-                        scale_u32(d.rect.bottom + cached_sensor_crop.top),
-                    )
-                })
-                .collect();
-            let mut engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("engine poisoned".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            let id = engine
-                .acquire_now_in_regions(
-                    &tracker_oriented.gray,
-                    &regions,
-                    cfg.anchor_padding_px,
-                    timestamp_ns,
-                )
-                .unwrap_or(0);
-            (id, h_view_to_sensor)
-        };
-        if anchor_id == 0 {
-            return AcquireTelemetry {
-                error: Some("acquire_now returned 0".into()),
-                ..Default::default()
-            };
-        }
         self.session.reset_anchor_state(anchor_id);
 
-        // Provisional bbox-only overlay. Surface coords at acquire
-        // time are view coords plus the sensor-crop offset (the same
-        // H run_post_detect uses below). Angles come straight from
-        // the detector — no reading-direction snap is needed because
-        // the canvas only paints translucent bg pills here; glyph
-        // raster waits for run_post_detect to fill display_text.
-        {
-            let surface_strips: Vec<OrientedRect> = detected
-                .iter()
-                .map(|d| {
-                    project_oriented_rect(&d.tight_box, &h_view_to_sensor)
-                        .unwrap_or_else(|| d.tight_box.clone())
-                })
-                .collect();
-            if !surface_strips.is_empty() {
-                self.session.upsert_provisional_overlay(
-                    anchor_id,
-                    surface_strips,
-                    &*self.font_provider,
-                );
+        // 3. Provisional bbox-only overlay — paints translucent
+        //    pills under each detection so the user has immediate
+        //    feedback that detection landed. Best-effort; canvas
+        //    rebuild folds these in atomically.
+        self.acquire_stage_provisional(anchor_id, &detected, &h_view_to_sensor);
+        if !gen_check() {
+            return canceled_telemetry(anchor_id, elapsed_ms());
+        }
+
+        // 4. Orient-rec — picks reading direction (R0/R180/…).
+        //    Failure here is fatal: rec downstream needs the
+        //    quadrant for angle snap + block grouping.
+        let estimated_quadrant = match self.acquire_stage_orient(frame, cfg, &detected) {
+            Ok(q) => q,
+            Err(msg) => return error_telemetry(msg),
+        };
+        self.acquire_stage_apply_orientation(anchor_id, estimated_quadrant);
+        if !gen_check() {
+            return canceled_telemetry(anchor_id, elapsed_ms());
+        }
+
+        // 5. Color matting (disabled by default). Inline because
+        //    it's a const-gated side effect, not a stage.
+        if ENABLE_COLOR_MATTING {
+            if let Err(msg) = self.acquire_stage_color_matting(frame, anchor_id, &detected) {
+                return error_telemetry(msg);
             }
         }
 
-        if !gen_check() {
-            return AcquireTelemetry {
-                canceled: true,
-                ..Default::default()
-            };
+        // 6. Rec + translate. Wraps `run_post_detect`, which fills
+        //    the canvas with the final translated blocks.
+        let total = detected.len();
+        let outcome = match self.acquire_stage_rec_translate(
+            frame,
+            display_crop,
+            cfg,
+            &detected,
+            anchor_id,
+            generation,
+        ) {
+            Ok(o) => o,
+            Err(msg) => return error_telemetry(msg),
+        };
+        self.session.on_acquire();
+        if outcome.canceled {
+            return canceled_telemetry(anchor_id, elapsed_ms());
         }
 
-        // Orientation estimate. Runs after acquire so the engine is
-        // already Locked and the provisional canvas is up — we're only
-        // resolving reading direction here, which run_post_detect
-        // needs for its angle snap + block grouping below.
+        // 7. Finalize: drop the anchor if rec found nothing,
+        //    sync session state to the engine's LRU.
+        self.acquire_stage_finalize(anchor_id, &outcome, total);
+
+        let rec_ok = outcome.rec_ok_count as usize;
+        let rec_empty = outcome.rec_empty_count as usize;
+        AcquireTelemetry {
+            anchor_id,
+            detected_count: total as u32,
+            rec_ok_count: rec_ok as u32,
+            rec_empty_count: rec_empty as u32,
+            cache_hits: outcome.cache_hits,
+            rec_called_count: outcome.rec_called_count,
+            total_ms: elapsed_ms(),
+            canceled: false,
+            error: None,
+            is_refresh: false,
+        }
+    }
+
+    /// Stage 1 of [`Self::run_acquire_inner`]. Ensures the oriented
+    /// RGB+gray cache is built for `display_crop`, then runs the
+    /// PaddleOCR detector. Returns the detected boxes already
+    /// scaled back to full-resolution pixel coords.
+    fn acquire_stage_detect(
+        &self,
+        frame: &Arc<LiveFrame>,
+        display_crop: Rect,
+        cfg: &PipelineConfig,
+    ) -> Result<Vec<DetectedTextBox>, &'static str> {
+        let mut state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+        state
+            .ensure_oriented_with_rgb(display_crop, cfg.det_max_pixels)
+            .map_err(|_| "ensure_oriented failed")?;
+        let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
+        let raw = self
+            .catalog
+            .detect_text_in_oriented_image(oriented)
+            .map_err(|e| {
+                log::warn!("detect failed: {e:?}");
+                "detect failed"
+            })?;
+        let scale = oriented.det_to_full_scale;
+        let rgb = oriented.rgb.as_ref().expect("with_rgb path");
+        let max_w = rgb.width();
+        let max_h = rgb.height();
+        Ok(raw
+            .into_iter()
+            .map(|b| scale_detected_box(b, scale, max_w, max_h))
+            .collect())
+    }
+
+    /// Stage 2: register the anchor and flip the engine to Locked.
+    /// Computes the tracker-resolution regions for
+    /// `acquire_now_in_regions` and the `view → sensor` translation
+    /// the provisional overlay (stage 3) and `run_post_detect`
+    /// (stage 6) reuse.
+    fn acquire_stage_register(
+        &self,
+        frame: &Arc<LiveFrame>,
+        cfg: &PipelineConfig,
+        detected: &[DetectedTextBox],
+        timestamp_ns: u64,
+    ) -> Result<(u64, [f32; 9]), &'static str> {
+        let mut state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+        state
+            .ensure_tracker_oriented(cfg.det_max_pixels)
+            .map_err(|_| "ensure_tracker failed")?;
+        let tracker_oriented = state
+            .cached_tracker
+            .as_ref()
+            .expect("ensure_tracker filled cache");
+        let cached_sensor_crop = state
+            .cached
+            .as_ref()
+            .map(|oi| oi.sensor_crop)
+            .unwrap_or(Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            });
+        let h_view_to_sensor = [
+            1.0,
+            0.0,
+            cached_sensor_crop.left as f32,
+            0.0,
+            1.0,
+            cached_sensor_crop.top as f32,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        let scale_down = if tracker_oriented.det_to_full_scale > 0.0 {
+            1.0 / tracker_oriented.det_to_full_scale
+        } else {
+            1.0
+        };
+        let regions: Vec<(u32, u32, u32, u32)> = detected
+            .iter()
+            .map(|d| {
+                let scale_u32 = |v: u32| ((v as f32) * scale_down).round() as u32;
+                (
+                    scale_u32(d.rect.left + cached_sensor_crop.left),
+                    scale_u32(d.rect.top + cached_sensor_crop.top),
+                    scale_u32(d.rect.right + cached_sensor_crop.left),
+                    scale_u32(d.rect.bottom + cached_sensor_crop.top),
+                )
+            })
+            .collect();
+        let mut engine = self.engine.lock().map_err(|_| "engine poisoned")?;
+        let id = engine
+            .acquire_now_in_regions(
+                &tracker_oriented.gray,
+                &regions,
+                cfg.anchor_padding_px,
+                timestamp_ns,
+            )
+            .unwrap_or(0);
+        if id == 0 {
+            return Err("acquire_now returned 0");
+        }
+        Ok((id, h_view_to_sensor))
+    }
+
+    /// Stage 3: publish the provisional bbox-only canvas. Pure side
+    /// effect; failures from inside `upsert_provisional_overlay`
+    /// (e.g. session lock poisoned) are swallowed because losing the
+    /// provisional layer is a UX downgrade, not a pipeline failure.
+    fn acquire_stage_provisional(
+        &self,
+        anchor_id: u64,
+        detected: &[DetectedTextBox],
+        h_view_to_sensor: &[f32; 9],
+    ) {
+        let surface_strips: Vec<OrientedRect> = detected
+            .iter()
+            .map(|d| {
+                project_oriented_rect(&d.tight_box, h_view_to_sensor)
+                    .unwrap_or_else(|| d.tight_box.clone())
+            })
+            .collect();
+        if !surface_strips.is_empty() {
+            self.session.upsert_provisional_overlay(
+                anchor_id,
+                surface_strips,
+                &*self.font_provider,
+            );
+        }
+    }
+
+    /// Stage 4: estimate the canonical reading-direction quadrant by
+    /// running the recognizer over a sample of detections at R0 and
+    /// R180 and picking the higher-confidence axis. Returns
+    /// `Ok(None)` when the estimator can't reach consensus — the
+    /// rec path then falls back to `last_known_quadrant`.
+    fn acquire_stage_orient(
+        &self,
+        frame: &Arc<LiveFrame>,
+        cfg: &PipelineConfig,
+        detected: &[DetectedTextBox],
+    ) -> Result<Option<Quadrant>, &'static str> {
         let forced_script = if cfg.is_auto_source {
             None
         } else {
             self.catalog.ppocr_script_for_language_code(&cfg.from_lang)
         };
-        let estimated_quadrant: Option<Quadrant> = {
-            let state = match frame.state().lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("frame.state poisoned".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            let oriented = match state.cached.as_ref() {
-                Some(o) => o,
-                None => {
-                    return AcquireTelemetry {
-                        error: Some("oriented cache miss".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            if let Some(script) = forced_script {
-                self.catalog
-                    .estimate_canonical_via_rec_in_oriented_image(oriented, &detected, script)
-                    .unwrap_or(None)
-            } else {
-                self.catalog
-                    .estimate_canonical_quadrant_in_oriented_image(oriented, &detected)
-                    .unwrap_or(None)
-            }
-        };
-        if let Some(q) = estimated_quadrant {
+        let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+        let oriented = state.cached.as_ref().ok_or("oriented cache miss")?;
+        Ok(if let Some(script) = forced_script {
+            self.catalog
+                .estimate_canonical_via_rec_in_oriented_image(oriented, detected, script)
+                .unwrap_or(None)
+        } else {
+            self.catalog
+                .estimate_canonical_quadrant_in_oriented_image(oriented, detected)
+                .unwrap_or(None)
+        })
+    }
+
+    /// Stage 5: write the resolved quadrant back onto the cached
+    /// anchor and drop the provisional canvas. Called after stage 4
+    /// even when `quadrant` is `None` so the provisional layer is
+    /// cleared before stage 6 paints the real blocks on top.
+    fn acquire_stage_apply_orientation(&self, anchor_id: u64, quadrant: Option<Quadrant>) {
+        if let Some(q) = quadrant {
             if let Ok(mut engine) = self.engine.lock() {
                 engine.set_canonical_rotation(anchor_id, q);
             }
         }
         self.session.drop_provisional_overlay(anchor_id);
-        if !gen_check() {
-            return AcquireTelemetry {
-                canceled: true,
-                ..Default::default()
-            };
-        }
+    }
 
-        // Color matting (disabled by default).
-        if ENABLE_COLOR_MATTING {
-            let matted: Vec<Option<MattedStrip>> = {
-                let state = match frame.state().lock() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return AcquireTelemetry {
-                            error: Some("frame.state poisoned".into()),
-                            ..Default::default()
-                        };
-                    }
-                };
-                let oriented = state.cached.as_ref().expect("oriented still cached");
-                crate::color_matting::mat_detections(
-                    &oriented.rgb.as_ref().expect("with_rgb path").to_rgba8(),
-                    &detected,
-                )
-            };
-            if let Ok(mut store) = self.matted_strips.lock() {
-                store.insert(anchor_id, matted);
-            }
+    /// Optional stage between orient and rec/translate: compute per-
+    /// detection background mats. Off by default (`ENABLE_COLOR_MATTING`).
+    fn acquire_stage_color_matting(
+        &self,
+        frame: &Arc<LiveFrame>,
+        anchor_id: u64,
+        detected: &[DetectedTextBox],
+    ) -> Result<(), &'static str> {
+        let matted: Vec<Option<MattedStrip>> = {
+            let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+            let oriented = state.cached.as_ref().expect("oriented still cached");
+            crate::color_matting::mat_detections(
+                &oriented.rgb.as_ref().expect("with_rgb path").to_rgba8(),
+                detected,
+            )
+        };
+        if let Ok(mut store) = self.matted_strips.lock() {
+            store.insert(anchor_id, matted);
         }
+        Ok(())
+    }
 
-        let total = detected.len();
+    /// Stage 6: rec + translate. Looks up the canonical quadrant
+    /// (now set by stage 5 if orient-rec succeeded), reads the
+    /// matting cache (empty if stage 5 skipped), and hands
+    /// everything to `run_post_detect` which observes the boxes
+    /// into the surface map, groups them, runs rec on the boxes that
+    /// need it, translates, and upserts the real blocks.
+    fn acquire_stage_rec_translate(
+        &self,
+        frame: &Arc<LiveFrame>,
+        display_crop: Rect,
+        cfg: &PipelineConfig,
+        detected: &[DetectedTextBox],
+        anchor_id: u64,
+        generation: u64,
+    ) -> Result<PostDetectOutcome, &'static str> {
         let available_codes: Vec<LanguageCode> = self
             .catalog
             .language_rows()
@@ -1554,79 +1614,59 @@ impl LiveTrackerPipeline {
             Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
             Err(_) => Vec::new(),
         };
-
         let cancel = || self.generation.load(Ordering::SeqCst) != generation;
         let session_ref: &TranslatorSession = &self.catalog;
-        let outcome = {
-            let state = match frame.state().lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    return AcquireTelemetry {
-                        error: Some("frame.state poisoned".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            let oriented = match state
-                .cached
-                .as_ref()
-                .filter(|oi| oi.display_crop == display_crop)
-            {
-                Some(o) => o,
-                None => {
-                    return AcquireTelemetry {
-                        error: Some("oriented cache miss".into()),
-                        ..Default::default()
-                    };
-                }
-            };
-            let h_view_to_sensor = [
-                1.0,
-                0.0,
-                oriented.sensor_crop.left as f32,
-                0.0,
-                1.0,
-                oriented.sensor_crop.top as f32,
-                0.0,
-                0.0,
-                1.0,
-            ];
-            let canonical_quadrant = self
-                .engine
-                .lock()
-                .ok()
-                .and_then(|e| e.canonical_rotation_for(anchor_id));
-            let outcome = self.session.run_post_detect(
-                PostDetectInput {
-                    detections: &detected,
-                    oriented,
-                    h_view_to_surface: Some(h_view_to_sensor),
-                    anchor_id,
-                    from_lang: &cfg.from_lang,
-                    to_lang: &cfg.to_lang,
-                    is_auto_source: cfg.is_auto_source,
-                    available_codes: &available_codes,
-                    font_provider: &*self.font_provider,
-                    matted_strips: &matted_strips,
-                    rec_batch_size: cfg.rec_batch_size,
-                    canonical_quadrant,
-                },
-                &session_ref,
-                &session_ref,
-                &cancel,
-            );
-            drop(state);
-            outcome
-        };
-        self.session.on_acquire();
 
-        if outcome.canceled {
-            return AcquireTelemetry {
-                canceled: true,
+        let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+        let oriented = state
+            .cached
+            .as_ref()
+            .filter(|oi| oi.display_crop == display_crop)
+            .ok_or("oriented cache miss")?;
+        let h_view_to_sensor = [
+            1.0,
+            0.0,
+            oriented.sensor_crop.left as f32,
+            0.0,
+            1.0,
+            oriented.sensor_crop.top as f32,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        let canonical_quadrant = self
+            .engine
+            .lock()
+            .ok()
+            .and_then(|e| e.canonical_rotation_for(anchor_id));
+        let outcome = self.session.run_post_detect(
+            PostDetectInput {
+                detections: detected,
+                oriented,
+                h_view_to_surface: Some(h_view_to_sensor),
                 anchor_id,
-                ..Default::default()
-            };
-        }
+                from_lang: &cfg.from_lang,
+                to_lang: &cfg.to_lang,
+                is_auto_source: cfg.is_auto_source,
+                available_codes: &available_codes,
+                font_provider: &*self.font_provider,
+                matted_strips: &matted_strips,
+                rec_batch_size: cfg.rec_batch_size,
+                canonical_quadrant,
+            },
+            &session_ref,
+            &session_ref,
+            &cancel,
+        );
+        drop(state);
+        Ok(outcome)
+    }
+
+    /// Stage 7: post-rec cleanup. Drops the anchor entirely if rec
+    /// produced nothing usable (every detection came back empty),
+    /// then syncs session per-anchor state to the engine's LRU set
+    /// so evicted anchors don't keep stale overlays around.
+    fn acquire_stage_finalize(&self, _anchor_id: u64, outcome: &PostDetectOutcome, total: usize) {
         let rec_ok = outcome.rec_ok_count as usize;
         let rec_empty = outcome.rec_empty_count as usize;
         if rec_ok == 0 && rec_empty + rec_ok == total {
@@ -1639,19 +1679,6 @@ impl LiveTrackerPipeline {
             let keep = engine.cached_root_ids();
             drop(engine);
             self.session.retain_anchors(&keep);
-        }
-
-        AcquireTelemetry {
-            anchor_id,
-            detected_count: total as u32,
-            rec_ok_count: rec_ok as u32,
-            rec_empty_count: rec_empty as u32,
-            cache_hits: outcome.cache_hits,
-            rec_called_count: outcome.rec_called_count,
-            total_ms: t_overall.elapsed().as_secs_f64() * 1000.0,
-            canceled: false,
-            error: None,
-            is_refresh: false,
         }
     }
 
@@ -1891,6 +1918,31 @@ fn scale_homography(h: &[f32; 9], s: f32) -> [f32; 9] {
         h[7] * inv_s,
         h[8],
     ]
+}
+
+/// Build the early-return telemetry the orchestrator emits when a
+/// `gen_check()` between stages comes back false. `anchor_id` is the
+/// in-flight id (zero before stage 2 lands), `total_ms` is the
+/// elapsed time so far. Mirrors the pre-split inline blocks so
+/// callers see the same fields they used to.
+fn canceled_telemetry(anchor_id: u64, total_ms: f64) -> AcquireTelemetry {
+    AcquireTelemetry {
+        anchor_id,
+        canceled: true,
+        total_ms,
+        ..Default::default()
+    }
+}
+
+/// Build the early-return telemetry the orchestrator emits when a
+/// stage returns `Err(&'static str)`. Mirrors the pre-split inline
+/// blocks (no anchor_id, no total_ms) for backwards-compatible
+/// telemetry shape.
+fn error_telemetry(msg: &'static str) -> AcquireTelemetry {
+    AcquireTelemetry {
+        error: Some(msg.into()),
+        ..Default::default()
+    }
 }
 
 /// Scale a `DetectedTextBox` from detector-image coords up to

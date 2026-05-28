@@ -1028,8 +1028,7 @@ impl LiveSession {
         // thread) keeps reading the *old* `canvas` while glyph
         // rasterization runs. Only the final pointer-swap below
         // takes the lock again, and that swap is instantaneous.
-        let canvas =
-            render_anchor_canvas(&blocks_snapshot, &provisional_snapshot, font_provider);
+        let canvas = render_anchor_canvas(&blocks_snapshot, &provisional_snapshot, font_provider);
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
                 // If a racing upsert mutated `blocks` while we were
