@@ -1692,6 +1692,7 @@ impl LiveTrackerPipeline {
             };
         }
         if detected.is_empty() {
+            self.clear_engine_and_overlays();
             return AcquireTelemetry {
                 anchor_id,
                 total_ms: t_overall.elapsed().as_secs_f64() * 1000.0,
@@ -1781,6 +1782,13 @@ impl LiveTrackerPipeline {
                 ..Default::default()
             };
         }
+        // Nothing kept (all rec results empty, no cache hits). Demote the
+        // engine to Idle so the next process_frame falls through to acquire
+        // instead of holding the Locked overlay against a scene that no
+        // longer has text.
+        if outcome.rec_ok_count == 0 && outcome.cache_hits == 0 {
+            self.clear_engine_and_overlays();
+        }
         AcquireTelemetry {
             anchor_id,
             detected_count: outcome.detected_count,
@@ -1793,6 +1801,13 @@ impl LiveTrackerPipeline {
             error: None,
             is_refresh: true,
         }
+    }
+
+    fn clear_engine_and_overlays(&self) {
+        if let Ok(mut engine) = self.engine.lock() {
+            engine.clear();
+        }
+        self.session.clear_overlays();
     }
 }
 
