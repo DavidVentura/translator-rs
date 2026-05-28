@@ -656,6 +656,97 @@ pub fn match_descriptors_guided(
         .collect()
 }
 
+/// Inlier penalty per pixel of corner-projection delta from the prior,
+/// applied beyond [`PRIOR_PENALTY_DEAD_PX`]. Saturates at
+/// [`PRIOR_PENALTY_MAX_INLIERS`] so a far-off but genuinely-supported basin
+/// can still win when its inlier margin over the prior is large enough.
+const PRIOR_PENALTY_PER_PX: f32 = 1.0;
+/// Corner-projection delta from the prior below which no penalty is applied.
+/// Sized for the legitimate per-tick motion of a hand-held camera (~5–8 px
+/// at this resolution) so real movement isn't discouraged.
+const PRIOR_PENALTY_DEAD_PX: f32 = 8.0;
+/// Saturation cap on the penalty in units of inliers. Two basins disagree
+/// over the far corner by up to ~30 px in the ABAB repro; capping at 30 means
+/// the prior wins ties within that radius but a new basin with ≥30 more
+/// inliers (a clear win) overrides it within one tick.
+const PRIOR_PENALTY_MAX_INLIERS: f32 = 30.0;
+/// If the prior's inlier count is at least this fraction of the best PROSAC
+/// sample's, refit on the prior's inliers instead. Locks per-tick refit
+/// determinism on still scenes; on a real scene change the new basin's
+/// inlier count exceeds 1/FRAC × the prior's, so this branch doesn't fire.
+const PRIOR_SHORT_CIRCUIT_FRAC: f32 = 0.9;
+
+/// Max corner-projection delta in pixels between two homographies,
+/// evaluated at the four `corners`. Used by the RANSAC prior-aware penalty
+/// to express "how different is this candidate's geometry from the prior's
+/// over the data region".
+fn max_corner_delta_px(h_a: &[f32; 9], h_b: &[f32; 9], corners: &[(f32, f32); 4]) -> f32 {
+    let mut max = 0.0_f32;
+    for &(x, y) in corners {
+        let (Some((ax, ay)), Some((bx, by))) = (project(h_a, x, y), project(h_b, x, y)) else {
+            continue;
+        };
+        let dx = ax - bx;
+        let dy = ay - by;
+        let d = (dx * dx + dy * dy).sqrt();
+        if d > max {
+            max = d;
+        }
+    }
+    max
+}
+
+/// Axis-aligned bounding box of the anchor side of `pairs`, as four corners.
+/// Falls back to a zero-extent quad when `pairs` is empty.
+fn pairs_anchor_aabb_corners(pairs: &[(f32, f32, f32, f32)]) -> [(f32, f32); 4] {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(x, y, _, _) in pairs {
+        if x < min_x {
+            min_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    if !min_x.is_finite() || !max_x.is_finite() {
+        return [(0.0, 0.0); 4];
+    }
+    [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ]
+}
+
+/// RANSAC scoring with a soft pull toward the prior basin. Equals raw inlier
+/// count when no prior is supplied or when the candidate is within
+/// [`PRIOR_PENALTY_DEAD_PX`] of the prior at every reference corner.
+fn adjusted_inlier_score(
+    inliers: usize,
+    h: &[f32; 9],
+    prior: Option<&[f32; 9]>,
+    reference_corners: &[(f32, f32); 4],
+) -> f32 {
+    let raw = inliers as f32;
+    let Some(p) = prior else {
+        return raw;
+    };
+    let delta = max_corner_delta_px(h, p, reference_corners);
+    let above_dead = (delta - PRIOR_PENALTY_DEAD_PX).max(0.0);
+    let penalty = (PRIOR_PENALTY_PER_PX * above_dead).min(PRIOR_PENALTY_MAX_INLIERS);
+    raw - penalty
+}
+
 /// RANSAC over `(canonical_x, canonical_y, frame_x, frame_y)` pairs.
 /// Samples 4 random correspondences per iteration, fits a homography,
 /// counts inliers (residual under `cfg.ransac_residual_px`), keeps the
@@ -687,6 +778,7 @@ pub fn ransac_homography_with_prior(
     let mut rng = SmallRng::from_seed(0xA5A5_5A5A_3C3C_C3C3);
     let mut best_h: Option<[f32; 9]> = None;
     let mut best_inliers_idx: Vec<usize> = Vec::new();
+    let mut best_score: f32 = f32::NEG_INFINITY;
     let r_thresh_sq = cfg.ransac_residual_px * cfg.ransac_residual_px;
     let n = pairs.len();
     // Only trust the prior if it's *still* well-supported by the
@@ -699,6 +791,15 @@ pub fn ransac_homography_with_prior(
     // prior's barely-passing inlier count blocks random samples from
     // displacing it.
     let prior_min_inliers = (min_inliers / 2).max(1);
+    // Reference corners for the prior-aware penalty: AABB of the anchor side
+    // of the pairs. Penalty measures basin discontinuity over the actual data
+    // region (no separate dims parameter required, and the magnitude is in
+    // view pixels at the resolution the fit is being computed in).
+    let reference_corners = pairs_anchor_aabb_corners(pairs);
+    // Track the prior's inlier set separately from the running winner so the
+    // post-PROSAC short-circuit can revert to it even when an adjusted-score
+    // PROSAC sample temporarily displaced it.
+    let mut prior_inliers_idx: Option<Vec<usize>> = None;
     if let Some(h) = prior {
         let mut inliers_idx = Vec::with_capacity(n);
         for (i, &(px, py, qx, qy)) in pairs.iter().enumerate() {
@@ -711,10 +812,20 @@ pub fn ransac_homography_with_prior(
             }
         }
         if inliers_idx.len() >= prior_min_inliers {
+            // Prior's corner-delta against itself is 0, so its adjusted score
+            // equals its raw inlier count. PROSAC samples have to beat this
+            // either on raw inliers (by more than their corner-delta penalty)
+            // or on prior-agreement (small delta means small penalty).
+            best_score = inliers_idx.len() as f32;
+            prior_inliers_idx = Some(inliers_idx.clone());
             best_inliers_idx = inliers_idx;
             best_h = Some(h);
         }
     }
+    // Only apply the prior-aware penalty when the prior actually had enough
+    // support to seed the search. A bad/stale prior would otherwise distort
+    // candidate scoring away from genuinely-better basins for no reason.
+    let prior_for_scoring: Option<[f32; 9]> = prior.filter(|_| prior_inliers_idx.is_some());
     // PROSAC schedule: assumes `pairs` is pre-sorted by match quality
     // (best first). Early iters sample from a small top-quality
     // prefix; the prefix grows in four phases over the iteration
@@ -758,19 +869,46 @@ pub fn ransac_homography_with_prior(
                 inliers_idx.push(i);
             }
         }
-        // `>=` rather than `>`: a random sample that *ties* the
-        // current best (often the prior) gets to replace it. Strict
-        // `>` made the prior sticky — once seeded, a fast camera
-        // move that produced equally-noisy correspondences for
-        // *every* random sample couldn't displace it, so the engine
-        // returned the same H frame after frame while the scene
-        // visibly moved underneath. Tie-replacement is slightly
-        // non-deterministic (last winning sample wins) but allows
-        // escape from a stale seed when random sampling finds an
-        // equally-good fresh fit.
-        if inliers_idx.len() >= best_inliers_idx.len() && !inliers_idx.is_empty() {
+        if inliers_idx.is_empty() {
+            continue;
+        }
+        // Prior-aware scoring. On the same scene the descriptor matcher can
+        // yield two near-equal-inlier basins differing in the perspective
+        // DoFs; without a tiebreak, PROSAC sample order picks one at random
+        // per tick (visible as the cadence-N ABAB pivot wobble at the far
+        // corner from the inlier centroid). Subtract a saturating penalty
+        // proportional to the corner-projection delta from the prior — on
+        // basin-flip this discounts the non-prior basin enough for the prior
+        // to keep winning, while real perspective change still transitions
+        // because the new basin out-inliers the prior beyond the penalty cap.
+        let score = adjusted_inlier_score(
+            inliers_idx.len(),
+            &h,
+            prior_for_scoring.as_ref(),
+            &reference_corners,
+        );
+        if score > best_score {
+            best_score = score;
             best_inliers_idx = inliers_idx;
             best_h = Some(h);
+        }
+    }
+    // Prior-as-seed short-circuit. If the prior already explains ≥ this
+    // fraction of what the best PROSAC sample found, refit on the prior's
+    // inlier set. Two effects: (a) per-tick determinism — same input + same
+    // prior → same refit set → same H (no sampling-order wobble), and (b) on
+    // a still scene the prior is the canonical basin, so we shouldn't trade
+    // it for a slightly-better-on-paper PROSAC sample that's likely just a
+    // sampling artefact. A clear-winner basin (>1/SHORT_CIRCUIT_FRAC times the
+    // prior's inliers) still takes over because it falls below the threshold.
+    if let (Some(prior_idx), Some(p_h)) = (prior_inliers_idx.as_ref(), prior) {
+        let winner_raw = best_inliers_idx.len();
+        if winner_raw > 0 {
+            let frac = prior_idx.len() as f32 / winner_raw as f32;
+            if frac >= PRIOR_SHORT_CIRCUIT_FRAC {
+                best_inliers_idx = prior_idx.clone();
+                best_h = Some(p_h);
+            }
         }
     }
     if best_inliers_idx.len() < min_inliers {

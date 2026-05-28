@@ -58,6 +58,18 @@ const RING: usize = 16;
 const COARSE_MIN_INLIERS: usize = 8;
 /// Cap on seeds carried frame to frame (mirror of the engine's `KLT_MAX_SEEDS`).
 const MAX_SEEDS: usize = 80;
+/// Element-wise EMA mix toward the latest `current_h` for the compose pose.
+/// `compose_h = α · current_h + (1-α) · prev_compose_h`. Smooths the residual
+/// per-frame perspective wobble from KLT sub-pixel jitter + descriptor refit
+/// noise on the same basin (~2 px at the far corner after the prior-aware
+/// RANSAC fix collapsed the 30 px cadence-N basin flip).
+///
+/// At 30 fps, α = 0.4 gives a first-order low-pass corner near 2 Hz: per-frame
+/// (15 Hz) noise is attenuated ~18 dB (≈8×), while hand-held motion (typically
+/// < 5 Hz dominant) passes with sub-frame lag. Lower α (0.2) attenuates more
+/// but lags visible during real perspective change; higher α (0.6) lets the
+/// 2 px residual through more.
+const COMPOSE_EMA_ALPHA: f32 = 0.4;
 
 pub struct CoarseTracker {
     cfg: TrackerConfig,
@@ -65,6 +77,12 @@ pub struct CoarseTracker {
     /// `(root, view)` correspondences from the previous frame.
     seeds: Vec<(f32, f32, f32, f32)>,
     current_h: Option<[f32; 9]>,
+    /// EMA-smoothed companion of `current_h`, exposed to callers as the
+    /// compose pose. Updated element-wise toward `current_h` after each fit,
+    /// snap, or weave. Kept separate from `current_h` so the Relocalizer's
+    /// guided-match prior still sees fresh data (smoothing the prior would
+    /// hide real motion from the matcher).
+    compose_h: Option<[f32; 9]>,
     root_id: Option<AnchorId>,
     canonical_rotation: Quadrant,
     ring: VecDeque<(u64, [f32; 9])>,
@@ -77,6 +95,7 @@ impl CoarseTracker {
             prev_pyramid: None,
             seeds: Vec::new(),
             current_h: None,
+            compose_h: None,
             root_id: None,
             canonical_rotation: Quadrant::default(),
             ring: VecDeque::with_capacity(RING),
@@ -84,12 +103,32 @@ impl CoarseTracker {
     }
 
     /// Current `H_root→view` — the prior the Relocalizer uses to guide matching.
+    /// Raw (un-smoothed) so the matcher sees fresh data; use [`compose_h`] for
+    /// display.
     pub fn current_h(&self) -> Option<[f32; 9]> {
         self.current_h
     }
 
+    /// Temporally-smoothed `H_root→view` for compositing. First-order EMA of
+    /// `current_h` with mix [`COMPOSE_EMA_ALPHA`]. Equals `current_h` on the
+    /// first frame after a reset/snap so a fresh lock isn't lerped from None.
+    pub fn compose_h(&self) -> Option<[f32; 9]> {
+        self.compose_h
+    }
+
     pub fn current_root(&self) -> Option<AnchorId> {
         self.root_id
+    }
+
+    /// `(root_x, root_y, view_x, view_y)` correspondences as of the most
+    /// recent `track`. Cloned so the caller can hand them to the worker
+    /// without holding the lock. Empty until the first Correction snaps in.
+    /// Used by the Relocalizer as KLT-prepend pairs: spatially-distributed
+    /// sub-pixel correspondences that anchor RANSAC's perspective DoFs
+    /// (which descriptor-only fits get under-determined on under perspective
+    /// change).
+    pub fn seeds_snapshot(&self) -> Vec<(f32, f32, f32, f32)> {
+        self.seeds.clone()
     }
 
     /// Forget all tracking state (overlay hides until the next Locked
@@ -97,6 +136,7 @@ impl CoarseTracker {
     pub fn reset(&mut self) {
         self.seeds.clear();
         self.current_h = None;
+        self.compose_h = None;
         self.root_id = None;
         self.ring.clear();
         // prev_pyramid is left; it's overwritten next `track` and only used
@@ -125,6 +165,7 @@ impl CoarseTracker {
             self.current_h,
         )?;
         self.current_h = Some(r.homography);
+        self.compose_h = Some(ema_step(self.compose_h, &r.homography));
         self.seeds = r.inlier_pairs.iter().take(MAX_SEEDS).copied().collect();
         self.ring.push_back((frame_idx, r.homography));
         while self.ring.len() > RING {
@@ -141,6 +182,13 @@ impl CoarseTracker {
     /// Fold in a Relocalizer `Correction`. Single-writer: the present thread.
     pub fn apply(&mut self, c: Correction) {
         match c.lifecycle {
+            // Drop tracking state — the engine has given up on this anchor.
+            // Keeping KLT alive with stale seeds drifts unboundedly under
+            // perspective change. The pipeline's loss-hide grace covers the
+            // brief gap until the next Locked Correction snaps to a fresh
+            // anchor; the right way to avoid frequent re-acquires is to keep
+            // the engine in Locked longer (see `degraded_max_frames`), not to
+            // mask their effects here.
             Lifecycle::Lost | Lifecycle::ReAcquire => self.reset(),
             Lifecycle::Locked => {
                 let root_changed = self.root_id != Some(c.root_id);
@@ -156,13 +204,18 @@ impl CoarseTracker {
     /// Different root (fresh acquire / cross-root relock): adopt the absolute
     /// pose wholesale. Brief staleness for one frame, then KLT catches up.
     fn snap(&mut self, c: Correction) {
-        self.current_h = Some(canonicalize(&c.refinement_h));
+        let h = canonicalize(&c.refinement_h);
+        self.current_h = Some(h);
+        // Reset compose smoothing: a fresh root has no prior trajectory to
+        // average with, and lerping from the previous root's pose would drag
+        // the new anchor's overlay across the screen for the EMA's settling
+        // time.
+        self.compose_h = Some(h);
         self.seeds = c.seeds;
         self.root_id = Some(c.root_id);
         self.canonical_rotation = c.canonical_rotation;
         self.ring.clear();
-        self.ring
-            .push_back((c.frame_idx, canonicalize(&c.refinement_h)));
+        self.ring.push_back((c.frame_idx, h));
     }
 
     /// Same root: correct in place by composing the absolute fix at `frame_idx`
@@ -170,6 +223,19 @@ impl CoarseTracker {
     /// `H_now := (H_now · inv(H_then)) · refinement_h`. Falls back to snap if the
     /// `frame_idx` pose was evicted from the ring.
     fn weave(&mut self, c: Correction) {
+        // Engine-side grace: the engine had no fresh fit + no cached relock on
+        // this frame, but it's internally still Locked, so it emits its
+        // `last_homography` as the refinement and leaves `seeds` empty. That
+        // refinement is stale by design; weaving it in would override the
+        // KLT-tracked motion this coarse path has accumulated, freezing the
+        // overlay at the last fresh fit until a new one lands (visible as
+        // "stuck overlay → sudden jump"). Treat empty-seeds as "no new
+        // information": skip the weave entirely, the per-frame KLT in
+        // `track()` already advanced `current_h` smoothly.
+        if c.seeds.is_empty() {
+            self.canonical_rotation = c.canonical_rotation;
+            return;
+        }
         let (Some(h_now), Some(h_then)) = (self.current_h, self.ring_get(c.frame_idx)) else {
             self.snap(c);
             return;
@@ -181,24 +247,19 @@ impl CoarseTracker {
         let motion = mat3_mul(&h_now, &h_then_inv); // view_then → view_now
         let woven = canonicalize(&mat3_mul(&motion, &c.refinement_h));
         self.current_h = Some(woven);
+        self.compose_h = Some(ema_step(self.compose_h, &woven));
         self.canonical_rotation = c.canonical_rotation;
         // Re-seed from the correction's fresh inliers, projecting their view
-        // side forward by the same motion so they line up with the current
-        // view. When the engine emits a `Locked` Correction with no fresh fit
-        // (engine-side grace: transient no-fit-no-cached frame still in Locked
-        // state), `c.seeds` is empty — keep our existing seeds so KLT carries
-        // on tracking through the skip.
-        if !c.seeds.is_empty() {
-            self.seeds = c
-                .seeds
-                .iter()
-                .map(|&(rx, ry, vx, vy)| {
-                    let (vx2, vy2) = project(&motion, vx, vy).unwrap_or((vx, vy));
-                    (rx, ry, vx2, vy2)
-                })
-                .take(MAX_SEEDS)
-                .collect();
-        }
+        // side forward by the same motion so they line up with the current view.
+        self.seeds = c
+            .seeds
+            .iter()
+            .map(|&(rx, ry, vx, vy)| {
+                let (vx2, vy2) = project(&motion, vx, vy).unwrap_or((vx, vy));
+                (rx, ry, vx2, vy2)
+            })
+            .take(MAX_SEEDS)
+            .collect();
     }
 
     fn ring_get(&self, frame_idx: u64) -> Option<[f32; 9]> {
@@ -207,6 +268,21 @@ impl CoarseTracker {
             .find(|(idx, _)| *idx == frame_idx)
             .map(|(_, h)| *h)
     }
+}
+
+/// Element-wise EMA step toward `target`. On the first call (no previous
+/// compose pose) the target is adopted verbatim — no settling from `None`.
+/// Caller is expected to canonicalise (`h22 = 1`) before mixing; both source
+/// and target should already share that convention.
+fn ema_step(prev: Option<[f32; 9]>, target: &[f32; 9]) -> [f32; 9] {
+    let Some(p) = prev else {
+        return *target;
+    };
+    let mut out = [0.0_f32; 9];
+    for i in 0..9 {
+        out[i] = COMPOSE_EMA_ALPHA * target[i] + (1.0 - COMPOSE_EMA_ALPHA) * p[i];
+    }
+    out
 }
 
 /// Divide all nine elements by `h22` so downstream consumers see `h22 = 1`

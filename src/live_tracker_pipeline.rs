@@ -359,6 +359,11 @@ struct TrackerRequest {
     /// Monotonic frame index — tags the resulting Correction so the
     /// CoarseTracker's ringbuffer can locate the matching `H_then` for the weave.
     frame_idx: u64,
+    /// `(root_x, root_y, view_x, view_y)` seeds from the CoarseTracker at
+    /// `frame_idx`. The Relocalizer transforms them into the active leaf's
+    /// canonical frame and prepends to RANSAC, anchoring h6/h7 against the
+    /// clustered-inlier perspective wobble descriptor-only fits exhibit.
+    coarse_seeds: Vec<(f32, f32, f32, f32)>,
 }
 
 /// What [`LiveTrackerPipeline::run_engine`] produces: the engine's correction
@@ -475,8 +480,6 @@ struct TimingStats {
     /// that justifies or kills that change.
     gray_build_ms_sum: f64,
     tracker_ms_sum: f64,
-    tracker_pyramid_ms_sum: f64,
-    tracker_klt_extras_ms_sum: f64,
     tracker_features_ms_sum: f64,
     tracker_track_ms_sum: f64,
     tracker_chain_refine_ms_sum: f64,
@@ -493,8 +496,6 @@ impl Default for TimingStats {
             total_ms_sum: 0.0,
             gray_build_ms_sum: 0.0,
             tracker_ms_sum: 0.0,
-            tracker_pyramid_ms_sum: 0.0,
-            tracker_klt_extras_ms_sum: 0.0,
             tracker_features_ms_sum: 0.0,
             tracker_track_ms_sum: 0.0,
             tracker_chain_refine_ms_sum: 0.0,
@@ -624,6 +625,15 @@ impl LiveTrackerPipeline {
         if let Ok(mut engine) = self.engine.lock() {
             engine.clear();
         }
+        // CoarseTracker no longer resets on Lost/ReAcquire (it keeps KLT-
+        // tracking through the engine's re-acquire window so the overlay
+        // doesn't freeze) — so an explicit user reset must clear it here.
+        if let Ok(mut coarse) = self.coarse.lock() {
+            coarse.reset();
+        }
+        if let Ok(mut v) = self.last_verdict.lock() {
+            *v = LastVerdict::default();
+        }
         if let Ok(mut sm) = self.last_emitted_h.lock() {
             *sm = LastEmittedH::default();
         }
@@ -691,6 +701,12 @@ impl LiveTrackerPipeline {
             self.generation.fetch_add(1, Ordering::SeqCst);
             if let Ok(mut engine) = self.engine.lock() {
                 engine.clear();
+            }
+            if let Ok(mut coarse) = self.coarse.lock() {
+                coarse.reset();
+            }
+            if let Ok(mut v) = self.last_verdict.lock() {
+                *v = LastVerdict::default();
             }
             if let Ok(mut sm) = self.last_emitted_h.lock() {
                 *sm = LastEmittedH::default();
@@ -764,7 +780,10 @@ impl LiveTrackerPipeline {
         // tick retries. The gray is moved into the request only on dispatch.
         let engine_frame = frame_idx % RELOCALIZER_CADENCE == 0;
         let dispatch_ok = if engine_frame {
-            let coarse_prior = self.coarse.lock().map_err(|_| poisoned())?.current_h();
+            let (coarse_prior, coarse_seeds) = {
+                let c = self.coarse.lock().map_err(|_| poisoned())?;
+                (c.current_h(), c.seeds_snapshot())
+            };
             self.tracker_compute
                 .lock()
                 .map_err(|_| poisoned())?
@@ -775,6 +794,7 @@ impl LiveTrackerPipeline {
                         timestamp_ns,
                         coarse_prior,
                         frame_idx,
+                        coarse_seeds,
                     })
                 })
                 .unwrap_or(false)
@@ -787,14 +807,17 @@ impl LiveTrackerPipeline {
         let v = self.last_verdict.lock().map(|g| *g).unwrap_or_default();
         let (lifecycle, tracker_anchor, tracker_inliers) = (v.lifecycle, v.root_id, v.inliers);
 
-        // Compose pose: `current_h` is the CoarseTracker's post-track and
-        // (when applied this frame) post-weave pose. On a brief mid-Locked
-        // KLT miss `track` returns None but `current_h` is left at the
-        // previous frame's good pose — coast on it rather than hiding the
-        // overlay; the worker's next Correction will either weave it back
-        // toward the absolute fix or say Lost (whereupon `apply` resets and
-        // we fall into grace).
-        let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.current_h();
+        // Compose pose from the CoarseTracker's `current_h` (post-track and,
+        // when applied this frame, post-weave). Gated by the engine's
+        // lifecycle: Locked → emit; Lost/ReAcquire → tracker_h = None and let
+        // `select_compose_h`'s loss-hide grace handle the brief gap until the
+        // next Locked Correction snaps in. Coarse is reset by `apply` on
+        // Lost/ReAcquire, so `current_h` is already None then anyway.
+        // Read the EMA-smoothed compose pose (per-frame low-pass on top of the
+        // raw KLT+weave path), not the raw `current_h`. The engine's prior
+        // continues to read `current_h` further up so the matcher isn't fed
+        // delayed data.
+        let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.compose_h();
         let tracker_h = match lifecycle {
             Lifecycle::Locked => coarse_h.map(|h| {
                 if det_to_full != 1.0 {
@@ -841,8 +864,11 @@ impl LiveTrackerPipeline {
         };
         let composite_ms = t_composite.elapsed().as_secs_f64() * 1000.0;
 
-        // Detect-on-tracking refresh trigger.
-        let should_refresh = matches!(tracker_state, PlanarTrackerState::Locked)
+        // Detect-on-tracking refresh trigger. Gated on the engine's lifecycle
+        // (not `tracker_state`, which is now Locked-when-coarse-has-a-pose for
+        // compositing); refresh only makes sense when the engine itself is
+        // locked.
+        let should_refresh = matches!(lifecycle, Lifecycle::Locked)
             && self.update_refresh_trigger(
                 tracker_anchor,
                 tracker_h,
@@ -851,20 +877,19 @@ impl LiveTrackerPipeline {
                 full_view_h,
             );
 
-        // Mode decision: Acquiring → acquire, Locked+should_refresh → refresh.
-        // At step 3 we dispatch only on frames where the worker actually
-        // delivered a fresh Correction (`applied_correction`). The verdict
-        // carries across non-apply frames untouched, so re-firing every frame
-        // would just spam the gray-only `rgb_request` path (one redundant RGB
-        // readback per non-apply frame); worker BP already keeps the OCR
-        // worker from overcommitting on the dispatch side.
+        // Mode decision off the engine's lifecycle, NOT the compositing
+        // `tracker_state` — otherwise the "coarse keeps tracking through
+        // ReAcquire" change suppresses the rgb_request that drives det/rec.
+        // Dispatch only on frames where the worker actually delivered a fresh
+        // Correction so a sustained ReAcquire window doesn't spam the gray-only
+        // rgb_request path every frame.
         let async_kind =
             if applied_correction.is_none() || matches!(cfg.target_mode, TargetMode::Suppressed) {
                 None
             } else {
-                match tracker_state {
-                    PlanarTrackerState::Acquiring => Some(AsyncKind::Acquire),
-                    PlanarTrackerState::Locked if should_refresh => Some(AsyncKind::Refresh),
+                match lifecycle {
+                    Lifecycle::ReAcquire => Some(AsyncKind::Acquire),
+                    Lifecycle::Locked if should_refresh => Some(AsyncKind::Refresh),
                     _ => None,
                 }
             };
@@ -918,8 +943,6 @@ impl LiveTrackerPipeline {
             t.total_ms_sum += total_ms;
             t.gray_build_ms_sum += gray_build_ms;
             t.tracker_ms_sum += tracker_ms;
-            t.tracker_pyramid_ms_sum += step_timings.pyramid_ms;
-            t.tracker_klt_extras_ms_sum += step_timings.klt_extras_ms;
             t.tracker_features_ms_sum += step_timings.features_ms;
             t.tracker_track_ms_sum += step_timings.track_ms;
             t.tracker_chain_refine_ms_sum += step_timings.chain_refine_ms;
@@ -931,14 +954,12 @@ impl LiveTrackerPipeline {
                 let wall_s = t.window_start.elapsed().as_secs_f64();
                 let fps = if wall_s > 1e-6 { n / wall_s } else { 0.0 };
                 log::info!(
-                    "[lt] {} frames fps={:.1} total={:.1}ms gray={:.1}ms tracker={:.1}ms (pyr={:.1} kltx={:.1} feat={:.1} match={:.1} chain={:.1} cached={:.1}) composite={:.1}ms (overlays={:.1})",
+                    "[lt] {} frames fps={:.1} total={:.1}ms gray={:.1}ms tracker={:.1}ms (feat={:.1} match={:.1} chain={:.1} cached={:.1}) composite={:.1}ms (overlays={:.1})",
                     t.window_count,
                     fps,
                     t.total_ms_sum / n,
                     t.gray_build_ms_sum / n,
                     t.tracker_ms_sum / n,
-                    t.tracker_pyramid_ms_sum / n,
-                    t.tracker_klt_extras_ms_sum / n,
                     t.tracker_features_ms_sum / n,
                     t.tracker_track_ms_sum / n,
                     t.tracker_chain_refine_ms_sum / n,
@@ -1005,8 +1026,13 @@ impl LiveTrackerPipeline {
     /// render thread.
     fn run_engine(&self, req: &TrackerRequest) -> TrackerComputeResult {
         let mut engine = self.engine.lock().map_err(|_| poisoned())?;
-        let correction =
-            engine.relocalize(&req.gray, req.coarse_prior, req.frame_idx, req.timestamp_ns);
+        let correction = engine.relocalize(
+            &req.gray,
+            req.coarse_prior,
+            &req.coarse_seeds,
+            req.frame_idx,
+            req.timestamp_ns,
+        );
         let step_timings = engine.last_step_timings();
         Ok((correction, step_timings))
     }

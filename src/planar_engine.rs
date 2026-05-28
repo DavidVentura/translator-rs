@@ -16,6 +16,7 @@ use image::GrayImage;
 use crate::coarse_tracker::{Correction, Lifecycle};
 use crate::coords::Quadrant;
 use crate::homography::{invert, mat3_mul, project};
+use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 use crate::planar_tracker::{
     FrameFeatures, SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
     compute_frame_features, track_against_anchor_with_features,
@@ -153,11 +154,13 @@ pub struct EngineConfig {
     /// correspondences as perspective drifts, and RANSAC will start
     /// over-fitting to whichever pocket of features still matches.
     pub degraded_inlier_threshold: usize,
-    /// After this many consecutive degraded frames, force the engine
-    /// back to Idle so the harness can re-acquire from the current
-    /// view. Lets us bound cumulative H-drift on a single anchor
-    /// instead of riding it through a perspective shift that the
-    /// descriptors can no longer track.
+    /// After this many consecutive degraded frames (descriptor-only inliers
+    /// below `degraded_inlier_threshold` while the engine is still accepting
+    /// fits), force the engine back to Idle to re-acquire. With KLT-prepend
+    /// supplying the per-frame fit's perspective constraint, descriptor
+    /// inliers can dip well below the threshold transiently without the actual
+    /// fit degrading — so this number is generous on purpose, only bounding
+    /// genuine sustained matcher collapse.
     pub degraded_max_frames: u32,
     /// Quadrant used for a fresh anchor when the textline-orientation
     /// estimator can't reach consensus AND no previous anchor has ever
@@ -199,6 +202,20 @@ pub struct EngineConfig {
     /// ratio is likely in a wrong basin even if the absolute inlier
     /// count is healthy — block it.
     pub handoff_min_inlier_ratio: f32,
+    /// Extended Kalman Filter on `H_anchor→view`. With it, the per-frame
+    /// RANSAC fit is treated as a noisy observation: the EKF carries per-DoF
+    /// covariance across frames so well-determined DoFs (translation under
+    /// spread inliers) respond promptly while under-determined ones (the
+    /// perspective entries `h6`/`h7`, which descriptor-only fits jitter on
+    /// text scenes) stay anchored to the prior. Filtered only on the steady-
+    /// state Locked→Locked branch; anchor-switch frames (acquire, handoff,
+    /// cached-snap) emit the raw RANSAC fit because the EKF state is anchor-
+    /// relative and the covariance from the previous anchor doesn't transfer
+    /// through the chain. See `analysis.md` § "EKF on H".
+    pub use_h_ekf: bool,
+    /// Per-inlier measurement variance (σ² in px²) for the EKF. Default
+    /// matches the RANSAC inlier residual gate interpreted as ≈ 2σ.
+    pub h_ekf_r_var: f64,
     /// Enable chain-composition refinement after a handoff. The
     /// spawn frame's `h_root_to_canonical_new` is fitted from one
     /// frame of RANSAC; on subsequent frames the engine re-tracks
@@ -281,6 +298,14 @@ impl Default for EngineConfig {
             // ratio ~0.2-0.3) we saw in earlier traces.
             handoff_max_median_residual_px: 1.5,
             handoff_min_inlier_ratio: 0.4,
+            // Re-enabled after the prior-aware RANSAC scoring + short-circuit
+            // collapsed the cadence-N ABAB basin-flip (~30 px corner swing) to
+            // the residual per-tick refit noise (~2 px corner swing from
+            // descriptor / KLT sub-pixel jitter on the same basin). The EKF's
+            // per-DoF Q (slow h6/h7, fast translation) is the right shape for
+            // attenuating that residual without lagging real motion.
+            use_h_ekf: true,
+            h_ekf_r_var: EKF_R_DEFAULT,
             use_chain_refine: true,
             chain_refine_frames: 10,
         }
@@ -316,6 +341,11 @@ pub struct LivePlanarEngine {
     /// anchor switches. Cleared on Lost/Idle so a re-acquire after
     /// loss doesn't lerp from a stale pre-loss H.
     emit_smooth: EmitSmoothState,
+    /// EKF on `H_anchor→view` for the active anchor. Re-initialised on every
+    /// anchor change (handoff / cached-snap / Lost / Idle) since the state is
+    /// anchor-relative and the covariance from the previous anchor doesn't
+    /// transfer through the chain. See [`EngineConfig::use_h_ekf`].
+    h_ekf: Option<HomographyEkfTracker>,
     /// Running average of `h_root_to_canonical` for a freshly-spawned
     /// handoff anchor, populated from re-tracking the parent against
     /// the current view across the first N post-spawn frames. See
@@ -358,10 +388,6 @@ pub struct LivePlanarEngine {
 /// can be attributed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepTimings {
-    /// KLT pyramid build on the current gray frame.
-    pub pyramid_ms: f64,
-    /// `collect_klt_extras`: tracking previous inliers forward.
-    pub klt_extras_ms: f64,
     /// `compute_frame_features`: FAST detect + BRIEF describe.
     pub features_ms: f64,
     /// `track_against_anchor_with_features`: match + RANSAC + refit.
@@ -403,6 +429,11 @@ pub struct GateCounters {
 /// `h_root_to_new = inv(H_new_to_view) · H_parent_to_view ·
 /// h_root_to_parent`, which is frame-invariant in the absence of
 /// RANSAC noise.
+struct HomographyEkfTracker {
+    anchor_id: AnchorId,
+    ekf: HomographyEkf,
+}
+
 struct ChainRefineState {
     new_anchor_id: AnchorId,
     parent_id: AnchorId,
@@ -638,6 +669,7 @@ impl LivePlanarEngine {
             last_known_quadrant: default_quadrant,
             last_track_result: None,
             emit_smooth: EmitSmoothState::default(),
+            h_ekf: None,
             chain_refine: None,
             last_cmd_kind: None,
             last_process_ns: None,
@@ -687,22 +719,25 @@ impl LivePlanarEngine {
     /// current anchor, fall back to a cached anchor, declare loss, or
     /// stay idle waiting for an acquire.
     pub fn process_frame(&mut self, gray: &GrayImage, timestamp_ns: u64) -> TrackerCommand {
-        self.run_inner(gray, timestamp_ns, None)
+        self.run_inner(gray, timestamp_ns, None, &[])
     }
 
     /// Async-H entry: run the per-frame relocalization with the CoarseTracker's
-    /// pose as the guided-match prior, and return a [`Correction`] (root→view
-    /// pose + root-coord seeds + lifecycle) for the CoarseTracker to weave/snap.
-    /// `frame_idx` tags the correction so the weave can compose it onto the
-    /// coarse pose for the frame it was computed from. See `async_h_design.md`.
+    /// pose as the guided-match prior + KLT seeds as RANSAC-anchoring extra
+    /// correspondences (in root coords), and return a [`Correction`]
+    /// (root→view pose + root-coord seeds + lifecycle) for the CoarseTracker
+    /// to weave/snap. `frame_idx` tags the correction so the weave can compose
+    /// it onto the coarse pose for the frame it was computed from. See
+    /// `async_h_design.md`.
     pub fn relocalize(
         &mut self,
         gray: &GrayImage,
         coarse_prior: Option<[f32; 9]>,
+        coarse_seeds: &[(f32, f32, f32, f32)],
         frame_idx: u64,
         timestamp_ns: u64,
     ) -> Correction {
-        let cmd = self.run_inner(gray, timestamp_ns, coarse_prior);
+        let cmd = self.run_inner(gray, timestamp_ns, coarse_prior, coarse_seeds);
         self.command_to_correction(cmd, frame_idx)
     }
 
@@ -786,6 +821,7 @@ impl LivePlanarEngine {
         gray: &GrayImage,
         timestamp_ns: u64,
         prior: Option<[f32; 9]>,
+        coarse_seeds: &[(f32, f32, f32, f32)],
     ) -> TrackerCommand {
         // Surface long gaps between calls — the engine being silent
         // for many frames usually means Kotlin paused the pipeline
@@ -806,7 +842,8 @@ impl LivePlanarEngine {
         // every `par_iter` it reaches (detect/describe/match) fans out
         // over the tracker threads rather than the global rayon pool.
         let pool = Arc::clone(&self.tracker_pool);
-        let cmd = pool.install(|| self.process_frame_inner(gray, timestamp_ns, prior));
+        let cmd =
+            pool.install(|| self.process_frame_inner(gray, timestamp_ns, prior, coarse_seeds));
         let kind = match &cmd {
             TrackerCommand::Idle => "Idle",
             TrackerCommand::Acquiring => "Acquiring",
@@ -829,6 +866,7 @@ impl LivePlanarEngine {
         gray: &GrayImage,
         timestamp_ns: u64,
         prior: Option<[f32; 9]>,
+        coarse_seeds: &[(f32, f32, f32, f32)],
     ) -> TrackerCommand {
         if self.stable_since_ns.is_none() {
             self.stable_since_ns = Some(timestamp_ns);
@@ -908,13 +946,28 @@ impl LivePlanarEngine {
                 let (brute_result, dims) = match (self.cache.get(anchor_id), features.as_ref()) {
                     (Some(a), Some(features)) => {
                         let dims = a.anchor.image_dims;
+                        // KLT-prepend: the CoarseTracker's seeds are
+                        // `(root_pt, view_pt)`; transform the model side
+                        // through this leaf's chain matrix into leaf-canonical
+                        // coords so they line up with the anchor's
+                        // descriptors. Spatial spread (KLT tracks the previous
+                        // anchor inliers, which were already spread by
+                        // construction) anchors h6/h7 against the clustered
+                        // descriptor matches under perspective change.
+                        let extras: Vec<(f32, f32, f32, f32)> = coarse_seeds
+                            .iter()
+                            .filter_map(|&(rx, ry, vx, vy)| {
+                                project(&a.h_root_to_canonical, rx, ry)
+                                    .map(|(lx, ly)| (lx, ly, vx, vy))
+                            })
+                            .collect();
                         let r = track_against_anchor_with_features(
                             &a.anchor,
                             features,
                             &self.config.tracker,
                             keep_min,
                             seed_prior,
-                            &[],
+                            &extras,
                         );
                         (r, dims)
                     }
@@ -955,8 +1008,24 @@ impl LivePlanarEngine {
                         }
                     }
                 };
+                // Capture the raw H pre-gate so we can detect a sanity-gate
+                // freeze (gate substituted `h_prev` for the suspicious fit):
+                // the substituted H is not a fresh observation, so the EKF
+                // should predict only — not fold the bad-fit inlier pairs in
+                // as measurements.
+                let pre_gate_h = result.as_ref().map(|r| r.homography);
                 let result = result.and_then(|r| self.apply_sanity_gate(r));
-                if let Some(r) = result {
+                if let Some(mut r) = result {
+                    if self.config.use_h_ekf {
+                        let frozen =
+                            pre_gate_h.map_or(false, |pre| !h_elementwise_eq(&pre, &r.homography));
+                        let new_h = if frozen {
+                            self.apply_h_ekf(anchor_id, r.homography, &[])
+                        } else {
+                            self.apply_h_ekf(anchor_id, r.homography, &r.inlier_pairs)
+                        };
+                        r.homography = new_h;
+                    }
                     // Chain-composition refinement: re-track the
                     // parent anchor against the current frame and
                     // fold the implied `h_root_to_canonical_new` into
@@ -1383,10 +1452,49 @@ impl LivePlanarEngine {
 
     fn reset_emit_smooth(&mut self) {
         self.emit_smooth = EmitSmoothState::default();
+        // EKF state is anchor-relative; drop whenever we leave the active
+        // anchor (Idle/Lost). It will re-initialise from the next accepted fit.
+        self.h_ekf = None;
         // Chain refinement is tied to the currently-active handoff
         // child. If we go Idle/Lost, that anchor's chain matrix is
         // frozen at whatever the running mean has accumulated so far.
         self.chain_refine = None;
+    }
+
+    /// Drive the per-anchor EKF on `H_anchor→view` and return the filtered
+    /// homography. Re-initialises from `raw_h` when the active anchor changes
+    /// or the EKF is empty (first frame after acquire / handoff / cached-snap).
+    /// Empty `pairs` skips the measurement update (predict only) — used on a
+    /// sanity-gate freeze where the upstream H is the substituted previous fit
+    /// rather than a fresh observation.
+    fn apply_h_ekf(
+        &mut self,
+        anchor_id: AnchorId,
+        raw_h: [f32; 9],
+        pairs: &[(f32, f32, f32, f32)],
+    ) -> [f32; 9] {
+        let same_anchor = self
+            .h_ekf
+            .as_ref()
+            .map_or(false, |s| s.anchor_id == anchor_id);
+        if !same_anchor {
+            match HomographyEkf::new(raw_h) {
+                Some(ekf) => {
+                    self.h_ekf = Some(HomographyEkfTracker { anchor_id, ekf });
+                }
+                None => {
+                    self.h_ekf = None;
+                }
+            }
+            return raw_h;
+        }
+        let tracker = self
+            .h_ekf
+            .as_mut()
+            .expect("same_anchor implies h_ekf is Some");
+        tracker.ekf.predict(&EKF_Q_DEFAULT);
+        tracker.ekf.update_pairs(pairs, self.config.h_ekf_r_var);
+        tracker.ekf.homography()
     }
 
     /// Seed chain-composition refinement for a newly-spawned handoff
@@ -2356,6 +2464,17 @@ fn lerp_h(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {
 /// (used by the P-EMA smoother) assumes h22 = 1 to keep S in
 /// 4-DoF similarity form. Degenerate matrices (h22 ≈ 0) are passed
 /// through unchanged — they were already broken.
+/// Bit-exact equality across all nine elements. Used to detect when the sanity
+/// gate substituted the freeze H for the raw RANSAC fit — the gate writes the
+/// substituted matrix bit-for-bit from `h_prev`, so any pre-vs-post difference
+/// indicates a freeze rather than a normal accept (and the EKF should skip
+/// folding the bad fit's inlier pairs in as measurements).
+fn h_elementwise_eq(a: &[f32; 9], b: &[f32; 9]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
 fn canonicalize_h(h: &[f32; 9]) -> [f32; 9] {
     let scale = h[8];
     if scale.abs() < 1e-9 {
