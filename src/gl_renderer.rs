@@ -467,6 +467,19 @@ impl GlesRenderer {
         Some(rgba)
     }
 
+    /// Bind a framebuffer + viewport on the renderer's own GL context. Pass
+    /// `fbo_id == 0` for the default framebuffer (EGL window surface). Lets
+    /// callers that don't own a separate `glow::Context` (the Android JNI
+    /// shim) re-target the present output after [`read_camera_gray`] /
+    /// [`read_camera_rgba`] leave their own readback FBO bound.
+    pub fn bind_present_framebuffer(&self, fbo_id: u32, width: i32, height: i32) {
+        unsafe {
+            let fbo = NonZeroU32::new(fbo_id).map(glow::NativeFramebuffer);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, fbo);
+            self.gl.viewport(0, 0, width, height);
+        }
+    }
+
     /// Render the composite into whatever framebuffer is currently bound;
     /// the caller owns FBO binding, viewport, and buffer swap. No
     /// readback — this is the production present path. Assumes the camera

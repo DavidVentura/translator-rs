@@ -38,6 +38,8 @@ pub mod language_detect;
 pub mod live_compositor;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod live_frame;
+#[cfg(feature = "gpu")]
+pub mod live_gpu_tick;
 #[cfg(feature = "planar-tracker")]
 pub mod live_session;
 #[cfg(feature = "planar-tracker")]
