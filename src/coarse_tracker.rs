@@ -146,21 +146,10 @@ impl CoarseTracker {
     /// One per-frame step: build the pyramid, LK-forward the seeds, fit
     /// `H_root→view`. Returns the pose to composite, or `None` when there are no
     /// seeds yet or the fit collapsed (caller applies its loss-hide grace).
-    ///
-    /// `prev_pyramid` only advances on a successful fit. On failure the seeds
-    /// still belong to the previous successful frame; advancing
-    /// `prev_pyramid` here would mean the next call's LK starts from view
-    /// points that were measured in one frame against a pyramid built from a
-    /// later frame — a coordinate-frame mismatch that can turn a single
-    /// marginal frame into a persistent freeze. Sustained KLT failure
-    /// eventually exceeds the LK pyramid's displacement range; the
-    /// relocalizer's `snap` is the intended recovery path beyond that point.
     pub fn track(&mut self, gray: &GrayImage, frame_idx: u64) -> Option<CoarsePose> {
         let cur = Pyramid::build(gray, DEFAULT_PYRAMID_LEVELS);
         let pose = self.fit(&cur, frame_idx);
-        if pose.is_some() {
-            self.prev_pyramid = Some(cur);
-        }
+        self.prev_pyramid = Some(cur);
         pose
     }
 
