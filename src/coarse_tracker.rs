@@ -56,20 +56,11 @@ const RING: usize = 16;
 /// Minimum KLT inliers to emit a coarse pose. Below this the frame is treated
 /// as un-placeable (→ caller's loss-hide grace). Tuned in step 1.
 const COARSE_MIN_INLIERS: usize = 8;
-/// Cap on seeds carried frame to frame (mirror of the engine's `KLT_MAX_SEEDS`).
+/// Cap on seeds carried frame to frame. Applied at every entry point that
+/// mutates `self.seeds` (fit, weave, snap) so the per-tick KLT cost stays
+/// bounded and a single oversized Correction can't blow up the engine's
+/// extras count on the next dispatch.
 const MAX_SEEDS: usize = 80;
-/// Element-wise EMA mix toward the latest `current_h` for the compose pose.
-/// `compose_h = α · current_h + (1-α) · prev_compose_h`. Smooths the residual
-/// per-frame perspective wobble from KLT sub-pixel jitter + descriptor refit
-/// noise on the same basin.
-///
-/// At 30 fps, α = 0.2 puts the first-order low-pass corner near 1 Hz: per-frame
-/// (15 Hz) noise is attenuated ~25 dB (≈18×). The async-seam reorder removed
-/// the cadence-locked basin flip that drove the visible perspective AB, so the
-/// residual to suppress here is the small per-tick refit jitter, and a
-/// stronger LPF is fine — hand-held perspective change is well below 1 Hz on
-/// device repro.
-const COMPOSE_EMA_ALPHA: f32 = 0.8;
 
 pub struct CoarseTracker {
     cfg: TrackerConfig,
@@ -77,12 +68,6 @@ pub struct CoarseTracker {
     /// `(root, view)` correspondences from the previous frame.
     seeds: Vec<(f32, f32, f32, f32)>,
     current_h: Option<[f32; 9]>,
-    /// EMA-smoothed companion of `current_h`, exposed to callers as the
-    /// compose pose. Updated element-wise toward `current_h` after each fit,
-    /// snap, or weave. Kept separate from `current_h` so the Relocalizer's
-    /// guided-match prior still sees fresh data (smoothing the prior would
-    /// hide real motion from the matcher).
-    compose_h: Option<[f32; 9]>,
     root_id: Option<AnchorId>,
     canonical_rotation: Quadrant,
     ring: VecDeque<(u64, [f32; 9])>,
@@ -95,25 +80,20 @@ impl CoarseTracker {
             prev_pyramid: None,
             seeds: Vec::new(),
             current_h: None,
-            compose_h: None,
             root_id: None,
             canonical_rotation: Quadrant::default(),
             ring: VecDeque::with_capacity(RING),
         }
     }
 
-    /// Current `H_root→view` — the prior the Relocalizer uses to guide matching.
-    /// Raw (un-smoothed) so the matcher sees fresh data; use [`compose_h`] for
-    /// display.
+    /// Current `H_root→view`. Used both as the Relocalizer's guided-match
+    /// prior and as the compose pose for display — there is no separate
+    /// smoothed channel. The coarse's delta-similarity refit holds the
+    /// prior's perspective entries constant frame-to-frame, so the residual
+    /// per-frame jitter is similarity-DoF only and small enough that an EMA
+    /// would mostly trade lag for negligible attenuation.
     pub fn current_h(&self) -> Option<[f32; 9]> {
         self.current_h
-    }
-
-    /// Temporally-smoothed `H_root→view` for compositing. First-order EMA of
-    /// `current_h` with mix [`COMPOSE_EMA_ALPHA`]. Equals `current_h` on the
-    /// first frame after a reset/snap so a fresh lock isn't lerped from None.
-    pub fn compose_h(&self) -> Option<[f32; 9]> {
-        self.compose_h
     }
 
     pub fn current_root(&self) -> Option<AnchorId> {
@@ -136,7 +116,6 @@ impl CoarseTracker {
     pub fn reset(&mut self) {
         self.seeds.clear();
         self.current_h = None;
-        self.compose_h = None;
         self.root_id = None;
         self.ring.clear();
         // prev_pyramid is left; it's overwritten next `track` and only used
@@ -146,10 +125,24 @@ impl CoarseTracker {
     /// One per-frame step: build the pyramid, LK-forward the seeds, fit
     /// `H_root→view`. Returns the pose to composite, or `None` when there are no
     /// seeds yet or the fit collapsed (caller applies its loss-hide grace).
+    ///
+    /// `prev_pyramid` only advances on a successful fit. If `fit` fails, seeds
+    /// still belong to the previous successful frame; advancing `prev_pyramid`
+    /// to this frame would mean the next call's LK starts from view points
+    /// that were computed in one frame and matched against a pyramid built
+    /// from a later frame — a coordinate-frame violation that turns one
+    /// marginal frame into a persistent freeze. Leaving `prev_pyramid` at the
+    /// last-successful frame keeps the invariant `prev_pyramid` and `seeds`
+    /// belong to the same frame. The price is that under sustained KLT
+    /// failure the inter-frame displacement grows past the LK pyramid range
+    /// — at which point the relocalizer's snap is the recovery path, which
+    /// is now reachable because the dispatch gate no longer blocks it.
     pub fn track(&mut self, gray: &GrayImage, frame_idx: u64) -> Option<CoarsePose> {
         let cur = Pyramid::build(gray, DEFAULT_PYRAMID_LEVELS);
         let pose = self.fit(&cur, frame_idx);
-        self.prev_pyramid = Some(cur);
+        if pose.is_some() {
+            self.prev_pyramid = Some(cur);
+        }
         pose
     }
 
@@ -165,7 +158,6 @@ impl CoarseTracker {
             self.current_h,
         )?;
         self.current_h = Some(r.homography);
-        self.compose_h = Some(ema_step(self.compose_h, &r.homography));
         self.seeds = r.inlier_pairs.iter().take(MAX_SEEDS).copied().collect();
         self.ring.push_back((frame_idx, r.homography));
         while self.ring.len() > RING {
@@ -203,15 +195,21 @@ impl CoarseTracker {
 
     /// Different root (fresh acquire / cross-root relock): adopt the absolute
     /// pose wholesale. Brief staleness for one frame, then KLT catches up.
+    ///
+    /// `c.seeds` is capped at [`MAX_SEEDS`] to match `weave` and `fit` —
+    /// without the cap, a snap could install thousands of correspondences
+    /// (Correction.seeds is the engine's RANSAC inlier set, bounded only by
+    /// `extras.len() + matches.len()` upstream, which can run to ~600+). The
+    /// next dispatch would then send those thousands back as extras, the
+    /// engine RANSAC would be dominated by the extras subset, `descriptor_inliers`
+    /// would crash because the resulting H no longer fits the descriptor
+    /// matches, and the degraded gate forces re-acquire → fresh snap → even
+    /// more seeds. Cap at [`MAX_SEEDS`] keeps the contract symmetric with the
+    /// per-frame fit path.
     fn snap(&mut self, c: Correction) {
         let h = canonicalize(&c.refinement_h);
         self.current_h = Some(h);
-        // Reset compose smoothing: a fresh root has no prior trajectory to
-        // average with, and lerping from the previous root's pose would drag
-        // the new anchor's overlay across the screen for the EMA's settling
-        // time.
-        self.compose_h = Some(h);
-        self.seeds = c.seeds;
+        self.seeds = c.seeds.into_iter().take(MAX_SEEDS).collect();
         self.root_id = Some(c.root_id);
         self.canonical_rotation = c.canonical_rotation;
         self.ring.clear();
@@ -247,7 +245,6 @@ impl CoarseTracker {
         let motion = mat3_mul(&h_now, &h_then_inv); // view_then → view_now
         let woven = canonicalize(&mat3_mul(&motion, &c.refinement_h));
         self.current_h = Some(woven);
-        self.compose_h = Some(ema_step(self.compose_h, &woven));
         self.canonical_rotation = c.canonical_rotation;
         // Re-seed from the correction's fresh inliers, projecting their view
         // side forward by the same motion so they line up with the current view.
@@ -268,21 +265,6 @@ impl CoarseTracker {
             .find(|(idx, _)| *idx == frame_idx)
             .map(|(_, h)| *h)
     }
-}
-
-/// Element-wise EMA step toward `target`. On the first call (no previous
-/// compose pose) the target is adopted verbatim — no settling from `None`.
-/// Caller is expected to canonicalise (`h22 = 1`) before mixing; both source
-/// and target should already share that convention.
-fn ema_step(prev: Option<[f32; 9]>, target: &[f32; 9]) -> [f32; 9] {
-    let Some(p) = prev else {
-        return *target;
-    };
-    let mut out = [0.0_f32; 9];
-    for i in 0..9 {
-        out[i] = COMPOSE_EMA_ALPHA * target[i] + (1.0 - COMPOSE_EMA_ALPHA) * p[i];
-    }
-    out
 }
 
 /// Divide all nine elements by `h22` so downstream consumers see `h22 = 1`
