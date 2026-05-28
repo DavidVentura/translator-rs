@@ -4,6 +4,8 @@ uniffi::setup_scaffolding!();
 pub mod api;
 pub mod bergamot;
 pub mod catalog;
+#[cfg(feature = "planar-tracker")]
+pub mod coarse_tracker;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod color_matting;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]

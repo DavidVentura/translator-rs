@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use image::GrayImage;
 
+use crate::coarse_tracker::{Correction, Lifecycle};
 use crate::coords::Quadrant;
-use crate::homography::{invert, mat3_mul};
+use crate::homography::{invert, mat3_mul, project};
 use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 use crate::klt::{KltConfig, Pyramid, track_points};
 use crate::planar_tracker::{
@@ -738,6 +739,96 @@ impl LivePlanarEngine {
     /// current anchor, fall back to a cached anchor, declare loss, or
     /// stay idle waiting for an acquire.
     pub fn process_frame(&mut self, gray: &GrayImage, timestamp_ns: u64) -> TrackerCommand {
+        self.run_inner(gray, timestamp_ns, None)
+    }
+
+    /// Async-H entry: run the per-frame relocalization with the CoarseTracker's
+    /// pose as the guided-match prior, and return a [`Correction`] (root→view
+    /// pose + root-coord seeds + lifecycle) for the CoarseTracker to weave/snap.
+    /// `frame_idx` tags the correction so the weave can compose it onto the
+    /// coarse pose for the frame it was computed from. See `async_h_design.md`.
+    pub fn relocalize(
+        &mut self,
+        gray: &GrayImage,
+        coarse_prior: Option<[f32; 9]>,
+        frame_idx: u64,
+        timestamp_ns: u64,
+    ) -> Correction {
+        let cmd = self.run_inner(gray, timestamp_ns, coarse_prior);
+        self.command_to_correction(cmd, frame_idx)
+    }
+
+    /// `(root_x, root_y, view_x, view_y)` for the last fit's inliers: the fit's
+    /// anchor side is in the active *leaf*'s canonical coords; map it to the
+    /// chain root via `inv(h_root_to_canonical)` so the CoarseTracker (which
+    /// works purely in root coords) can track them forward.
+    fn root_coord_seeds(&self) -> Vec<(f32, f32, f32, f32)> {
+        let Some(r) = self.last_track_result.as_ref() else {
+            return Vec::new();
+        };
+        let leaf = match self.state {
+            EngineState::Locked { anchor_id, .. } => anchor_id,
+            _ => return Vec::new(),
+        };
+        let h_rtc = self
+            .cache
+            .get(leaf)
+            .map(|a| a.h_root_to_canonical)
+            .unwrap_or(IDENTITY);
+        let inv = invert(&h_rtc).unwrap_or(IDENTITY);
+        r.inlier_pairs
+            .iter()
+            .map(|&(lx, ly, vx, vy)| {
+                let (rx, ry) = project(&inv, lx, ly).unwrap_or((lx, ly));
+                (rx, ry, vx, vy)
+            })
+            .collect()
+    }
+
+    fn command_to_correction(&self, cmd: TrackerCommand, frame_idx: u64) -> Correction {
+        let base = Correction {
+            frame_idx,
+            lifecycle: Lifecycle::Lost,
+            refinement_h: IDENTITY,
+            seeds: Vec::new(),
+            root_id: 0,
+            canonical_rotation: Quadrant::default(),
+            inliers: 0,
+        };
+        match cmd {
+            TrackerCommand::Locked {
+                anchor_id: root_id,
+                homography,
+                inliers,
+                canonical_rotation,
+                ..
+            } => Correction {
+                lifecycle: Lifecycle::Locked,
+                refinement_h: homography,
+                seeds: self.root_coord_seeds(),
+                root_id,
+                canonical_rotation,
+                inliers,
+                ..base
+            },
+            // Acquiring is the engine asking for a fresh detect/recognize; the
+            // pipeline satisfies it via the rgb-request seam.
+            TrackerCommand::Acquiring => Correction {
+                lifecycle: Lifecycle::ReAcquire,
+                ..base
+            },
+            // Idle (not yet stable) and Lost (relock failing) both hide the
+            // overlay without running det/rec.
+            TrackerCommand::Idle | TrackerCommand::Lost { .. } => base,
+        }
+    }
+
+    fn run_inner(
+        &mut self,
+        gray: &GrayImage,
+        timestamp_ns: u64,
+        prior: Option<[f32; 9]>,
+    ) -> TrackerCommand {
         // Surface long gaps between calls — the engine being silent
         // for many frames usually means Kotlin paused the pipeline
         // (AF scan, surface lifecycle, etc.) and is the most likely
@@ -757,7 +848,7 @@ impl LivePlanarEngine {
         // every `par_iter` it reaches (detect/describe/match) fans out
         // over the tracker threads rather than the global rayon pool.
         let pool = Arc::clone(&self.tracker_pool);
-        let cmd = pool.install(|| self.process_frame_inner(gray, timestamp_ns, None));
+        let cmd = pool.install(|| self.process_frame_inner(gray, timestamp_ns, prior));
         let kind = match &cmd {
             TrackerCommand::Idle => "Idle",
             TrackerCommand::Acquiring => "Acquiring",

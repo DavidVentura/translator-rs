@@ -14,6 +14,7 @@ use image::GrayImage;
 use rayon::prelude::*;
 
 use crate::homography::{fit_affine, fit_homography, fit_similarity, invert, mat3_mul, project};
+use crate::klt::{KltConfig, Pyramid, track_points};
 
 /// Master toggle for per-frame tracker timing logs (target
 /// `planar_timing`). Flip to `false` to silence the per-frame
@@ -816,6 +817,34 @@ pub fn ransac_homography_with_prior(
         inlier_pairs,
         descriptor_inliers: 0,
     })
+}
+
+/// Coarse per-frame pose: LK-track each seed's previous view-point from
+/// `prev_pyr` into `cur_pyr`, then fit `model→view` from the survivors. The
+/// cheap every-frame step the CoarseTracker runs, with no descriptor matching —
+/// `model` is whatever frame the seeds are expressed in (root coords, here).
+/// Returns the fit plus the tracked `(model, cur_view)` inlier pairs (next
+/// frame's seeds). `None` if too few survive, or the pyramids disagree on size.
+pub fn klt_forward_fit(
+    prev_pyr: &Pyramid,
+    cur_pyr: &Pyramid,
+    seeds: &[(f32, f32, f32, f32)],
+    cfg: &TrackerConfig,
+    min_inliers: usize,
+    prior: Option<[f32; 9]>,
+) -> Option<TrackResult> {
+    if seeds.is_empty() || prev_pyr.levels[0].dimensions() != cur_pyr.levels[0].dimensions() {
+        return None;
+    }
+    let prev_view_pts: Vec<(f32, f32)> = seeds.iter().map(|&(_, _, vx, vy)| (vx, vy)).collect();
+    let tracked = track_points(prev_pyr, cur_pyr, &prev_view_pts, &KltConfig::default());
+    let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(seeds.len());
+    for (seed, t) in seeds.iter().zip(tracked.iter()) {
+        if t.success {
+            pairs.push((seed.0, seed.1, t.x, t.y));
+        }
+    }
+    ransac_homography_with_prior(&pairs, cfg, min_inliers, prior)
 }
 
 /// FAST-9 corner detector with non-maximum suppression. Scans every

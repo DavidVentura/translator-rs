@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use crate::LanguageCode;
 use crate::api::TranslatorError;
+use crate::coarse_tracker::{CoarseTracker, Correction, Lifecycle};
 use crate::color_matting::MattedStrip;
 use crate::coords::Quadrant;
 use crate::font_provider::FontProvider;
@@ -44,7 +45,7 @@ use crate::live_session::{
     LiveSession, PostDetectInput, h_view_to_surface_from, viewport_surface_aabb,
 };
 use crate::ocr::{DetectedTextBox, OrientedRect, Rect};
-use crate::planar_engine::{EngineConfig, LivePlanarEngine, TrackerCommand};
+use crate::planar_engine::{EngineConfig, LivePlanarEngine};
 use crate::session::TranslatorSession;
 
 /// Tracker state surfaced to the caller. Mirrors the engine command
@@ -325,20 +326,20 @@ struct TrackerRequest {
     gray: image::GrayImage,
     det_to_full: f32,
     timestamp_ns: u64,
+    /// CoarseTracker's current `H_root→view` (det-res), used as the engine's
+    /// guided-match prior — replaces the engine's `last_homography` fallback so
+    /// the descriptor matcher sees this frame's KLT pose, not the previous fit.
+    coarse_prior: Option<[f32; 9]>,
+    /// Monotonic frame index — tags the resulting Correction so the
+    /// CoarseTracker's ringbuffer can locate the matching `H_then` for the weave.
+    frame_idx: u64,
 }
 
-/// What [`LiveTrackerPipeline::run_engine`] produces: tracker state, anchor,
-/// inliers, the (full-coord) homography, and the engine sub-step timings.
-type TrackerComputeResult = Result<
-    (
-        PlanarTrackerState,
-        u64,
-        u32,
-        Option<[f32; 9]>,
-        crate::planar_engine::StepTimings,
-    ),
-    TranslatorError,
->;
+/// What [`LiveTrackerPipeline::run_engine`] produces: the engine's correction
+/// (det-coord refinement_h + root-coord seeds + lifecycle) plus its sub-step
+/// timings. The pipeline scales `refinement_h` by `det_to_full` before applying.
+type TrackerComputeResult =
+    Result<(Correction, crate::planar_engine::StepTimings), TranslatorError>;
 
 /// Long-lived thread that runs the (lock-free) engine step, so the camera
 /// upload can overlap it without spawning a fresh OS thread every frame.
@@ -368,7 +369,7 @@ impl TrackerCompute {
                     let Some(pipeline) = pipeline_weak.upgrade() else {
                         return;
                     };
-                    let result = pipeline.run_engine(&req.gray, req.det_to_full, req.timestamp_ns);
+                    let result = pipeline.run_engine(&req);
                     // Drop the upgraded Arc before blocking on the next
                     // `recv`, so a concurrent pipeline drop isn't deadlocked
                     // behind this thread holding the last reference.
@@ -453,6 +454,13 @@ const TIMING_WINDOW_FRAMES: u32 = 10;
 
 /// The pipeline itself.
 pub struct LiveTrackerPipeline {
+    /// Async-H fast half: per-frame KLT pose owner. The present thread runs
+    /// `track` to produce the compose pose + the prior the engine relocalizes
+    /// against; `apply` weaves the engine's Correction back in.
+    coarse: Mutex<CoarseTracker>,
+    /// Monotonic per-frame counter — tags each Correction so the weave can find
+    /// the matching ringbuffer entry.
+    frame_counter: AtomicU64,
     engine: Mutex<LivePlanarEngine>,
     session: Arc<LiveSession>,
     last_emitted_h: Mutex<LastEmittedH>,
@@ -481,8 +489,12 @@ impl LiveTrackerPipeline {
         catalog: Arc<TranslatorSession>,
         font_provider: Arc<dyn FontProvider + Send + Sync>,
     ) -> Arc<Self> {
+        let engine_cfg = EngineConfig::default();
+        let coarse = CoarseTracker::new(engine_cfg.tracker.clone());
         let pipeline = Arc::new(Self {
-            engine: Mutex::new(LivePlanarEngine::new(EngineConfig::default())),
+            coarse: Mutex::new(coarse),
+            frame_counter: AtomicU64::new(0),
+            engine: Mutex::new(LivePlanarEngine::new(engine_cfg)),
             session: Arc::new(LiveSession::new()),
             last_emitted_h: Mutex::new(LastEmittedH::default()),
             last_root_to_view: Mutex::new(None),
@@ -613,11 +625,21 @@ impl LiveTrackerPipeline {
         let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
         let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
 
-        // Overlap the H-independent camera upload with the tracker: hand the
-        // engine step to the long-lived compute thread, run `upload_camera`
-        // on this (render/GL) thread, then block for the engine result. On
-        // the CPU target `upload_camera` is a no-op, so the upload simply
-        // returns immediately and we wait out the engine.
+        // Async-H step 1 (synchronous): run the CoarseTracker on the same
+        // tracker gray before submitting, so its KLT pose becomes the engine's
+        // guided-match prior. `frame_idx` tags the Correction so the weave can
+        // line it up with this frame's ringbuffer entry.
+        let frame_idx = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let coarse_prior = {
+            let mut c = self.coarse.lock().map_err(|_| poisoned())?;
+            let _ = c.track(&tracker_gray, frame_idx);
+            c.current_h()
+        };
+
+        // Overlap the H-independent camera upload with the engine relocalize:
+        // hand the job to the long-lived compute thread, run `upload_camera` on
+        // this (render/GL) thread, then block for the result. On the CPU target
+        // `upload_camera` is a no-op, so the upload returns immediately.
         let t_tracker = Instant::now();
         let (tracker_outcome, upload_result) = {
             let tc_guard = self.tracker_compute.lock().map_err(|_| poisoned())?;
@@ -628,15 +650,45 @@ impl LiveTrackerPipeline {
                 gray: tracker_gray,
                 det_to_full,
                 timestamp_ns,
+                coarse_prior,
+                frame_idx,
             });
             let upload_result = self.upload_camera_to_target(frame, target);
             (tc.wait(), upload_result)
         };
-        let (tracker_state, tracker_anchor, tracker_inliers, tracker_h, step_timings) =
-            tracker_outcome?;
+        let (correction, step_timings) = tracker_outcome?;
         if let Err(e) = upload_result {
             log::warn!("camera upload failed: {e:?}");
         }
+
+        // Apply the engine's Correction to the CoarseTracker, then read the
+        // (post-weave/snap) pose for compositing. Synchronous: `frame_idx`
+        // matches the just-tracked ring entry, so the weave reduces to adopting
+        // `refinement_h` modulo numerical drift — i.e. the compose pose ≈ the
+        // engine's emit, isolating the wiring change from any fit change.
+        let tracker_anchor = correction.root_id;
+        let tracker_inliers = correction.inliers as u32;
+        let lifecycle = correction.lifecycle;
+        let coarse_h = {
+            let mut c = self.coarse.lock().map_err(|_| poisoned())?;
+            c.apply(correction);
+            c.current_h()
+        };
+        let tracker_h = match lifecycle {
+            Lifecycle::Locked => coarse_h.map(|h| {
+                if det_to_full != 1.0 {
+                    scale_homography(&h, det_to_full)
+                } else {
+                    h
+                }
+            }),
+            _ => None,
+        };
+        let tracker_state = match lifecycle {
+            Lifecycle::Locked => PlanarTrackerState::Locked,
+            Lifecycle::ReAcquire => PlanarTrackerState::Acquiring,
+            Lifecycle::Lost => PlanarTrackerState::Lost,
+        };
         let tracker_scale = tracker_h
             .map(|h| (h[0] * h[4] - h[1] * h[3]).abs().sqrt())
             .unwrap_or(0.0);
@@ -823,51 +875,12 @@ impl LiveTrackerPipeline {
     /// Run the engine on the pre-built gray. Takes only the engine lock, so
     /// it can run on a scoped thread while the camera upload proceeds on the
     /// render thread.
-    fn run_engine(
-        &self,
-        gray: &image::GrayImage,
-        det_to_full: f32,
-        timestamp_ns: u64,
-    ) -> Result<
-        (
-            PlanarTrackerState,
-            u64,
-            u32,
-            Option<[f32; 9]>,
-            crate::planar_engine::StepTimings,
-        ),
-        TranslatorError,
-    > {
+    fn run_engine(&self, req: &TrackerRequest) -> TrackerComputeResult {
         let mut engine = self.engine.lock().map_err(|_| poisoned())?;
-        let cmd = engine.process_frame(gray, timestamp_ns);
+        let correction =
+            engine.relocalize(&req.gray, req.coarse_prior, req.frame_idx, req.timestamp_ns);
         let step_timings = engine.last_step_timings();
-        drop(engine);
-        let (state_kind, anchor_id, h, inliers) = match cmd {
-            TrackerCommand::Idle => (PlanarTrackerState::Idle, 0u64, None, 0u32),
-            TrackerCommand::Acquiring => (PlanarTrackerState::Acquiring, 0, None, 0),
-            TrackerCommand::Locked {
-                anchor_id,
-                homography,
-                inliers,
-                ..
-            } => {
-                let h = if det_to_full != 1.0 {
-                    scale_homography(&homography, det_to_full)
-                } else {
-                    homography
-                };
-                (
-                    PlanarTrackerState::Locked,
-                    anchor_id,
-                    Some(h),
-                    inliers as u32,
-                )
-            }
-            TrackerCommand::Lost { last_anchor_id } => {
-                (PlanarTrackerState::Lost, last_anchor_id, None, 0)
-            }
-        };
-        Ok((state_kind, anchor_id, inliers, h, step_timings))
+        Ok((correction, step_timings))
     }
 
     fn select_compose_h(
