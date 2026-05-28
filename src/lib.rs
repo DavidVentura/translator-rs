@@ -104,6 +104,7 @@ mod translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;
 pub mod tts;
+pub mod txt;
 
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{
