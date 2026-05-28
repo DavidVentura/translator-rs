@@ -69,7 +69,7 @@ const MAX_SEEDS: usize = 80;
 /// residual to suppress here is the small per-tick refit jitter, and a
 /// stronger LPF is fine — hand-held perspective change is well below 1 Hz on
 /// device repro.
-const COMPOSE_EMA_ALPHA: f32 = 0.8;
+const COMPOSE_EMA_ALPHA: f32 = 1.0;
 
 pub struct CoarseTracker {
     cfg: TrackerConfig,
@@ -146,10 +146,21 @@ impl CoarseTracker {
     /// One per-frame step: build the pyramid, LK-forward the seeds, fit
     /// `H_root→view`. Returns the pose to composite, or `None` when there are no
     /// seeds yet or the fit collapsed (caller applies its loss-hide grace).
+    ///
+    /// `prev_pyramid` only advances on a successful fit. On failure the seeds
+    /// still belong to the previous successful frame; advancing
+    /// `prev_pyramid` here would mean the next call's LK starts from view
+    /// points that were measured in one frame against a pyramid built from a
+    /// later frame — a coordinate-frame mismatch that can turn a single
+    /// marginal frame into a persistent freeze. Sustained KLT failure
+    /// eventually exceeds the LK pyramid's displacement range; the
+    /// relocalizer's `snap` is the intended recovery path beyond that point.
     pub fn track(&mut self, gray: &GrayImage, frame_idx: u64) -> Option<CoarsePose> {
         let cur = Pyramid::build(gray, DEFAULT_PYRAMID_LEVELS);
         let pose = self.fit(&cur, frame_idx);
-        self.prev_pyramid = Some(cur);
+        if pose.is_some() {
+            self.prev_pyramid = Some(cur);
+        }
         pose
     }
 
@@ -211,7 +222,17 @@ impl CoarseTracker {
         // the new anchor's overlay across the screen for the EMA's settling
         // time.
         self.compose_h = Some(h);
-        self.seeds = c.seeds;
+        // Cap at MAX_SEEDS to match `weave` and `fit`. `c.seeds` is the
+        // engine's RANSAC inlier set projected to root coords; it's bounded
+        // only by `extras + descriptor_matches` upstream and can carry
+        // several hundred entries. Without the cap, a snap installs the full
+        // set as `self.seeds`, the next dispatch sends them back as extras,
+        // the engine RANSAC is dominated by the extras, descriptor_inliers
+        // crashes (the fit no longer aligns the descriptor matches), the
+        // degraded gate trips, and re-acquire fires → fresh snap with even
+        // more seeds. Cap keeps the contract symmetric across all three
+        // mutating paths.
+        self.seeds = c.seeds.into_iter().take(MAX_SEEDS).collect();
         self.root_id = Some(c.root_id);
         self.canonical_rotation = c.canonical_rotation;
         self.ring.clear();
