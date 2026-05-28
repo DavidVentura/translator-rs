@@ -186,6 +186,11 @@ const LOSS_HIDE_AFTER_FRAMES: u32 = 4;
 /// is synchronous (still on the present thread via the compute-thread submit/wait
 /// rendezvous); step 3 moves it off-thread. The engine's frame-counted gates are
 /// rescaled by this value at pipeline init so wall-time hysteresis matches step 1.
+///
+/// Temporarily 1 for bisection: confirms the bounce seen at cadence=2 is the
+/// synchronous AB pattern (descriptor fit vs KLT-forwarded), not residue from
+/// stripping the engine's per-frame EKF. At cadence=1 every frame is an engine
+/// frame, so the alternation can't form.
 const RELOCALIZER_CADENCE: u64 = 2;
 const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// Inflation around the viewport AABB when asking the session
@@ -743,13 +748,17 @@ impl LiveTrackerPipeline {
             )
         };
 
-        // Compose pose: post-apply on engine frames; post-track on non-engine
-        // frames. Trust `current_h()` only when the per-frame KLT actually
-        // produced a fresh pose this frame, OR the engine apply just ran.
+        // Compose pose: `current_h` is the post-apply pose on engine frames,
+        // post-track on non-engine. On a brief mid-Locked KLT miss, `track`
+        // returns None but `current_h` is left at the previous frame's good
+        // pose — coast on it rather than hiding the overlay, since the next
+        // engine tick is at most one frame away and will either correct it or
+        // say Lost (whereupon `apply` resets and we fall into grace). Hiding
+        // on every transient KLT miss produced visible 1-frame flickers.
+        let _ = coarse_pose;
         let coarse_h = self.coarse.lock().map_err(|_| poisoned())?.current_h();
-        let fresh_pose = engine_frame || coarse_pose.is_some();
         let tracker_h = match lifecycle {
-            Lifecycle::Locked if fresh_pose => coarse_h.map(|h| {
+            Lifecycle::Locked => coarse_h.map(|h| {
                 if det_to_full != 1.0 {
                     scale_homography(&h, det_to_full)
                 } else {

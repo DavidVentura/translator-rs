@@ -183,16 +183,22 @@ impl CoarseTracker {
         self.current_h = Some(woven);
         self.canonical_rotation = c.canonical_rotation;
         // Re-seed from the correction's fresh inliers, projecting their view
-        // side forward by the same motion so they line up with the current view.
-        self.seeds = c
-            .seeds
-            .iter()
-            .map(|&(rx, ry, vx, vy)| {
-                let (vx2, vy2) = project(&motion, vx, vy).unwrap_or((vx, vy));
-                (rx, ry, vx2, vy2)
-            })
-            .take(MAX_SEEDS)
-            .collect();
+        // side forward by the same motion so they line up with the current
+        // view. When the engine emits a `Locked` Correction with no fresh fit
+        // (engine-side grace: transient no-fit-no-cached frame still in Locked
+        // state), `c.seeds` is empty — keep our existing seeds so KLT carries
+        // on tracking through the skip.
+        if !c.seeds.is_empty() {
+            self.seeds = c
+                .seeds
+                .iter()
+                .map(|&(rx, ry, vx, vy)| {
+                    let (vx2, vy2) = project(&motion, vx, vy).unwrap_or((vx, vy));
+                    (rx, ry, vx2, vy2)
+                })
+                .take(MAX_SEEDS)
+                .collect();
+        }
     }
 
     fn ring_get(&self, frame_idx: u64) -> Option<[f32; 9]> {

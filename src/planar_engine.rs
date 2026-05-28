@@ -765,9 +765,19 @@ impl LivePlanarEngine {
                 lifecycle: Lifecycle::ReAcquire,
                 ..base
             },
-            // Idle (not yet stable) and Lost (relock failing) both hide the
-            // overlay without running det/rec.
-            TrackerCommand::Idle | TrackerCommand::Lost { .. } => base,
+            // Lost during the loss-hide grace still needs the chain root so the
+            // compositor can find the anchor's overlay canvas while the pipeline
+            // projects through `sm.h` — otherwise `overlay_count` drops to 0 and
+            // the overlay vanishes for the Lost frame even though grace returns
+            // a valid H.
+            TrackerCommand::Lost { last_anchor_id } => Correction {
+                lifecycle: Lifecycle::Lost,
+                root_id: last_anchor_id,
+                ..base
+            },
+            // Idle: engine gave up; grace will exhaust, no need to preserve an
+            // anchor reference here.
+            TrackerCommand::Idle => base,
         }
     }
 
@@ -1209,20 +1219,31 @@ impl LivePlanarEngine {
                         last_anchor_id: root,
                     }
                 } else {
+                    // Engine-side grace: we're internally still Locked
+                    // (frames_lost < threshold) on a transient no-fit + no-
+                    // cached frame. Emit Locked with the previous good H
+                    // rather than thrashing the pipeline through Lost (which
+                    // also resets `emit_smooth` and floods state-transition
+                    // logs at every other-frame matcher hiccup). No fresh fit
+                    // → no fresh inliers → the Correction's seeds come out
+                    // empty, and the CoarseTracker keeps its existing seeds
+                    // tracking on the woven H.
                     self.state = EngineState::Locked {
                         anchor_id,
                         frames_lost: new_frames_lost,
-                        last_homography: match self.state {
-                            EngineState::Locked {
-                                last_homography, ..
-                            } => last_homography,
-                            _ => unreachable!(),
-                        },
+                        last_homography,
                     };
-                    self.reset_emit_smooth();
-                    TrackerCommand::Lost {
-                        last_anchor_id: root,
-                    }
+                    let (root_id, h_root_to_view) =
+                        self.chain_homography(anchor_id, &last_homography);
+                    let canonical_rotation = self.quadrant_for_active(anchor_id);
+                    self.emit_locked(
+                        root_id,
+                        anchor_id,
+                        h_root_to_view,
+                        false,
+                        0,
+                        canonical_rotation,
+                    )
                 }
             }
             EngineState::Lost {
