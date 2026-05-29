@@ -1111,17 +1111,15 @@ impl PpocrDetector {
     ) -> Result<Vec<DetBox>, TranslatorError> {
         let (orig_w, orig_h) = image.dimensions();
         let t_pre = Instant::now();
-        let scaled = resize_to_max_side(image, DET_MAX_SIDE);
+        let scaled = resize_to_det_aligned(image, DET_MAX_SIDE);
         let (scaled_w, scaled_h) = scaled.dimensions();
-        let pad_w = pad_to_multiple(scaled_w, 32);
-        let pad_h = pad_to_multiple(scaled_h, 32);
-        let tensor_buf = preprocess_for_det(&scaled, pad_w, pad_h);
+        let tensor_buf = preprocess_for_det(&scaled, scaled_w, scaled_h);
         let pre_ms = t_pre.elapsed().as_secs_f32() * 1000.0;
 
         let t_infer = Instant::now();
         let (mask, out_shape) = self
             .session
-            .run(&tensor_buf, &[1, 3, pad_h as usize, pad_w as usize])?;
+            .run(&tensor_buf, &[1, 3, scaled_h as usize, scaled_w as usize])?;
         let infer_ms = t_infer.elapsed().as_secs_f32() * 1000.0;
 
         if out_shape.len() < 4 {
@@ -1165,11 +1163,11 @@ impl PpocrDetector {
         );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
         log::info!(
-            "ppocr det: input_pad={}x{} scaled={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{} — pre={:.1}ms infer={:.1}ms post={:.1}ms",
-            pad_w,
-            pad_h,
+            "ppocr det: det={}x{} recv={}x{} out={}x{} mask[min/max/mean]={:.3}/{:.3}/{:.3} over_{}={}/{} — pre={:.1}ms infer={:.1}ms post={:.1}ms",
             scaled_w,
             scaled_h,
+            orig_w,
+            orig_h,
             out_w,
             out_h,
             mask_min,
@@ -1187,14 +1185,12 @@ impl PpocrDetector {
 
     fn probability_map(&self, image: &DynamicImage) -> Result<GrayImage, TranslatorError> {
         let (orig_w, orig_h) = image.dimensions();
-        let scaled = resize_to_max_side(image, DET_MAX_SIDE);
+        let scaled = resize_to_det_aligned(image, DET_MAX_SIDE);
         let (scaled_w, scaled_h) = scaled.dimensions();
-        let pad_w = pad_to_multiple(scaled_w, 32);
-        let pad_h = pad_to_multiple(scaled_h, 32);
-        let tensor_buf = preprocess_for_det(&scaled, pad_w, pad_h);
+        let tensor_buf = preprocess_for_det(&scaled, scaled_w, scaled_h);
         let (mask, out_shape) = self
             .session
-            .run(&tensor_buf, &[1, 3, pad_h as usize, pad_w as usize])?;
+            .run(&tensor_buf, &[1, 3, scaled_h as usize, scaled_w as usize])?;
         if out_shape.len() < 4 {
             return Err(TranslatorError::new(
                 TranslatorErrorKind::Internal,
@@ -1203,21 +1199,14 @@ impl PpocrDetector {
         }
         let out_h = out_shape[out_shape.len() - 2] as u32;
         let out_w = out_shape[out_shape.len() - 1] as u32;
-        // The content sits at the top-left of the padded canvas and the model
-        // keeps that padding in its output, so crop back to the content region
-        // before resampling to the caller's original resolution.
-        let content_w =
-            (((out_w as f32) * (scaled_w as f32) / (pad_w as f32)).round() as u32).clamp(1, out_w);
-        let content_h =
-            (((out_h as f32) * (scaled_h as f32) / (pad_h as f32)).round() as u32).clamp(1, out_h);
-        let mut buf = vec![0u8; (content_w * content_h) as usize];
-        for y in 0..content_h {
-            for x in 0..content_w {
+        let mut buf = vec![0u8; (out_w * out_h) as usize];
+        for y in 0..out_h {
+            for x in 0..out_w {
                 let v = mask[(y * out_w + x) as usize].clamp(0.0, 1.0);
-                buf[(y * content_w + x) as usize] = (v * 255.0).round() as u8;
+                buf[(y * out_w + x) as usize] = (v * 255.0).round() as u8;
             }
         }
-        let content = GrayImage::from_raw(content_w, content_h, buf).ok_or_else(|| {
+        let content = GrayImage::from_raw(out_w, out_h, buf).ok_or_else(|| {
             TranslatorError::new(
                 TranslatorErrorKind::Internal,
                 "failed to build heatmap image",
@@ -1359,19 +1348,19 @@ fn top_textline_ori_candidate(row: &[f32]) -> Option<TextlineOriCandidate> {
     Some(TextlineOriCandidate { label, score })
 }
 
-fn pad_to_multiple(v: u32, m: u32) -> u32 {
-    v.div_ceil(m) * m
-}
-
-fn resize_to_max_side(image: &DynamicImage, max_side: u32) -> DynamicImage {
+fn resize_to_det_aligned(image: &DynamicImage, max_side: u32) -> DynamicImage {
     let (w, h) = image.dimensions();
     let max_dim = w.max(h);
-    if max_dim <= max_side {
+    let scale = if max_dim > max_side {
+        max_side as f32 / max_dim as f32
+    } else {
+        1.0_f32
+    };
+    let nw = ((w as f32 * scale) as u32 / 32).max(1) * 32;
+    let nh = ((h as f32 * scale) as u32 / 32).max(1) * 32;
+    if nw == w && nh == h {
         return image.clone();
     }
-    let scale = max_side as f32 / max_dim as f32;
-    let nw = (w as f32 * scale).round().max(1.0) as u32;
-    let nh = (h as f32 * scale).round().max(1.0) as u32;
     image.resize_exact(nw, nh, FilterType::Triangle)
 }
 

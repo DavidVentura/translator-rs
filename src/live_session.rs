@@ -731,6 +731,23 @@ impl LiveSession {
         }
     }
 
+    /// The exact oriented pill footprints currently painted for `anchor_id`, in
+    /// canonical coords — the [`AnchorRaster::painted_pills`] the canvas builder
+    /// emitted. The screen monitor masks these out of its movement diff; later
+    /// passes focus on them to watch for text changing under a pill. Reads the
+    /// emitted geometry rather than re-deriving it from the raw strips, so the
+    /// mask can't drift from what's actually opaque.
+    pub fn overlay_pill_rects(&self, anchor_id: AnchorId) -> Vec<OrientedRect> {
+        let Ok(anchors) = self.overlay_anchors.lock() else {
+            return Vec::new();
+        };
+        anchors
+            .get(&anchor_id)
+            .and_then(|a| a.canvas.as_ref())
+            .map(|raster| raster.painted_pills.clone())
+            .unwrap_or_default()
+    }
+
     /// Reset the refresh counter. Call after each fresh acquire so
     /// `should_refresh_now` doesn't immediately fire again on the
     /// next Locked frame.
@@ -2649,6 +2666,12 @@ pub struct AnchorRaster {
     pub surface_origin_x: f32,
     pub surface_origin_y: f32,
     pub row_extents: Vec<(u32, u32)>,
+    /// The exact oriented pill footprints painted into `bitmap`, in surface
+    /// coords (the inflated, normalized block + provisional visuals). The single
+    /// source of truth for "where the opaque overlay is" — the screen monitor
+    /// masks these out of its movement diff, and under-pill detection focuses on
+    /// them. Saved here so no consumer re-derives geometry from the raw strips.
+    pub painted_pills: Vec<OrientedRect>,
 }
 
 /// Unpack a `0xAARRGGBB` value into the `[r, g, b, a]` byte tuple the
@@ -2824,6 +2847,15 @@ pub fn render_anchor_canvas(
     if prepared.is_empty() && prepared_provisional.is_empty() {
         return None;
     }
+
+    // The exact pill footprints we're about to paint, in surface coords — saved
+    // on the raster so the screen monitor (and under-pill detection) read what
+    // was emitted rather than re-deriving it from the raw strips.
+    let painted_pills: Vec<OrientedRect> = prepared
+        .iter()
+        .flat_map(|pb| pb.visuals.iter().copied())
+        .chain(prepared_provisional.iter().copied())
+        .collect();
 
     // 2. Union AABB across all blocks' visuals + provisional strips.
     let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
@@ -3017,6 +3049,7 @@ pub fn render_anchor_canvas(
         surface_origin_x: origin_x,
         surface_origin_y: origin_y,
         row_extents,
+        painted_pills,
     })
 }
 
