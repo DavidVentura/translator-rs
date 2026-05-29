@@ -19,7 +19,7 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
-use crate::ocr::Rect;
+use crate::ocr::{DetectedTextBox, Rect};
 /// A frame's cropped, rotated, and detection-ready derivatives.
 ///
 /// `gray` is always populated. `rgb` and `rgb_det` are `Some` iff this
@@ -27,7 +27,7 @@ use crate::ocr::Rect;
 /// planar-tracker step uses the faster gray-only path and leaves them
 /// `None`.
 ///
-/// `det_to_full_scale` is meaningful iff `rgb_det.is_some()`.
+/// `det_to_full` is meaningful iff `rgb_det.is_some()`.
 pub struct OrientedImage {
     pub gray: GrayImage,
     /// Cache key from the caller (visible region in display coords).
@@ -42,7 +42,18 @@ pub struct OrientedImage {
     pub sensor_crop: Rect,
     pub rgb: Option<DynamicImage>,
     pub rgb_det: Option<DynamicImage>,
-    pub det_to_full_scale: f32,
+    /// Per-axis scale mapping detector-image coords → canonical (box/overlay)
+    /// coords: `(canon_w/det_w, canon_h/det_h)`. A tuple, not a scalar, because
+    /// the GPU path renders the detector input at a 32-aligned size whose x/y
+    /// scales differ slightly from the canonical aspect. The CPU `build`/
+    /// `build_with_rgb` paths are isotropic and set both components equal; the
+    /// tracker reads only `.0`.
+    pub det_to_full: (f32, f32),
+    /// Scale mapping canonical (box) coords → this image's `rgb`/`gray`
+    /// resolution. `1.0` when `rgb` is at canonical res (CPU paths); `0.5` when
+    /// recognition reads back at half res (GPU split path). Crop-from-`rgb`
+    /// sites multiply canonical boxes by this before cropping.
+    pub rec_scale: f32,
 }
 
 impl OrientedImage {
@@ -96,7 +107,8 @@ impl OrientedImage {
             sensor_crop,
             rgb: None,
             rgb_det: None,
-            det_to_full_scale,
+            det_to_full: (det_to_full_scale, det_to_full_scale),
+            rec_scale: 1.0,
         })
     }
 
@@ -152,7 +164,53 @@ impl OrientedImage {
             sensor_crop,
             rgb: Some(rgb_full),
             rgb_det: Some(rgb_det),
-            det_to_full_scale,
+            det_to_full: (det_to_full_scale, det_to_full_scale),
+            rec_scale: 1.0,
+        })
+    }
+
+    /// Build an oriented image from two **GPU-rendered** buffers, doing no CPU
+    /// crop/rotate/resize (orientation + crop are already baked into the GPU
+    /// sampling transform). `det_gray` is the detector input rendered straight at
+    /// the 32-aligned size (`det_w×det_h`); `rec_rgba` is the recognition source
+    /// rendered at `rec_w×rec_h` (typically half canonical). `canon_w/h` is the
+    /// canonical box/overlay coord space; `crop` is the originating display-crop
+    /// (used as the cache key + sensor offset).
+    ///
+    /// `rgb_det` wraps `det_gray` as `Luma8` — the detector's `to_rgb8()`
+    /// channel-replicates and its `resize_to_det_aligned` is a no-op (already
+    /// 32-aligned), so zero CPU resize for detection. `rgb`/`gray` are derived
+    /// from `rec_rgba` (cheap drop-alpha / BT.709 luma at the small rec size).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gpu_split(
+        det_gray: Vec<u8>,
+        det_w: u32,
+        det_h: u32,
+        rec_rgba: &[u8],
+        rec_w: u32,
+        rec_h: u32,
+        canon_w: u32,
+        canon_h: u32,
+        crop: Rect,
+    ) -> Result<Self, TranslatorError> {
+        let det_luma = GrayImage::from_raw(det_w, det_h, det_gray).ok_or_else(|| {
+            TranslatorError::new(TranslatorErrorKind::Internal, "det gray size mismatch")
+        })?;
+        let rgb = rgba_to_rgb(rec_rgba, rec_w, rec_h)?;
+        let gray = rgba_to_luma(rec_rgba, rec_w, rec_h)?;
+        let det_to_full = (
+            canon_w as f32 / det_w.max(1) as f32,
+            canon_h as f32 / det_h.max(1) as f32,
+        );
+        let rec_scale = rec_w as f32 / canon_w.max(1) as f32;
+        Ok(OrientedImage {
+            gray,
+            display_crop: crop,
+            sensor_crop: crop,
+            rgb: Some(DynamicImage::ImageRgb8(rgb)),
+            rgb_det: Some(DynamicImage::ImageLuma8(det_luma)),
+            det_to_full,
+            rec_scale,
         })
     }
 
@@ -161,6 +219,19 @@ impl OrientedImage {
     /// caller this frame needs rgb — rebuild."
     pub fn has_rgb(&self) -> bool {
         self.rgb.is_some()
+    }
+
+    /// Map canonical-coord boxes into this image's `rgb`/`gray` resolution for
+    /// cropping (recognition / matting read those buffers, which may be rec-res).
+    /// No-op when `rec_scale == 1.0` (CPU paths: `rgb` is already canonical).
+    pub fn rec_scaled_boxes(&self, boxes: &[DetectedTextBox]) -> Vec<DetectedTextBox> {
+        if self.rec_scale == 1.0 {
+            return boxes.to_vec();
+        }
+        boxes
+            .iter()
+            .map(|b| b.scaled_xy(self.rec_scale, self.rec_scale))
+            .collect()
     }
 }
 
@@ -322,6 +393,66 @@ fn build_rgb_full(
         TranslatorError::new(TranslatorErrorKind::Internal, "rgb buffer size mismatch")
     })?;
     Ok(DynamicImage::ImageRgb8(sensor_rgb))
+}
+
+/// Detector input dims for a `canon_w×canon_h` canonical frame: the largest box
+/// within the `det_max_pixels` budget that preserves aspect, with each side
+/// floored to a multiple of 32 (what the PP-OCR detector wants — so a gray
+/// rendered directly at this size needs no `resize_to_det_aligned`). Matches the
+/// size the legacy CPU chain converged on (e.g. 540×1200 → 512×1184).
+pub fn aligned_det_dims(canon_w: u32, canon_h: u32, det_max_pixels: u32) -> (u32, u32) {
+    let cw = canon_w.max(1);
+    let ch = canon_h.max(1);
+    let full = (cw as f64) * (ch as f64);
+    // Only ever downscale to fit the budget — never upscale a smaller canonical
+    // (the camera's is already under budget; upscaling just wastes detector work).
+    let scale = (det_max_pixels as f64 / full).sqrt().min(1.0);
+    let det_w = (((cw as f64 * scale) as u32) / 32).max(1) * 32;
+    let det_h = (((ch as f64 * scale) as u32) / 32).max(1) * 32;
+    (det_w, det_h)
+}
+
+/// RGBA → RGB (drop alpha), sequential stride-1. Small (rec-res) input.
+fn rgba_to_rgb(rgba: &[u8], w: u32, h: u32) -> Result<RgbImage, TranslatorError> {
+    let n = (w as usize) * (h as usize);
+    if rgba.len() < n * 4 {
+        return Err(TranslatorError::new(
+            TranslatorErrorKind::Internal,
+            "rec rgba too small",
+        ));
+    }
+    let mut rgb = Vec::with_capacity(n * 3);
+    for i in 0..n {
+        let p = i * 4;
+        rgb.push(rgba[p]);
+        rgb.push(rgba[p + 1]);
+        rgb.push(rgba[p + 2]);
+    }
+    RgbImage::from_raw(w, h, rgb)
+        .ok_or_else(|| TranslatorError::new(TranslatorErrorKind::Internal, "rec rgb size mismatch"))
+}
+
+/// RGBA → luma (BT.709 ints matching [`build_gray_fused`] for parity with the
+/// tracker/legacy strips), sequential stride-1. Small (rec-res) input.
+fn rgba_to_luma(rgba: &[u8], w: u32, h: u32) -> Result<GrayImage, TranslatorError> {
+    let n = (w as usize) * (h as usize);
+    if rgba.len() < n * 4 {
+        return Err(TranslatorError::new(
+            TranslatorErrorKind::Internal,
+            "rec rgba too small",
+        ));
+    }
+    let mut gray = vec![0u8; n];
+    for (i, g) in gray.iter_mut().enumerate() {
+        let p = i * 4;
+        let rr = rgba[p] as u32;
+        let gg = rgba[p + 1] as u32;
+        let bb = rgba[p + 2] as u32;
+        *g = ((13933 * rr + 46871 * gg + 4732 * bb) >> 16) as u8;
+    }
+    GrayImage::from_raw(w, h, gray).ok_or_else(|| {
+        TranslatorError::new(TranslatorErrorKind::Internal, "rec gray size mismatch")
+    })
 }
 
 /// Apply the inverse of a sensor→display rotation to a display-orient rect to
@@ -667,9 +798,54 @@ impl LiveFrame {
             sensor_crop: crop,
             rgb: None,
             rgb_det: None,
-            det_to_full_scale: 1.0,
+            det_to_full: (1.0, 1.0),
+            rec_scale: 1.0,
         });
         state.gray_only = true;
+    }
+
+    /// Install a pre-built [`OrientedImage`] (typically from
+    /// [`OrientedImage::from_gpu_split`]) directly as the OCR-side cache, so the
+    /// acquire path's `ensure_oriented_with_rgb` finds it ready (matching crop,
+    /// rgb present) and does no CPU build. Carries no RGBA.
+    ///
+    /// `tracker_gray` is the canonical-resolution luma the planar tracker's
+    /// anchor registration needs (`acquire_stage_register` →
+    /// `ensure_tracker_oriented`). The camera path supplies it (same gray +
+    /// transform as the per-frame tracker, so anchor features align); the screen
+    /// path (no tracker) passes `None`.
+    pub fn reset_oriented_split(
+        &self,
+        oriented: OrientedImage,
+        tracker_gray: Option<(Vec<u8>, u32, u32)>,
+    ) {
+        let cached_tracker = tracker_gray.map(|(g, w, h)| {
+            let crop = Rect {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            OrientedImage {
+                gray: image::GrayImage::from_raw(w, h, g)
+                    .expect("tracker gray length must equal width*height"),
+                display_crop: crop,
+                sensor_crop: crop,
+                rgb: None,
+                rgb_det: None,
+                det_to_full: (1.0, 1.0),
+                rec_scale: 1.0,
+            }
+        });
+        let mut state = self.state.lock().expect("frame mutex poisoned");
+        state.rgba = Vec::new();
+        state.external_rgba = None;
+        state.width = oriented.display_crop.right;
+        state.height = oriented.display_crop.bottom;
+        state.rotation_degrees = 0;
+        state.cached_tracker = cached_tracker;
+        state.cached = Some(oriented);
+        state.gray_only = false;
     }
 
     /// Memcpy `len` bytes from `src` into the owned RGBA buffer and
@@ -742,6 +918,70 @@ mod tests {
             v.extend_from_slice(&[r, g, b, 255]);
         }
         v
+    }
+
+    #[test]
+    fn aligned_det_dims_multiple_of_32_within_budget() {
+        // 540×1200 canonical, 650k budget → 512×1184 (matches the legacy chain).
+        assert_eq!(aligned_det_dims(540, 1200, 650_000), (512, 1184));
+        let (w, h) = aligned_det_dims(540, 1200, 650_000);
+        assert_eq!(w % 32, 0);
+        assert_eq!(h % 32, 0);
+        assert!((w as u64) * (h as u64) <= 650_000);
+    }
+
+    #[test]
+    fn from_gpu_split_scales_det_box_to_canonical() {
+        let (det_w, det_h) = (512u32, 1184u32);
+        let (rec_w, rec_h) = (270u32, 600u32); // half of 540×1200
+        let (canon_w, canon_h) = (540u32, 1200u32);
+        let det_gray = vec![0u8; (det_w * det_h) as usize];
+        let rec_rgba = vec![0u8; (rec_w * rec_h * 4) as usize];
+        let crop = Rect {
+            left: 0,
+            top: 0,
+            right: canon_w,
+            bottom: canon_h,
+        };
+        let oi = OrientedImage::from_gpu_split(
+            det_gray, det_w, det_h, &rec_rgba, rec_w, rec_h, canon_w, canon_h, crop,
+        )
+        .unwrap();
+        // det→canonical per-axis: a box at the det image's far corner maps to the
+        // canonical far corner (within rounding).
+        let (sx, sy) = oi.det_to_full;
+        assert!(((det_w as f32 * sx) - canon_w as f32).abs() < 1.0);
+        assert!(((det_h as f32 * sy) - canon_h as f32).abs() < 1.0);
+        // rec_scale maps canonical → rec (half here).
+        assert!((oi.rec_scale - 0.5).abs() < 1e-3);
+        let b = DetectedTextBox {
+            rect: Rect {
+                left: 100,
+                top: 200,
+                right: 140,
+                bottom: 240,
+            },
+            oriented_box: crate::ocr::OrientedRect {
+                cx: 120.0,
+                cy: 220.0,
+                width: 40.0,
+                height: 40.0,
+                angle_radians: 0.0,
+            },
+            tight_box: crate::ocr::OrientedRect {
+                cx: 120.0,
+                cy: 220.0,
+                width: 40.0,
+                height: 40.0,
+                angle_radians: 0.0,
+            },
+            contour: vec![100.0, 200.0, 140.0, 240.0],
+            score: 0.9,
+        };
+        let scaled = oi.rec_scaled_boxes(std::slice::from_ref(&b));
+        assert_eq!(scaled[0].rect.left, 50); // 100 * 0.5
+        assert_eq!(scaled[0].contour[0], 50.0);
+        assert_eq!(scaled[0].contour[1], 100.0); // 200 * 0.5
     }
 
     #[test]

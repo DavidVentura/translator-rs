@@ -427,6 +427,15 @@ impl LiveScreenPipeline {
         self.session.set_overlay_oversample(factor);
     }
 
+    /// Detector pixel budget — the JNI layer uses it to size the GPU det-gray
+    /// readback ([`crate::live_frame::aligned_det_dims`]).
+    pub fn det_max_pixels(&self) -> u32 {
+        self.config
+            .lock()
+            .map(|c| c.det_max_pixels)
+            .unwrap_or(650_000)
+    }
+
     pub fn clear_overlay(&self) {
         self.session.clear_overlays();
     }

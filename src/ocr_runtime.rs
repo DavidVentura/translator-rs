@@ -176,7 +176,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?;
     let det_boxes: Vec<DetectedTextBox> = det_raw
         .into_iter()
-        .map(|b| scale_detected_box(b, oriented.det_to_full_scale, width, height))
+        .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
         .collect();
 
     let scripts = match source_selection {

@@ -268,6 +268,46 @@ pub struct DetectedTextBox {
     pub score: f32,
 }
 
+impl DetectedTextBox {
+    /// Scale all geometry by a per-axis `(sx, sy)` (rect, oriented/tight boxes,
+    /// contour); angle unchanged. Used to map a box between coordinate spaces of
+    /// different resolution (e.g. canonical → half-res rec source for cropping).
+    pub fn scaled_xy(&self, sx: f32, sy: f32) -> DetectedTextBox {
+        let r = OrientedRect {
+            cx: self.oriented_box.cx * sx,
+            cy: self.oriented_box.cy * sy,
+            width: self.oriented_box.width * sx,
+            height: self.oriented_box.height * sy,
+            angle_radians: self.oriented_box.angle_radians,
+        };
+        let t = OrientedRect {
+            cx: self.tight_box.cx * sx,
+            cy: self.tight_box.cy * sy,
+            width: self.tight_box.width * sx,
+            height: self.tight_box.height * sy,
+            angle_radians: self.tight_box.angle_radians,
+        };
+        let contour = self
+            .contour
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i % 2 == 0 { v * sx } else { v * sy })
+            .collect();
+        DetectedTextBox {
+            rect: Rect {
+                left: ((self.rect.left as f32) * sx) as u32,
+                top: ((self.rect.top as f32) * sy) as u32,
+                right: ((self.rect.right as f32) * sx).ceil() as u32,
+                bottom: ((self.rect.bottom as f32) * sy).ceil() as u32,
+            },
+            oriented_box: r,
+            tight_box: t,
+            contour,
+            score: self.score,
+        }
+    }
+}
+
 /// Output of recognition over a previously-detected box. The caller can feed
 /// `text` to a translation/cache layer.
 #[derive(Debug, Clone)]

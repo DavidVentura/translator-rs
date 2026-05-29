@@ -19,9 +19,18 @@ use std::sync::Arc;
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::gl_renderer::{ExternalPresentTarget, GlesRenderer};
-use crate::live_frame::LiveFrame;
+use crate::live_frame::{LiveFrame, OrientedImage, aligned_det_dims};
 use crate::live_tracker_pipeline::{LiveTrackerPipeline, ProcessFrameResult};
 use crate::ocr::Rect;
+
+/// Row-major 3×3 mapping `w×h` dst-pixel coords → clip `[-1,1]` — the
+/// resolution-independent normalize `read_camera_*` wants as `dst_to_clip`
+/// (orientation lives in the `uv` transform set by [`frame_from_camera_gray`]).
+fn clip_xform(w: u32, h: u32) -> [f32; 9] {
+    let w = w.max(1) as f32;
+    let h = h.max(1) as f32;
+    [2.0 / w, 0.0, -1.0, 0.0, 2.0 / h, -1.0, 0.0, 0.0, 1.0]
+}
 
 /// Borrow the external camera texture, GPU-render the canonical luma into a
 /// `width*height` byte buffer, and wrap it in a fresh [`LiveFrame`] ready for
@@ -89,16 +98,55 @@ pub fn run_tracker_with_acquire(
         )?
     };
     if let Some(req) = result.rgb_request.clone() {
-        let rgba = gles
-            .read_camera_rgba(canonical_w, canonical_h, &display_xform)
+        // Render the two OCR inputs directly on the GPU instead of reading back
+        // full-res RGBA and CPU-resizing: detector gray at the 32-aligned size,
+        // recognition RGBA at half canonical. Orientation is already in `uv`
+        // (set by `frame_from_camera_gray`); `clip_xform` just sizes each FBO.
+        let (det_w, det_h) = aligned_det_dims(canonical_w, canonical_h, req.det_max_pixels());
+        // Recognition reads back at full canonical (the camera's canonical is
+        // already modest, ≤1000 long edge); half-res lost too much on small
+        // glyphs. `rec_scale` then becomes 1.0 → crops straight from full rgb.
+        let (rec_w, rec_h) = (canonical_w, canonical_h);
+        let det_gray = gles
+            .read_camera_gray(det_w, det_h, &clip_xform(det_w, det_h))
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::Internal,
+                    "read_camera_gray returned None on acquire",
+                )
+            })?;
+        let rec_rgba = gles
+            .read_camera_rgba(rec_w, rec_h, &clip_xform(rec_w, rec_h))
             .ok_or_else(|| {
                 TranslatorError::new(
                     TranslatorErrorKind::Internal,
                     "read_camera_rgba returned None on acquire",
                 )
             })?;
+        let oriented = OrientedImage::from_gpu_split(
+            det_gray,
+            det_w,
+            det_h,
+            &rec_rgba,
+            rec_w,
+            rec_h,
+            canonical_w,
+            canonical_h,
+            req.display_crop(),
+        )?;
+        // The planar tracker's anchor registration needs a canonical-res gray
+        // (matching the per-frame tracker gray's size + transform, so anchor
+        // features align). Read it with the same `display_xform`.
+        let tracker_gray = gles
+            .read_camera_gray(canonical_w, canonical_h, &display_xform)
+            .ok_or_else(|| {
+                TranslatorError::new(
+                    TranslatorErrorKind::Internal,
+                    "read_camera_gray (tracker) returned None on acquire",
+                )
+            })?;
         let rgb_frame = Arc::new(LiveFrame::new(0));
-        rgb_frame.reset_owned(rgba, canonical_w, canonical_h, 0);
+        rgb_frame.reset_oriented_split(oriented, Some((tracker_gray, canonical_w, canonical_h)));
         pipeline.provide_acquire_rgb(req, &rgb_frame);
     }
     Ok(result)

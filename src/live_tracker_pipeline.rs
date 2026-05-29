@@ -169,6 +169,18 @@ pub struct AcquireRequest {
     generation: u64,
 }
 
+impl AcquireRequest {
+    /// The crop the acquire will detect/recognize in — the GPU bridge stamps
+    /// this onto the split [`OrientedImage`] so the cache key matches.
+    pub fn display_crop(&self) -> Rect {
+        self.display_crop
+    }
+    /// Detector pixel budget for sizing the GPU det-gray readback.
+    pub fn det_max_pixels(&self) -> u32 {
+        self.config.det_max_pixels
+    }
+}
+
 /// Per-anchor record of the last emitted homography. Used so the
 /// `LOSS_HIDE_AFTER_FRAMES` grace period during Lost can keep
 /// projecting overlays through the last-good H before they hide.
@@ -1029,7 +1041,8 @@ impl LiveTrackerPipeline {
             .cached_tracker
             .as_ref()
             .expect("ensure_tracker filled cache");
-        Ok((oriented.gray.clone(), oriented.det_to_full_scale))
+        // Tracker oriented image is isotropic (CPU `build`), so `.0 == .1`.
+        Ok((oriented.gray.clone(), oriented.det_to_full.0))
     }
 
     /// Read the frame's RGBA and hand it to the target's H-independent
@@ -1410,8 +1423,8 @@ impl LiveTrackerPipeline {
             0.0,
             1.0,
         ];
-        let scale_down = if tracker_oriented.det_to_full_scale > 0.0 {
-            1.0 / tracker_oriented.det_to_full_scale
+        let scale_down = if tracker_oriented.det_to_full.0 > 0.0 {
+            1.0 / tracker_oriented.det_to_full.0
         } else {
             1.0
         };
@@ -1512,10 +1525,24 @@ impl LiveTrackerPipeline {
         let matted: Vec<Option<MattedStrip>> = {
             let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
             let oriented = state.cached.as_ref().expect("oriented still cached");
-            crate::color_matting::mat_detections(
+            let rec_scale = oriented.rec_scale;
+            // Crop colours from the (possibly rec-res) rgb with rec-scaled boxes,
+            // then lift the strips' canonical geometry back to canonical coords.
+            let scaled = oriented.rec_scaled_boxes(detected);
+            let mut matted = crate::color_matting::mat_detections(
                 &oriented.rgb.as_ref().expect("with_rgb path").to_rgba8(),
-                detected,
-            )
+                &scaled,
+            );
+            if rec_scale != 1.0 {
+                let inv = 1.0 / rec_scale;
+                for m in matted.iter_mut().flatten() {
+                    m.canonical_cx *= inv;
+                    m.canonical_cy *= inv;
+                    m.canonical_width *= inv;
+                    m.canonical_height *= inv;
+                }
+            }
+            matted
         };
         if let Ok(mut store) = self.matted_strips.lock() {
             store.insert(anchor_id, matted);
@@ -1665,12 +1692,12 @@ impl LiveTrackerPipeline {
                     };
                 }
             };
-            let scale = oriented.det_to_full_scale;
+            let (sx, sy) = oriented.det_to_full;
             let rgb = oriented.rgb.as_ref().expect("with_rgb path");
-            let max_w = rgb.width();
-            let max_h = rgb.height();
+            let max_w = (rgb.width() as f32 / oriented.rec_scale) as u32;
+            let max_h = (rgb.height() as f32 / oriented.rec_scale) as u32;
             raw.into_iter()
-                .map(|b| scale_detected_box(b, scale, max_w, max_h))
+                .map(|b| scale_detected_box(b, sx, sy, max_w, max_h))
                 .collect()
         };
         if !gen_check() {
@@ -1879,13 +1906,15 @@ pub(crate) fn acquire_detect(
             log::warn!("detect failed: {e:?}");
             "detect failed"
         })?;
-    let scale = oriented.det_to_full_scale;
+    let (sx, sy) = oriented.det_to_full;
     let rgb = oriented.rgb.as_ref().expect("with_rgb path");
-    let max_w = rgb.width();
-    let max_h = rgb.height();
+    // Boxes land in canonical coords; `rgb` may be rec-res (rec_scale<1), so the
+    // canonical clamp is rgb dims / rec_scale (== rgb dims on the CPU paths).
+    let max_w = (rgb.width() as f32 / oriented.rec_scale) as u32;
+    let max_h = (rgb.height() as f32 / oriented.rec_scale) as u32;
     Ok(raw
         .into_iter()
-        .map(|b| scale_detected_box(b, scale, max_w, max_h))
+        .map(|b| scale_detected_box(b, sx, sy, max_w, max_h))
         .collect())
 }
 
@@ -2048,11 +2077,22 @@ pub(crate) fn composite_overlays(
     target.draw(&input).map(|()| overlay_count)
 }
 
-fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) -> DetectedTextBox {
-    let left = ((b.rect.left as f32) * scale).max(0.0) as u32;
-    let top = ((b.rect.top as f32) * scale).max(0.0) as u32;
-    let right = ((b.rect.right as f32) * scale).min(max_w as f32) as u32;
-    let bottom = ((b.rect.bottom as f32) * scale).min(max_h as f32) as u32;
+/// Scale a detected box by a per-axis `(sx, sy)`, clamped to `max_w×max_h`.
+/// Per-axis (not a single scalar) because the GPU detector input is rendered at
+/// a 32-aligned size whose x/y scales to canonical differ slightly; the CPU
+/// paths pass `sx == sy`. Even contour points scale by x, odd by y. Angle is
+/// left unchanged — the anisotropy here is ≈1.04 vs 1.01, sub-degree.
+fn scale_detected_box(
+    b: DetectedTextBox,
+    sx: f32,
+    sy: f32,
+    max_w: u32,
+    max_h: u32,
+) -> DetectedTextBox {
+    let left = ((b.rect.left as f32) * sx).max(0.0) as u32;
+    let top = ((b.rect.top as f32) * sy).max(0.0) as u32;
+    let right = ((b.rect.right as f32) * sx).min(max_w as f32) as u32;
+    let bottom = ((b.rect.bottom as f32) * sy).min(max_h as f32) as u32;
     let rect = Rect {
         left: left.min(right.saturating_sub(1)),
         top: top.min(bottom.saturating_sub(1)),
@@ -2060,22 +2100,22 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
         bottom: bottom.max(top + 1),
     };
     let oriented = OrientedRect {
-        cx: b.oriented_box.cx * scale,
-        cy: b.oriented_box.cy * scale,
-        width: b.oriented_box.width * scale,
-        height: b.oriented_box.height * scale,
+        cx: b.oriented_box.cx * sx,
+        cy: b.oriented_box.cy * sy,
+        width: b.oriented_box.width * sx,
+        height: b.oriented_box.height * sy,
         angle_radians: b.oriented_box.angle_radians,
     };
     let tight = OrientedRect {
-        cx: b.tight_box.cx * scale,
-        cy: b.tight_box.cy * scale,
-        width: b.tight_box.width * scale,
-        height: b.tight_box.height * scale,
+        cx: b.tight_box.cx * sx,
+        cy: b.tight_box.cy * sy,
+        width: b.tight_box.width * sx,
+        height: b.tight_box.height * sy,
         angle_radians: b.tight_box.angle_radians,
     };
     let mut contour = Vec::with_capacity(b.contour.len());
-    for v in &b.contour {
-        contour.push(v * scale);
+    for (i, v) in b.contour.iter().enumerate() {
+        contour.push(if i % 2 == 0 { v * sx } else { v * sy });
     }
     DetectedTextBox {
         rect,

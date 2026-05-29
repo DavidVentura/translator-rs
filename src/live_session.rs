@@ -1295,10 +1295,14 @@ pub fn estimate_canonical_via_rec(
         );
         return None;
     }
-    let samples: Vec<DetectedTextBox> = sample_indices
-        .iter()
-        .map(|(i, _)| boxes[*i].clone())
-        .collect();
+    // Scale to the rec-source resolution: these samples are both PCA-analyzed
+    // (angle is scale-invariant) and cropped from `oriented.rgb` (rec-res).
+    let samples: Vec<DetectedTextBox> = oriented.rec_scaled_boxes(
+        &sample_indices
+            .iter()
+            .map(|(i, _)| boxes[*i].clone())
+            .collect::<Vec<_>>(),
+    );
     let scripts = vec![script; samples.len()];
 
     // The dewarp's canonical parameter is a sign-flip on the PCA axis,
@@ -2147,10 +2151,14 @@ impl LiveSession {
             let original_indices: Vec<usize> = (start..end)
                 .filter(|&i| !entries[i].rec_attempted)
                 .collect();
-            let batch_boxes: Vec<DetectedTextBox> = original_indices
-                .iter()
-                .map(|&i| entries[i].rec_box.clone())
-                .collect();
+            // Boxes are canonical; the recognizer crops from `oriented.rgb`,
+            // which may be rec-resolution (half) — scale to that space.
+            let batch_boxes: Vec<DetectedTextBox> = input.oriented.rec_scaled_boxes(
+                &original_indices
+                    .iter()
+                    .map(|&i| entries[i].rec_box.clone())
+                    .collect::<Vec<_>>(),
+            );
             let lines = if batch_boxes.is_empty() {
                 Vec::new()
             } else {

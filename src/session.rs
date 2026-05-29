@@ -460,8 +460,8 @@ impl TranslatorSession {
 
     /// Live-OCR detect: takes a pre-built `OrientedImage` (the live pipeline's
     /// FrameHandle holds one of these). Boxes returned are in detection-image
-    /// coords; multiply by `oriented.det_to_full_scale` to lift to the full
-    /// display-orient crop's coord space.
+    /// coords; multiply by `oriented.det_to_full` (per-axis) to lift to the
+    /// canonical box coord space.
     #[cfg(feature = "ppocr")]
     pub(crate) fn detect_text_in_oriented_image(
         &self,
@@ -495,11 +495,13 @@ impl TranslatorSession {
             .as_ref()
             .expect("estimate path requires build_with_rgb");
         let gray_display = image::imageops::grayscale(&rgb.to_rgb8());
+        // Boxes are canonical; `rgb` may be rec-res — scale to crop correctly.
+        let scaled = oriented.rec_scaled_boxes(boxes);
         Ok(crate::live_session::estimate_canonical_quadrant(
             &ppocr,
             rgb,
             &gray_display,
-            boxes,
+            &scaled,
         ))
     }
 

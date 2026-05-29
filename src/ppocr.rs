@@ -1367,9 +1367,25 @@ fn resize_to_det_aligned(image: &DynamicImage, max_side: u32) -> DynamicImage {
 fn preprocess_for_det(image: &DynamicImage, pad_w: u32, pad_h: u32) -> Vec<f32> {
     let plane = (pad_w as usize) * (pad_h as usize);
     let mut buf = vec![0.0f32; 3 * plane];
+    let pad_w_u = pad_w as usize;
+    // Fast path for a gray detector input (the GPU split path renders luma
+    // straight at the aligned size): read the single channel and write the same
+    // value to all three, skipping the `to_rgb8()` channel-replication alloc.
+    if let DynamicImage::ImageLuma8(luma) = image {
+        let (w, h) = luma.dimensions();
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let v = luma.get_pixel(x as u32, y as u32)[0] as f32 / 255.0;
+                let idx = y * pad_w_u + x;
+                buf[idx] = (v - PPOCR_DET_MEAN[0]) / PPOCR_DET_STD[0];
+                buf[plane + idx] = (v - PPOCR_DET_MEAN[1]) / PPOCR_DET_STD[1];
+                buf[2 * plane + idx] = (v - PPOCR_DET_MEAN[2]) / PPOCR_DET_STD[2];
+            }
+        }
+        return buf;
+    }
     let rgb = image.to_rgb8();
     let (w, h) = rgb.dimensions();
-    let pad_w_u = pad_w as usize;
     for y in 0..h as usize {
         for x in 0..w as usize {
             let pixel = rgb.get_pixel(x as u32, y as u32);
