@@ -41,6 +41,8 @@ pub mod live_frame;
 #[cfg(feature = "gpu")]
 pub mod live_gpu_tick;
 #[cfg(feature = "planar-tracker")]
+pub mod live_screen;
+#[cfg(feature = "planar-tracker")]
 pub mod live_session;
 #[cfg(feature = "planar-tracker")]
 pub mod live_tracker_pipeline;

@@ -36,6 +36,22 @@ pub enum GlError {
     MissingLocation(&'static str),
 }
 
+/// What [`GlesRenderer::present`] draws into the bound framebuffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PresentContent {
+    /// Opaque camera passthrough with the overlays composited on top — the
+    /// live-camera path. Clears to opaque black under the camera quad.
+    #[default]
+    CameraAndOverlay,
+    /// Only the overlays, over a transparent (alpha 0) clear, with
+    /// premultiplied-alpha output. For a translucent window that floats over
+    /// live content the renderer does not own (the MediaProjection
+    /// screen-translate overlay): the camera passthrough quad is skipped so
+    /// the real screen behind the window shows through. The tracker gray/RGBA
+    /// readbacks still sample the external source, so OCR is unaffected.
+    OverlayOnly,
+}
+
 const VERT_SRC: &str = r#"#version 100
 attribute vec2 a_pos;
 uniform mat3 u_transform;
@@ -56,9 +72,15 @@ precision highp float;
 precision mediump float;
 #endif
 uniform sampler2D u_tex;
+uniform float u_overlay_alpha;
 varying vec2 v_uv;
 void main() {
-    gl_FragColor = texture2D(u_tex, v_uv);
+    vec4 c = texture2D(u_tex, v_uv);
+    // Parametric overlay opacity (1.0 for camera passthrough). Scaling alpha
+    // pre-blend is premultiply-correct: the source-over blend then yields an
+    // effective coverage of (texel alpha × u_overlay_alpha).
+    c.a *= u_overlay_alpha;
+    gl_FragColor = c;
 }
 "#;
 
@@ -133,7 +155,13 @@ pub struct GlesRenderer {
     u_transform: glow::UniformLocation,
     u_uv_xform: glow::UniformLocation,
     u_tex: glow::UniformLocation,
+    u_overlay_alpha: glow::UniformLocation,
     a_pos: u32,
+    /// Parametric overlay opacity for the 2D program, applied to overlay draws
+    /// (forced 1.0 for the camera passthrough). Set once per renderer via
+    /// [`set_overlay_alpha`](Self::set_overlay_alpha); the screen path uses it
+    /// to control overlay opacity independently of the camera path.
+    overlay_alpha: f32,
     quad_vbo: glow::Buffer,
     camera_tex: glow::Texture,
     overlay_tex: glow::Texture,
@@ -163,6 +191,10 @@ pub struct GlesRenderer {
     /// than the uploaded 2D `camera_tex`. The uv transform carries the
     /// upright/crop/flip from sensor space into the canonical frame.
     camera_external: Option<(u32, [f32; 9])>,
+    /// Whether [`present`](Self::present) composites the camera + overlays or
+    /// only the overlays over transparent. Set once for the renderer's
+    /// lifetime via [`set_present_content`](Self::set_present_content).
+    present_content: PresentContent,
 }
 
 /// The external-OES camera program (shares [`VERT_SRC`] with the 2D program;
@@ -197,6 +229,9 @@ impl GlesRenderer {
             let u_tex = gl
                 .get_uniform_location(program, "u_tex")
                 .ok_or(GlError::MissingLocation("u_tex"))?;
+            let u_overlay_alpha = gl
+                .get_uniform_location(program, "u_overlay_alpha")
+                .ok_or(GlError::MissingLocation("u_overlay_alpha"))?;
             let a_pos = gl
                 .get_attrib_location(program, "a_pos")
                 .ok_or(GlError::MissingLocation("a_pos"))?;
@@ -220,7 +255,9 @@ impl GlesRenderer {
                 u_transform,
                 u_uv_xform,
                 u_tex,
+                u_overlay_alpha,
                 a_pos,
+                overlay_alpha: 1.0,
                 quad_vbo,
                 camera_tex,
                 overlay_tex,
@@ -236,6 +273,7 @@ impl GlesRenderer {
                 gray_fbo_size: None,
                 ext: None,
                 camera_external: None,
+                present_content: PresentContent::default(),
             })
         }
     }
@@ -272,6 +310,22 @@ impl GlesRenderer {
 
     pub fn clear_camera_external(&mut self) {
         self.camera_external = None;
+    }
+
+    /// Choose what [`present`](Self::present) draws — camera + overlays, or
+    /// overlays only over a transparent clear (see [`PresentContent`]). The
+    /// camera/screen source is independent of this; it governs only the
+    /// final present composite, not the tracker readbacks.
+    pub fn set_present_content(&mut self, content: PresentContent) {
+        self.present_content = content;
+    }
+
+    /// Set the overlay opacity multiplier (0..1) applied to overlay draws.
+    /// `1.0` (default) = the overlay's own alpha unchanged. The camera path
+    /// leaves it at 1.0; the screen path can lower it independently of the
+    /// (touch-capped) window alpha.
+    pub fn set_overlay_alpha(&mut self, alpha: f32) {
+        self.overlay_alpha = alpha.clamp(0.0, 1.0);
     }
 
     fn build_ext_program(&self) -> Option<ExtProgram> {
@@ -500,24 +554,14 @@ impl GlesRenderer {
     /// bound framebuffer. The camera upload is the caller's responsibility
     /// (via [`upload_camera_tex`](Self::upload_camera_tex)); overlay uploads
     /// stay here because they depend on the per-anchor overlay items.
-    fn draw(&mut self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
+    /// Draw the opaque camera passthrough quad: the base layer beneath the
+    /// overlays in [`PresentContent::CameraAndOverlay`]. Either the borrowed
+    /// external-OES texture (zero-copy, sampled through the canonical uv
+    /// transform that carries upright/crop/flip) or the uploaded 2D texture
+    /// sampled through the sensor-crop uv.
+    fn draw_camera_passthrough(&self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
         let dst_w = input.dst_w as f32;
         let dst_h = input.dst_h as f32;
-        // Fast-clear so tiled GPUs skip loading the previous framebuffer; the
-        // opaque camera quad then covers it.
-        unsafe {
-            let gl = &self.gl;
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
-            gl.active_texture(glow::TEXTURE0);
-            gl.disable(glow::BLEND);
-        }
-
-        // Camera passthrough (opaque base). Either a borrowed external-OES
-        // texture (zero-copy, sampled through the canonical uv transform that
-        // carries upright/crop/flip) or the uploaded 2D texture sampled through
-        // the sensor-crop uv.
         let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
         match self.camera_external {
             Some((id, uv)) if self.ext.is_some() => unsafe {
@@ -544,6 +588,7 @@ impl GlesRenderer {
                 gl.enable_vertex_attrib_array(self.a_pos);
                 gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
                 gl.uniform_1_i32(Some(&self.u_tex), 0);
+                gl.uniform_1_f32(Some(&self.u_overlay_alpha), 1.0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
                 let cam_uv = [
                     dst_w / input.src_full_w as f32,
@@ -569,6 +614,26 @@ impl GlesRenderer {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             },
         }
+    }
+
+    fn draw(&mut self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
+        let overlay_only = self.present_content == PresentContent::OverlayOnly;
+        // Fast-clear so tiled GPUs skip loading the previous framebuffer. The
+        // camera path clears to opaque black under the camera quad; overlay-only
+        // clears transparent so the glyphs composite over the live content
+        // behind a translucent window.
+        unsafe {
+            let gl = &self.gl;
+            let clear_a = if overlay_only { 0.0 } else { 1.0 };
+            gl.clear_color(0.0, 0.0, 0.0, clear_a);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.active_texture(glow::TEXTURE0);
+            gl.disable(glow::BLEND);
+        }
+        if !overlay_only {
+            self.draw_camera_passthrough(input, dst_to_clip);
+        }
 
         // Overlays: source-over with straight (non-premultiplied) alpha,
         // matching the CPU blend. Always the 2D program. Each item warped by the
@@ -579,6 +644,7 @@ impl GlesRenderer {
             gl.enable_vertex_attrib_array(self.a_pos);
             gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.uniform_1_i32(Some(&self.u_tex), 0);
+            gl.uniform_1_f32(Some(&self.u_overlay_alpha), self.overlay_alpha);
             // The external-camera pass left a GL_TEXTURE_EXTERNAL_OES bound on
             // unit 0. Adreno/Mali return nothing when a sampler2D reads a unit
             // that still has an external texture bound, so clear it before
@@ -594,7 +660,21 @@ impl GlesRenderer {
             gl.disable(glow::SCISSOR_TEST);
             gl.enable(glow::BLEND);
             gl.blend_equation(glow::FUNC_ADD);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            // Overlay-only output goes to a translucent window, so the alpha
+            // channel matters: accumulate it with (ONE, ONE_MINUS_SRC_ALPHA)
+            // while RGB stays source-over, leaving the framebuffer premultiplied
+            // (rgb already ×alpha, alpha = coverage) the way SurfaceFlinger
+            // blends a layer. The opaque camera path keeps the plain blend.
+            if overlay_only {
+                gl.blend_func_separate(
+                    glow::SRC_ALPHA,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                );
+            } else {
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            }
             // On the external path `read_camera_rgba` row-flips the readback to
             // give the pipeline a top-down canonical frame, so overlays are
             // authored vertically mirrored relative to the (non-flipped) on-screen

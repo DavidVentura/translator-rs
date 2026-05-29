@@ -1104,62 +1104,15 @@ impl LiveTrackerPipeline {
         h_surface_to_viewport: Option<[f32; 9]>,
         active_anchor_id: u64,
     ) -> Result<u32, CompositeError> {
-        let state = frame.state().lock().expect("frame mutex poisoned");
-        let sensor_w = state.width;
-        let sensor_h = state.height;
-        let src_offset_x = sensor_w.saturating_sub(bitmap_w) / 2;
-        let src_offset_y = sensor_h.saturating_sub(bitmap_h) / 2;
-        // One bitmap per anchor (bg + glyphs already composed in
-        // surface space at canvas-build time). The compositor does a
-        // single bilinear warp per item; cross-block bg overlap is
-        // resolved in the canvas, not per frame.
-        let overlay_guard = self.session.overlay_anchors.lock().ok();
-        let items_vec: Vec<OverlayItem<'_>> = match (&overlay_guard, h_surface_to_viewport) {
-            (Some(anchors), Some(_)) => anchors
-                .get(&active_anchor_id)
-                .and_then(|a| a.canvas.as_ref())
-                .map(|c| {
-                    vec![OverlayItem {
-                        bitmap_rgba: &c.bitmap,
-                        bitmap_width: c.width,
-                        bitmap_height: c.height,
-                        oversample: c.oversample,
-                        bitmap_origin_surface_x: c.surface_origin_x,
-                        bitmap_origin_surface_y: c.surface_origin_y,
-                        row_extents: &c.row_extents,
-                    }]
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        let h_for_call =
-            h_surface_to_viewport.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-        let translate = [
-            1.0,
-            0.0,
-            -(src_offset_x as f32),
-            0.0,
-            1.0,
-            -(src_offset_y as f32),
-            0.0,
-            0.0,
-            1.0,
-        ];
-        let h_translated = homography::mat3_mul(&translate, &h_for_call);
-        let overlay_count = items_vec.len() as u32;
-        let camera = state.rgba_bytes();
-        let input = live_compositor::CompositeInput {
-            dst_w: bitmap_w,
-            dst_h: bitmap_h,
-            camera_rgba: camera,
-            src_full_w: sensor_w,
-            src_full_h: sensor_h,
-            src_offset_x,
-            src_offset_y,
-            h_surface_to_viewport: &h_translated,
-            items: &items_vec,
-        };
-        target.draw(&input).map(|()| overlay_count)
+        composite_overlays(
+            &self.session,
+            frame,
+            target,
+            bitmap_w,
+            bitmap_h,
+            h_surface_to_viewport,
+            active_anchor_id,
+        )
     }
 
     fn update_refresh_trigger(
@@ -1413,26 +1366,7 @@ impl LiveTrackerPipeline {
         display_crop: Rect,
         cfg: &PipelineConfig,
     ) -> Result<Vec<DetectedTextBox>, &'static str> {
-        let mut state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
-        state
-            .ensure_oriented_with_rgb(display_crop, cfg.det_max_pixels)
-            .map_err(|_| "ensure_oriented failed")?;
-        let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
-        let raw = self
-            .catalog
-            .detect_text_in_oriented_image(oriented)
-            .map_err(|e| {
-                log::warn!("detect failed: {e:?}");
-                "detect failed"
-            })?;
-        let scale = oriented.det_to_full_scale;
-        let rgb = oriented.rgb.as_ref().expect("with_rgb path");
-        let max_w = rgb.width();
-        let max_h = rgb.height();
-        Ok(raw
-            .into_iter()
-            .map(|b| scale_detected_box(b, scale, max_w, max_h))
-            .collect())
+        acquire_detect(&self.catalog, frame, display_crop, cfg.det_max_pixels)
     }
 
     /// Stage 2: register the anchor and flip the engine to Locked.
@@ -1545,22 +1479,13 @@ impl LiveTrackerPipeline {
         cfg: &PipelineConfig,
         detected: &[DetectedTextBox],
     ) -> Result<Option<Quadrant>, &'static str> {
-        let forced_script = if cfg.is_auto_source {
-            None
-        } else {
-            self.catalog.ppocr_script_for_language_code(&cfg.from_lang)
-        };
-        let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
-        let oriented = state.cached.as_ref().ok_or("oriented cache miss")?;
-        Ok(if let Some(script) = forced_script {
-            self.catalog
-                .estimate_canonical_via_rec_in_oriented_image(oriented, detected, script)
-                .unwrap_or(None)
-        } else {
-            self.catalog
-                .estimate_canonical_quadrant_in_oriented_image(oriented, detected)
-                .unwrap_or(None)
-        })
+        acquire_orient(
+            &self.catalog,
+            frame,
+            &cfg.from_lang,
+            cfg.is_auto_source,
+            detected,
+        )
     }
 
     /// Stage 5: write the resolved quadrant back onto the cached
@@ -1613,62 +1538,32 @@ impl LiveTrackerPipeline {
         anchor_id: u64,
         generation: u64,
     ) -> Result<PostDetectOutcome, &'static str> {
-        let available_codes: Vec<LanguageCode> = self
-            .catalog
-            .language_rows()
-            .into_iter()
-            .map(|row| LanguageCode::from(row.language.code.as_str()))
-            .collect();
         let matted_strips: Vec<Option<MattedStrip>> = match self.matted_strips.lock() {
             Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
             Err(_) => Vec::new(),
         };
-        let cancel = || self.generation.load(Ordering::SeqCst) != generation;
-        let session_ref: &TranslatorSession = &self.catalog;
-
-        let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
-        let oriented = state
-            .cached
-            .as_ref()
-            .filter(|oi| oi.display_crop == display_crop)
-            .ok_or("oriented cache miss")?;
-        let h_view_to_sensor = [
-            1.0,
-            0.0,
-            oriented.sensor_crop.left as f32,
-            0.0,
-            1.0,
-            oriented.sensor_crop.top as f32,
-            0.0,
-            0.0,
-            1.0,
-        ];
         let canonical_quadrant = self
             .engine
             .lock()
             .ok()
             .and_then(|e| e.canonical_rotation_for(anchor_id));
-        let outcome = self.session.run_post_detect(
-            PostDetectInput {
-                detections: detected,
-                oriented,
-                h_view_to_surface: Some(h_view_to_sensor),
-                anchor_id,
-                from_lang: &cfg.from_lang,
-                to_lang: &cfg.to_lang,
-                is_auto_source: cfg.is_auto_source,
-                available_codes: &available_codes,
-                font_provider: &*self.font_provider,
-                matted_strips: &matted_strips,
-                rec_batch_size: cfg.rec_batch_size,
-                canonical_quadrant,
-            },
-            &session_ref,
-            &session_ref,
+        let cancel = || self.generation.load(Ordering::SeqCst) != generation;
+        acquire_rec_translate(
+            &self.catalog,
+            &self.session,
+            &*self.font_provider,
+            frame,
+            display_crop,
+            &cfg.from_lang,
+            &cfg.to_lang,
+            cfg.is_auto_source,
+            cfg.rec_batch_size,
+            detected,
+            anchor_id,
+            canonical_quadrant,
+            &matted_strips,
             &cancel,
-        );
-        drop(state);
-        Ok(outcome)
+        )
     }
 
     /// Stage 7: post-rec cleanup. Drops the anchor entirely if rec
@@ -1956,6 +1851,203 @@ fn error_telemetry(msg: &'static str) -> AcquireTelemetry {
 
 /// Scale a `DetectedTextBox` from detector-image coords up to
 /// full-crop coords, clamping inside the destination dimensions.
+// ---------------------------------------------------------------------------
+// Shared acquire-core ops. Called by both `LiveTrackerPipeline` (tracked camera
+// path) and `LiveScreenPipeline` (static screen-capture path) so the
+// detect → orient → rec/translate → composite work has a single definition.
+// The engine/anchor-lifecycle bits (register, write-quadrant-to-engine,
+// finalize/LRU) stay in `LiveTrackerPipeline`; these take only what they need.
+// ---------------------------------------------------------------------------
+
+/// Ensure the oriented RGB+gray cache for `display_crop`, run the detector, and
+/// return boxes in full-resolution pixel coords. (Body of
+/// `LiveTrackerPipeline::acquire_stage_detect`.)
+pub(crate) fn acquire_detect(
+    catalog: &TranslatorSession,
+    frame: &Arc<LiveFrame>,
+    display_crop: Rect,
+    det_max_pixels: u32,
+) -> Result<Vec<DetectedTextBox>, &'static str> {
+    let mut state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+    state
+        .ensure_oriented_with_rgb(display_crop, det_max_pixels)
+        .map_err(|_| "ensure_oriented failed")?;
+    let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
+    let raw = catalog
+        .detect_text_in_oriented_image(oriented)
+        .map_err(|e| {
+            log::warn!("detect failed: {e:?}");
+            "detect failed"
+        })?;
+    let scale = oriented.det_to_full_scale;
+    let rgb = oriented.rgb.as_ref().expect("with_rgb path");
+    let max_w = rgb.width();
+    let max_h = rgb.height();
+    Ok(raw
+        .into_iter()
+        .map(|b| scale_detected_box(b, scale, max_w, max_h))
+        .collect())
+}
+
+/// Estimate the canonical reading-direction quadrant. (Body of
+/// `LiveTrackerPipeline::acquire_stage_orient`.) `None` = no consensus.
+pub(crate) fn acquire_orient(
+    catalog: &TranslatorSession,
+    frame: &Arc<LiveFrame>,
+    from_lang: &str,
+    is_auto_source: bool,
+    detected: &[DetectedTextBox],
+) -> Result<Option<Quadrant>, &'static str> {
+    let forced_script = if is_auto_source {
+        None
+    } else {
+        catalog.ppocr_script_for_language_code(from_lang)
+    };
+    let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+    let oriented = state.cached.as_ref().ok_or("oriented cache miss")?;
+    Ok(if let Some(script) = forced_script {
+        catalog
+            .estimate_canonical_via_rec_in_oriented_image(oriented, detected, script)
+            .unwrap_or(None)
+    } else {
+        catalog
+            .estimate_canonical_quadrant_in_oriented_image(oriented, detected)
+            .unwrap_or(None)
+    })
+}
+
+/// Recognize + translate the detections and upsert the resident overlay blocks
+/// for `anchor_id` via [`LiveSession::run_post_detect`]. (Body of
+/// `LiveTrackerPipeline::acquire_stage_rec_translate`, minus the engine
+/// quadrant lookup — pass `canonical_quadrant` directly.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acquire_rec_translate(
+    catalog: &TranslatorSession,
+    session: &LiveSession,
+    font_provider: &dyn FontProvider,
+    frame: &Arc<LiveFrame>,
+    display_crop: Rect,
+    from_lang: &str,
+    to_lang: &str,
+    is_auto_source: bool,
+    rec_batch_size: usize,
+    detected: &[DetectedTextBox],
+    anchor_id: u64,
+    canonical_quadrant: Option<Quadrant>,
+    matted_strips: &[Option<MattedStrip>],
+    cancel: &dyn Fn() -> bool,
+) -> Result<PostDetectOutcome, &'static str> {
+    let available_codes: Vec<LanguageCode> = catalog
+        .language_rows()
+        .into_iter()
+        .map(|row| LanguageCode::from(row.language.code.as_str()))
+        .collect();
+    let session_ref: &TranslatorSession = catalog;
+    let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
+    let oriented = state
+        .cached
+        .as_ref()
+        .filter(|oi| oi.display_crop == display_crop)
+        .ok_or("oriented cache miss")?;
+    let h_view_to_sensor = [
+        1.0,
+        0.0,
+        oriented.sensor_crop.left as f32,
+        0.0,
+        1.0,
+        oriented.sensor_crop.top as f32,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    let outcome = session.run_post_detect(
+        PostDetectInput {
+            detections: detected,
+            oriented,
+            h_view_to_surface: Some(h_view_to_sensor),
+            anchor_id,
+            from_lang,
+            to_lang,
+            is_auto_source,
+            available_codes: &available_codes,
+            font_provider,
+            matted_strips,
+            rec_batch_size,
+            canonical_quadrant,
+        },
+        &session_ref,
+        &session_ref,
+        cancel,
+    );
+    drop(state);
+    Ok(outcome)
+}
+
+/// Project anchor `active_anchor_id`'s overlay canvas through
+/// `h_surface_to_viewport` and draw it into `target`. (Body of
+/// `LiveTrackerPipeline::composite_to_target`.)
+pub(crate) fn composite_overlays(
+    session: &LiveSession,
+    frame: &Arc<LiveFrame>,
+    target: &mut dyn ComposeTarget,
+    bitmap_w: u32,
+    bitmap_h: u32,
+    h_surface_to_viewport: Option<[f32; 9]>,
+    active_anchor_id: u64,
+) -> Result<u32, CompositeError> {
+    let state = frame.state().lock().expect("frame mutex poisoned");
+    let sensor_w = state.width;
+    let sensor_h = state.height;
+    let src_offset_x = sensor_w.saturating_sub(bitmap_w) / 2;
+    let src_offset_y = sensor_h.saturating_sub(bitmap_h) / 2;
+    let overlay_guard = session.overlay_anchors.lock().ok();
+    let items_vec: Vec<OverlayItem<'_>> = match (&overlay_guard, h_surface_to_viewport) {
+        (Some(anchors), Some(_)) => anchors
+            .get(&active_anchor_id)
+            .and_then(|a| a.canvas.as_ref())
+            .map(|c| {
+                vec![OverlayItem {
+                    bitmap_rgba: &c.bitmap,
+                    bitmap_width: c.width,
+                    bitmap_height: c.height,
+                    oversample: c.oversample,
+                    bitmap_origin_surface_x: c.surface_origin_x,
+                    bitmap_origin_surface_y: c.surface_origin_y,
+                    row_extents: &c.row_extents,
+                }]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let h_for_call = h_surface_to_viewport.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    let translate = [
+        1.0,
+        0.0,
+        -(src_offset_x as f32),
+        0.0,
+        1.0,
+        -(src_offset_y as f32),
+        0.0,
+        0.0,
+        1.0,
+    ];
+    let h_translated = homography::mat3_mul(&translate, &h_for_call);
+    let overlay_count = items_vec.len() as u32;
+    let camera = state.rgba_bytes();
+    let input = live_compositor::CompositeInput {
+        dst_w: bitmap_w,
+        dst_h: bitmap_h,
+        camera_rgba: camera,
+        src_full_w: sensor_w,
+        src_full_h: sensor_h,
+        src_offset_x,
+        src_offset_y,
+        h_surface_to_viewport: &h_translated,
+        items: &items_vec,
+    };
+    target.draw(&input).map(|()| overlay_count)
+}
+
 fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) -> DetectedTextBox {
     let left = ((b.rect.left as f32) * scale).max(0.0) as u32;
     let top = ((b.rect.top as f32) * scale).max(0.0) as u32;

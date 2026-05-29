@@ -425,6 +425,10 @@ pub struct LiveSession {
     /// so the per-frame warp upscales them less. See
     /// [`render_anchor_canvas`].
     overlay_oversample: AtomicU32,
+    /// Default pill background, RGBA packed as `(r<<24)|(g<<16)|(b<<8)|a`. The
+    /// camera path keeps the translucent `0x101010C8`; the screen path sets an
+    /// opaque pill so it isn't double-dimmed by the touch-capped window alpha.
+    overlay_bg: AtomicU32,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -449,6 +453,7 @@ impl LiveSession {
             last_refresh_locked_frame: AtomicU64::new(0),
             refresh_every_n_locked_frames: AtomicU32::new(DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES),
             overlay_oversample: AtomicU32::new(1.0_f32.to_bits()),
+            overlay_bg: AtomicU32::new(0x1010_10C8),
         }
     }
 
@@ -464,6 +469,21 @@ impl LiveSession {
 
     fn overlay_oversample(&self) -> f32 {
         f32::from_bits(self.overlay_oversample.load(Ordering::Relaxed))
+    }
+
+    /// Set the default pill background (RGBA). Opaque values avoid double-dimming
+    /// when the host window is already alpha-clamped (screen-translate path).
+    pub fn set_overlay_bg(&self, rgba: [u8; 4]) {
+        let packed = ((rgba[0] as u32) << 24)
+            | ((rgba[1] as u32) << 16)
+            | ((rgba[2] as u32) << 8)
+            | (rgba[3] as u32);
+        self.overlay_bg.store(packed, Ordering::Relaxed);
+    }
+
+    fn overlay_bg(&self) -> [u8; 4] {
+        let p = self.overlay_bg.load(Ordering::Relaxed);
+        [(p >> 24) as u8, (p >> 16) as u8, (p >> 8) as u8, p as u8]
     }
 
     /// Drop all session state. Caller invokes on tap-to-focus,
@@ -1054,6 +1074,7 @@ impl LiveSession {
             &provisional_snapshot,
             font_provider,
             self.overlay_oversample(),
+            self.overlay_bg(),
         );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -1400,6 +1421,42 @@ pub fn estimate_canonical_via_rec(
 /// Original textline-ori-based estimator, kept for the auto-source path
 /// (where we don't know the script up-front and can't run rec).
 #[cfg(feature = "ppocr")]
+/// Geometric reading-direction quadrant from detected-box contour angles —
+/// no recognizer pass. Picks the dominant principal axis (horizontal vs
+/// vertical, length-weighted) and assumes world-up: horizontal → R0, vertical
+/// → R90. Used by the screen pipeline, which is always world-up but may be
+/// captured in landscape; the rec-based 180° disambiguation that
+/// [`estimate_canonical_quadrant`] adds is skipped for speed.
+pub fn dominant_axis_quadrant(boxes: &[DetectedTextBox]) -> crate::coords::Quadrant {
+    use crate::ppocr::contour_principal_axis_angle;
+    let mut horizontal = 0.0f32;
+    let mut vertical = 0.0f32;
+    for b in boxes {
+        if b.contour.is_empty() || b.contour.len() % 2 != 0 {
+            continue;
+        }
+        let contour: Vec<(f32, f32)> = b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let Some(theta) = contour_principal_axis_angle(&contour) else {
+            continue;
+        };
+        let w = b.rect.right.saturating_sub(b.rect.left) as f32;
+        let h = b.rect.bottom.saturating_sub(b.rect.top) as f32;
+        let weight = w.max(h);
+        // θ ∈ [0, π): |sin θ| is 0 for a horizontal axis, 1 for vertical; split
+        // at 45°.
+        if theta.sin().abs() < std::f32::consts::FRAC_1_SQRT_2 {
+            horizontal += weight;
+        } else {
+            vertical += weight;
+        }
+    }
+    if vertical > horizontal {
+        crate::coords::Quadrant::R90
+    } else {
+        crate::coords::Quadrant::R0
+    }
+}
+
 pub fn estimate_canonical_quadrant(
     engine: &crate::ppocr::PpocrEngine,
     image: &image::DynamicImage,
@@ -2692,6 +2749,7 @@ pub fn render_anchor_canvas(
     provisional_strips: &[OrientedRect],
     font_provider: &dyn crate::font_provider::FontProvider,
     oversample: f32,
+    bg_rgba: [u8; 4],
 ) -> Option<AnchorRaster> {
     use crate::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
@@ -2818,7 +2876,7 @@ pub fn render_anchor_canvas(
         let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
             DEBUG_BG_PALETTE[(pb.block_id as usize) % DEBUG_BG_PALETTE.len()]
         } else {
-            [0x10, 0x10, 0x10, 0xC8]
+            bg_rgba
         };
         for (i, v) in local.iter().enumerate() {
             let strip_color = pb
@@ -2845,7 +2903,7 @@ pub fn render_anchor_canvas(
     //     only before rec runs. Each strip stands alone (no grouping)
     //     so `fill_oriented_rect_blended`'s "only write when new
     //     alpha > old" semantic keeps overlaps from stacking.
-    let provisional_bg = [0x10, 0x10, 0x10, 0xC8];
+    let provisional_bg = bg_rgba;
     for v in &prepared_provisional {
         let local = OrientedRect {
             cx: (v.cx - origin_x) * os,
