@@ -513,18 +513,41 @@ impl LiveSession {
     /// `None` if there's no canvas or `dst` is too small. Lets the screen path
     /// hand the CPU-rendered overlay straight to the Canvas view, skipping the
     /// GPU composite + readback.
-    pub fn copy_overlay_canvas(
+    /// Geometry of the mounted overlay canvas (no copy): `(w, h, origin_x,
+    /// origin_y)`. The screen present uses it to size the destination Bitmap before
+    /// locking it.
+    pub fn overlay_canvas_dims(&self, anchor_id: AnchorId) -> Option<(u32, u32, f32, f32)> {
+        let anchors = self.overlay_anchors.lock().ok()?;
+        let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
+        Some((
+            raster.width,
+            raster.height,
+            raster.surface_origin_x,
+            raster.surface_origin_y,
+        ))
+    }
+
+    /// Copy the mounted overlay canvas into `dst` row-by-row at `dst_stride` bytes
+    /// per row (the destination's rows may be padded — e.g. a locked Android
+    /// Bitmap). `dst_stride` must be ≥ the canvas row (`width * 4`).
+    pub fn copy_overlay_canvas_strided(
         &self,
         anchor_id: AnchorId,
         dst: &mut [u8],
+        dst_stride: usize,
     ) -> Option<(u32, u32, f32, f32)> {
         let anchors = self.overlay_anchors.lock().ok()?;
         let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
-        let n = raster.bitmap.len();
-        if dst.len() < n {
+        let (w, h) = (raster.width as usize, raster.height as usize);
+        let src_stride = w * 4;
+        if dst_stride < src_stride || dst.len() < (h.saturating_sub(1)) * dst_stride + src_stride {
             return None;
         }
-        dst[..n].copy_from_slice(&raster.bitmap);
+        for y in 0..h {
+            let s = y * src_stride;
+            let d = y * dst_stride;
+            dst[d..d + src_stride].copy_from_slice(&raster.bitmap[s..s + src_stride]);
+        }
         Some((
             raster.width,
             raster.height,

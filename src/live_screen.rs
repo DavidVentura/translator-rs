@@ -620,16 +620,25 @@ impl LiveScreenPipeline {
     /// Composite the resident overlays into `target` at identity (present-only,
     /// no OCR). Runs on the GL thread. The minimal `frame` just carries the
     /// canonical dims; the overlay-only target ignores its (empty) camera bytes.
-    /// Render the overlay canvas (if a deferred upsert left it stale) and copy it
-    /// into `dst` for the Canvas view to draw directly — no GPU composite/readback.
-    /// Returns `(width, height, surface_origin_x, surface_origin_y)` of the canvas
-    /// (a sub-region of the canonical frame), or `None` if there's nothing to show.
-    pub fn overlay_canvas_into(&self, dst: &mut [u8]) -> Option<(u32, u32, f32, f32)> {
-        // Render here (GL thread) if deferred upserts left it stale — coalesces
-        // many worker-side block upserts into one raster per present.
+    /// Render the overlay (if a deferred upsert left it stale) and return its
+    /// geometry without copying. Paired with [`Self::copy_overlay_strided`] so the
+    /// present can size the destination Bitmap before locking it. Both run on the
+    /// GL thread, so the canvas is stable between the two calls.
+    pub fn ensure_overlay_dims(&self) -> Option<(u32, u32, f32, f32)> {
         self.session
             .ensure_anchor_canvas(SCREEN_ANCHOR_ID, &*self.font_provider);
-        self.session.copy_overlay_canvas(SCREEN_ANCHOR_ID, dst)
+        self.session.overlay_canvas_dims(SCREEN_ANCHOR_ID)
+    }
+
+    /// Copy the (already-rendered) overlay canvas into a locked Bitmap's pixels at
+    /// `dst_stride` bytes per row — one copy, straight into the Bitmap.
+    pub fn copy_overlay_strided(
+        &self,
+        dst: &mut [u8],
+        dst_stride: usize,
+    ) -> Option<(u32, u32, f32, f32)> {
+        self.session
+            .copy_overlay_canvas_strided(SCREEN_ANCHOR_ID, dst, dst_stride)
     }
 
     /// Worker-thread body: detect → provisional overlay → rec/translate → full
