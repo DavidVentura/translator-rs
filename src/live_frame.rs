@@ -196,8 +196,7 @@ impl OrientedImage {
         let det_luma = GrayImage::from_raw(det_w, det_h, det_gray).ok_or_else(|| {
             TranslatorError::new(TranslatorErrorKind::Internal, "det gray size mismatch")
         })?;
-        let rgb = rgba_to_rgb(rec_rgba, rec_w, rec_h)?;
-        let gray = rgba_to_luma(rec_rgba, rec_w, rec_h)?;
+        let (rgb, gray) = rgba_to_rgb_and_luma(rec_rgba, rec_w, rec_h)?;
         let det_to_full = (
             canon_w as f32 / det_w.max(1) as f32,
             canon_h as f32 / det_h.max(1) as f32,
@@ -412,8 +411,14 @@ pub fn aligned_det_dims(canon_w: u32, canon_h: u32, det_max_pixels: u32) -> (u32
     (det_w, det_h)
 }
 
-/// RGBA → RGB (drop alpha), sequential stride-1. Small (rec-res) input.
-fn rgba_to_rgb(rgba: &[u8], w: u32, h: u32) -> Result<RgbImage, TranslatorError> {
+/// RGBA → (RGB drop-alpha, BT.709 luma) in a single pass. The luma weights match
+/// [`build_gray_fused`] for parity with the tracker/legacy strips. Small (rec-res)
+/// input, so one walk of the buffer producing both outputs beats two.
+fn rgba_to_rgb_and_luma(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+) -> Result<(RgbImage, GrayImage), TranslatorError> {
     let n = (w as usize) * (h as usize);
     if rgba.len() < n * 4 {
         return Err(TranslatorError::new(
@@ -422,37 +427,22 @@ fn rgba_to_rgb(rgba: &[u8], w: u32, h: u32) -> Result<RgbImage, TranslatorError>
         ));
     }
     let mut rgb = Vec::with_capacity(n * 3);
-    for i in 0..n {
-        let p = i * 4;
-        rgb.push(rgba[p]);
-        rgb.push(rgba[p + 1]);
-        rgb.push(rgba[p + 2]);
-    }
-    RgbImage::from_raw(w, h, rgb)
-        .ok_or_else(|| TranslatorError::new(TranslatorErrorKind::Internal, "rec rgb size mismatch"))
-}
-
-/// RGBA → luma (BT.709 ints matching [`build_gray_fused`] for parity with the
-/// tracker/legacy strips), sequential stride-1. Small (rec-res) input.
-fn rgba_to_luma(rgba: &[u8], w: u32, h: u32) -> Result<GrayImage, TranslatorError> {
-    let n = (w as usize) * (h as usize);
-    if rgba.len() < n * 4 {
-        return Err(TranslatorError::new(
-            TranslatorErrorKind::Internal,
-            "rec rgba too small",
-        ));
-    }
     let mut gray = vec![0u8; n];
     for (i, g) in gray.iter_mut().enumerate() {
         let p = i * 4;
-        let rr = rgba[p] as u32;
-        let gg = rgba[p + 1] as u32;
-        let bb = rgba[p + 2] as u32;
-        *g = ((13933 * rr + 46871 * gg + 4732 * bb) >> 16) as u8;
+        let (rr, gg, bb) = (rgba[p], rgba[p + 1], rgba[p + 2]);
+        rgb.push(rr);
+        rgb.push(gg);
+        rgb.push(bb);
+        *g = ((13933 * rr as u32 + 46871 * gg as u32 + 4732 * bb as u32) >> 16) as u8;
     }
-    GrayImage::from_raw(w, h, gray).ok_or_else(|| {
+    let rgb = RgbImage::from_raw(w, h, rgb).ok_or_else(|| {
+        TranslatorError::new(TranslatorErrorKind::Internal, "rec rgb size mismatch")
+    })?;
+    let gray = GrayImage::from_raw(w, h, gray).ok_or_else(|| {
         TranslatorError::new(TranslatorErrorKind::Internal, "rec gray size mismatch")
-    })
+    })?;
+    Ok((rgb, gray))
 }
 
 /// Apply the inverse of a sensor→display rotation to a display-orient rect to
