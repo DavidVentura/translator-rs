@@ -434,26 +434,23 @@ pub struct LiveSession {
     /// incrementally as each rec batch lands; the camera path composites every
     /// frame and ignores it.
     canvas_version: AtomicU64,
-    /// When set, `upsert_block` / `upsert_provisional_overlay` update block data
-    /// but do **not** render the canvas — the caller renders it later (e.g. on
-    /// the GL thread at present time via `ensure_anchor_canvas`). The screen path
-    /// enables this so the per-block canvas raster doesn't run inline on the OCR
-    /// worker thread (it was O(N²) and stalled rec/translate ~2×). The camera
-    /// leaves it off (it renders on the worker as before).
-    defer_canvas: AtomicBool,
     /// Bumped on every block/provisional *data* change (independent of whether
     /// the canvas was rendered). The deferred (screen) path polls this to know
     /// when to render+present.
     content_version: AtomicU64,
     /// Per-block rasterized text tiles, keyed by block id → `(content_hash,
-    /// tile)`. When `defer_canvas` is set (screen), `render_anchor_canvas`
-    /// re-rasters only blocks whose hash changed and composites cached tiles for
-    /// the rest — instead of re-shaping+rasterizing every block each render.
+    /// tile)`. On the screen path `render_anchor_canvas` re-rasters only blocks
+    /// whose hash changed and composites cached tiles for the rest — instead of
+    /// re-shaping+rasterizing every block each render.
     block_tiles: Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
     /// Marks the lightweight screen-overlay render path (vs the camera). When set:
-    /// pills are filled solid + square (opaque, no SDF feather/rounding) and the
+    /// pills are filled solid + square (opaque, no SDF feather/rounding); the
     /// full-bitmap `row_extents` scan is skipped (the screen copies the bitmap
-    /// straight to the Canvas view; only the camera's GPU warp needs row extents).
+    /// straight to the Canvas view; only the camera's GPU warp needs row extents);
+    /// and `upsert_block` / `upsert_provisional_overlay` defer the canvas raster to
+    /// the GL thread at present time instead of running it inline on the OCR worker
+    /// (it was O(N²) and stalled rec/translate ~2×). The camera leaves all of this
+    /// off and renders on the worker.
     screen_overlay: AtomicBool,
     /// Serializes screen-overlay canvas renders. The screen mutates its persistent
     /// canvas in place (incremental block adds), and `ensure_anchor_canvas` is
@@ -487,7 +484,6 @@ impl LiveSession {
             overlay_oversample: AtomicU32::new(1.0_f32.to_bits()),
             overlay_bg: AtomicU32::new(0x1010_10C8),
             canvas_version: AtomicU64::new(0),
-            defer_canvas: AtomicBool::new(false),
             content_version: AtomicU64::new(0),
             block_tiles: Mutex::new(HashMap::new()),
             screen_overlay: AtomicBool::new(false),
@@ -504,11 +500,6 @@ impl LiveSession {
     /// [`Self::canvas_version`]).
     pub fn canvas_version(&self) -> u64 {
         self.canvas_version.load(Ordering::SeqCst)
-    }
-
-    /// Defer canvas rendering off the upsert path (see [`Self::defer_canvas`]).
-    pub fn set_defer_canvas(&self, defer: bool) {
-        self.defer_canvas.store(defer, Ordering::SeqCst);
     }
 
     /// Monotonic counter of block/provisional data changes (see
@@ -1081,16 +1072,16 @@ impl LiveSession {
         self.after_content_change(anchor_id, font_provider);
     }
 
-    /// Record a block/provisional data change: bump `content_version`, and
-    /// render the canvas now unless deferred (the deferred caller renders later,
-    /// off this thread). See [`Self::defer_canvas`].
+    /// Record a block/provisional data change: bump `content_version`, and render
+    /// the canvas now unless this is the screen path (which renders later on the GL
+    /// thread, off the worker). See [`Self::screen_overlay`].
     fn after_content_change(
         &self,
         anchor_id: AnchorId,
         font_provider: &dyn crate::font_provider::FontProvider,
     ) {
         self.content_version.fetch_add(1, Ordering::SeqCst);
-        if !self.defer_canvas.load(Ordering::SeqCst) {
+        if !self.screen_overlay.load(Ordering::SeqCst) {
             self.ensure_anchor_canvas(anchor_id, font_provider);
         }
     }

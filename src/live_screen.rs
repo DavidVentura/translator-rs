@@ -410,14 +410,11 @@ impl LiveScreenPipeline {
         // for touch passthrough, so the default translucent pill (0xC8) would
         // double-dim into unreadable mush. Camera keeps the translucent default.
         session.set_overlay_bg([0x00, 0x00, 0x00, 0xFF]);
-        // Render the overlay canvas on the GL thread at present time, not inline
-        // on the OCR worker per block — the per-block raster was O(N²) and stalled
-        // rec/translate (~2× slower than the snapshot path).
-        session.set_defer_canvas(true);
-        // Mark the screen-overlay render path: solid square pills (the opaque,
-        // touch-cap-dimmed pills make the camera's SDF feather/rounding invisible)
-        // and skip the row-extent scan (only the camera's GPU warp needs it; the
-        // screen copies the canvas straight to the Canvas view).
+        // Mark the screen-overlay render path: solid square pills (opaque,
+        // touch-cap-dimmed → the camera's SDF feather/rounding is invisible), skip
+        // the row-extent scan (only the camera's GPU warp needs it), and defer the
+        // canvas raster to the GL thread at present time rather than running it
+        // inline on the OCR worker per block (it was O(N²) and stalled rec/translate).
         session.set_screen_overlay(true);
         let pipeline = Arc::new(Self {
             catalog,
