@@ -206,11 +206,36 @@ fn shift_block(block: &PreparedTextBlock, dx: f32, dy: f32) -> PreparedTextBlock
 
 #[derive(Default)]
 struct FontCache {
+    /// Parsed faces, keyed by handle. Each `Face` borrows the bytes held in
+    /// `fonts`; declared first so it drops before the bytes it views. Caching the
+    /// parsed face matters because `Face::from_slice` re-parses cmap + GSUB/GPOS,
+    /// and a single block is shaped (whole + per-line) and rasterized — ~3 parses
+    /// of the same font per run without this.
+    faces: HashMap<FontHandle, Option<Face<'static>>>,
     fonts: HashMap<FontHandle, Option<Arc<Vec<u8>>>>,
     chains: HashMap<(Script, bool, bool, bool), Vec<FontHandle>>,
 }
 
 impl FontCache {
+    /// Parse `handle` once and cache the `Face`, reused for shaping and rasterizing
+    /// every run that uses this font in this render.
+    fn face(&mut self, handle: &FontHandle) -> Option<&Face<'static>> {
+        if !self.faces.contains_key(handle) {
+            let parsed = self.bytes(handle).and_then(|arc| {
+                // SAFETY: the same `Arc<Vec<u8>>` is held in `self.fonts` for the life
+                // of this `FontCache` (`bytes` only inserts, never removes/mutates), so
+                // its heap buffer outlives every `Face` stored here. The `'static`
+                // lifetime is a lie scoped to the cache: faces are handed out only as
+                // `&Face` borrowing `&self`, so none can outlive the bytes.
+                let slice: &'static [u8] =
+                    unsafe { core::mem::transmute::<&[u8], &'static [u8]>(arc.as_slice()) };
+                Face::from_slice(slice, handle.ttc_index)
+            });
+            self.faces.insert(handle.clone(), parsed);
+        }
+        self.faces.get(handle).and_then(|f| f.as_ref())
+    }
+
     fn chain_for(
         &mut self,
         script: Script,
@@ -382,9 +407,9 @@ struct ShapedRun {
     units_per_em: i32,
     ascent: i32,
     descent: i32,
-    /// Font bytes shared via Arc so multiple shapes can reuse it.
-    font_bytes: Arc<Vec<u8>>,
-    ttc_index: u32,
+    /// Font this run was shaped with; the rasterizer re-fetches the parsed `Face`
+    /// from the same per-render `FontCache`, so it's a cache hit rather than a parse.
+    handle: FontHandle,
     rtl: bool,
     /// Byte offset of this run's first character in the source string
     /// passed to `shape_line`. Each glyph's `cluster` is relative to
@@ -400,8 +425,7 @@ fn shape_run(
     handle: &FontHandle,
     cache: &mut FontCache,
 ) -> Option<ShapedRun> {
-    let bytes = cache.bytes(handle)?;
-    let face = Face::from_slice(bytes.as_slice(), handle.ttc_index)?;
+    let face = cache.face(handle)?;
     let units_per_em = face.units_per_em();
     let ascent = face.ascender() as i32;
     let descent = face.descender() as i32;
@@ -414,7 +438,7 @@ fn shape_run(
         Direction::LeftToRight
     });
     buf.set_script(map_script(run.script));
-    let glyph_buffer = rustybuzz::shape(&face, &[], buf);
+    let glyph_buffer = rustybuzz::shape(face, &[], buf);
     let infos = glyph_buffer.glyph_infos();
     let positions = glyph_buffer.glyph_positions();
 
@@ -434,8 +458,7 @@ fn shape_run(
         units_per_em,
         ascent,
         descent,
-        font_bytes: bytes,
-        ttc_index: handle.ttc_index,
+        handle: handle.clone(),
         rtl: run.rtl,
         byte_start_in_text: run.start,
     })
@@ -805,6 +828,7 @@ fn render_per_line(
             prepared.width,
             prepared.height,
             &line_shape,
+            cache,
             origin_x,
             origin_y,
             cos,
@@ -986,6 +1010,7 @@ fn render_block_rect(
             prepared.width,
             prepared.height,
             &line_shape,
+            cache,
             block.bounding_box.left as f32,
             baseline_y,
             1.0,
@@ -1057,11 +1082,13 @@ fn wrap_into_block(text: &str, width: f32, font_size: f32) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Draw a shaped line into the BGRA canvas.
 
+#[allow(clippy::too_many_arguments)]
 fn draw_shaped_line(
     canvas: &mut [u8],
     width: u32,
     height: u32,
     line: &LineShape,
+    cache: &mut FontCache,
     origin_x: f32,
     origin_y: f32,
     cos_angle: f32,
@@ -1075,7 +1102,7 @@ fn draw_shaped_line(
     let mut cursor_x = 0.0f32;
     for run in &line.runs {
         let scale = font_size / run.units_per_em as f32;
-        let face = match Face::from_slice(run.font_bytes.as_slice(), run.ttc_index) {
+        let face = match cache.face(&run.handle) {
             Some(f) => f,
             None => continue,
         };
