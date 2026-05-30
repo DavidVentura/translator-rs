@@ -458,6 +458,12 @@ pub struct LiveSession {
     /// provisional render), so the in-place mutation must not interleave. Camera
     /// renders into fresh buffers and don't take this.
     screen_render_lock: Mutex<()>,
+    /// Persistent glyph cache (parsed faces + glyph alpha-mask atlas) reused across
+    /// renders, so repeat acquires and streaming updates find glyphs already
+    /// rasterized instead of rebuilding a per-call cache. Font-file-keyed, so it
+    /// never goes stale (chain lookups are cleared per render). The screen renders
+    /// under `screen_render_lock`, so this Mutex is effectively uncontended.
+    glyph_cache: Mutex<crate::image_render::FontCache>,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -488,6 +494,7 @@ impl LiveSession {
             block_tiles: Mutex::new(HashMap::new()),
             screen_overlay: AtomicBool::new(false),
             screen_render_lock: Mutex::new(()),
+            glyph_cache: Mutex::new(crate::image_render::FontCache::default()),
         }
     }
 
@@ -1218,6 +1225,7 @@ impl LiveSession {
             None,
             false,
             None,
+            None,
         );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -1281,6 +1289,7 @@ impl LiveSession {
             Some(&self.block_tiles),
             true,
             prev,
+            Some(&self.glyph_cache),
         );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -3022,7 +3031,7 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
 /// thread on the OCR worker, and the per-frame warp is cheap), and it needs a GL
 /// glyph/tile atlas path the screen's CPU-direct copy doesn't.
 #[allow(clippy::type_complexity)]
-pub fn render_anchor_canvas(
+pub(crate) fn render_anchor_canvas(
     blocks: &std::collections::BTreeMap<u64, BlockSpec>,
     provisional_strips: &[OrientedRect],
     font_provider: &dyn crate::font_provider::FontProvider,
@@ -3031,6 +3040,7 @@ pub fn render_anchor_canvas(
     tile_cache: Option<&Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>>,
     screen_overlay: bool,
     prev: Option<AnchorRaster>,
+    glyph_cache: Option<&Mutex<crate::image_render::FontCache>>,
 ) -> Option<AnchorRaster> {
     use crate::ocr::{PreparedImageOverlay, PreparedTextBlock};
     if blocks.is_empty() && provisional_strips.is_empty() {
@@ -3308,11 +3318,14 @@ pub fn render_anchor_canvas(
                             min_font_size_px: 6.0 * os,
                         };
                         let t_tiles = std::time::Instant::now();
-                        let tiles = crate::image_render::render_block_tiles(
-                            &text_blocks,
-                            font_provider,
-                            &opts,
-                        );
+                        let tiles = with_glyph_cache(glyph_cache, |gc| {
+                            crate::image_render::render_block_tiles(
+                                &text_blocks,
+                                gc,
+                                font_provider,
+                                &opts,
+                            )
+                        });
                         tiles_ms = t_tiles.elapsed().as_secs_f64() * 1000.0;
                         let t_comp = std::time::Instant::now();
                         for ((bid, hash), tile_opt) in metas.iter().zip(tiles) {
@@ -3454,6 +3467,7 @@ pub fn render_anchor_canvas(
             &prepared_text_blocks,
             &block_meta,
             cache,
+            glyph_cache,
             font_provider,
             &opts,
         )
@@ -3506,6 +3520,19 @@ pub fn render_anchor_canvas(
         painted_provisional_fp: prov_fp,
         painted_provisional_pills: prepared_provisional.clone(),
     })
+}
+
+/// Run `f` with a `FontCache`: the persistent one (locked) when provided, else a
+/// fresh throwaway. Lets the screen reuse its glyph atlas across renders while the
+/// camera/sim stay on per-call caches.
+fn with_glyph_cache<R>(
+    glyph_cache: Option<&Mutex<crate::image_render::FontCache>>,
+    f: impl FnOnce(&mut crate::image_render::FontCache) -> R,
+) -> R {
+    match glyph_cache {
+        Some(m) => f(&mut m.lock().expect("glyph cache poisoned")),
+        None => f(&mut crate::image_render::FontCache::default()),
+    }
 }
 
 /// Translate a block's surface-coord visuals into oversampled canvas-local coords.
@@ -3630,6 +3657,7 @@ fn composite_block_tiles(
     blocks: &[crate::ocr::PreparedTextBlock],
     block_meta: &[(u64, u64)],
     cache: &Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
+    glyph_cache: Option<&Mutex<crate::image_render::FontCache>>,
     font_provider: &dyn crate::font_provider::FontProvider,
     opts: &crate::image_render::RenderOptions,
 ) -> Vec<u8> {
@@ -3644,7 +3672,9 @@ fn composite_block_tiles(
     if !to_render.is_empty() {
         let subset: Vec<crate::ocr::PreparedTextBlock> =
             to_render.iter().map(|&i| blocks[i].clone()).collect();
-        let tiles = crate::image_render::render_block_tiles(&subset, font_provider, opts);
+        let tiles = with_glyph_cache(glyph_cache, |gc| {
+            crate::image_render::render_block_tiles(&subset, gc, font_provider, opts)
+        });
         for (&i, tile_opt) in to_render.iter().zip(tiles.into_iter()) {
             let (bid, hash) = block_meta[i];
             match tile_opt {

@@ -114,18 +114,24 @@ pub struct BlockTile {
 }
 
 /// Render each block's text into its own transparent tile (sized to the block's
-/// bbox, coords shifted tile-local), **sharing one `FontCache`** across the batch
-/// so per-block rendering doesn't reload fonts. Returns one entry per input block
-/// (`None` for empty-text blocks). Because blocks don't interact (independent
-/// layout, no cross-block bleed), compositing these tiles is pixel-identical to a
-/// single [`render_overlay`] over all blocks — but a cache can skip unchanged
-/// blocks. Coords in `blocks` are canvas-local (the same the monolithic path uses).
-pub fn render_block_tiles(
+/// bbox, coords shifted tile-local), sharing `cache` across the batch. Returns one
+/// entry per input block (`None` for empty-text blocks). Because blocks don't
+/// interact (independent layout, no cross-block bleed), compositing these tiles is
+/// pixel-identical to a single [`render_overlay`] over all blocks — but a cache can
+/// skip unchanged blocks. Coords in `blocks` are canvas-local (the same the
+/// monolithic path uses).
+///
+/// `cache` may be reused across renders to persist the parsed-`Face` and glyph
+/// atlas (font-file-keyed, provider-independent). The font-chain lookups *are*
+/// provider-dependent, so they're cleared each call and rebuilt for the current
+/// `fonts`.
+pub(crate) fn render_block_tiles(
     blocks: &[PreparedTextBlock],
+    cache: &mut FontCache,
     fonts: &dyn FontProvider,
     opts: &RenderOptions,
 ) -> Vec<Option<BlockTile>> {
-    let mut cache = FontCache::default();
+    cache.clear_chains();
     blocks
         .iter()
         .map(|block| {
@@ -148,10 +154,10 @@ pub fn render_block_tiles(
             let mut tile = vec![0u8; (tw as usize) * (th as usize) * 4];
             match shifted.layout_hints.layout_mode {
                 OverlayLayoutMode::PerLine => {
-                    render_per_line(&mut tile, &prepared, &shifted, &mut cache, fonts, opts)
+                    render_per_line(&mut tile, &prepared, &shifted, cache, fonts, opts)
                 }
                 OverlayLayoutMode::BlockRect => {
-                    render_block_rect(&mut tile, &prepared, &shifted, &mut cache, fonts, opts)
+                    render_block_rect(&mut tile, &prepared, &shifted, cache, fonts, opts)
                 }
             }
             Some(BlockTile {
@@ -220,6 +226,11 @@ thread_local! {
     static RENDER_STATS: std::cell::RefCell<RenderStats> = std::cell::RefCell::new(RenderStats::default());
 }
 
+/// Cap on the persistent glyph atlas; dropped+re-warmed past this. ~tens of MB at
+/// worst (mask bytes scale with size²), generous for one language's glyphs × the
+/// handful of px sizes the layout settles on.
+const GLYPH_ATLAS_CAP: usize = 8192;
+
 /// Take and reset the calling thread's accumulated render stats.
 pub fn take_render_stats() -> RenderStats {
     RENDER_STATS.with(|s| std::mem::take(&mut *s.borrow_mut()))
@@ -253,7 +264,7 @@ struct GlyphMask {
 }
 
 #[derive(Default)]
-struct FontCache {
+pub(crate) struct FontCache {
     /// Parsed faces, keyed by handle. Each `Face` borrows the bytes held in
     /// `fonts`; declared first so it drops before the bytes it views. Caching the
     /// parsed face matters because `Face::from_slice` re-parses cmap + GSUB/GPOS,
@@ -275,6 +286,19 @@ struct FontCache {
 }
 
 impl FontCache {
+    /// Drop the font-chain lookups (which depend on the `FontProvider` — language,
+    /// fallback config). Called at the start of each render so a reused cache can't
+    /// serve a stale chain after a language change. The parsed faces and glyph atlas
+    /// are font-file-keyed (provider-independent), so they persist — except the
+    /// glyph atlas is dropped if it has grown past a cap, bounding memory over a
+    /// long session (it re-warms on the next render).
+    pub(crate) fn clear_chains(&mut self) {
+        self.chains.clear();
+        if self.glyphs.len() > GLYPH_ATLAS_CAP {
+            self.glyphs.clear();
+        }
+    }
+
     /// Parse `handle` once and cache the `Face`, reused for shaping and rasterizing
     /// every run that uses this font in this render.
     fn face(&mut self, handle: &FontHandle) -> Option<&Face<'static>> {
