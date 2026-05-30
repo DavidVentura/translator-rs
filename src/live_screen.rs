@@ -17,17 +17,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::font_provider::FontProvider;
-use crate::live_compositor::ComposeTarget;
 use crate::live_frame::LiveFrame;
 use crate::live_session::{LiveSession, dominant_axis_quadrant};
-use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate, composite_overlays};
+use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate};
 use crate::ocr::{OrientedRect, Rect};
 use crate::session::TranslatorSession;
 
 /// The one anchor the screen pipeline owns; everything composites against it.
 const SCREEN_ANCHOR_ID: u64 = 1;
-
-const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
 /// Coarse-diff downscale: the longest side of the gray we diff per frame. Heavy
 /// on purpose — small FX / noise wash out, so only structural change (a real
@@ -621,28 +618,16 @@ impl LiveScreenPipeline {
     /// Composite the resident overlays into `target` at identity (present-only,
     /// no OCR). Runs on the GL thread. The minimal `frame` just carries the
     /// canonical dims; the overlay-only target ignores its (empty) camera bytes.
-    pub fn composite_current(
-        &self,
-        target: &mut dyn ComposeTarget,
-        canonical_w: u32,
-        canonical_h: u32,
-    ) -> u32 {
-        // Render the canvas here (GL thread) if a deferred upsert left it stale —
-        // coalesces many worker-side block upserts into one raster per present.
+    /// Render the overlay canvas (if a deferred upsert left it stale) and copy it
+    /// into `dst` for the Canvas view to draw directly — no GPU composite/readback.
+    /// Returns `(width, height, surface_origin_x, surface_origin_y)` of the canvas
+    /// (a sub-region of the canonical frame), or `None` if there's nothing to show.
+    pub fn overlay_canvas_into(&self, dst: &mut [u8]) -> Option<(u32, u32, f32, f32)> {
+        // Render here (GL thread) if deferred upserts left it stale — coalesces
+        // many worker-side block upserts into one raster per present.
         self.session
             .ensure_anchor_canvas(SCREEN_ANCHOR_ID, &*self.font_provider);
-        let frame = Arc::new(LiveFrame::new(0));
-        frame.reset_owned(Vec::new(), canonical_w, canonical_h, 0);
-        composite_overlays(
-            &self.session,
-            &frame,
-            target,
-            canonical_w,
-            canonical_h,
-            Some(IDENTITY),
-            SCREEN_ANCHOR_ID,
-        )
-        .unwrap_or(0)
+        self.session.copy_overlay_canvas(SCREEN_ANCHOR_ID, dst)
     }
 
     /// Worker-thread body: detect → provisional overlay → rec/translate → full

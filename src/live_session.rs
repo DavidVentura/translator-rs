@@ -445,6 +445,11 @@ pub struct LiveSession {
     /// the canvas was rendered). The deferred (screen) path polls this to know
     /// when to render+present.
     content_version: AtomicU64,
+    /// Per-block rasterized text tiles, keyed by block id → `(content_hash,
+    /// tile)`. When `defer_canvas` is set (screen), `render_anchor_canvas`
+    /// re-rasters only blocks whose hash changed and composites cached tiles for
+    /// the rest — instead of re-shaping+rasterizing every block each render.
+    block_tiles: Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -473,6 +478,7 @@ impl LiveSession {
             canvas_version: AtomicU64::new(0),
             defer_canvas: AtomicBool::new(false),
             content_version: AtomicU64::new(0),
+            block_tiles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -491,6 +497,31 @@ impl LiveSession {
     /// [`Self::content_version`]).
     pub fn content_version(&self) -> u64 {
         self.content_version.load(Ordering::SeqCst)
+    }
+
+    /// Copy the resident overlay canvas (RGBA, top-down) for `anchor_id` into
+    /// `dst`, returning `(width, height, surface_origin_x, surface_origin_y)`.
+    /// `None` if there's no canvas or `dst` is too small. Lets the screen path
+    /// hand the CPU-rendered overlay straight to the Canvas view, skipping the
+    /// GPU composite + readback.
+    pub fn copy_overlay_canvas(
+        &self,
+        anchor_id: AnchorId,
+        dst: &mut [u8],
+    ) -> Option<(u32, u32, f32, f32)> {
+        let anchors = self.overlay_anchors.lock().ok()?;
+        let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
+        let n = raster.bitmap.len();
+        if dst.len() < n {
+            return None;
+        }
+        dst[..n].copy_from_slice(&raster.bitmap);
+        Some((
+            raster.width,
+            raster.height,
+            raster.surface_origin_x,
+            raster.surface_origin_y,
+        ))
     }
 
     /// Set the overlay-canvas oversample factor (texels per surface
@@ -1140,12 +1171,20 @@ impl LiveSession {
         // thread) keeps reading the *old* `canvas` while glyph
         // rasterization runs. Only the final pointer-swap below
         // takes the lock again, and that swap is instantaneous.
+        // Deferred (screen) path: re-raster only changed blocks via the per-block
+        // tile cache. Camera path: `None` → the monolithic render_overlay.
+        let tile_cache = if self.defer_canvas.load(Ordering::SeqCst) {
+            Some(&self.block_tiles)
+        } else {
+            None
+        };
         let canvas = render_anchor_canvas(
             &blocks_snapshot,
             &provisional_snapshot,
             font_provider,
             self.overlay_oversample(),
             self.overlay_bg(),
+            tile_cache,
         );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -2830,12 +2869,14 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
 /// Returns `None` when no block has any usable strip. `font_provider`
 /// supplies typefaces — Android passes `AndroidFontProvider`, the
 /// simulator can pass any `FontProvider` impl.
+#[allow(clippy::type_complexity)]
 pub fn render_anchor_canvas(
     blocks: &std::collections::BTreeMap<u64, BlockSpec>,
     provisional_strips: &[OrientedRect],
     font_provider: &dyn crate::font_provider::FontProvider,
     oversample: f32,
     bg_rgba: [u8; 4],
+    tile_cache: Option<&Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>>,
 ) -> Option<AnchorRaster> {
     use crate::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
@@ -3020,6 +3061,9 @@ pub fn render_anchor_canvas(
     //    Empty-text blocks (pending placeholders) keep their bg-only
     //    contribution from step 3 and don't appear in the text pass.
     let mut prepared_text_blocks: Vec<PreparedTextBlock> = Vec::new();
+    // (block_id, content_hash) parallel to `prepared_text_blocks` — the tile cache
+    // key + invalidation hash.
+    let mut block_meta: Vec<(u64, u64)> = Vec::new();
     let mut anchor_lang = String::new();
     for (pb, local) in prepared.iter().zip(local_visuals.iter()) {
         if pb.spec.display_text.trim().is_empty() {
@@ -3084,11 +3128,30 @@ pub fn render_anchor_canvas(
             background_argb: 0,
             foreground_argb,
         });
+        block_meta.push((pb.block_id, pb.spec.content_hash));
     }
 
+    let opts = crate::image_render::RenderOptions {
+        language: anchor_lang,
+        min_font_size_px: 6.0 * os,
+    };
     let final_bitmap = if prepared_text_blocks.is_empty() {
         canvas
+    } else if let Some(cache) = tile_cache {
+        // Incremental: re-raster only blocks whose hash changed, reuse cached
+        // tiles for the rest, and src-over composite all tiles onto the bg canvas.
+        composite_block_tiles(
+            canvas,
+            bitmap_w,
+            bitmap_h,
+            &prepared_text_blocks,
+            &block_meta,
+            cache,
+            font_provider,
+            &opts,
+        )
     } else {
+        // Monolithic (camera): one render_overlay over all blocks.
         let prepared = PreparedImageOverlay {
             rgba_bytes: canvas,
             width: bitmap_w,
@@ -3096,10 +3159,6 @@ pub fn render_anchor_canvas(
             extracted_text: String::new(),
             translated_text: String::new(),
             blocks: prepared_text_blocks,
-        };
-        let opts = crate::image_render::RenderOptions {
-            language: anchor_lang,
-            min_font_size_px: 6.0 * os,
         };
         crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?
     };
@@ -3114,6 +3173,92 @@ pub fn render_anchor_canvas(
         row_extents,
         painted_pills,
     })
+}
+
+/// Incremental text pass: re-raster only blocks whose `content_hash` changed
+/// (via [`crate::image_render::render_block_tiles`], one shared FontCache),
+/// reuse cached tiles for the rest, then src-over composite every tile onto the
+/// bg-painted `canvas`. Returns the finished bitmap.
+#[allow(clippy::too_many_arguments)]
+fn composite_block_tiles(
+    mut canvas: Vec<u8>,
+    bitmap_w: u32,
+    bitmap_h: u32,
+    blocks: &[crate::ocr::PreparedTextBlock],
+    block_meta: &[(u64, u64)],
+    cache: &Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
+    font_provider: &dyn crate::font_provider::FontProvider,
+    opts: &crate::image_render::RenderOptions,
+) -> Vec<u8> {
+    let mut cache = cache.lock().expect("tile cache poisoned");
+    // Render the blocks that are missing or whose hash changed.
+    let to_render: Vec<usize> = block_meta
+        .iter()
+        .enumerate()
+        .filter(|(_, (bid, hash))| !matches!(cache.get(bid), Some((h, _)) if h == hash))
+        .map(|(i, _)| i)
+        .collect();
+    if !to_render.is_empty() {
+        let subset: Vec<crate::ocr::PreparedTextBlock> =
+            to_render.iter().map(|&i| blocks[i].clone()).collect();
+        let tiles = crate::image_render::render_block_tiles(&subset, font_provider, opts);
+        for (&i, tile_opt) in to_render.iter().zip(tiles.into_iter()) {
+            let (bid, hash) = block_meta[i];
+            match tile_opt {
+                Some(tile) => {
+                    cache.insert(bid, (hash, tile));
+                }
+                None => {
+                    cache.remove(&bid);
+                }
+            }
+        }
+    }
+    // Prune tiles for blocks no longer present so a shrinking set leaves no ghost.
+    let live: std::collections::HashSet<u64> = block_meta.iter().map(|(b, _)| *b).collect();
+    cache.retain(|id, _| live.contains(id));
+    // Composite every live block's tile over the bg canvas (premultiplied over —
+    // the tiles carry coverage-premultiplied RGB from the rasterizer).
+    for (bid, _) in block_meta {
+        if let Some((_, tile)) = cache.get(bid) {
+            composite_tile(&mut canvas, bitmap_w, bitmap_h, tile);
+        }
+    }
+    canvas
+}
+
+/// Premultiplied src-over of a text tile onto `canvas`. The tile's RGB is already
+/// `fg * coverage` (the rasterizer blits over a transparent buffer), so
+/// `out = tile_rgb + dst * (1 - tile_a)` reproduces the direct text-over-bg blend.
+fn composite_tile(canvas: &mut [u8], cw: u32, ch: u32, tile: &crate::image_render::BlockTile) {
+    let tw = tile.width;
+    for ty in 0..tile.height {
+        let cy = tile.top + ty as i32;
+        if cy < 0 || cy >= ch as i32 {
+            continue;
+        }
+        let crow = (cy as u32 * cw) as usize;
+        let trow = (ty * tw) as usize;
+        for tx in 0..tw {
+            let cx = tile.left + tx as i32;
+            if cx < 0 || cx >= cw as i32 {
+                continue;
+            }
+            let ti = (trow + tx as usize) * 4;
+            let ta = tile.rgba[ti + 3];
+            if ta == 0 {
+                continue;
+            }
+            let inv = 1.0 - ta as f32 / 255.0;
+            let ci = (crow + cx as usize) * 4;
+            for c in 0..3 {
+                let v = tile.rgba[ti + c] as f32 + canvas[ci + c] as f32 * inv;
+                canvas[ci + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            let v = ta as f32 + canvas[ci + 3] as f32 * inv;
+            canvas[ci + 3] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 fn block_aabb_within_canvas(
