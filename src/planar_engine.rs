@@ -2681,6 +2681,73 @@ pub fn fill_oriented_rect_blended(
     }
 }
 
+/// Fill an oriented rect with a **solid** color — hard square edges, no
+/// anti-aliased feather, no rounded corners, no per-pixel SDF/`sqrt`. The screen
+/// overlay uses this: its pills are opaque and dimmed under the touch cap, so the
+/// SDF niceties are invisible and the per-pixel rounded-rect math was the whole
+/// per-present cost (~200–500 ms). Axis-aligned rects take a row-span fast path;
+/// tilted ones fall back to a per-pixel hard inside-test (still no `sqrt`).
+///
+/// Writes unconditionally (no "only-if-greater-alpha" read): opaque-over-opaque
+/// is idempotent, so overlapping pills just re-set the same color.
+pub fn fill_oriented_rect_solid(
+    rgba: &mut [u8],
+    w: u32,
+    h: u32,
+    rect: &crate::ocr::OrientedRect,
+    color: [u8; 4],
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let hw = rect.width * 0.5;
+    let hh = rect.height * 0.5;
+    // Axis-aligned fast path: fill each row span as a contiguous slice so the
+    // bounds-check is hoisted out of the inner loop and the 4-byte stores
+    // vectorize, rather than a per-pixel bounds-checked write.
+    if rect.angle_radians.abs() < 1e-3 {
+        let min_x = (rect.cx - hw).round().clamp(0.0, w as f32) as usize;
+        let max_x = (rect.cx + hw).round().clamp(0.0, w as f32) as usize;
+        let min_y = (rect.cy - hh).round().clamp(0.0, h as f32) as usize;
+        let max_y = (rect.cy + hh).round().clamp(0.0, h as f32) as usize;
+        if max_x <= min_x {
+            return;
+        }
+        let stride = w as usize;
+        for y in min_y..max_y {
+            let base = (y * stride + min_x) * 4;
+            let end = (y * stride + max_x) * 4;
+            for px in rgba[base..end].chunks_exact_mut(4) {
+                px.copy_from_slice(&color);
+            }
+        }
+        return;
+    }
+    // Tilted: per-pixel hard inside-test over the rect's AABB.
+    let cos = rect.angle_radians.cos();
+    let sin = rect.angle_radians.sin();
+    let half_diag = (hw * hw + hh * hh).sqrt();
+    let min_x = ((rect.cx - half_diag).floor() as i32).max(0) as u32;
+    let min_y = ((rect.cy - half_diag).floor() as i32).max(0) as u32;
+    let max_x = ((rect.cx + half_diag).ceil() as i32).max(0).min(w as i32) as u32;
+    let max_y = ((rect.cy + half_diag).ceil() as i32).max(0).min(h as i32) as u32;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let dx = x as f32 + 0.5 - rect.cx;
+            let dy = y as f32 + 0.5 - rect.cy;
+            let lx = dx * cos + dy * sin;
+            let ly = -dx * sin + dy * cos;
+            if lx.abs() <= hw && ly.abs() <= hh {
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx] = color[0];
+                rgba[idx + 1] = color[1];
+                rgba[idx + 2] = color[2];
+                rgba[idx + 3] = color[3];
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn blend_pixel(dst: &mut [u8], src: [u8; 4]) {
     let sa = src[3] as u32;

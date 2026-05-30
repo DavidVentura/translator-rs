@@ -414,6 +414,11 @@ impl LiveScreenPipeline {
         // on the OCR worker per block — the per-block raster was O(N²) and stalled
         // rec/translate (~2× slower than the snapshot path).
         session.set_defer_canvas(true);
+        // Mark the screen-overlay render path: solid square pills (the opaque,
+        // touch-cap-dimmed pills make the camera's SDF feather/rounding invisible)
+        // and skip the row-extent scan (only the camera's GPU warp needs it; the
+        // screen copies the canvas straight to the Canvas view).
+        session.set_screen_overlay(true);
         let pipeline = Arc::new(Self {
             catalog,
             session,

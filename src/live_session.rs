@@ -450,6 +450,11 @@ pub struct LiveSession {
     /// re-rasters only blocks whose hash changed and composites cached tiles for
     /// the rest — instead of re-shaping+rasterizing every block each render.
     block_tiles: Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
+    /// Marks the lightweight screen-overlay render path (vs the camera). When set:
+    /// pills are filled solid + square (opaque, no SDF feather/rounding) and the
+    /// full-bitmap `row_extents` scan is skipped (the screen copies the bitmap
+    /// straight to the Canvas view; only the camera's GPU warp needs row extents).
+    screen_overlay: AtomicBool,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -479,7 +484,13 @@ impl LiveSession {
             defer_canvas: AtomicBool::new(false),
             content_version: AtomicU64::new(0),
             block_tiles: Mutex::new(HashMap::new()),
+            screen_overlay: AtomicBool::new(false),
         }
+    }
+
+    /// See [`Self::screen_overlay`]. The screen pipeline sets this `true`.
+    pub fn set_screen_overlay(&self, is_screen: bool) {
+        self.screen_overlay.store(is_screen, Ordering::SeqCst);
     }
 
     /// Monotonic counter of visible overlay-canvas changes (see
@@ -1185,6 +1196,7 @@ impl LiveSession {
             self.overlay_oversample(),
             self.overlay_bg(),
             tile_cache,
+            self.screen_overlay.load(Ordering::SeqCst),
         );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -2869,6 +2881,16 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
 /// Returns `None` when no block has any usable strip. `font_provider`
 /// supplies typefaces — Android passes `AndroidFontProvider`, the
 /// simulator can pass any `FontProvider` impl.
+///
+/// FUTURE (camera GPU overlay compositor): the camera path still CPU-builds the
+/// whole canvas here and then GPU-warps the finished bitmap every frame. Since the
+/// screen path already rasterizes each block into its own tile (`block_tiles` /
+/// `render_block_tiles`), the camera could adopt the same per-block tiles, upload
+/// each as a GL texture, and have the GPU draw the pill rects + composite the text
+/// tiles + warp in one pass — eliminating the CPU canvas build entirely. Not done
+/// yet: the win is smaller for the camera (its build is already off the display
+/// thread on the OCR worker, and the per-frame warp is cheap), and it needs a GL
+/// glyph/tile atlas path the screen's CPU-direct copy doesn't.
 #[allow(clippy::type_complexity)]
 pub fn render_anchor_canvas(
     blocks: &std::collections::BTreeMap<u64, BlockSpec>,
@@ -2877,6 +2899,7 @@ pub fn render_anchor_canvas(
     oversample: f32,
     bg_rgba: [u8; 4],
     tile_cache: Option<&Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>>,
+    screen_overlay: bool,
 ) -> Option<AnchorRaster> {
     use crate::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
@@ -2890,6 +2913,7 @@ pub fn render_anchor_canvas(
     // are scaled by `os` so glyphs rasterize denser than the surface;
     // the compositor maps the result back onto the 1:1 surface footprint.
     let os = oversample.max(1.0);
+    let t0 = std::time::Instant::now();
 
     // 1. Per-block: inflate strips into visuals, normalize basis,
     //    collect for later AABB + paint passes.
@@ -2989,6 +3013,22 @@ pub fn render_anchor_canvas(
     let bitmap_h = (((max_y + pad - origin_y) * os).ceil() as i32).max(1) as u32;
     let pixels = (bitmap_w as usize) * (bitmap_h as usize);
     let mut canvas = vec![0u8; pixels * 4];
+    let t_alloc = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Pill background fill. The screen overlay uses solid square pills (opaque,
+    // dimmed under the touch cap → the SDF feather/rounding is invisible and was
+    // the entire per-present cost). The camera keeps the anti-aliased rounded SDF
+    // fill, which reads nicely over live video and runs once per acquire on the
+    // worker.
+    let fill_pill = |canvas: &mut Vec<u8>, rect: &OrientedRect, color: [u8; 4]| {
+        if screen_overlay {
+            crate::planar_engine::fill_oriented_rect_solid(canvas, bitmap_w, bitmap_h, rect, color);
+        } else {
+            crate::planar_engine::fill_oriented_rect_blended(
+                canvas, bitmap_w, bitmap_h, rect, color,
+            );
+        }
+    };
 
     // 3. Translate each block's visuals into canvas-local coords and
     //    paint backgrounds. Within a block, strips paint normally.
@@ -2996,6 +3036,11 @@ pub fn render_anchor_canvas(
     //    where the existing canvas alpha is ≥ the candidate alpha —
     //    so a second block's 0xC8 bg can't darken pixels a previous
     //    block already covered at 0xC8.
+    // Sum of painted pill area in canvas px² (oversampled space, i.e. the actual
+    // bytes touched). Lets us normalize `bg` ms against fill volume so a fast
+    // light-text canvas isn't mistaken for a fast paint — if ms/Mpx jumps while
+    // area is flat, the cost is CPU contention, not the fill.
+    let mut pill_area_px: f64 = 0.0;
     let mut local_visuals: Vec<Vec<OrientedRect>> = Vec::with_capacity(prepared.len());
     for pb in &prepared {
         let local: Vec<OrientedRect> = pb
@@ -3023,13 +3068,8 @@ pub fn render_anchor_canvas(
                 .and_then(|m| m.bg_uniform_argb)
                 .map(argb_to_rgba_bytes)
                 .unwrap_or(default_bg);
-            crate::planar_engine::fill_oriented_rect_blended(
-                &mut canvas,
-                bitmap_w,
-                bitmap_h,
-                v,
-                strip_color,
-            );
+            pill_area_px += (v.width * v.height).max(0.0) as f64;
+            fill_pill(&mut canvas, v, strip_color);
         }
         local_visuals.push(local);
     }
@@ -3048,15 +3088,11 @@ pub fn render_anchor_canvas(
             height: v.height * os,
             angle_radians: v.angle_radians,
         };
-        crate::planar_engine::fill_oriented_rect_blended(
-            &mut canvas,
-            bitmap_w,
-            bitmap_h,
-            &local,
-            provisional_bg,
-        );
+        pill_area_px += (local.width * local.height).max(0.0) as f64;
+        fill_pill(&mut canvas, &local, provisional_bg);
     }
 
+    let t_bg = t0.elapsed().as_secs_f64() * 1000.0;
     // 4. Build a `PreparedTextBlock` per OCR block that has text.
     //    Empty-text blocks (pending placeholders) keep their bg-only
     //    contribution from step 3 and don't appear in the text pass.
@@ -3162,7 +3198,26 @@ pub fn render_anchor_canvas(
         };
         crate::image_render::render_overlay(&prepared, font_provider, &opts).ok()?
     };
-    let row_extents = compute_row_extents(&final_bitmap, bitmap_w, bitmap_h);
+    let t_text = t0.elapsed().as_secs_f64() * 1000.0;
+    // Skip the full-bitmap row-extent scan when the consumer copies the bitmap
+    // (screen) rather than GPU-warping it (camera).
+    let row_extents = if screen_overlay {
+        Vec::new()
+    } else {
+        compute_row_extents(&final_bitmap, bitmap_w, bitmap_h)
+    };
+    let t_rows = t0.elapsed().as_secs_f64() * 1000.0;
+    let cached = tile_cache.is_some();
+    let bg_ms = t_bg - t_alloc;
+    let pill_mpx = pill_area_px / 1.0e6;
+    let bg_per_mpx = if pill_mpx > 0.0 { bg_ms / pill_mpx } else { 0.0 };
+    log::info!(
+        "[canvas] {bitmap_w}x{bitmap_h} blocks={} pills={pill_mpx:.2}Mpx prep+alloc={t_alloc:.1} bg={bg_ms:.1}({bg_per_mpx:.0}ms/Mpx) text={:.1}{} rows={:.1} total={t_rows:.1}ms",
+        blocks.len(),
+        t_text - t_bg,
+        if cached { "(tiles)" } else { "" },
+        t_rows - t_text,
+    );
     Some(AnchorRaster {
         bitmap: final_bitmap,
         width: bitmap_w,
