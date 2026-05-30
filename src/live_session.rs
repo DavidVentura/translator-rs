@@ -2859,6 +2859,10 @@ pub const ITEM_BITMAP_PAD_PX: f32 = 4.0;
 /// transparent, so no fringe of the original solid fill survives at the edge.
 const CLEAR_MARGIN_SURFACE_PX: f32 = 1.5;
 
+/// Angles within this of axis-aligned are snapped to exactly 0 — detection noise on
+/// world-up text isn't worth the slow rotated pill fill + atlas bypass. 1°.
+const AXIS_SNAP_RAD: f32 = 0.017_453_293;
+
 /// Half-open AABB overlap test (touching edges don't count). Used to decide whether
 /// a clear may have nicked a surviving block's pill, so it gets re-asserted.
 fn aabb_overlaps(a: &crate::ocr::Rect, b: &crate::ocr::Rect) -> bool {
@@ -3070,6 +3074,15 @@ pub fn render_anchor_canvas(
             continue;
         }
         normalize_block_visuals_rotated_basis(&mut visuals);
+        // Snap near-axis-aligned text to exactly axis-aligned. Detected angles carry
+        // sub-degree noise (screen content is world-up); leaving it non-zero forces
+        // the pill fill onto its slow per-pixel rotated path and bypasses the glyph
+        // atlas, for a tilt no one can see. Snap < 1° to 0.
+        for v in &mut visuals {
+            if v.angle_radians.abs() < AXIS_SNAP_RAD {
+                v.angle_radians = 0.0;
+            }
+        }
         prepared.push(PreparedBlock {
             block_id: *block_id,
             visuals,
@@ -3082,12 +3095,17 @@ pub fn render_anchor_canvas(
     let prepared_provisional: Vec<OrientedRect> = provisional_strips
         .iter()
         .filter_map(|s| {
+            let angle = if s.angle_radians.abs() < AXIS_SNAP_RAD {
+                0.0
+            } else {
+                s.angle_radians
+            };
             let v = OrientedRect {
                 cx: s.cx,
                 cy: s.cy,
                 width: s.width + 2.0 * HORIZONTAL_PAD_PX,
                 height: s.height * TIGHT_VERTICAL_INFLATE,
-                angle_radians: s.angle_radians,
+                angle_radians: angle,
             };
             if v.width <= 0.0 || v.height <= 0.0 {
                 None
@@ -3248,10 +3266,15 @@ pub fn render_anchor_canvas(
                 let mut lang = String::new();
                 let mut text_blocks: Vec<crate::ocr::PreparedTextBlock> = Vec::new();
                 let mut metas: Vec<(u64, u64)> = Vec::new();
+                // Clear stale shape/raster counters; read after the tile render below.
+                let _ = crate::image_render::take_render_stats();
+                let mut pill_area_px: f64 = 0.0;
+                let t_pill = std::time::Instant::now();
                 for pb in &to_repaint {
                     let local = localize_visuals(&pb.visuals, ox, oy, os);
                     for (i, v) in local.iter().enumerate() {
                         let color = block_pill_color(pb.spec, i, pb.block_id, bg_rgba);
+                        pill_area_px += (v.width * v.height).max(0.0) as f64;
                         crate::planar_engine::fill_oriented_rect_solid(
                             &mut raster.bitmap,
                             cw,
@@ -3272,6 +3295,8 @@ pub fn render_anchor_canvas(
                         metas.push((pb.block_id, pb.spec.content_hash));
                     }
                 }
+                let pill_ms = t_pill.elapsed().as_secs_f64() * 1000.0;
+                let (mut tiles_ms, mut comp_ms) = (0.0_f64, 0.0_f64);
                 {
                     let mut c = cache.lock().expect("tile cache poisoned");
                     for id in &removed {
@@ -3282,11 +3307,14 @@ pub fn render_anchor_canvas(
                             language: lang,
                             min_font_size_px: 6.0 * os,
                         };
+                        let t_tiles = std::time::Instant::now();
                         let tiles = crate::image_render::render_block_tiles(
                             &text_blocks,
                             font_provider,
                             &opts,
                         );
+                        tiles_ms = t_tiles.elapsed().as_secs_f64() * 1000.0;
+                        let t_comp = std::time::Instant::now();
                         for ((bid, hash), tile_opt) in metas.iter().zip(tiles) {
                             match tile_opt {
                                 Some(tile) => {
@@ -3298,6 +3326,7 @@ pub fn render_anchor_canvas(
                                 }
                             }
                         }
+                        comp_ms = t_comp.elapsed().as_secs_f64() * 1000.0;
                     }
                 }
                 // Rebuild the flat pill list (monitor mask) from the current
@@ -3308,12 +3337,21 @@ pub fn render_anchor_canvas(
                     .copied()
                     .chain(raster.painted_blocks.values().flat_map(|(_, p)| p.iter().copied()))
                     .collect();
+                let st = crate::image_render::take_render_stats();
                 let t_incr = t0.elapsed().as_secs_f64() * 1000.0;
+                let pill_mpx = pill_area_px / 1.0e6;
+                let pill_rate = if pill_mpx > 0.0 { pill_ms / pill_mpx } else { 0.0 };
                 log::info!(
-                    "[canvas] {cw}x{ch} incr ~{}blk -{}rm (now {}) {t_incr:.1}ms",
+                    "[canvas] {cw}x{ch} incr ~{}blk -{}rm (now {}) {t_incr:.1}ms \
+                     [pill={pill_ms:.1}({pill_mpx:.2}Mpx {pill_rate:.0}ms/Mpx) \
+                     tiles={tiles_ms:.1}(shape={:.1} raster={:.1} {}g/{}h) comp={comp_ms:.1}]",
                     to_repaint.len(),
                     removed.len(),
                     raster.painted_blocks.len(),
+                    st.shape_us as f64 / 1000.0,
+                    st.raster_us as f64 / 1000.0,
+                    st.glyphs_rastered,
+                    st.glyphs_reused,
                 );
                 return Some(raster);
             }
