@@ -204,6 +204,54 @@ fn shift_block(block: &PreparedTextBlock, dx: f32, dy: f32) -> PreparedTextBlock
 // ---------------------------------------------------------------------------
 // Font cache
 
+/// Per-render glyph timing/counters, accumulated thread-locally during a render and
+/// read by the caller via [`take_render_stats`]. Instrumentation only — lets the
+/// screen overlay attribute an `incr` present to shaping vs glyph rasterization vs
+/// atlas reuse, so we can tell real raster work from a scheduling/memory stall.
+#[derive(Clone, Copy, Default)]
+pub struct RenderStats {
+    pub shape_us: u64,
+    pub raster_us: u64,
+    pub glyphs_rastered: u32,
+    pub glyphs_reused: u32,
+}
+
+thread_local! {
+    static RENDER_STATS: std::cell::RefCell<RenderStats> = std::cell::RefCell::new(RenderStats::default());
+}
+
+/// Take and reset the calling thread's accumulated render stats.
+pub fn take_render_stats() -> RenderStats {
+    RENDER_STATS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+fn stat_shape(us: u64) {
+    RENDER_STATS.with(|s| s.borrow_mut().shape_us += us);
+}
+
+fn stat_raster(us: u64) {
+    RENDER_STATS.with(|s| {
+        let mut st = s.borrow_mut();
+        st.raster_us += us;
+        st.glyphs_rastered += 1;
+    });
+}
+
+fn stat_glyph_hit() {
+    RENDER_STATS.with(|s| s.borrow_mut().glyphs_reused += 1);
+}
+
+/// One glyph's alpha-coverage mask, rasterized axis-aligned at the glyph origin
+/// `(0, 0)`. `left`/`top` are the mask's offset from that origin (the side bearing /
+/// ascent), so a draw blits it at `pen.round() + (left, top)`.
+struct GlyphMask {
+    cov: Vec<u8>,
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+}
+
 #[derive(Default)]
 struct FontCache {
     /// Parsed faces, keyed by handle. Each `Face` borrows the bytes held in
@@ -214,6 +262,16 @@ struct FontCache {
     faces: HashMap<FontHandle, Option<Face<'static>>>,
     fonts: HashMap<FontHandle, Option<Arc<Vec<u8>>>>,
     chains: HashMap<(Script, bool, bool, bool), Vec<FontHandle>>,
+    /// Small dense id per font handle, so the glyph-atlas key is cheap ints.
+    font_ids: HashMap<FontHandle, u32>,
+    next_font_id: u32,
+    /// Glyph alpha-mask atlas keyed by `(font id, glyph id, rounded px size)`. The
+    /// same glyph recurs constantly within a render (every 'e', every space); this
+    /// rasterizes each distinct one once and re-blits the mask. Keyed on the shaped
+    /// *glyph id*, so ligatures / contextual forms are correct (they're distinct
+    /// gids). `None` caches a no-outline glyph (space, .notdef) so it isn't retried.
+    /// Axis-aligned only — a tilted line can't reuse an upright mask.
+    glyphs: HashMap<(u32, u16, u32), Option<GlyphMask>>,
 }
 
 impl FontCache {
@@ -234,6 +292,42 @@ impl FontCache {
             self.faces.insert(handle.clone(), parsed);
         }
         self.faces.get(handle).and_then(|f| f.as_ref())
+    }
+
+    /// Stable small id for a font handle (resolved once per run, not per glyph).
+    fn font_id(&mut self, handle: &FontHandle) -> u32 {
+        if let Some(id) = self.font_ids.get(handle) {
+            return *id;
+        }
+        let id = self.next_font_id;
+        self.next_font_id += 1;
+        self.font_ids.insert(handle.clone(), id);
+        id
+    }
+
+    /// Atlas lookup: the alpha mask for glyph `gid` of font `fid`/`handle` at
+    /// `size_px`. Rasterizes (axis-aligned at the glyph origin) on first miss, then
+    /// reused. `scale = font_size / units_per_em`.
+    fn glyph(
+        &mut self,
+        fid: u32,
+        handle: &FontHandle,
+        gid: u16,
+        size_px: u32,
+        scale: f32,
+    ) -> Option<&GlyphMask> {
+        let key = (fid, gid, size_px);
+        if self.glyphs.contains_key(&key) {
+            stat_glyph_hit();
+        } else {
+            let t = std::time::Instant::now();
+            let gm = self
+                .face(handle)
+                .and_then(|face| raster_glyph(face, gid, scale));
+            stat_raster(t.elapsed().as_micros() as u64);
+            self.glyphs.insert(key, gm);
+        }
+        self.glyphs.get(&key).and_then(|g| g.as_ref())
     }
 
     fn chain_for(
@@ -665,6 +759,7 @@ fn shape_line(
     chain_lookup: &mut dyn FnMut(Script, &mut FontCache) -> Vec<FontHandle>,
     cache: &mut FontCache,
 ) -> LineShape {
+    let t_shape = std::time::Instant::now();
     let runs = segment_runs(text);
     let mut shaped: Vec<(usize, ShapedRun)> = Vec::new();
     for run in &runs {
@@ -710,6 +805,7 @@ fn shape_line(
         cum_em_at_byte[byte] = acc;
     }
 
+    stat_shape(t_shape.elapsed().as_micros() as u64);
     LineShape {
         runs: runs_only,
         total_widths,
@@ -1099,9 +1195,38 @@ fn draw_shaped_line(
     // cursor_x advances in line-local space (along the reading direction). The image-space
     // pen position for each glyph is obtained by rotating the local pen offset by the line's
     // angle and adding the origin.
+    //
+    // Axis-aligned lines (the screen overlay; CJK block-rect) reuse the glyph atlas:
+    // each distinct (gid, size) is rasterized once and its mask re-blitted at every
+    // pen position (snapped to whole pixels). Tilted lines can't reuse an upright
+    // mask, so they rasterize per glyph in line orientation.
+    let axis_aligned = sin_angle.abs() < 1e-3 && cos_angle > 0.0;
+    let size_px = font_size.round().max(1.0) as u32;
     let mut cursor_x = 0.0f32;
     for run in &line.runs {
         let scale = font_size / run.units_per_em as f32;
+        if axis_aligned {
+            let fid = cache.font_id(&run.handle);
+            for glyph in &run.glyphs {
+                let glyph_x = origin_x + cursor_x + glyph.offset_x as f32 * scale;
+                let glyph_y = origin_y - glyph.offset_y as f32 * scale;
+                if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
+                    blit_mask(
+                        canvas,
+                        width,
+                        height,
+                        &gm.cov,
+                        glyph_x.round() as i32 + gm.left,
+                        glyph_y.round() as i32 + gm.top,
+                        gm.w,
+                        gm.h,
+                        fg_argb,
+                    );
+                }
+                cursor_x += glyph.advance_x as f32 * scale;
+            }
+            continue;
+        }
         let face = match cache.face(&run.handle) {
             Some(f) => f,
             None => continue,
@@ -1145,6 +1270,38 @@ fn draw_shaped_line(
             cursor_x += glyph.advance_x as f32 * scale;
         }
     }
+}
+
+/// Rasterize one glyph's alpha mask axis-aligned at the origin `(0, 0)` and `scale`
+/// — the atlas entry, re-blitted at each pen position. Returns `None` for glyphs
+/// with no outline (space, .notdef).
+fn raster_glyph(face: &Face, gid: u16, scale: f32) -> Option<GlyphMask> {
+    let mut commands: Vec<Command> = Vec::new();
+    let mut sink = OutlineSink {
+        builder: &mut commands,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        scale,
+        cos_angle: 1.0,
+        sin_angle: 0.0,
+    };
+    face.outline_glyph(ttf_parser::GlyphId(gid), &mut sink)?;
+    if commands.is_empty() {
+        return None;
+    }
+    let (mask, placement) = Mask::new(commands.as_slice())
+        .format(Format::Alpha)
+        .render();
+    if placement.width == 0 || placement.height == 0 {
+        return None;
+    }
+    Some(GlyphMask {
+        cov: mask,
+        w: placement.width,
+        h: placement.height,
+        left: placement.left,
+        top: placement.top,
+    })
 }
 
 struct OutlineSink<'a> {
