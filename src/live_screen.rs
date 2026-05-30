@@ -14,7 +14,7 @@
 //! duplicated OCR/overlay logic — only the orchestration differs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::font_provider::FontProvider;
 use crate::live_compositor::ComposeTarget;
@@ -94,12 +94,13 @@ enum MonitorState {
         base: Option<Vec<u8>>,
         deadline_ns: Option<i64>,
     },
-    /// We just presented a freshly-acquired overlay; the next frame verifies the
-    /// screen didn't change *during* the (synchronous, multi-second) OCR by
-    /// diffing against `clean_base` — the coarse gray the OCR actually ran on. If
-    /// it moved (e.g. the user tabbed to another app mid-acquire), the overlay is
-    /// stale → hide + re-acquire; otherwise → Idle.
-    Validating { clean_base: Vec<u8> },
+    /// An async acquire (detect/rec/translate) is running on the worker thread.
+    /// `clean_base` is the coarse gray the OCR ran on; each captured frame is
+    /// masked-diffed against it (same pill mask as `Idle`), and real content
+    /// motion → hide + abort + re-acquire. The worker flips this to `Idle` on a
+    /// clean finish; an abort moves it to `Settling` first (guarded so the worker
+    /// won't clobber that).
+    Acquiring { clean_base: Vec<u8> },
     /// Overlay reflects the current static screen; wait for movement. The diff
     /// here masks out the pill cells (our own opaque overlay), so our redraw
     /// never reads as movement and only real content motion in the gaps counts.
@@ -196,11 +197,23 @@ fn step_frame(
     now_ns: i64,
 ) -> (MonitorState, MonitorAction) {
     match state {
-        // Resolved by `monitor_validate_clean` (a pre-present, pill-free check),
-        // not by captured frames — the GL thread is single-threaded and runs that
-        // check before any monitor_frame call. Defensive no-op if one slips in.
-        MonitorState::Validating { clean_base } => {
-            (MonitorState::Validating { clean_base }, MonitorAction::None)
+        // Worker running OCR. Masked-diff vs the frame it ran on; real content
+        // motion → hide + re-acquire (the GL thread also aborts the worker). Our
+        // own pills appearing are masked out (same as Idle). The worker flips
+        // this to Idle on clean finish.
+        MonitorState::Acquiring { clean_base } => {
+            let g = match excluded {
+                Some(ex) => mean_abs_diff_masked(&clean_base, gray, ex),
+                None => mean_abs_diff(&clean_base, gray),
+            };
+            if g > MOVE_THRESHOLD {
+                log::info!(
+                    "[screen-monitor] movement g={g:.1} during acquire → abort + re-acquire"
+                );
+                (settling(gray.to_vec(), now_ns), MonitorAction::Hide)
+            } else {
+                (MonitorState::Acquiring { clean_base }, MonitorAction::None)
+            }
         }
         MonitorState::Idle { base: None } => (
             MonitorState::Idle {
@@ -234,8 +247,14 @@ fn step_frame(
                 (settling(gray.to_vec(), now_ns), MonitorAction::None)
             } else if deadline_ns.is_some_and(|d| now_ns >= d) {
                 log::info!("[screen-monitor] settled (frame) g={g:.1} → acquire");
+                // Stay Settling until the dispatch actually lands (the worker may
+                // still be draining a just-aborted job); `monitor_confirm_acquire`
+                // flips us to Acquiring on success, else we re-fire next tick.
                 (
-                    MonitorState::Validating { clean_base: b },
+                    MonitorState::Settling {
+                        base: Some(b),
+                        deadline_ns,
+                    },
                     MonitorAction::Acquire,
                 )
             } else {
@@ -251,25 +270,6 @@ fn step_frame(
     }
 }
 
-/// Pure transition for the pre-present staleness check: `Validating` resolves to
-/// `Idle` (screen unchanged → present) or `Settling` + `Hide` (screen moved
-/// during OCR → drop stale overlay, re-acquire). `gray` is a pill-free frame.
-fn step_validate(state: MonitorState, gray: &[u8], now_ns: i64) -> (MonitorState, MonitorAction) {
-    let MonitorState::Validating { clean_base } = state else {
-        return (state, MonitorAction::None);
-    };
-    let g = mean_abs_diff(&clean_base, gray);
-    if g > MOVE_THRESHOLD {
-        log::info!(
-            "[screen-monitor] stale overlay (screen moved during OCR) g={g:.1} → re-acquire"
-        );
-        (settling(gray.to_vec(), now_ns), MonitorAction::Hide)
-    } else {
-        log::debug!("[screen-monitor] overlay validated g={g:.1}");
-        (MonitorState::Idle { base: None }, MonitorAction::None)
-    }
-}
-
 /// Pure transition for a timed tick (no new frame): only a pending settle fires.
 fn step_tick(state: MonitorState, now_ns: i64) -> (MonitorState, MonitorAction) {
     match state {
@@ -278,12 +278,115 @@ fn step_tick(state: MonitorState, now_ns: i64) -> (MonitorState, MonitorAction) 
             deadline_ns: Some(d),
         } if now_ns >= d => {
             log::info!("[screen-monitor] settled (tick) → acquire");
+            // Stay Settling until dispatch lands (see step_frame).
             (
-                MonitorState::Validating { clean_base },
+                MonitorState::Settling {
+                    base: Some(clean_base),
+                    deadline_ns: Some(d),
+                },
                 MonitorAction::Acquire,
             )
         }
         other => (other, MonitorAction::None),
+    }
+}
+
+/// One acquire job: the GPU-rendered OCR frame + the generation it was dispatched
+/// at (so a later `abort`/reset can cancel it mid-flight).
+struct ScreenJob {
+    frame: Arc<LiveFrame>,
+    generation: u64,
+}
+
+struct ScreenWorkerState {
+    pending: Option<ScreenJob>,
+    busy: bool,
+    shutting_down: bool,
+}
+
+struct ScreenWorkerInner {
+    slot: Mutex<ScreenWorkerState>,
+    cv: Condvar,
+}
+
+/// Single-slot background worker that runs `run_screen_acquire` off the GL
+/// thread. Mirrors the camera's `Worker` (live_tracker_pipeline.rs): drops a new
+/// job while one is in flight (the monitor guarantees they're serialized anyway),
+/// holds a `Weak` back-ref, and tears down on `Drop`.
+struct ScreenWorker {
+    inner: Arc<ScreenWorkerInner>,
+}
+
+impl ScreenWorker {
+    fn spawn(pipeline: Arc<LiveScreenPipeline>) -> Self {
+        let inner = Arc::new(ScreenWorkerInner {
+            slot: Mutex::new(ScreenWorkerState {
+                pending: None,
+                busy: false,
+                shutting_down: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let inner_clone = Arc::clone(&inner);
+        let pipeline_weak = Arc::downgrade(&pipeline);
+        std::thread::Builder::new()
+            .name("LiveScreenWorker".into())
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let mut state = inner_clone.slot.lock().expect("screen worker poisoned");
+                        while state.pending.is_none() && !state.shutting_down {
+                            state = inner_clone
+                                .cv
+                                .wait(state)
+                                .expect("screen worker cv poisoned");
+                        }
+                        if state.shutting_down {
+                            return;
+                        }
+                        let job = state.pending.take();
+                        if job.is_some() {
+                            state.busy = true;
+                        }
+                        job
+                    };
+                    let Some(job) = job else { continue };
+                    let Some(pipeline) = pipeline_weak.upgrade() else {
+                        return;
+                    };
+                    pipeline.run_screen_acquire(job.frame, job.generation);
+                    drop(pipeline);
+                    let mut state = inner_clone.slot.lock().expect("screen worker poisoned");
+                    state.busy = false;
+                    inner_clone.cv.notify_all();
+                }
+            })
+            .expect("failed to spawn LiveScreenWorker");
+        ScreenWorker { inner }
+    }
+
+    fn try_dispatch(&self, job: ScreenJob) -> bool {
+        let mut state = self.inner.slot.lock().expect("screen worker poisoned");
+        if state.busy || state.pending.is_some() {
+            return false;
+        }
+        state.pending = Some(job);
+        self.inner.cv.notify_one();
+        true
+    }
+
+    fn busy(&self) -> bool {
+        let state = self.inner.slot.lock().expect("screen worker poisoned");
+        state.busy || state.pending.is_some()
+    }
+}
+
+impl Drop for ScreenWorker {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.inner.slot.lock() {
+            state.shutting_down = true;
+            self.inner.cv.notify_all();
+        }
     }
 }
 
@@ -292,10 +395,12 @@ pub struct LiveScreenPipeline {
     session: Arc<LiveSession>,
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     config: Mutex<ScreenConfig>,
-    /// Bumped on reset / language change so an in-flight rec/translate bails.
+    /// Bumped on reset / language change / abort so an in-flight rec/translate bails.
     generation: AtomicU64,
     /// Movement / settle change-detection state (the v1 "Monitoring" logic).
     monitor: Mutex<MonitorState>,
+    /// Background OCR worker; `None` only transiently during `new`.
+    worker: Mutex<Option<ScreenWorker>>,
 }
 
 impl LiveScreenPipeline {
@@ -308,7 +413,11 @@ impl LiveScreenPipeline {
         // for touch passthrough, so the default translucent pill (0xC8) would
         // double-dim into unreadable mush. Camera keeps the translucent default.
         session.set_overlay_bg([0x00, 0x00, 0x00, 0xFF]);
-        Arc::new(Self {
+        // Render the overlay canvas on the GL thread at present time, not inline
+        // on the OCR worker per block — the per-block raster was O(N²) and stalled
+        // rec/translate (~2× slower than the snapshot path).
+        session.set_defer_canvas(true);
+        let pipeline = Arc::new(Self {
             catalog,
             session,
             font_provider,
@@ -318,7 +427,11 @@ impl LiveScreenPipeline {
                 base: None,
                 deadline_ns: None,
             }),
-        })
+            worker: Mutex::new(None),
+        });
+        let worker = ScreenWorker::spawn(Arc::clone(&pipeline));
+        *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
+        pipeline
     }
 
     fn reset_monitor(&self) {
@@ -359,10 +472,15 @@ impl LiveScreenPipeline {
         now_ns: i64,
     ) -> MonitorAction {
         let mut guard = self.monitor.lock().expect("monitor lock");
-        // Mask pill cells only while the overlay is up (Idle). In Settling the
-        // overlay is hidden, and the stale rects would wrongly exclude the very
-        // content whose motion we await.
-        let mask = if matches!(&*guard, MonitorState::Idle { base: Some(_) }) {
+        // Mask pill cells whenever the overlay is (or is becoming) visible — Idle,
+        // and Acquiring (our provisional/full pills appear mid-acquire). In
+        // Settling the overlay is hidden and stale rects would wrongly exclude the
+        // very content whose motion we await.
+        let overlay_up = matches!(
+            &*guard,
+            MonitorState::Idle { base: Some(_) } | MonitorState::Acquiring { .. }
+        );
+        let mask = if overlay_up {
             let rects = self.session.overlay_pill_rects(SCREEN_ANCHOR_ID);
             Some(build_pill_mask(&rects, gw, gh, cw, ch))
         } else {
@@ -384,29 +502,41 @@ impl LiveScreenPipeline {
         action
     }
 
-    /// Pre-present staleness check: after the (synchronous, multi-second) OCR,
-    /// the GL worker drains the latest captured frame — still pill-free, since
-    /// the new overlay hasn't been shown — and calls this with its coarse gray.
-    /// If it differs from `clean_base` (the frame the OCR ran on), the screen
-    /// changed underneath us (e.g. the user tabbed away): `Hide` → drop the stale
-    /// overlay and re-acquire. Otherwise `None` → safe to present. No mask: both
-    /// frames are pill-free, so we compare the whole frame.
-    pub fn monitor_validate_clean(&self, gray: &[u8], now_ns: i64) -> MonitorAction {
+    /// Flip `Settling → Acquiring` once a dispatch actually landed (so a dropped
+    /// dispatch — worker still draining an aborted job — leaves us Settling to
+    /// retry rather than stuck in Acquiring with no worker).
+    fn monitor_confirm_acquire(&self) {
         let mut guard = self.monitor.lock().expect("monitor lock");
         let state = std::mem::replace(&mut *guard, MonitorState::Idle { base: None });
-        let (next, action) = step_validate(state, gray, now_ns);
-        *guard = next;
-        action
+        *guard = match state {
+            MonitorState::Settling { base: Some(b), .. } => {
+                MonitorState::Acquiring { clean_base: b }
+            }
+            other => other,
+        };
     }
 
-    /// Whether the GL worker should poll on a timer (a settle deadline is armed).
+    /// Called by the worker on a clean acquire finish: flip `Acquiring → Idle`
+    /// (the next captured frame rebaselines). Guarded so an abort that already
+    /// moved us to `Settling` isn't clobbered by a worker that hadn't yet seen
+    /// the cancel.
+    fn monitor_set_idle_if_acquiring(&self) {
+        let mut guard = self.monitor.lock().expect("monitor lock");
+        if matches!(&*guard, MonitorState::Acquiring { .. }) {
+            *guard = MonitorState::Idle { base: None };
+        }
+    }
+
+    /// Whether the GL worker should poll on a timer: a settle deadline is armed,
+    /// or an acquire is in flight (so it picks up the worker's provisional/full
+    /// overlays even though the static screen emits no frames).
     pub fn wants_tick(&self) -> bool {
         matches!(
             &*self.monitor.lock().expect("monitor lock"),
             MonitorState::Settling {
                 deadline_ns: Some(_),
                 ..
-            }
+            } | MonitorState::Acquiring { .. }
         )
     }
 
@@ -446,57 +576,98 @@ impl LiveScreenPipeline {
         self.reset_monitor();
     }
 
-    /// Drive one frame: on the detect cadence run detect → orient →
-    /// rec/translate (into [`SCREEN_ANCHOR_ID`]); every frame composite the
-    /// resident overlays into `target` at identity. `frame` carries the
-    /// captured canonical RGBA; `canonical_w/h` are its dims.
-    pub fn process_frame_overlay(
+    /// Dispatch an acquire (detect/rec/translate) to the background worker for
+    /// the GPU-rendered `frame`. Non-blocking; returns whether the job was
+    /// queued (the monitor serializes acquires, so this should always succeed).
+    pub fn dispatch_acquire(&self, frame: Arc<LiveFrame>) -> bool {
+        let generation = self.generation.load(Ordering::SeqCst);
+        let job = ScreenJob { frame, generation };
+        let dispatched = self
+            .worker
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|w| w.try_dispatch(job)))
+            .unwrap_or(false);
+        if dispatched {
+            self.monitor_confirm_acquire();
+        }
+        dispatched
+    }
+
+    /// Abort an in-flight acquire (the screen moved). Bumps the generation so the
+    /// worker's `cancel` closure trips at the next rec batch.
+    pub fn abort_acquire(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether the worker is busy (an acquire is in flight or queued).
+    pub fn acquire_busy(&self) -> bool {
+        self.worker
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|w| w.busy()))
+            .unwrap_or(false)
+    }
+
+    /// Monotonically increasing each time overlay *content* changes (the
+    /// provisional pills, then each rec batch's translated block, then the
+    /// post-retain cleanup). The GL thread re-presents whenever this changes —
+    /// and the actual canvas raster happens in [`Self::composite_current`] on
+    /// that thread, so blocks appear incrementally without stalling the worker.
+    pub fn overlay_version(&self) -> u64 {
+        self.session.content_version()
+    }
+
+    /// Composite the resident overlays into `target` at identity (present-only,
+    /// no OCR). Runs on the GL thread. The minimal `frame` just carries the
+    /// canonical dims; the overlay-only target ignores its (empty) camera bytes.
+    pub fn composite_current(
         &self,
-        frame: &Arc<LiveFrame>,
         target: &mut dyn ComposeTarget,
         canonical_w: u32,
         canonical_h: u32,
-    ) -> ScreenFrameResult {
-        let cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
-        let mut result = ScreenFrameResult::default();
-
-        // The GL worker gates the detect cadence and only calls this on a
-        // detect-due frame, so we always detect + composite here.
-        result.did_detect = true;
-        self.run_detect_cycle(frame, canonical_w, canonical_h, &cfg, &mut result);
-
-        result.overlay_count = composite_overlays(
+    ) -> u32 {
+        // Render the canvas here (GL thread) if a deferred upsert left it stale —
+        // coalesces many worker-side block upserts into one raster per present.
+        self.session
+            .ensure_anchor_canvas(SCREEN_ANCHOR_ID, &*self.font_provider);
+        let frame = Arc::new(LiveFrame::new(0));
+        frame.reset_owned(Vec::new(), canonical_w, canonical_h, 0);
+        composite_overlays(
             &self.session,
-            frame,
+            &frame,
             target,
             canonical_w,
             canonical_h,
             Some(IDENTITY),
             SCREEN_ANCHOR_ID,
         )
-        .unwrap_or(0);
-        result
+        .unwrap_or(0)
     }
 
-    fn run_detect_cycle(
-        &self,
-        frame: &Arc<LiveFrame>,
-        canonical_w: u32,
-        canonical_h: u32,
-        cfg: &ScreenConfig,
-        result: &mut ScreenFrameResult,
-    ) {
-        // Each acquire re-detects the whole screen fresh; drop the previous
-        // pass's surface map + blocks + canvas so boxes don't accumulate.
-        self.session.reset_anchor_state(SCREEN_ANCHOR_ID);
+    /// Worker-thread body: detect → provisional overlay → rec/translate → full
+    /// overlay, bumping [`overlay_version`](Self::overlay_version) after each
+    /// upsert so the GL thread presents provisional pills immediately and the
+    /// translated text when ready. Bails at any stage if `generation` moved
+    /// (language change / reset / abort-on-movement).
+    fn run_screen_acquire(&self, frame: Arc<LiveFrame>, generation: u64) {
+        let cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
+        let cancel = || self.generation.load(Ordering::SeqCst) != generation;
+        let (cw, ch) = {
+            let s = frame.state().lock().expect("frame state poisoned");
+            (s.width, s.height)
+        };
         let crop = Rect {
             left: 0,
             top: 0,
-            right: canonical_w,
-            bottom: canonical_h,
+            right: cw,
+            bottom: ch,
         };
+        // Drop the previous pass's surface map + blocks + canvas so boxes don't
+        // accumulate.
+        self.session.reset_anchor_state(SCREEN_ANCHOR_ID);
         let t_det = std::time::Instant::now();
-        let detected = match acquire_detect(&self.catalog, frame, crop, cfg.det_max_pixels) {
+        let detected = match acquire_detect(&self.catalog, &frame, crop, cfg.det_max_pixels) {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("[screen] detect failed: {e}");
@@ -504,23 +675,40 @@ impl LiveScreenPipeline {
             }
         };
         let det_ms = t_det.elapsed().as_secs_f64() * 1000.0;
+        if cancel() {
+            return;
+        }
         if detected.is_empty() {
             self.session.clear_overlays();
+            self.monitor_set_idle_if_acquiring();
             log::info!("[screen] detect={det_ms:.0}ms boxes=0");
             return;
         }
-        result.detected_count = detected.len() as u32;
+        // Provisional bbox-only pills the instant detection lands (identity
+        // transform → the detected tight boxes are already in canonical/surface
+        // coords). The canvas rebuild bumps the session version, so the GL thread
+        // presents these before rec/translate finishes.
+        let strips: Vec<OrientedRect> = detected.iter().map(|d| d.tight_box.clone()).collect();
+        self.session
+            .upsert_provisional_overlay(SCREEN_ANCHOR_ID, strips, &*self.font_provider);
+        // Force the provisional canvas to render now (one cheap raster — bbox
+        // pills, no glyphs) so it's on screen before the deferred rec blocks
+        // start landing; otherwise its visible window is shorter than the GL
+        // present poll and it gets coalesced straight into the finished overlay.
+        self.session
+            .ensure_anchor_canvas(SCREEN_ANCHOR_ID, &*self.font_provider);
+        if cancel() {
+            return;
+        }
         // Geometric 90° quadrant (supports landscape); skip the rec-based 180°
         // disambiguation since a captured screen is world-up.
         let quadrant = Some(dominant_axis_quadrant(&detected));
-        let gen_id = self.generation.load(Ordering::SeqCst);
-        let cancel = || self.generation.load(Ordering::SeqCst) != gen_id;
         let t_rec = std::time::Instant::now();
         let rec_result = acquire_rec_translate(
             &self.catalog,
             &self.session,
             &*self.font_provider,
-            frame,
+            &frame,
             crop,
             &cfg.from_lang,
             &cfg.to_lang,
@@ -533,22 +721,33 @@ impl LiveScreenPipeline {
             &cancel,
         );
         let rec_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
+        let mut rec_ok = 0;
         match rec_result {
             Ok(outcome) => {
-                result.rec_ok_count = outcome.rec_ok_count;
+                rec_ok = outcome.rec_ok_count;
                 // Drop placeholders for rec-failed blocks so only translated
-                // text stays resident.
+                // text stays resident, and clear the provisional bbox pills —
+                // boxes that never became a surviving block (low detection
+                // confidence, rec/translate failure) were still showing their
+                // provisional pill (the camera drops these in
+                // `acquire_stage_apply_orientation`; the screen path kept them
+                // through streaming for feedback). Then rebuild the canvas
+                // (retain_blocks/drop only mark it stale) so the cleaned-up
+                // overlay — surviving translated blocks only — is presented.
+                // (Canvas raster is deferred to the GL thread's present, so these
+                // just bump content_version; no inline render on the worker.)
                 self.session
                     .retain_blocks(SCREEN_ANCHOR_ID, &outcome.surviving_block_ids);
+                self.session.drop_provisional_overlay(SCREEN_ANCHOR_ID);
             }
             Err(e) => log::warn!("[screen] rec/translate failed: {e}"),
         }
+        if !cancel() {
+            self.monitor_set_idle_if_acquiring();
+        }
         log::info!(
-            "[screen] detect={:.0}ms rec+translate={:.0}ms boxes={} rec_ok={}",
-            det_ms,
-            rec_ms,
+            "[screen] detect={det_ms:.0}ms rec+translate={rec_ms:.0}ms boxes={} rec_ok={rec_ok}",
             detected.len(),
-            result.rec_ok_count,
         );
     }
 }
@@ -585,11 +784,32 @@ mod monitor_tests {
         // Before the deadline: nothing.
         let (s, a) = step_tick(s, (QUIET_MS - 1) * MS);
         assert_eq!(a, MonitorAction::None);
-        // At the deadline: acquire, and we land in Validating awaiting the
-        // post-present frame to confirm the screen didn't move during OCR.
+        // At the deadline: emit Acquire but stay Settling — the GL worker confirms
+        // (→ Acquiring) only once the dispatch actually lands.
         let (s, a) = step_tick(s, QUIET_MS * MS);
         assert_eq!(a, MonitorAction::Acquire);
-        assert!(matches!(s, MonitorState::Validating { .. }));
+        assert!(matches!(s, MonitorState::Settling { base: Some(_), .. }));
+    }
+
+    #[test]
+    fn acquiring_aborts_on_movement() {
+        // While an acquire runs, a big content change → Hide + back to Settling
+        // (the GL thread aborts the worker). A quiet frame keeps Acquiring.
+        let s = MonitorState::Acquiring {
+            clean_base: flat(100),
+        };
+        let (s, a) = step_frame(s, &flat(101), None, 0);
+        assert_eq!(a, MonitorAction::None);
+        assert!(matches!(s, MonitorState::Acquiring { .. }));
+        let (s, a) = step_frame(s, &flat(220), None, 5 * MS);
+        assert_eq!(a, MonitorAction::Hide);
+        assert!(matches!(
+            s,
+            MonitorState::Settling {
+                deadline_ns: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -682,35 +902,11 @@ mod monitor_tests {
             assert_eq!(a, MonitorAction::None, "frame at {t}ms should not fire");
             s = ns;
         }
-        // A frame past the deadline (still sub-threshold) fires the acquire.
+        // A frame past the deadline (still sub-threshold) fires the acquire (and
+        // stays Settling until the dispatch is confirmed).
         let (s, a) = step_frame(s, &flat(101), None, (QUIET_MS + 1) * MS);
         assert_eq!(a, MonitorAction::Acquire);
-        assert!(matches!(s, MonitorState::Validating { .. }));
-    }
-
-    #[test]
-    fn validate_clean_reacquires_when_screen_moved_during_ocr() {
-        // Screen unchanged across OCR → overlay valid → Idle (rebaseline next).
-        let s = MonitorState::Validating {
-            clean_base: flat(100),
-        };
-        let (s, a) = step_validate(s, &flat(101), 0);
-        assert_eq!(a, MonitorAction::None);
-        assert!(matches!(s, MonitorState::Idle { base: None }));
-        // Screen changed a lot during OCR (tabbed to another app) → stale → hide
-        // + re-acquire. Compared pill-free, no mask needed.
-        let s = MonitorState::Validating {
-            clean_base: flat(0),
-        };
-        let (s, a) = step_validate(s, &flat(200), 5 * MS);
-        assert_eq!(a, MonitorAction::Hide);
-        assert!(matches!(
-            s,
-            MonitorState::Settling {
-                deadline_ns: Some(_),
-                ..
-            }
-        ));
+        assert!(matches!(s, MonitorState::Settling { base: Some(_), .. }));
     }
 
     #[test]

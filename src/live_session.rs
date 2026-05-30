@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::api::LanguageCode;
 use crate::color_matting::MattedStrip;
@@ -429,6 +429,22 @@ pub struct LiveSession {
     /// camera path keeps the translucent `0x101010C8`; the screen path sets an
     /// opaque pill so it isn't double-dimmed by the touch-capped window alpha.
     overlay_bg: AtomicU32,
+    /// Bumped every time an anchor canvas is swapped in (a visible overlay
+    /// change). The screen path's GL worker polls this to re-present overlays
+    /// incrementally as each rec batch lands; the camera path composites every
+    /// frame and ignores it.
+    canvas_version: AtomicU64,
+    /// When set, `upsert_block` / `upsert_provisional_overlay` update block data
+    /// but do **not** render the canvas — the caller renders it later (e.g. on
+    /// the GL thread at present time via `ensure_anchor_canvas`). The screen path
+    /// enables this so the per-block canvas raster doesn't run inline on the OCR
+    /// worker thread (it was O(N²) and stalled rec/translate ~2×). The camera
+    /// leaves it off (it renders on the worker as before).
+    defer_canvas: AtomicBool,
+    /// Bumped on every block/provisional *data* change (independent of whether
+    /// the canvas was rendered). The deferred (screen) path polls this to know
+    /// when to render+present.
+    content_version: AtomicU64,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -454,7 +470,27 @@ impl LiveSession {
             refresh_every_n_locked_frames: AtomicU32::new(DEFAULT_REFRESH_EVERY_N_LOCKED_FRAMES),
             overlay_oversample: AtomicU32::new(1.0_f32.to_bits()),
             overlay_bg: AtomicU32::new(0x1010_10C8),
+            canvas_version: AtomicU64::new(0),
+            defer_canvas: AtomicBool::new(false),
+            content_version: AtomicU64::new(0),
         }
+    }
+
+    /// Monotonic counter of visible overlay-canvas changes (see
+    /// [`Self::canvas_version`]).
+    pub fn canvas_version(&self) -> u64 {
+        self.canvas_version.load(Ordering::SeqCst)
+    }
+
+    /// Defer canvas rendering off the upsert path (see [`Self::defer_canvas`]).
+    pub fn set_defer_canvas(&self, defer: bool) {
+        self.defer_canvas.store(defer, Ordering::SeqCst);
+    }
+
+    /// Monotonic counter of block/provisional data changes (see
+    /// [`Self::content_version`]).
+    pub fn content_version(&self) -> u64 {
+        self.content_version.load(Ordering::SeqCst)
     }
 
     /// Set the overlay-canvas oversample factor (texels per surface
@@ -729,6 +765,8 @@ impl LiveSession {
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             anchors.clear();
         }
+        self.canvas_version.fetch_add(1, Ordering::SeqCst);
+        self.content_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The exact oriented pill footprints currently painted for `anchor_id`, in
@@ -991,7 +1029,21 @@ impl LiveSession {
         // refresh. The flash that creates is the price of correctness
         // until the staged-atomic-swap refactor lands. See
         // `analysis.md` § "Overlay swap on refresh" for context.
-        self.ensure_anchor_canvas(anchor_id, font_provider);
+        self.after_content_change(anchor_id, font_provider);
+    }
+
+    /// Record a block/provisional data change: bump `content_version`, and
+    /// render the canvas now unless deferred (the deferred caller renders later,
+    /// off this thread). See [`Self::defer_canvas`].
+    fn after_content_change(
+        &self,
+        anchor_id: AnchorId,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) {
+        self.content_version.fetch_add(1, Ordering::SeqCst);
+        if !self.defer_canvas.load(Ordering::SeqCst) {
+            self.ensure_anchor_canvas(anchor_id, font_provider);
+        }
     }
 
     /// Publish a provisional bbox-only overlay covering all
@@ -1018,7 +1070,7 @@ impl LiveSession {
                 .or_insert_with(|| AnchorOverlay::new(anchor_id));
             anchor.provisional_strips = surface_strips;
         }
-        self.ensure_anchor_canvas(anchor_id, font_provider);
+        self.after_content_change(anchor_id, font_provider);
     }
 
     /// Drop the provisional bbox-only strips published by
@@ -1032,6 +1084,7 @@ impl LiveSession {
                 anchor.provisional_strips.clear();
             }
         }
+        self.content_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Drop blocks from `anchor_id` whose id isn't in `ids`. Used
@@ -1050,6 +1103,7 @@ impl LiveSession {
                 // available here, so we can't rebuild eagerly.
             }
         }
+        self.content_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Rebuild the anchor canvas from its current block specs.
@@ -1104,6 +1158,7 @@ impl LiveSession {
                 if anchor.content_fingerprint() == snapshot_fp {
                     anchor.canvas = canvas;
                     anchor.rendered_fingerprint = Some(snapshot_fp);
+                    self.canvas_version.fetch_add(1, Ordering::SeqCst);
                 }
             }
         }
