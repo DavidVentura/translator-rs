@@ -455,6 +455,12 @@ pub struct LiveSession {
     /// full-bitmap `row_extents` scan is skipped (the screen copies the bitmap
     /// straight to the Canvas view; only the camera's GPU warp needs row extents).
     screen_overlay: AtomicBool,
+    /// Serializes screen-overlay canvas renders. The screen mutates its persistent
+    /// canvas in place (incremental block adds), and `ensure_anchor_canvas` is
+    /// called from both the GL thread (every present) and the worker (the one-shot
+    /// provisional render), so the in-place mutation must not interleave. Camera
+    /// renders into fresh buffers and don't take this.
+    screen_render_lock: Mutex<()>,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -485,6 +491,7 @@ impl LiveSession {
             content_version: AtomicU64::new(0),
             block_tiles: Mutex::new(HashMap::new()),
             screen_overlay: AtomicBool::new(false),
+            screen_render_lock: Mutex::new(()),
         }
     }
 
@@ -1160,6 +1167,10 @@ impl LiveSession {
         anchor_id: AnchorId,
         font_provider: &dyn crate::font_provider::FontProvider,
     ) {
+        if self.screen_overlay.load(Ordering::SeqCst) {
+            self.ensure_anchor_canvas_screen(anchor_id, font_provider);
+            return;
+        }
         let (snapshot_fp, blocks_snapshot, provisional_snapshot) = {
             let anchors = match self.overlay_anchors.lock() {
                 Ok(a) => a,
@@ -1182,21 +1193,17 @@ impl LiveSession {
         // thread) keeps reading the *old* `canvas` while glyph
         // rasterization runs. Only the final pointer-swap below
         // takes the lock again, and that swap is instantaneous.
-        // Deferred (screen) path: re-raster only changed blocks via the per-block
-        // tile cache. Camera path: `None` → the monolithic render_overlay.
-        let tile_cache = if self.defer_canvas.load(Ordering::SeqCst) {
-            Some(&self.block_tiles)
-        } else {
-            None
-        };
+        // Camera path: `None` tile cache → the monolithic render_overlay; no prev
+        // (camera always rebuilds — its canvas is read concurrently by the warp).
         let canvas = render_anchor_canvas(
             &blocks_snapshot,
             &provisional_snapshot,
             font_provider,
             self.overlay_oversample(),
             self.overlay_bg(),
-            tile_cache,
-            self.screen_overlay.load(Ordering::SeqCst),
+            None,
+            false,
+            None,
         );
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -1211,6 +1218,65 @@ impl LiveSession {
                     anchor.rendered_fingerprint = Some(snapshot_fp);
                     self.canvas_version.fetch_add(1, Ordering::SeqCst);
                 }
+            }
+        }
+    }
+
+    /// Screen variant of [`Self::ensure_anchor_canvas`]. The screen keeps a single
+    /// persistent canvas and updates it *in place* (incremental block adds via the
+    /// `prev` arg to `render_anchor_canvas`), so it must serialize renders — `ensure`
+    /// is called both from the GL thread (every present) and from the worker (the
+    /// one-shot provisional render). `screen_render_lock` guarantees one render at a
+    /// time; the canvas is taken out for the render so concurrent readers
+    /// (copy/monitor) see no canvas briefly and keep their last frame rather than a
+    /// torn one.
+    fn ensure_anchor_canvas_screen(
+        &self,
+        anchor_id: AnchorId,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) {
+        let _render = match self.screen_render_lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let (snapshot_fp, blocks_snapshot, provisional_snapshot, prev) = {
+            let mut anchors = match self.overlay_anchors.lock() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let anchor = match anchors.get_mut(&anchor_id) {
+                Some(a) => a,
+                None => return,
+            };
+            if anchor.is_canvas_current() {
+                return;
+            }
+            (
+                anchor.content_fingerprint(),
+                anchor.blocks.clone(),
+                anchor.provisional_strips.clone(),
+                anchor.canvas.take(),
+            )
+        };
+        let canvas = render_anchor_canvas(
+            &blocks_snapshot,
+            &provisional_snapshot,
+            font_provider,
+            self.overlay_oversample(),
+            self.overlay_bg(),
+            Some(&self.block_tiles),
+            true,
+            prev,
+        );
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            if let Some(anchor) = anchors.get_mut(&anchor_id) {
+                anchor.canvas = canvas;
+                // Mark as reflecting the snapshot. If a worker upsert raced in after
+                // the snapshot, `content_fingerprint()` now differs, so the next
+                // present re-renders and incrementally adds the newer block — the
+                // in-place paint we just did stays correct for what it covered.
+                anchor.rendered_fingerprint = Some(snapshot_fp);
+                self.canvas_version.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -2658,6 +2724,25 @@ fn block_content_hash(strips: &[OrientedRect], display_text: &str, language: &st
     h.finish()
 }
 
+/// Geometry hash of a set of pill strips. Used two ways by the incremental update
+/// path: over the provisional strips (vs [`AnchorRaster::painted_provisional_fp`])
+/// to detect provisional publish/clear, and over a block's strips to detect a
+/// geometry change (text-only change keeps the same hash → safe in-place repaint;
+/// re-segmentation changes it → full rebuild).
+fn strips_fingerprint(strips: &[OrientedRect]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (strips.len() as u64).hash(&mut h);
+    for s in strips {
+        s.cx.to_bits().hash(&mut h);
+        s.cy.to_bits().hash(&mut h);
+        s.width.to_bits().hash(&mut h);
+        s.height.to_bits().hash(&mut h);
+        s.angle_radians.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Per-detection result from [`LiveSession::observe_detections`].
 #[derive(Clone, Debug)]
 pub struct DetectionOutcome {
@@ -2756,6 +2841,16 @@ pub const HORIZONTAL_PAD_PX: f32 = 8.0;
 /// antialiasing room.
 pub const ITEM_BITMAP_PAD_PX: f32 = 4.0;
 
+/// Surface-px margin the incremental clear inflates a pill by when erasing it to
+/// transparent, so no fringe of the original solid fill survives at the edge.
+const CLEAR_MARGIN_SURFACE_PX: f32 = 1.5;
+
+/// Half-open AABB overlap test (touching edges don't count). Used to decide whether
+/// a clear may have nicked a surviving block's pill, so it gets re-asserted.
+fn aabb_overlaps(a: &crate::ocr::Rect, b: &crate::ocr::Rect) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
 /// Pre-composed RGBA canvas covering one anchor's full overlay
 /// (background fills + translated glyphs already blended in surface
 /// space). The per-frame compositor warps this single bitmap with one
@@ -2786,6 +2881,23 @@ pub struct AnchorRaster {
     /// masks these out of its movement diff, and under-pill detection focuses on
     /// them. Saved here so no consumer re-derives geometry from the raw strips.
     pub painted_pills: Vec<OrientedRect>,
+    /// `block_id -> (content_hash, surface_pills)` of every block baked into
+    /// `bitmap`. The screen incremental path repaints any block whose `content_hash`
+    /// differs (new block, or placeholder→text — which often *widens* the block as
+    /// paragraph lines merge); repainting the opaque pill at its current geometry
+    /// covers the old narrower pill + its text, so the update is clean in place. It
+    /// falls back to a full rebuild only on the unsafe cases: a block removed, or the
+    /// canvas AABB grown (can't happen while the provisional still bounds the set).
+    /// The stored pills (surface coords) keep [`Self::painted_pills`] — the monitor's
+    /// mask — in sync as blocks widen. The camera fills it with all blocks each build.
+    pub painted_blocks: HashMap<u64, (u64, Vec<OrientedRect>)>,
+    /// Fingerprint of the provisional strips baked into `bitmap`. When it changes,
+    /// the incremental path clears the now-unwanted provisional pills in place.
+    pub painted_provisional_fp: u64,
+    /// The provisional pill footprints (surface coords) baked into `bitmap`. On a
+    /// provisional drop the incremental path clears the *orphans* among these — the
+    /// ones not covered by a surviving block — to transparent, instead of rebuilding.
+    pub painted_provisional_pills: Vec<OrientedRect>,
 }
 
 /// Unpack a `0xAARRGGBB` value into the `[r, g, b, a]` byte tuple the
@@ -2900,11 +3012,9 @@ pub fn render_anchor_canvas(
     bg_rgba: [u8; 4],
     tile_cache: Option<&Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>>,
     screen_overlay: bool,
+    prev: Option<AnchorRaster>,
 ) -> Option<AnchorRaster> {
-    use crate::ocr::{
-        OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
-        PreparedTextLine, Rect,
-    };
+    use crate::ocr::{PreparedImageOverlay, PreparedTextBlock};
     if blocks.is_empty() && provisional_strips.is_empty() {
         return None;
     }
@@ -3009,8 +3119,193 @@ pub fn render_anchor_canvas(
     let pad = ITEM_BITMAP_PAD_PX;
     let origin_x = (min_x - pad).max(0.0);
     let origin_y = (min_y - pad).max(0.0);
-    let bitmap_w = (((max_x + pad - origin_x) * os).ceil() as i32).max(1) as u32;
-    let bitmap_h = (((max_y + pad - origin_y) * os).ceil() as i32).max(1) as u32;
+    // floor, not ceil: a sub-pixel of overhang dropped at the right/bottom edge is
+    // invisible (1px on a ~3000px screen) and avoids a phantom pixel that would jitter
+    // the canvas size as block normalization nudges the AABB.
+    let bitmap_w = (((max_x + pad - origin_x) * os).floor() as i32).max(1) as u32;
+    let bitmap_h = (((max_y + pad - origin_y) * os).floor() as i32).max(1) as u32;
+    let prov_fp = strips_fingerprint(&prepared_provisional);
+
+    // Incremental in-place update (screen only). When the canvas geometry and the
+    // provisional set are unchanged and no block was removed, repaint just the
+    // *changed* blocks (new ones, and placeholder→text updates — which often widen
+    // the block as paragraph lines merge) onto the persistent canvas. Repainting a
+    // block's opaque pill at its current geometry covers the old narrower pill + its
+    // text, so the update is clean in place; unchanged blocks + the provisional are
+    // left untouched. Streaming presents then touch only the blocks that moved,
+    // instead of repainting the whole canvas (provisional included) every present
+    // against the OCR pool. The end-of-acquire provisional drop changes the geometry
+    // and falls through to one full rebuild.
+    if screen_overlay {
+        if let (Some(p), Some(cache)) = (&prev, tile_cache) {
+            // Paint into the persistent buffer using *its* geometry, not the freshly
+            // computed one. The recomputed size can differ by ±1px of pure `ceil()`
+            // jitter when blocks first land on the provisional (block normalization
+            // snaps line angles to the block average, nudging the x/y AABB a hair) —
+            // a real resize would exceed the tolerance and fall through to a rebuild.
+            let (cw, ch, ox, oy) = (p.width, p.height, p.surface_origin_x, p.surface_origin_y);
+            let geom_ok = (cw as i32 - bitmap_w as i32).abs() <= 2
+                && (ch as i32 - bitmap_h as i32).abs() <= 2
+                && (ox - origin_x).abs() < 2.0
+                && (oy - origin_y).abs() < 2.0
+                && (p.oversample - os).abs() < 1e-4;
+            if geom_ok {
+                let mut raster = prev.expect("checked Some above");
+                let to_canvas = |r: &OrientedRect| OrientedRect {
+                    cx: (r.cx - ox) * os,
+                    cy: (r.cy - oy) * os,
+                    width: r.width * os,
+                    height: r.height * os,
+                    angle_radians: r.angle_radians,
+                };
+                let clear_margin = CLEAR_MARGIN_SURFACE_PX * os;
+                let mut cleared: Vec<crate::ocr::Rect> = Vec::new();
+
+                // 1. Removed blocks (rec-failed, dropped by the end-of-acquire retain):
+                //    erase their pills + text to transparent. Blocks are disjoint, so a
+                //    removed block can't overlap a survivor.
+                let prepared_ids: std::collections::HashSet<u64> =
+                    prepared.iter().map(|pb| pb.block_id).collect();
+                let removed: Vec<u64> = raster
+                    .painted_blocks
+                    .keys()
+                    .filter(|id| !prepared_ids.contains(id))
+                    .copied()
+                    .collect();
+                for id in &removed {
+                    if let Some((_, pills)) = raster.painted_blocks.remove(id) {
+                        for pp in &pills {
+                            crate::planar_engine::clear_oriented_rect(
+                                &mut raster.bitmap,
+                                cw,
+                                ch,
+                                &to_canvas(pp),
+                                clear_margin,
+                            );
+                            cleared.push(pp.to_aabb());
+                        }
+                    }
+                }
+
+                // 2. Provisional change (the end-of-acquire drop): erase the *orphan*
+                //    provisional pills — those not covered by any surviving block. The
+                //    ones under a block are left (the opaque block pill hides them).
+                if prov_fp != raster.painted_provisional_fp {
+                    let block_pills: Vec<OrientedRect> = raster
+                        .painted_blocks
+                        .values()
+                        .flat_map(|(_, pl)| pl.iter().copied())
+                        .collect();
+                    for pp in &raster.painted_provisional_pills {
+                        if !block_pills.iter().any(|bp| bp.contains_point(pp.cx, pp.cy)) {
+                            crate::planar_engine::clear_oriented_rect(
+                                &mut raster.bitmap,
+                                cw,
+                                ch,
+                                &to_canvas(pp),
+                                clear_margin,
+                            );
+                            cleared.push(pp.to_aabb());
+                        }
+                    }
+                    raster.painted_provisional_pills = prepared_provisional.clone();
+                    raster.painted_provisional_fp = prov_fp;
+                }
+
+                // 3. Blocks to repaint: content changed (new, or placeholder→text /
+                //    widening), or an unchanged survivor whose pill a clear above may
+                //    have nicked at the edge (re-assert it so no hole is left).
+                let to_repaint: Vec<&PreparedBlock> = prepared
+                    .iter()
+                    .filter(|pb| {
+                        match raster.painted_blocks.get(&pb.block_id) {
+                            None => true,
+                            Some((h, pills)) => {
+                                *h != pb.spec.content_hash
+                                    || (!cleared.is_empty()
+                                        && pills.iter().any(|pp| {
+                                            let a = pp.to_aabb();
+                                            cleared.iter().any(|c| aabb_overlaps(&a, c))
+                                        }))
+                            }
+                        }
+                    })
+                    .collect();
+                let mut lang = String::new();
+                let mut text_blocks: Vec<crate::ocr::PreparedTextBlock> = Vec::new();
+                let mut metas: Vec<(u64, u64)> = Vec::new();
+                for pb in &to_repaint {
+                    let local = localize_visuals(&pb.visuals, ox, oy, os);
+                    for (i, v) in local.iter().enumerate() {
+                        let color = block_pill_color(pb.spec, i, pb.block_id, bg_rgba);
+                        crate::planar_engine::fill_oriented_rect_solid(
+                            &mut raster.bitmap,
+                            cw,
+                            ch,
+                            v,
+                            color,
+                        );
+                    }
+                    raster
+                        .painted_blocks
+                        .insert(pb.block_id, (pb.spec.content_hash, pb.visuals.clone()));
+                    if let Some(tb) = build_block_text_block(pb.spec, &pb.visuals, &local, os, cw, ch)
+                    {
+                        if lang.is_empty() {
+                            lang = pb.spec.language.clone();
+                        }
+                        text_blocks.push(tb);
+                        metas.push((pb.block_id, pb.spec.content_hash));
+                    }
+                }
+                {
+                    let mut c = cache.lock().expect("tile cache poisoned");
+                    for id in &removed {
+                        c.remove(id);
+                    }
+                    if !text_blocks.is_empty() {
+                        let opts = crate::image_render::RenderOptions {
+                            language: lang,
+                            min_font_size_px: 6.0 * os,
+                        };
+                        let tiles = crate::image_render::render_block_tiles(
+                            &text_blocks,
+                            font_provider,
+                            &opts,
+                        );
+                        for ((bid, hash), tile_opt) in metas.iter().zip(tiles) {
+                            match tile_opt {
+                                Some(tile) => {
+                                    composite_tile(&mut raster.bitmap, cw, ch, &tile);
+                                    c.insert(*bid, (*hash, tile));
+                                }
+                                None => {
+                                    c.remove(bid);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Rebuild the flat pill list (monitor mask) from the current
+                // provisional + per-block pills so widened blocks update their mask.
+                raster.painted_pills = raster
+                    .painted_provisional_pills
+                    .iter()
+                    .copied()
+                    .chain(raster.painted_blocks.values().flat_map(|(_, p)| p.iter().copied()))
+                    .collect();
+                let t_incr = t0.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "[canvas] {cw}x{ch} incr ~{}blk -{}rm (now {}) {t_incr:.1}ms",
+                    to_repaint.len(),
+                    removed.len(),
+                    raster.painted_blocks.len(),
+                );
+                return Some(raster);
+            }
+        }
+    }
+
     let pixels = (bitmap_w as usize) * (bitmap_h as usize);
     let mut canvas = vec![0u8; pixels * 4];
     let t_alloc = t0.elapsed().as_secs_f64() * 1000.0;
@@ -3043,31 +3338,9 @@ pub fn render_anchor_canvas(
     let mut pill_area_px: f64 = 0.0;
     let mut local_visuals: Vec<Vec<OrientedRect>> = Vec::with_capacity(prepared.len());
     for pb in &prepared {
-        let local: Vec<OrientedRect> = pb
-            .visuals
-            .iter()
-            .map(|v| OrientedRect {
-                cx: (v.cx - origin_x) * os,
-                cy: (v.cy - origin_y) * os,
-                width: v.width * os,
-                height: v.height * os,
-                angle_radians: v.angle_radians,
-            })
-            .collect();
-        let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
-            DEBUG_BG_PALETTE[(pb.block_id as usize) % DEBUG_BG_PALETTE.len()]
-        } else {
-            bg_rgba
-        };
+        let local = localize_visuals(&pb.visuals, origin_x, origin_y, os);
         for (i, v) in local.iter().enumerate() {
-            let strip_color = pb
-                .spec
-                .matted_strips
-                .get(i)
-                .and_then(|m| m.as_ref())
-                .and_then(|m| m.bg_uniform_argb)
-                .map(argb_to_rgba_bytes)
-                .unwrap_or(default_bg);
+            let strip_color = block_pill_color(pb.spec, i, pb.block_id, bg_rgba);
             pill_area_px += (v.width * v.height).max(0.0) as f64;
             fill_pill(&mut canvas, v, strip_color);
         }
@@ -3102,69 +3375,15 @@ pub fn render_anchor_canvas(
     let mut block_meta: Vec<(u64, u64)> = Vec::new();
     let mut anchor_lang = String::new();
     for (pb, local) in prepared.iter().zip(local_visuals.iter()) {
-        if pb.spec.display_text.trim().is_empty() {
-            continue;
+        if let Some(tb) =
+            build_block_text_block(pb.spec, &pb.visuals, local, os, bitmap_w, bitmap_h)
+        {
+            if anchor_lang.is_empty() {
+                anchor_lang = pb.spec.language.clone();
+            }
+            prepared_text_blocks.push(tb);
+            block_meta.push((pb.block_id, pb.spec.content_hash));
         }
-        if anchor_lang.is_empty() {
-            anchor_lang = pb.spec.language.clone();
-        }
-        let foreground_argb: u32 = pb
-            .spec
-            .matted_strips
-            .iter()
-            .find_map(|m| m.as_ref().map(|s| s.ink_is_dark))
-            .map(|dark| if dark { 0xFF10_1010 } else { 0xFFFF_FFFF })
-            .unwrap_or(0xFFFF_FFFF);
-        let lines: Vec<PreparedTextLine> = local
-            .iter()
-            .map(|v| {
-                let text_box = OrientedRect {
-                    cx: v.cx,
-                    cy: v.cy,
-                    width: (v.width
-                        - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX * os)
-                        .max(1.0),
-                    height: v.height,
-                    angle_radians: v.angle_radians,
-                };
-                let aabb = text_box.to_aabb();
-                let bbox = Rect {
-                    left: aabb.left.min(bitmap_w.saturating_sub(1)),
-                    top: aabb.top.min(bitmap_h.saturating_sub(1)),
-                    right: aabb.right.min(bitmap_w),
-                    bottom: aabb.bottom.min(bitmap_h),
-                };
-                PreparedTextLine {
-                    text: String::new(),
-                    bounding_box: bbox.clone(),
-                    oriented_box: text_box,
-                    word_rects: vec![bbox],
-                    background_argb: 0,
-                    foreground_argb,
-                }
-            })
-            .collect();
-        let suggested_font_px = pb
-            .visuals
-            .iter()
-            .map(|v| v.height)
-            .fold(0.0_f32, f32::max)
-            .clamp(10.0, 120.0)
-            * os;
-        let block_bbox = block_aabb_within_canvas(local, bitmap_w, bitmap_h);
-        prepared_text_blocks.push(PreparedTextBlock {
-            source_text: String::new(),
-            translated_text: pb.spec.display_text.clone(),
-            bounding_box: block_bbox,
-            lines,
-            layout_hints: OverlayLayoutHints {
-                layout_mode: OverlayLayoutMode::PerLine,
-                suggested_font_size_px: suggested_font_px,
-            },
-            background_argb: 0,
-            foreground_argb,
-        });
-        block_meta.push((pb.block_id, pb.spec.content_hash));
     }
 
     let opts = crate::image_render::RenderOptions {
@@ -3218,6 +3437,10 @@ pub fn render_anchor_canvas(
         if cached { "(tiles)" } else { "" },
         t_rows - t_text,
     );
+    let painted_blocks: HashMap<u64, (u64, Vec<OrientedRect>)> = prepared
+        .iter()
+        .map(|pb| (pb.block_id, (pb.spec.content_hash, pb.visuals.clone())))
+        .collect();
     Some(AnchorRaster {
         bitmap: final_bitmap,
         width: bitmap_w,
@@ -3227,6 +3450,119 @@ pub fn render_anchor_canvas(
         surface_origin_y: origin_y,
         row_extents,
         painted_pills,
+        painted_blocks,
+        painted_provisional_fp: prov_fp,
+        painted_provisional_pills: prepared_provisional.clone(),
+    })
+}
+
+/// Translate a block's surface-coord visuals into oversampled canvas-local coords.
+/// Shared by the full build (step 3) and the screen incremental update.
+fn localize_visuals(
+    visuals: &[OrientedRect],
+    origin_x: f32,
+    origin_y: f32,
+    os: f32,
+) -> Vec<OrientedRect> {
+    visuals
+        .iter()
+        .map(|v| OrientedRect {
+            cx: (v.cx - origin_x) * os,
+            cy: (v.cy - origin_y) * os,
+            width: v.width * os,
+            height: v.height * os,
+            angle_radians: v.angle_radians,
+        })
+        .collect()
+}
+
+/// Background color for a block's i-th pill: the matted per-strip color when the
+/// matting resolved a uniform bg, else the anchor default (or a debug palette
+/// entry keyed by block id when `DEBUG_PER_BLOCK_BG_COLOR`).
+fn block_pill_color(spec: &BlockSpec, i: usize, block_id: u64, bg_rgba: [u8; 4]) -> [u8; 4] {
+    let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
+        DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
+    } else {
+        bg_rgba
+    };
+    spec.matted_strips
+        .get(i)
+        .and_then(|m| m.as_ref())
+        .and_then(|m| m.bg_uniform_argb)
+        .map(argb_to_rgba_bytes)
+        .unwrap_or(default_bg)
+}
+
+/// Build one block's `PreparedTextBlock` (per-line oriented text boxes + layout
+/// hints) from its spec + localized visuals. Returns `None` for empty-text
+/// placeholder blocks (they keep their bg-only pill, no glyph pass). Shared by the
+/// full build (step 4) and the screen incremental update.
+fn build_block_text_block(
+    spec: &BlockSpec,
+    visuals: &[OrientedRect],
+    local: &[OrientedRect],
+    os: f32,
+    bitmap_w: u32,
+    bitmap_h: u32,
+) -> Option<crate::ocr::PreparedTextBlock> {
+    use crate::ocr::{
+        OverlayLayoutHints, OverlayLayoutMode, PreparedTextBlock, PreparedTextLine, Rect,
+    };
+    if spec.display_text.trim().is_empty() {
+        return None;
+    }
+    let foreground_argb: u32 = spec
+        .matted_strips
+        .iter()
+        .find_map(|m| m.as_ref().map(|s| s.ink_is_dark))
+        .map(|dark| if dark { 0xFF10_1010 } else { 0xFFFF_FFFF })
+        .unwrap_or(0xFFFF_FFFF);
+    let lines: Vec<PreparedTextLine> = local
+        .iter()
+        .map(|v| {
+            let text_box = OrientedRect {
+                cx: v.cx,
+                cy: v.cy,
+                width: (v.width - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX * os)
+                    .max(1.0),
+                height: v.height,
+                angle_radians: v.angle_radians,
+            };
+            let aabb = text_box.to_aabb();
+            let bbox = Rect {
+                left: aabb.left.min(bitmap_w.saturating_sub(1)),
+                top: aabb.top.min(bitmap_h.saturating_sub(1)),
+                right: aabb.right.min(bitmap_w),
+                bottom: aabb.bottom.min(bitmap_h),
+            };
+            PreparedTextLine {
+                text: String::new(),
+                bounding_box: bbox.clone(),
+                oriented_box: text_box,
+                word_rects: vec![bbox],
+                background_argb: 0,
+                foreground_argb,
+            }
+        })
+        .collect();
+    let suggested_font_px = visuals
+        .iter()
+        .map(|v| v.height)
+        .fold(0.0_f32, f32::max)
+        .clamp(10.0, 120.0)
+        * os;
+    let block_bbox = block_aabb_within_canvas(local, bitmap_w, bitmap_h);
+    Some(PreparedTextBlock {
+        source_text: String::new(),
+        translated_text: spec.display_text.clone(),
+        bounding_box: block_bbox,
+        lines,
+        layout_hints: OverlayLayoutHints {
+            layout_mode: OverlayLayoutMode::PerLine,
+            suggested_font_size_px: suggested_font_px,
+        },
+        background_argb: 0,
+        foreground_argb,
     })
 }
 

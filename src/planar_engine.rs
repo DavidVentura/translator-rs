@@ -2700,11 +2700,36 @@ pub fn fill_oriented_rect_solid(
     if color[3] == 0 {
         return;
     }
+    fill_oriented_rect_solid_unguarded(rgba, w, h, rect, color);
+}
+
+/// Reset an oriented rect region to transparent (`0,0,0,0`), inflated by `margin`
+/// px on every side. Used to erase a pill (background + the text composited over
+/// it) from the persistent screen canvas when a block is removed or a provisional
+/// pill is dropped — the canvas has no content underneath, so transparent is the
+/// correct "uncovered" value. The margin covers sub-pixel overhang of the original
+/// solid fill so no fringe is left behind.
+pub fn clear_oriented_rect(rgba: &mut [u8], w: u32, h: u32, rect: &crate::ocr::OrientedRect, margin: f32) {
+    let grown = crate::ocr::OrientedRect {
+        width: rect.width + 2.0 * margin,
+        height: rect.height + 2.0 * margin,
+        ..*rect
+    };
+    fill_oriented_rect_solid_unguarded(rgba, w, h, &grown, [0, 0, 0, 0]);
+}
+
+/// Body of [`fill_oriented_rect_solid`] without the `color[3] == 0` early-out, so a
+/// fully-transparent clear actually writes. Kept private; callers use
+/// `fill_oriented_rect_solid` (fills) or `clear_oriented_rect` (erases).
+fn fill_oriented_rect_solid_unguarded(
+    rgba: &mut [u8],
+    w: u32,
+    h: u32,
+    rect: &crate::ocr::OrientedRect,
+    color: [u8; 4],
+) {
     let hw = rect.width * 0.5;
     let hh = rect.height * 0.5;
-    // Axis-aligned fast path: fill each row span as a contiguous slice so the
-    // bounds-check is hoisted out of the inner loop and the 4-byte stores
-    // vectorize, rather than a per-pixel bounds-checked write.
     if rect.angle_radians.abs() < 1e-3 {
         let min_x = (rect.cx - hw).round().clamp(0.0, w as f32) as usize;
         let max_x = (rect.cx + hw).round().clamp(0.0, w as f32) as usize;
@@ -2723,7 +2748,6 @@ pub fn fill_oriented_rect_solid(
         }
         return;
     }
-    // Tilted: per-pixel hard inside-test over the rect's AABB.
     let cos = rect.angle_radians.cos();
     let sin = rect.angle_radians.sin();
     let half_diag = (hw * hw + hh * hh).sqrt();

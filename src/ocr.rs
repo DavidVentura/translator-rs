@@ -85,6 +85,18 @@ impl OrientedRect {
     pub fn is_axis_aligned(&self, epsilon: f32) -> bool {
         self.angle_radians.abs() < epsilon
     }
+
+    /// True when `(px, py)` lies inside the oriented rect (project into the rect's local frame
+    /// and bounds-check). Used to decide whether a provisional pill is covered by a block pill.
+    pub fn contains_point(&self, px: f32, py: f32) -> bool {
+        let cos = self.angle_radians.cos();
+        let sin = self.angle_radians.sin();
+        let dx = px - self.cx;
+        let dy = py - self.cy;
+        let lx = dx * cos + dy * sin;
+        let ly = -dx * sin + dy * cos;
+        lx.abs() <= self.width * 0.5 && ly.abs() <= self.height * 0.5
+    }
 }
 
 impl Default for OrientedRect {
