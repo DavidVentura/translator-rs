@@ -267,6 +267,19 @@ pub struct BlockSpec {
     /// compares against the previous value to skip canvas rebuilds
     /// when the same content arrives twice.
     pub content_hash: u64,
+    /// Shaped glyph instances for the GPU compositor (screen overlay
+    /// only), with pen positions in this block's own canvas-texel frame
+    /// — relative to the block's AABB origin (`canvas_geometry` over the
+    /// block's visuals), scaled by oversample. Shaped once on upsert so
+    /// the per-present draw-list build only offsets them by the
+    /// block-origin → canvas-origin delta instead of re-shaping every
+    /// frame. Empty for the camera path and for empty-text placeholders.
+    pub glyph_instances: Vec<crate::image_render::GlyphInstanceData>,
+    /// Upright coverage masks for the unique glyphs referenced by
+    /// `glyph_instances`. Block-local because they're shaped at upsert
+    /// time; merged across blocks (deduped by key) at draw-list build.
+    pub glyph_masks:
+        HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
 }
 
 /// Scan an RGBA bitmap and return, per row, the half-open
@@ -444,11 +457,6 @@ pub struct LiveSession {
     /// the canvas was rendered). The deferred (screen) path polls this to know
     /// when to render+present.
     content_version: AtomicU64,
-    /// Per-block rasterized text tiles, keyed by block id → `(content_hash,
-    /// tile)`. On the screen path `render_anchor_canvas` re-rasters only blocks
-    /// whose hash changed and composites cached tiles for the rest — instead of
-    /// re-shaping+rasterizing every block each render.
-    block_tiles: Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
     /// Marks the lightweight screen-overlay render path (vs the camera). When set:
     /// pills are filled solid + square (opaque, no SDF feather/rounding); the
     /// full-bitmap `row_extents` scan is skipped (the screen copies the bitmap
@@ -491,7 +499,6 @@ impl LiveSession {
             overlay_bg: AtomicU32::new(0x1010_10C8),
             canvas_version: AtomicU64::new(0),
             content_version: AtomicU64::new(0),
-            block_tiles: Mutex::new(HashMap::new()),
             screen_overlay: AtomicBool::new(false),
             glyph_cache: Mutex::new(crate::image_render::FontCache::default()),
         }
@@ -586,14 +593,11 @@ impl LiveSession {
 
     /// Build the GPU overlay draw list for `anchor_id` from its current block +
     /// provisional content (the GPU replacement for [`Self::ensure_anchor_canvas`]).
-    /// Snapshots under the lock, builds outside it (glyph raster), then stashes the
-    /// pill footprints back on the anchor for the movement monitor's mask. `None`
-    /// when there's nothing to show. Runs on the GL thread.
-    pub fn overlay_draw_list(
-        &self,
-        anchor_id: AnchorId,
-        font_provider: &dyn crate::font_provider::FontProvider,
-    ) -> Option<OverlayDrawList> {
+    /// Snapshots under the lock, builds outside it (glyphs are already shaped on
+    /// upsert, so this is just pill geometry + pen-offset arithmetic), then stashes
+    /// the pill footprints back on the anchor for the movement monitor's mask.
+    /// `None` when there's nothing to show. Runs on the GL thread.
+    pub fn overlay_draw_list(&self, anchor_id: AnchorId) -> Option<OverlayDrawList> {
         let (blocks, provisional) = {
             let anchors = self.overlay_anchors.lock().ok()?;
             let anchor = anchors.get(&anchor_id)?;
@@ -602,11 +606,8 @@ impl LiveSession {
         let dl = build_overlay_draw_list(
             &blocks,
             &provisional,
-            font_provider,
             self.overlay_oversample(),
             self.overlay_bg(),
-            &self.block_tiles,
-            &self.glyph_cache,
         )?;
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             if let Some(anchor) = anchors.get_mut(&anchor_id) {
@@ -1108,6 +1109,36 @@ impl LiveSession {
         let display_text = pick_display_text(&source_text, &translated_text);
         let hash = block_content_hash(&strips, &display_text, &language);
         {
+            let anchors = match self.overlay_anchors.lock() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            if let Some(existing) = anchors.get(&anchor_id).and_then(|a| a.blocks.get(&id)) {
+                if existing.content_hash == hash {
+                    return;
+                }
+            }
+        }
+        let mut spec = BlockSpec {
+            strips,
+            matted_strips,
+            display_text,
+            language,
+            content_hash: hash,
+            glyph_instances: Vec::new(),
+            glyph_masks: HashMap::new(),
+        };
+        // Screen overlay composites glyphs on the GPU from these pre-shaped
+        // instances; shape them here (off the present thread, once per content
+        // change) so `build_overlay_draw_list` only offsets pen positions. The
+        // camera path rasterizes its CPU canvas in `render_anchor_canvas`, so it
+        // leaves the glyph fields empty.
+        if self.screen_overlay.load(Ordering::SeqCst) {
+            let (instances, masks) = self.shape_block_glyphs(&spec, font_provider);
+            spec.glyph_instances = instances;
+            spec.glyph_masks = masks;
+        }
+        {
             let mut anchors = match self.overlay_anchors.lock() {
                 Ok(a) => a,
                 Err(_) => return,
@@ -1115,21 +1146,7 @@ impl LiveSession {
             let anchor = anchors
                 .entry(anchor_id)
                 .or_insert_with(|| AnchorOverlay::new(anchor_id));
-            if let Some(existing) = anchor.blocks.get(&id) {
-                if existing.content_hash == hash {
-                    return;
-                }
-            }
-            anchor.blocks.insert(
-                id,
-                BlockSpec {
-                    strips,
-                    matted_strips,
-                    display_text,
-                    language,
-                    content_hash: hash,
-                },
-            );
+            anchor.blocks.insert(id, spec);
             // Deliberately *don't* drop `anchor.canvas` — the next
             // `ensure_anchor_canvas` call will build the new canvas
             // off the lock and swap it in atomically once ready, so
@@ -1157,6 +1174,45 @@ impl LiveSession {
         // until the staged-atomic-swap refactor lands. See
         // `analysis.md` § "Overlay swap on refresh" for context.
         self.after_content_change(anchor_id, font_provider);
+    }
+
+    /// Shape one block's glyphs into its own canvas-texel frame for the GPU
+    /// compositor: pen positions are relative to the block's AABB origin
+    /// (`canvas_geometry` over the block's own visuals) scaled by oversample, so
+    /// `build_overlay_draw_list` only has to offset them by the block-origin →
+    /// canvas-origin delta. Returns empty for placeholder (empty-text) blocks.
+    /// Mirrors the geometry chain of [`build_overlay_draw_list`]'s per-block setup,
+    /// localized to the block instead of the shared canvas.
+    fn shape_block_glyphs(
+        &self,
+        spec: &BlockSpec,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) -> (
+        Vec<crate::image_render::GlyphInstanceData>,
+        HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
+    ) {
+        let os = self.overlay_oversample().max(1.0);
+        let visuals = inflate_block_visuals(spec);
+        let Some((origin_x, origin_y, bitmap_w, bitmap_h)) = canvas_geometry(&visuals, os) else {
+            return (Vec::new(), HashMap::new());
+        };
+        let local = localize_visuals(&visuals, origin_x, origin_y, os);
+        let Some(tb) = build_block_text_block(spec, &visuals, &local, os, bitmap_w, bitmap_h) else {
+            return (Vec::new(), HashMap::new());
+        };
+        let opts = crate::image_render::RenderOptions {
+            language: spec.language.clone(),
+            min_font_size_px: 6.0 * os,
+        };
+        let collector = with_glyph_cache(Some(&self.glyph_cache), |gc| {
+            crate::image_render::collect_overlay_glyphs(
+                std::slice::from_ref(&tb),
+                gc,
+                font_provider,
+                &opts,
+            )
+        });
+        (collector.instances, collector.masks)
     }
 
     /// Record a block/provisional data change: bump `content_version`, and render
@@ -3117,31 +3173,14 @@ pub struct OverlayPill {
     pub color: [u8; 4],
 }
 
-/// One block's translated-text tile, placed in **overlay-texture-local texel**
-/// coords (`left/top`, like [`crate::image_render::BlockTile`]). `rgba` is the
-/// premultiplied straight-alpha tile the GPU uploads as a texture; the compositor
-/// caches it by `(block_id, content_hash)` so an unchanged block skips the
-/// re-upload.
-#[derive(Clone, Debug)]
-pub struct OverlayTile {
-    pub block_id: u64,
-    pub content_hash: u64,
-    pub rgba: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub left: i32,
-    pub top: i32,
-}
-
 /// Backend-agnostic GPU draw list for one anchor's overlay: oriented pill quads
-/// (surface coords) + per-block text tiles (texture-local coords), plus the
-/// canvas geometry the compositor renders into and the `painted_pills` the
-/// movement monitor masks. The GPU compositor renders this into an overlay
-/// texture (rounded pills + tiles), which the present then warps by the
-/// homography (camera) or identity (screen) — replacing the CPU
-/// [`AnchorRaster`] build for production. Shared by both paths; the camera differs
-/// only in the present transform.
-#[derive(Clone, Debug, Default)]
+/// (surface coords) + per-glyph instance data for the GPU atlas compositor, plus
+/// the canvas geometry the compositor renders into and the `painted_pills` the
+/// movement monitor masks. The GPU compositor renders this into an overlay texture
+/// (rounded pills + glyph quads), which the present then warps by the homography
+/// (camera) or identity (screen) — replacing the CPU [`AnchorRaster`] build for
+/// production. Shared by both paths; the camera differs only in the present transform.
+#[derive(Default)]
 pub struct OverlayDrawList {
     /// Canvas (overlay-texture) origin in surface coords.
     pub origin_x: f32,
@@ -3152,26 +3191,25 @@ pub struct OverlayDrawList {
     pub bitmap_w: u32,
     pub bitmap_h: u32,
     pub pills: Vec<OverlayPill>,
-    pub tiles: Vec<OverlayTile>,
+    pub glyphs: crate::image_render::GlyphCollector,
     /// Pill footprints (surface coords) for the movement monitor's mask.
     pub painted_pills: Vec<OrientedRect>,
 }
 
 /// Build the GPU draw list for one anchor's overlay: the GPU counterpart of
-/// [`render_anchor_canvas`], producing oriented pill quads + per-block text tiles
-/// instead of compositing them into a bitmap. Glyph rasterization still happens
-/// on the CPU via [`render_block_tiles`] (per-block, cached in `tile_cache`), but
-/// the pill fill + tile composite move to the GPU. Geometry is computed
-/// identically to `render_anchor_canvas` so the result is pixel-aligned. `None`
-/// when there's nothing to show.
+/// [`render_anchor_canvas`], producing oriented pill quads + per-glyph instance
+/// data for the GPU atlas compositor. Glyphs are shaped once per content change in
+/// [`LiveSession::shape_block_glyphs`] (block-local pen positions); this only
+/// offsets each block's instances by its block-origin → canvas-origin delta and
+/// merges the per-block masks — O(N_glyphs) arithmetic, no font access. The GPU
+/// places and rotates the upright masks, so a tilted line reuses the same atlas
+/// entry as axis-aligned text. Geometry is computed identically to
+/// `render_anchor_canvas`. `None` when there is nothing to show.
 pub(crate) fn build_overlay_draw_list(
     blocks: &std::collections::BTreeMap<u64, BlockSpec>,
     provisional_strips: &[OrientedRect],
-    font_provider: &dyn crate::font_provider::FontProvider,
     oversample: f32,
     bg_rgba: [u8; 4],
-    tile_cache: &Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
-    glyph_cache: &Mutex<crate::image_render::FontCache>,
 ) -> Option<OverlayDrawList> {
     if blocks.is_empty() && provisional_strips.is_empty() {
         return None;
@@ -3224,70 +3262,31 @@ pub(crate) fn build_overlay_draw_list(
         });
     }
 
-    // Text tiles: build one PreparedTextBlock per block with text, render (cached)
-    // per-block tiles. Mirrors `composite_block_tiles`' cache discipline (render
-    // changed, retain live). Tile `left/top` are texture-local texel coords.
-    let mut text_blocks: Vec<crate::ocr::PreparedTextBlock> = Vec::new();
-    let mut block_meta: Vec<(u64, u64)> = Vec::new();
-    let mut anchor_lang = String::new();
+    // Glyphs were shaped block-local at upsert time (pen positions relative to each
+    // block's own AABB origin × oversample). Offset each block's instances by the
+    // delta from its block origin to the shared canvas origin — `shape_block_glyphs`
+    // uses the same `canvas_geometry(block visuals)` origin, so adding the delta
+    // reconstructs canvas-texel pen positions exactly — and merge the masks (deduped
+    // by key) for the GPU atlas upload.
+    let mut glyphs = crate::image_render::GlyphCollector::default();
     for pb in &prepared {
-        let local = localize_visuals(&pb.visuals, origin_x, origin_y, os);
-        if let Some(tb) =
-            build_block_text_block(pb.spec, &pb.visuals, &local, os, bitmap_w, bitmap_h)
-        {
-            if anchor_lang.is_empty() {
-                anchor_lang = pb.spec.language.clone();
-            }
-            text_blocks.push(tb);
-            block_meta.push((pb.block_id, pb.spec.content_hash));
-        }
-    }
-
-    let mut tiles: Vec<OverlayTile> = Vec::new();
-    {
-        let opts = crate::image_render::RenderOptions {
-            language: anchor_lang,
-            min_font_size_px: 6.0 * os,
+        let Some((block_origin_x, block_origin_y, _, _)) = canvas_geometry(&pb.visuals, os) else {
+            continue;
         };
-        let mut cache = tile_cache.lock().expect("tile cache poisoned");
-        let to_render: Vec<usize> = block_meta
-            .iter()
-            .enumerate()
-            .filter(|(_, (bid, hash))| !matches!(cache.get(bid), Some((h, _)) if h == hash))
-            .map(|(i, _)| i)
-            .collect();
-        if !to_render.is_empty() {
-            let subset: Vec<crate::ocr::PreparedTextBlock> =
-                to_render.iter().map(|&i| text_blocks[i].clone()).collect();
-            let rendered = with_glyph_cache(Some(glyph_cache), |gc| {
-                crate::image_render::render_block_tiles(&subset, gc, font_provider, &opts)
+        let dx = (block_origin_x - origin_x) * os;
+        let dy = (block_origin_y - origin_y) * os;
+        for inst in &pb.spec.glyph_instances {
+            glyphs.instances.push(crate::image_render::GlyphInstanceData {
+                key: inst.key,
+                pen_x: inst.pen_x + dx,
+                pen_y: inst.pen_y + dy,
+                cos: inst.cos,
+                sin: inst.sin,
+                color: inst.color,
             });
-            for (&i, tile_opt) in to_render.iter().zip(rendered.into_iter()) {
-                let (bid, hash) = block_meta[i];
-                match tile_opt {
-                    Some(tile) => {
-                        cache.insert(bid, (hash, tile));
-                    }
-                    None => {
-                        cache.remove(&bid);
-                    }
-                }
-            }
         }
-        let live: std::collections::HashSet<u64> = block_meta.iter().map(|(b, _)| *b).collect();
-        cache.retain(|id, _| live.contains(id));
-        for (bid, hash) in &block_meta {
-            if let Some((_, tile)) = cache.get(bid) {
-                tiles.push(OverlayTile {
-                    block_id: *bid,
-                    content_hash: *hash,
-                    rgba: tile.rgba.clone(),
-                    width: tile.width,
-                    height: tile.height,
-                    left: tile.left,
-                    top: tile.top,
-                });
-            }
+        for (key, mask) in &pb.spec.glyph_masks {
+            glyphs.masks.entry(*key).or_insert_with(|| mask.clone());
         }
     }
 
@@ -3298,7 +3297,7 @@ pub(crate) fn build_overlay_draw_list(
         bitmap_w,
         bitmap_h,
         pills,
-        tiles,
+        glyphs,
         painted_pills,
     })
 }

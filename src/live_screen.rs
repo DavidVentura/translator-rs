@@ -646,8 +646,7 @@ impl LiveScreenPipeline {
     /// and presents it — no CPU canvas raster. `None` when there's nothing to
     /// show. Runs on the GL thread.
     pub fn overlay_draw_list(&self) -> Option<crate::live_session::OverlayDrawList> {
-        self.session
-            .overlay_draw_list(SCREEN_ANCHOR_ID, &*self.font_provider)
+        self.session.overlay_draw_list(SCREEN_ANCHOR_ID)
     }
 
     /// Worker-thread body: detect → provisional overlay → rec/translate → full

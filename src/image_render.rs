@@ -89,12 +89,15 @@ pub fn render_overlay(
         if block.translated_text.trim().is_empty() {
             continue;
         }
+        let mut sink = GlyphSink::Canvas {
+            canvas: &mut canvas,
+            width: prepared.width,
+            height: prepared.height,
+        };
         match block.layout_hints.layout_mode {
-            OverlayLayoutMode::PerLine => {
-                render_per_line(&mut canvas, prepared, block, &mut cache, fonts, opts)
-            }
+            OverlayLayoutMode::PerLine => render_per_line(&mut sink, block, &mut cache, fonts, opts),
             OverlayLayoutMode::BlockRect => {
-                render_block_rect(&mut canvas, prepared, block, &mut cache, fonts, opts)
+                render_block_rect(&mut sink, block, &mut cache, fonts, opts)
             }
         }
     }
@@ -112,6 +115,58 @@ pub struct BlockTile {
     pub height: u32,
     pub left: i32,
     pub top: i32,
+}
+
+/// `(font_id, glyph_id, size_px)` — the dense key for the CPU glyph atlas and the
+/// GPU atlas. All three dimensions must match for a mask to be reused.
+pub type GlyphKey = (u32, u16, u32);
+
+/// One glyph draw call for the GPU atlas path. `pen_x`/`pen_y` are the pen
+/// position in canvas-texel coords (pre-rounding, subpixel). `cos`/`sin` are the
+/// line's reading-direction angle; for axis-aligned text these are 1.0/0.0. The
+/// GPU quad is placed at `pen + rotate(left, top)` and rotated by (cos, sin), so
+/// the same upright atlas entry serves both horizontal and tilted text.
+#[derive(Clone)]
+pub struct GlyphInstanceData {
+    pub key: GlyphKey,
+    pub pen_x: f32,
+    pub pen_y: f32,
+    pub cos: f32,
+    pub sin: f32,
+    pub color: [u8; 4],
+}
+
+/// Upright coverage mask for one glyph, copied out of the [`FontCache`] atlas for
+/// upload to the GPU atlas. Stored alongside its pen-relative placement so the GPU
+/// quad can position it without re-reading the CPU mask.
+#[derive(Clone)]
+pub struct GlyphMaskData {
+    pub key: GlyphKey,
+    pub cov: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    pub left: i32,
+    pub top: i32,
+}
+
+/// Accumulates glyph instances + unique mask data for GPU atlas upload. Produced
+/// by [`collect_overlay_glyphs`] and consumed by the GL compositor.
+#[derive(Default)]
+pub struct GlyphCollector {
+    pub instances: Vec<GlyphInstanceData>,
+    pub masks: HashMap<GlyphKey, GlyphMaskData>,
+}
+
+/// Route for glyph output from [`draw_shaped_line`]: either CPU-blit into a pixel
+/// canvas (existing paths — PDF, test) or collect instance + mask data for the GPU
+/// atlas compositor (screen overlay).
+pub(crate) enum GlyphSink<'a> {
+    Canvas {
+        canvas: &'a mut [u8],
+        width: u32,
+        height: u32,
+    },
+    Collect(&'a mut GlyphCollector),
 }
 
 /// Render each block's text into its own transparent tile (sized to the block's
@@ -143,22 +198,16 @@ pub(crate) fn render_block_tiles(
             let tw = bbox.right.saturating_sub(bbox.left).max(1);
             let th = bbox.bottom.saturating_sub(bbox.top).max(1);
             let shifted = shift_block(block, bbox.left as f32, bbox.top as f32);
-            // `render_per_line`/`render_block_rect` only read `prepared.width/height`.
-            let prepared = PreparedImageOverlay {
-                rgba_bytes: Vec::new(),
+            let mut tile = vec![0u8; (tw as usize) * (th as usize) * 4];
+            let mut sink = GlyphSink::Canvas {
+                canvas: &mut tile,
                 width: tw,
                 height: th,
-                extracted_text: String::new(),
-                translated_text: String::new(),
-                blocks: Vec::new(),
             };
-            let mut tile = vec![0u8; (tw as usize) * (th as usize) * 4];
             match shifted.layout_hints.layout_mode {
-                OverlayLayoutMode::PerLine => {
-                    render_per_line(&mut tile, &prepared, &shifted, cache, fonts, opts)
-                }
+                OverlayLayoutMode::PerLine => render_per_line(&mut sink, &shifted, cache, fonts, opts),
                 OverlayLayoutMode::BlockRect => {
-                    render_block_rect(&mut tile, &prepared, &shifted, cache, fonts, opts)
+                    render_block_rect(&mut sink, &shifted, cache, fonts, opts)
                 }
             }
             Some(BlockTile {
@@ -170,6 +219,31 @@ pub(crate) fn render_block_tiles(
             })
         })
         .collect()
+}
+
+/// Collect glyph instances and upright mask data for the GPU atlas compositor,
+/// mirroring [`render_block_tiles`] but without producing per-block RGBA bitmaps.
+/// Blocks must be in canvas-texel coords (not tile-local); pen positions in the
+/// returned [`GlyphCollector`] are canvas-texel coordinates ready for the GPU.
+pub(crate) fn collect_overlay_glyphs(
+    blocks: &[PreparedTextBlock],
+    cache: &mut FontCache,
+    fonts: &dyn FontProvider,
+    opts: &RenderOptions,
+) -> GlyphCollector {
+    cache.clear_chains();
+    let mut collector = GlyphCollector::default();
+    for block in blocks {
+        if block.translated_text.trim().is_empty() {
+            continue;
+        }
+        let mut sink = GlyphSink::Collect(&mut collector);
+        match block.layout_hints.layout_mode {
+            OverlayLayoutMode::PerLine => render_per_line(&mut sink, block, cache, fonts, opts),
+            OverlayLayoutMode::BlockRect => render_block_rect(&mut sink, block, cache, fonts, opts),
+        }
+    }
+    collector
 }
 
 /// Translate a block's geometry by `-(dx, dy)` so it lands in a tile whose origin
@@ -853,8 +927,7 @@ impl LineShape {
 }
 
 fn render_per_line(
-    canvas: &mut [u8],
-    prepared: &PreparedImageOverlay,
+    sink: &mut GlyphSink<'_>,
     block: &PreparedTextBlock,
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
@@ -945,9 +1018,7 @@ fn render_per_line(
         let origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
         let origin_y = oriented.cy - half_w * sin + v_from_center * cos;
         draw_shaped_line(
-            canvas,
-            prepared.width,
-            prepared.height,
+            sink,
             &line_shape,
             cache,
             origin_x,
@@ -1062,8 +1133,7 @@ fn break_into_lines_by_words(
 // Layout — BlockRect
 
 fn render_block_rect(
-    canvas: &mut [u8],
-    prepared: &PreparedImageOverlay,
+    sink: &mut GlyphSink<'_>,
     block: &PreparedTextBlock,
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
@@ -1127,9 +1197,7 @@ fn render_block_rect(
         // Block-rect layout (CJK vertical / multi-line block) never rotates — block boxes are
         // axis-aligned. Pass identity rotation (cos=1, sin=0).
         draw_shaped_line(
-            canvas,
-            prepared.width,
-            prepared.height,
+            sink,
             &line_shape,
             cache,
             block.bounding_box.left as f32,
@@ -1205,9 +1273,7 @@ fn wrap_into_block(text: &str, width: f32, font_size: f32) -> Vec<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn draw_shaped_line(
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
+    sink: &mut GlyphSink<'_>,
     line: &LineShape,
     cache: &mut FontCache,
     origin_x: f32,
@@ -1221,10 +1287,10 @@ fn draw_shaped_line(
     // pen position for each glyph is obtained by rotating the local pen offset by the line's
     // angle and adding the origin.
     //
-    // Axis-aligned lines (the screen overlay; CJK block-rect) reuse the glyph atlas:
-    // each distinct (gid, size) is rasterized once and its mask re-blitted at every
-    // pen position (snapped to whole pixels). Tilted lines can't reuse an upright
-    // mask, so they rasterize per glyph in line orientation.
+    // Canvas path: axis-aligned lines reuse the glyph atlas (rasterized once, re-blitted per
+    // pen position snapped to whole pixels); tilted lines rasterize per-glyph in line orientation.
+    // Collect path: always uses the upright atlas entry and carries the line angle per-instance —
+    // the GPU quad rotates for free, so tilted text reuses the same atlas entry as axis-aligned.
     let axis_aligned = sin_angle.abs() < 1e-3 && cos_angle > 0.0;
     let size_px = font_size.round().max(1.0) as u32;
     let mut cursor_x = 0.0f32;
@@ -1235,64 +1301,126 @@ fn draw_shaped_line(
             for glyph in &run.glyphs {
                 let glyph_x = origin_x + cursor_x + glyph.offset_x as f32 * scale;
                 let glyph_y = origin_y - glyph.offset_y as f32 * scale;
-                if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
-                    blit_mask(
-                        canvas,
-                        width,
-                        height,
-                        &gm.cov,
-                        glyph_x.round() as i32 + gm.left,
-                        glyph_y.round() as i32 + gm.top,
-                        gm.w,
-                        gm.h,
-                        fg_argb,
-                    );
+                match sink {
+                    GlyphSink::Canvas { canvas, width, height } => {
+                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale)
+                        {
+                            blit_mask(
+                                canvas,
+                                *width,
+                                *height,
+                                &gm.cov,
+                                glyph_x.round() as i32 + gm.left,
+                                glyph_y.round() as i32 + gm.top,
+                                gm.w,
+                                gm.h,
+                                fg_argb,
+                            );
+                        }
+                    }
+                    GlyphSink::Collect(col) => {
+                        let key = (fid, glyph.gid, size_px);
+                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale)
+                        {
+                            let (cov, w, h, left, top) =
+                                (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
+                            col.masks.entry(key).or_insert_with(|| GlyphMaskData {
+                                key,
+                                cov,
+                                w,
+                                h,
+                                left,
+                                top,
+                            });
+                            col.instances.push(GlyphInstanceData {
+                                key,
+                                pen_x: glyph_x,
+                                pen_y: glyph_y,
+                                cos: cos_angle,
+                                sin: sin_angle,
+                                color: fg_argb.to_ne_bytes(),
+                            });
+                        }
+                    }
                 }
                 cursor_x += glyph.advance_x as f32 * scale;
             }
             continue;
         }
-        let face = match cache.face(&run.handle) {
-            Some(f) => f,
-            None => continue,
-        };
-        for glyph in &run.glyphs {
-            // Pen position for this glyph in line-local coords (font y points up; flip).
-            let pen_local_x = cursor_x + glyph.offset_x as f32 * scale;
-            let pen_local_y = -(glyph.offset_y as f32) * scale;
-            let glyph_x = origin_x + pen_local_x * cos_angle - pen_local_y * sin_angle;
-            let glyph_y = origin_y + pen_local_x * sin_angle + pen_local_y * cos_angle;
-
-            let mut commands: Vec<Command> = Vec::new();
-            let mut sink = OutlineSink {
-                builder: &mut commands,
-                origin_x: glyph_x,
-                origin_y: glyph_y,
-                scale,
-                cos_angle,
-                sin_angle,
-            };
-            if face
-                .outline_glyph(ttf_parser::GlyphId(glyph.gid), &mut sink)
-                .is_some()
-            {
-                let (mask, placement) = Mask::new(commands.as_slice())
-                    .format(Format::Alpha)
-                    .render();
-                blit_mask(
-                    canvas,
-                    width,
-                    height,
-                    &mask,
-                    placement.left,
-                    placement.top,
-                    placement.width,
-                    placement.height,
-                    fg_argb,
-                );
+        // Non-axis-aligned: Canvas path rasterizes each glyph rotated in-line; Collect path
+        // uses the upright atlas entry and carries the angle per-instance for the GPU to rotate.
+        match sink {
+            GlyphSink::Canvas { canvas, width, height } => {
+                let face = match cache.face(&run.handle) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                for glyph in &run.glyphs {
+                    let pen_local_x = cursor_x + glyph.offset_x as f32 * scale;
+                    let pen_local_y = -(glyph.offset_y as f32) * scale;
+                    let glyph_x = origin_x + pen_local_x * cos_angle - pen_local_y * sin_angle;
+                    let glyph_y = origin_y + pen_local_x * sin_angle + pen_local_y * cos_angle;
+                    let mut commands: Vec<Command> = Vec::new();
+                    let mut outline_sink = OutlineSink {
+                        builder: &mut commands,
+                        origin_x: glyph_x,
+                        origin_y: glyph_y,
+                        scale,
+                        cos_angle,
+                        sin_angle,
+                    };
+                    if face
+                        .outline_glyph(ttf_parser::GlyphId(glyph.gid), &mut outline_sink)
+                        .is_some()
+                    {
+                        let (mask, placement) =
+                            Mask::new(commands.as_slice()).format(Format::Alpha).render();
+                        blit_mask(
+                            canvas,
+                            *width,
+                            *height,
+                            &mask,
+                            placement.left,
+                            placement.top,
+                            placement.width,
+                            placement.height,
+                            fg_argb,
+                        );
+                    }
+                    cursor_x += glyph.advance_x as f32 * scale;
+                }
             }
-
-            cursor_x += glyph.advance_x as f32 * scale;
+            GlyphSink::Collect(col) => {
+                let fid = cache.font_id(&run.handle);
+                for glyph in &run.glyphs {
+                    let pen_local_x = cursor_x + glyph.offset_x as f32 * scale;
+                    let pen_local_y = -(glyph.offset_y as f32) * scale;
+                    let glyph_x = origin_x + pen_local_x * cos_angle - pen_local_y * sin_angle;
+                    let glyph_y = origin_y + pen_local_x * sin_angle + pen_local_y * cos_angle;
+                    let key = (fid, glyph.gid, size_px);
+                    if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
+                        let (cov, w, h, left, top) =
+                            (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
+                        col.masks.entry(key).or_insert_with(|| GlyphMaskData {
+                            key,
+                            cov,
+                            w,
+                            h,
+                            left,
+                            top,
+                        });
+                        col.instances.push(GlyphInstanceData {
+                            key,
+                            pen_x: glyph_x,
+                            pen_y: glyph_y,
+                            cos: cos_angle,
+                            sin: sin_angle,
+                            color: fg_argb.to_ne_bytes(),
+                        });
+                    }
+                    cursor_x += glyph.advance_x as f32 * scale;
+                }
+            }
         }
     }
 }
