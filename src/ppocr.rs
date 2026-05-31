@@ -16,6 +16,7 @@ use crate::mnn_inference::MnnSession;
 use mnn_sys::{MemoryMode, PrecisionMode};
 
 const REC_TARGET_HEIGHT: u32 = 48;
+const REC_WIDTH_BUCKET: usize = 32;
 const REC_MIN_SCORE: f32 = 0.3;
 /// Per-character CTC score gate for punctuation glyphs. Kept lower than `REC_MIN_SCORE`
 /// because real punctuation is small and ambiguous (period vs comma vs apostrophe), so its
@@ -621,8 +622,15 @@ impl PpocrEngine {
         for (idx, chunk) in rec_chunks.iter().enumerate() {
             grouped.entry(scripts[chunk.owner]).or_default().push(idx);
         }
-        for (script, indices) in grouped {
+        for (script, mut indices) in grouped {
             let recognizer = self.recognizer(script)?;
+            indices.sort_unstable_by_key(|&idx| {
+                let (w, h) = rec_chunks[idx].image.dimensions();
+                let sw = ((w as f32 * REC_TARGET_HEIGHT as f32 / h as f32)
+                    .round()
+                    .max(1.0)) as usize;
+                (sw + REC_WIDTH_BUCKET - 1) / REC_WIDTH_BUCKET * REC_WIDTH_BUCKET
+            });
             let timings_us = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
             let t_rec_wall = Instant::now();
             let group_results: Vec<Result<RecResult, TranslatorError>> =
@@ -719,7 +727,7 @@ impl PpocrEngine {
                 source_code: None,
             });
         }
-        log::debug!(
+        log::info!(
             "ppocr rec: src={}x{} boxes={} dewarped={}/{} mean_crop={:.0}x{:.0} \
              wide_boxes={} chunks={} splits={} mean_chunk={:.0}x{:.0} max_rec_w={} \
              accepted={} empty={} low_score={} (drop {:.2}) — \
@@ -1112,7 +1120,11 @@ impl PpocrDetector {
         let (orig_w, orig_h) = image.dimensions();
         let t_pre = Instant::now();
         let scaled = resize_to_det_aligned(image, DET_MAX_SIDE);
-        let (scaled_w, scaled_h) = scaled.dimensions();
+        let (content_w, content_h) = scaled.dimensions();
+        // DBNet requires multiple-of-32 dims; pad up with zeros (preprocess fills
+        // the content into a larger zeroed buffer) instead of resampling.
+        let scaled_w = content_w.div_ceil(32) * 32;
+        let scaled_h = content_h.div_ceil(32) * 32;
         let tensor_buf = preprocess_for_det(&scaled, scaled_w, scaled_h);
         let pre_ms = t_pre.elapsed().as_secs_f32() * 1000.0;
 
@@ -1186,7 +1198,11 @@ impl PpocrDetector {
     fn probability_map(&self, image: &DynamicImage) -> Result<GrayImage, TranslatorError> {
         let (orig_w, orig_h) = image.dimensions();
         let scaled = resize_to_det_aligned(image, DET_MAX_SIDE);
-        let (scaled_w, scaled_h) = scaled.dimensions();
+        let (content_w, content_h) = scaled.dimensions();
+        // DBNet requires multiple-of-32 dims; pad up with zeros (preprocess fills
+        // the content into a larger zeroed buffer) instead of resampling.
+        let scaled_w = content_w.div_ceil(32) * 32;
+        let scaled_h = content_h.div_ceil(32) * 32;
         let tensor_buf = preprocess_for_det(&scaled, scaled_w, scaled_h);
         let (mask, out_shape) = self
             .session
@@ -1351,16 +1367,15 @@ fn top_textline_ori_candidate(row: &[f32]) -> Option<TextlineOriCandidate> {
 fn resize_to_det_aligned(image: &DynamicImage, max_side: u32) -> DynamicImage {
     let (w, h) = image.dimensions();
     let max_dim = w.max(h);
-    let scale = if max_dim > max_side {
-        max_side as f32 / max_dim as f32
-    } else {
-        1.0_f32
-    };
-    let nw = ((w as f32 * scale) as u32 / 32).max(1) * 32;
-    let nh = ((h as f32 * scale) as u32 / 32).max(1) * 32;
-    if nw == w && nh == h {
+    if max_dim <= max_side {
+        // No downscale needed: skip the resample entirely. The caller pads the
+        // (possibly unaligned) dimensions up to a multiple of 32 with zeros,
+        // which is a strided copy rather than a full Triangle resize.
         return image.clone();
     }
+    let scale = max_side as f32 / max_dim as f32;
+    let nw = ((w as f32 * scale) as u32 / 32).max(1) * 32;
+    let nh = ((h as f32 * scale) as u32 / 32).max(1) * 32;
     image.resize_exact(nw, nh, FilterType::Triangle)
 }
 
@@ -1368,31 +1383,48 @@ fn preprocess_for_det(image: &DynamicImage, pad_w: u32, pad_h: u32) -> Vec<f32> 
     let plane = (pad_w as usize) * (pad_h as usize);
     let mut buf = vec![0.0f32; 3 * plane];
     let pad_w_u = pad_w as usize;
+    // Per-channel u8 -> normalized-f32 lookup tables: the input is u8, so the
+    // `(v/255 - mean)/std` normalization has only 256 possible outputs per
+    // channel. Precompute them once and replace the per-pixel float math (and
+    // bounds-checked `get_pixel`) with a table read over the raw buffer.
+    let make_lut = |c: usize| {
+        let mut t = [0.0f32; 256];
+        for (v, e) in t.iter_mut().enumerate() {
+            *e = (v as f32 / 255.0 - PPOCR_DET_MEAN[c]) / PPOCR_DET_STD[c];
+        }
+        t
+    };
+    let (lut_r, lut_g, lut_b) = (make_lut(0), make_lut(1), make_lut(2));
+
     // Fast path for a gray detector input (the GPU split path renders luma
     // straight at the aligned size): read the single channel and write the same
     // value to all three, skipping the `to_rgb8()` channel-replication alloc.
     if let DynamicImage::ImageLuma8(luma) = image {
         let (w, h) = luma.dimensions();
+        let (w_u, raw) = (w as usize, luma.as_raw());
         for y in 0..h as usize {
-            for x in 0..w as usize {
-                let v = luma.get_pixel(x as u32, y as u32)[0] as f32 / 255.0;
-                let idx = y * pad_w_u + x;
-                buf[idx] = (v - PPOCR_DET_MEAN[0]) / PPOCR_DET_STD[0];
-                buf[plane + idx] = (v - PPOCR_DET_MEAN[1]) / PPOCR_DET_STD[1];
-                buf[2 * plane + idx] = (v - PPOCR_DET_MEAN[2]) / PPOCR_DET_STD[2];
+            let row = &raw[y * w_u..y * w_u + w_u];
+            let base = y * pad_w_u;
+            for (x, &v) in row.iter().enumerate() {
+                let idx = base + x;
+                buf[idx] = lut_r[v as usize];
+                buf[plane + idx] = lut_g[v as usize];
+                buf[2 * plane + idx] = lut_b[v as usize];
             }
         }
         return buf;
     }
     let rgb = image.to_rgb8();
     let (w, h) = rgb.dimensions();
+    let (w_u, raw) = (w as usize, rgb.as_raw());
     for y in 0..h as usize {
-        for x in 0..w as usize {
-            let pixel = rgb.get_pixel(x as u32, y as u32);
-            let idx = y * pad_w_u + x;
-            buf[idx] = (pixel[0] as f32 / 255.0 - PPOCR_DET_MEAN[0]) / PPOCR_DET_STD[0];
-            buf[plane + idx] = (pixel[1] as f32 / 255.0 - PPOCR_DET_MEAN[1]) / PPOCR_DET_STD[1];
-            buf[2 * plane + idx] = (pixel[2] as f32 / 255.0 - PPOCR_DET_MEAN[2]) / PPOCR_DET_STD[2];
+        let row = &raw[y * w_u * 3..(y * w_u + w_u) * 3];
+        let base = y * pad_w_u;
+        for (x, px) in row.chunks_exact(3).enumerate() {
+            let idx = base + x;
+            buf[idx] = lut_r[px[0] as usize];
+            buf[plane + idx] = lut_g[px[1] as usize];
+            buf[2 * plane + idx] = lut_b[px[2] as usize];
         }
     }
     buf
@@ -1641,11 +1673,12 @@ impl PpocrRecognizer {
 
         let resized = image.resize_exact(sw, REC_TARGET_HEIGHT, FilterType::Triangle);
         let rgb = resized.to_rgb8();
-        let w_us = sw as usize;
+        let w_exact = sw as usize;
+        let w_us = (w_exact + REC_WIDTH_BUCKET - 1) / REC_WIDTH_BUCKET * REC_WIDTH_BUCKET;
         let mut buf = vec![0.0f32; 3 * target_h * w_us];
         let plane = target_h * w_us;
         for y in 0..target_h {
-            for x in 0..w_us {
+            for x in 0..w_exact {
                 let pixel = rgb.get_pixel(x as u32, y as u32);
                 let idx = y * w_us + x;
                 buf[idx] = (pixel[0] as f32 / 255.0 - PPOCR_REC_MEAN[0]) / PPOCR_REC_STD[0];

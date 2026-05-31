@@ -14,12 +14,13 @@
 //! duplicated OCR/overlay logic — only the orchestration differs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use crate::font_provider::FontProvider;
 use crate::live_frame::LiveFrame;
 use crate::live_session::{LiveSession, dominant_axis_quadrant};
 use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate};
+use crate::live_worker::SlotWorker;
 use crate::ocr::{OrientedRect, Rect};
 use crate::session::TranslatorSession;
 
@@ -295,98 +296,6 @@ struct ScreenJob {
     generation: u64,
 }
 
-struct ScreenWorkerState {
-    pending: Option<ScreenJob>,
-    busy: bool,
-    shutting_down: bool,
-}
-
-struct ScreenWorkerInner {
-    slot: Mutex<ScreenWorkerState>,
-    cv: Condvar,
-}
-
-/// Single-slot background worker that runs `run_screen_acquire` off the GL
-/// thread. Mirrors the camera's `Worker` (live_tracker_pipeline.rs): drops a new
-/// job while one is in flight (the monitor guarantees they're serialized anyway),
-/// holds a `Weak` back-ref, and tears down on `Drop`.
-struct ScreenWorker {
-    inner: Arc<ScreenWorkerInner>,
-}
-
-impl ScreenWorker {
-    fn spawn(pipeline: Arc<LiveScreenPipeline>) -> Self {
-        let inner = Arc::new(ScreenWorkerInner {
-            slot: Mutex::new(ScreenWorkerState {
-                pending: None,
-                busy: false,
-                shutting_down: false,
-            }),
-            cv: Condvar::new(),
-        });
-        let inner_clone = Arc::clone(&inner);
-        let pipeline_weak = Arc::downgrade(&pipeline);
-        std::thread::Builder::new()
-            .name("LiveScreenWorker".into())
-            .spawn(move || {
-                loop {
-                    let job = {
-                        let mut state = inner_clone.slot.lock().expect("screen worker poisoned");
-                        while state.pending.is_none() && !state.shutting_down {
-                            state = inner_clone
-                                .cv
-                                .wait(state)
-                                .expect("screen worker cv poisoned");
-                        }
-                        if state.shutting_down {
-                            return;
-                        }
-                        let job = state.pending.take();
-                        if job.is_some() {
-                            state.busy = true;
-                        }
-                        job
-                    };
-                    let Some(job) = job else { continue };
-                    let Some(pipeline) = pipeline_weak.upgrade() else {
-                        return;
-                    };
-                    pipeline.run_screen_acquire(job.frame, job.generation);
-                    drop(pipeline);
-                    let mut state = inner_clone.slot.lock().expect("screen worker poisoned");
-                    state.busy = false;
-                    inner_clone.cv.notify_all();
-                }
-            })
-            .expect("failed to spawn LiveScreenWorker");
-        ScreenWorker { inner }
-    }
-
-    fn try_dispatch(&self, job: ScreenJob) -> bool {
-        let mut state = self.inner.slot.lock().expect("screen worker poisoned");
-        if state.busy || state.pending.is_some() {
-            return false;
-        }
-        state.pending = Some(job);
-        self.inner.cv.notify_one();
-        true
-    }
-
-    fn busy(&self) -> bool {
-        let state = self.inner.slot.lock().expect("screen worker poisoned");
-        state.busy || state.pending.is_some()
-    }
-}
-
-impl Drop for ScreenWorker {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.inner.slot.lock() {
-            state.shutting_down = true;
-            self.inner.cv.notify_all();
-        }
-    }
-}
-
 pub struct LiveScreenPipeline {
     catalog: Arc<TranslatorSession>,
     session: Arc<LiveSession>,
@@ -397,7 +306,7 @@ pub struct LiveScreenPipeline {
     /// Movement / settle change-detection state (the v1 "Monitoring" logic).
     monitor: Mutex<MonitorState>,
     /// Background OCR worker; `None` only transiently during `new`.
-    worker: Mutex<Option<ScreenWorker>>,
+    worker: Mutex<Option<SlotWorker<ScreenJob>>>,
 }
 
 impl LiveScreenPipeline {
@@ -428,7 +337,15 @@ impl LiveScreenPipeline {
             }),
             worker: Mutex::new(None),
         });
-        let worker = ScreenWorker::spawn(Arc::clone(&pipeline));
+        let worker = {
+            let pipeline_weak = Arc::downgrade(&pipeline);
+            SlotWorker::spawn("LiveScreenWorker", move |job: ScreenJob| {
+                let Some(pipeline) = pipeline_weak.upgrade() else {
+                    return;
+                };
+                pipeline.run_screen_acquire(job.frame, job.generation);
+            })
+        };
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
         pipeline
     }
@@ -615,30 +532,6 @@ impl LiveScreenPipeline {
     /// that thread, so blocks appear incrementally without stalling the worker.
     pub fn overlay_version(&self) -> u64 {
         self.session.content_version()
-    }
-
-    /// Composite the resident overlays into `target` at identity (present-only,
-    /// no OCR). Runs on the GL thread. The minimal `frame` just carries the
-    /// canonical dims; the overlay-only target ignores its (empty) camera bytes.
-    /// Render the overlay (if a deferred upsert left it stale) and return its
-    /// geometry without copying. Paired with [`Self::copy_overlay_strided`] so the
-    /// present can size the destination Bitmap before locking it. Both run on the
-    /// GL thread, so the canvas is stable between the two calls.
-    pub fn ensure_overlay_dims(&self) -> Option<(u32, u32, f32, f32)> {
-        self.session
-            .ensure_anchor_canvas(SCREEN_ANCHOR_ID, &*self.font_provider);
-        self.session.overlay_canvas_dims(SCREEN_ANCHOR_ID)
-    }
-
-    /// Copy the (already-rendered) overlay canvas into a locked Bitmap's pixels at
-    /// `dst_stride` bytes per row — one copy, straight into the Bitmap.
-    pub fn copy_overlay_strided(
-        &self,
-        dst: &mut [u8],
-        dst_stride: usize,
-    ) -> Option<(u32, u32, f32, f32)> {
-        self.session
-            .copy_overlay_canvas_strided(SCREEN_ANCHOR_ID, dst, dst_stride)
     }
 
     /// Build the GPU overlay draw list (pills + per-block text tiles) from the

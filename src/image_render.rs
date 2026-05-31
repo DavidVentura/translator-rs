@@ -95,7 +95,9 @@ pub fn render_overlay(
             height: prepared.height,
         };
         match block.layout_hints.layout_mode {
-            OverlayLayoutMode::PerLine => render_per_line(&mut sink, block, &mut cache, fonts, opts),
+            OverlayLayoutMode::PerLine => {
+                render_per_line(&mut sink, block, &mut cache, fonts, opts)
+            }
             OverlayLayoutMode::BlockRect => {
                 render_block_rect(&mut sink, block, &mut cache, fonts, opts)
             }
@@ -205,7 +207,9 @@ pub(crate) fn render_block_tiles(
                 height: th,
             };
             match shifted.layout_hints.layout_mode {
-                OverlayLayoutMode::PerLine => render_per_line(&mut sink, &shifted, cache, fonts, opts),
+                OverlayLayoutMode::PerLine => {
+                    render_per_line(&mut sink, &shifted, cache, fonts, opts)
+                }
                 OverlayLayoutMode::BlockRect => {
                     render_block_rect(&mut sink, &shifted, cache, fonts, opts)
                 }
@@ -1302,9 +1306,12 @@ fn draw_shaped_line(
                 let glyph_x = origin_x + cursor_x + glyph.offset_x as f32 * scale;
                 let glyph_y = origin_y - glyph.offset_y as f32 * scale;
                 match sink {
-                    GlyphSink::Canvas { canvas, width, height } => {
-                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale)
-                        {
+                    GlyphSink::Canvas {
+                        canvas,
+                        width,
+                        height,
+                    } => {
+                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
                             blit_mask(
                                 canvas,
                                 *width,
@@ -1320,8 +1327,7 @@ fn draw_shaped_line(
                     }
                     GlyphSink::Collect(col) => {
                         let key = (fid, glyph.gid, size_px);
-                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale)
-                        {
+                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
                             let (cov, w, h, left, top) =
                                 (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
                             col.masks.entry(key).or_insert_with(|| GlyphMaskData {
@@ -1350,7 +1356,11 @@ fn draw_shaped_line(
         // Non-axis-aligned: Canvas path rasterizes each glyph rotated in-line; Collect path
         // uses the upright atlas entry and carries the angle per-instance for the GPU to rotate.
         match sink {
-            GlyphSink::Canvas { canvas, width, height } => {
+            GlyphSink::Canvas {
+                canvas,
+                width,
+                height,
+            } => {
                 let face = match cache.face(&run.handle) {
                     Some(f) => f,
                     None => continue,
@@ -1373,8 +1383,9 @@ fn draw_shaped_line(
                         .outline_glyph(ttf_parser::GlyphId(glyph.gid), &mut outline_sink)
                         .is_some()
                     {
-                        let (mask, placement) =
-                            Mask::new(commands.as_slice()).format(Format::Alpha).render();
+                        let (mask, placement) = Mask::new(commands.as_slice())
+                            .format(Format::Alpha)
+                            .render();
                         blit_mask(
                             canvas,
                             *width,
@@ -1399,8 +1410,7 @@ fn draw_shaped_line(
                     let glyph_y = origin_y + pen_local_x * sin_angle + pen_local_y * cos_angle;
                     let key = (fid, glyph.gid, size_px);
                     if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
-                        let (cov, w, h, left, top) =
-                            (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
+                        let (cov, w, h, left, top) = (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
                         col.masks.entry(key).or_insert_with(|| GlyphMaskData {
                             key,
                             cov,

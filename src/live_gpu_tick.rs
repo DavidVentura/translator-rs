@@ -26,7 +26,7 @@ use crate::ocr::Rect;
 /// Row-major 3×3 mapping `w×h` dst-pixel coords → clip `[-1,1]` — the
 /// resolution-independent normalize `read_camera_*` wants as `dst_to_clip`
 /// (orientation lives in the `uv` transform set by [`frame_from_camera_gray`]).
-fn clip_xform(w: u32, h: u32) -> [f32; 9] {
+pub fn clip_xform(w: u32, h: u32) -> [f32; 9] {
     let w = w.max(1) as f32;
     let h = h.max(1) as f32;
     [2.0 / w, 0.0, -1.0, 0.0, 2.0 / h, -1.0, 0.0, 0.0, 1.0]
@@ -150,4 +150,56 @@ pub fn run_tracker_with_acquire(
         pipeline.provide_acquire_rgb(req, &rgb_frame);
     }
     Ok(result)
+}
+
+/// Screen counterpart to the acquire readback in [`run_tracker_with_acquire`]:
+/// borrow the captured external texture and GPU-render the two inference inputs
+/// (detector gray at the 32-aligned size, recognition RGBA at half canonical),
+/// wrapped in a fresh [`LiveFrame`] ready for the screen worker. `None` if a
+/// readback or the split fails. Unlike the camera path there's no tracker gray
+/// (the screen anchor is fixed) and the crop is the whole frame.
+pub fn screen_acquire_frame(
+    gles: &mut GlesRenderer,
+    camera_tex: u32,
+    canonical_w: u32,
+    canonical_h: u32,
+    uv_xform: [f32; 9],
+    det_max_pixels: u32,
+) -> Option<Arc<LiveFrame>> {
+    gles.set_camera_external(camera_tex, uv_xform);
+    let (det_w, det_h) = aligned_det_dims(canonical_w, canonical_h, det_max_pixels);
+    let (rec_w, rec_h) = ((canonical_w / 2).max(1), (canonical_h / 2).max(1));
+    let t_readback = std::time::Instant::now();
+    let det_gray = gles.read_camera_gray(det_w, det_h, &clip_xform(det_w, det_h))?;
+    let rec_rgba = gles.read_camera_rgba(rec_w, rec_h, &clip_xform(rec_w, rec_h))?;
+    let crop = Rect {
+        left: 0,
+        top: 0,
+        right: canonical_w,
+        bottom: canonical_h,
+    };
+    let oriented = match OrientedImage::from_gpu_split(
+        det_gray,
+        det_w,
+        det_h,
+        &rec_rgba,
+        rec_w,
+        rec_h,
+        canonical_w,
+        canonical_h,
+        crop,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("[screen] from_gpu_split failed: {e:?}");
+            return None;
+        }
+    };
+    log::info!(
+        "[screen] dispatch det {det_w}x{det_h} + rec {rec_w}x{rec_h} readback {:.0}ms",
+        t_readback.elapsed().as_secs_f64() * 1000.0,
+    );
+    let frame = Arc::new(LiveFrame::new(0));
+    frame.reset_oriented_split(oriented, None);
+    Some(frame)
 }

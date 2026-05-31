@@ -278,8 +278,7 @@ pub struct BlockSpec {
     /// Upright coverage masks for the unique glyphs referenced by
     /// `glyph_instances`. Block-local because they're shaped at upsert
     /// time; merged across blocks (deduped by key) at draw-list build.
-    pub glyph_masks:
-        HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
+    pub glyph_masks: HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
 }
 
 /// Scan an RGBA bitmap and return, per row, the half-open
@@ -519,76 +518,6 @@ impl LiveSession {
     /// [`Self::content_version`]).
     pub fn content_version(&self) -> u64 {
         self.content_version.load(Ordering::SeqCst)
-    }
-
-    /// Copy the resident overlay canvas (RGBA, top-down) for `anchor_id` into
-    /// `dst`, returning `(width, height, surface_origin_x, surface_origin_y)`.
-    /// `None` if there's no canvas or `dst` is too small. Lets the screen path
-    /// hand the CPU-rendered overlay straight to the Canvas view, skipping the
-    /// GPU composite + readback.
-    /// Geometry of the mounted overlay canvas (no copy): `(w, h, origin_x,
-    /// origin_y)`. The screen present uses it to size the destination Bitmap before
-    /// locking it.
-    pub fn overlay_canvas_dims(&self, anchor_id: AnchorId) -> Option<(u32, u32, f32, f32)> {
-        let anchors = self.overlay_anchors.lock().ok()?;
-        let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
-        Some((
-            raster.width,
-            raster.height,
-            raster.surface_origin_x,
-            raster.surface_origin_y,
-        ))
-    }
-
-    /// Copy the mounted overlay canvas into `dst` row-by-row at `dst_stride` bytes
-    /// per row (the destination's rows may be padded — e.g. a locked Android
-    /// Bitmap). `dst_stride` must be ≥ the canvas row (`width * 4`).
-    pub fn copy_overlay_canvas_strided(
-        &self,
-        anchor_id: AnchorId,
-        dst: &mut [u8],
-        dst_stride: usize,
-    ) -> Option<(u32, u32, f32, f32)> {
-        let anchors = self.overlay_anchors.lock().ok()?;
-        let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
-        let (w, h) = (raster.width as usize, raster.height as usize);
-        let src_stride = w * 4;
-        if dst_stride < src_stride || dst.len() < (h.saturating_sub(1)) * dst_stride + src_stride {
-            return None;
-        }
-        for y in 0..h {
-            let s = y * src_stride;
-            let d = y * dst_stride;
-            dst[d..d + src_stride].copy_from_slice(&raster.bitmap[s..s + src_stride]);
-        }
-        Some((
-            raster.width,
-            raster.height,
-            raster.surface_origin_x,
-            raster.surface_origin_y,
-        ))
-    }
-
-    /// Run `f` with the mounted overlay canvas of `anchor_id` — `(rgba, width,
-    /// height, surface_origin_x, surface_origin_y, oversample)` — under the held
-    /// lock. `None` when there's no canvas. The GPU screen present uploads `rgba`
-    /// straight to a texture inside `f`; the caller must have rendered the canvas
-    /// first (e.g. via [`Self::ensure_anchor_canvas`]).
-    pub fn with_overlay_canvas<R>(
-        &self,
-        anchor_id: AnchorId,
-        f: impl FnOnce(&[u8], u32, u32, f32, f32, f32) -> R,
-    ) -> Option<R> {
-        let anchors = self.overlay_anchors.lock().ok()?;
-        let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
-        Some(f(
-            &raster.bitmap,
-            raster.width,
-            raster.height,
-            raster.surface_origin_x,
-            raster.surface_origin_y,
-            raster.oversample,
-        ))
     }
 
     /// Build the GPU overlay draw list for `anchor_id` from its current block +
@@ -1197,7 +1126,8 @@ impl LiveSession {
             return (Vec::new(), HashMap::new());
         };
         let local = localize_visuals(&visuals, origin_x, origin_y, os);
-        let Some(tb) = build_block_text_block(spec, &visuals, &local, os, bitmap_w, bitmap_h) else {
+        let Some(tb) = build_block_text_block(spec, &visuals, &local, os, bitmap_w, bitmap_h)
+        else {
             return (Vec::new(), HashMap::new());
         };
         let opts = crate::image_render::RenderOptions {
@@ -3276,14 +3206,16 @@ pub(crate) fn build_overlay_draw_list(
         let dx = (block_origin_x - origin_x) * os;
         let dy = (block_origin_y - origin_y) * os;
         for inst in &pb.spec.glyph_instances {
-            glyphs.instances.push(crate::image_render::GlyphInstanceData {
-                key: inst.key,
-                pen_x: inst.pen_x + dx,
-                pen_y: inst.pen_y + dy,
-                cos: inst.cos,
-                sin: inst.sin,
-                color: inst.color,
-            });
+            glyphs
+                .instances
+                .push(crate::image_render::GlyphInstanceData {
+                    key: inst.key,
+                    pen_x: inst.pen_x + dx,
+                    pen_y: inst.pen_y + dy,
+                    cos: inst.cos,
+                    sin: inst.sin,
+                    color: inst.color,
+                });
         }
         for (key, mask) in &pb.spec.glyph_masks {
             glyphs.masks.entry(*key).or_insert_with(|| mask.clone());

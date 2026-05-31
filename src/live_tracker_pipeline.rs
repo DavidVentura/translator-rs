@@ -29,7 +29,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+
+use crate::live_worker::SlotWorker;
 use std::time::Instant;
 
 use crate::LanguageCode;
@@ -246,119 +248,6 @@ enum PendingJob {
     },
 }
 
-/// Single-thread async worker. Lives for the pipeline's lifetime;
-/// drained via Condvar so we don't pay thread-spawn cost on every
-/// acquire (~50 μs is negligible per acquire but the pattern is also
-/// noisy in profiles).
-struct Worker {
-    inner: Arc<WorkerInner>,
-}
-
-struct WorkerInner {
-    /// Single slot: at most one job is pending or in-flight at a time.
-    /// Per-frame backpressure: if a new job arrives while a worker is
-    /// busy, the new job is dropped (analogous to today's
-    /// `acquireInFlight: AtomicBoolean` gate on the Kotlin side).
-    slot: Mutex<WorkerState>,
-    cv: Condvar,
-}
-
-struct WorkerState {
-    pending: Option<PendingJob>,
-    busy: bool,
-    shutting_down: bool,
-}
-
-impl Worker {
-    fn spawn(pipeline: Arc<LiveTrackerPipeline>) -> Self {
-        let inner = Arc::new(WorkerInner {
-            slot: Mutex::new(WorkerState {
-                pending: None,
-                busy: false,
-                shutting_down: false,
-            }),
-            cv: Condvar::new(),
-        });
-        let inner_clone = Arc::clone(&inner);
-        let pipeline_weak = Arc::downgrade(&pipeline);
-        std::thread::Builder::new()
-            .name("LiveTrackerPipelineWorker".into())
-            .spawn(move || {
-                loop {
-                    let job = {
-                        let mut state = inner_clone.slot.lock().expect("worker slot poisoned");
-                        while state.pending.is_none() && !state.shutting_down {
-                            state = inner_clone.cv.wait(state).expect("worker cv poisoned");
-                        }
-                        if state.shutting_down {
-                            return;
-                        }
-                        let job = state.pending.take();
-                        if job.is_some() {
-                            state.busy = true;
-                        }
-                        job
-                    };
-                    let Some(job) = job else { continue };
-                    let Some(pipeline) = pipeline_weak.upgrade() else {
-                        return;
-                    };
-                    let telemetry = match job {
-                        PendingJob::Acquire {
-                            frame,
-                            display_crop,
-                            config,
-                            timestamp_ns,
-                            generation,
-                        } => pipeline.run_acquire_inner(
-                            &frame,
-                            display_crop,
-                            &config,
-                            timestamp_ns,
-                            generation,
-                        ),
-                        PendingJob::Refresh {
-                            frame,
-                            display_crop,
-                            config,
-                            generation,
-                        } => pipeline.run_refresh_inner(&frame, display_crop, &config, generation),
-                    };
-                    if let Ok(mut slot) = pipeline.last_telemetry.lock() {
-                        *slot = Some(telemetry);
-                    }
-                    let mut state = inner_clone.slot.lock().expect("worker slot poisoned");
-                    state.busy = false;
-                    inner_clone.cv.notify_all();
-                }
-            })
-            .expect("failed to spawn LiveTrackerPipelineWorker");
-        Worker { inner }
-    }
-
-    /// Try to dispatch a new job. Drops the request if a job is
-    /// already in flight or already queued (the per-frame caller will
-    /// try again on a later frame).
-    fn try_dispatch(&self, job: PendingJob) -> bool {
-        let mut state = self.inner.slot.lock().expect("worker slot poisoned");
-        if state.busy || state.pending.is_some() {
-            return false;
-        }
-        state.pending = Some(job);
-        self.inner.cv.notify_one();
-        true
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.inner.slot.lock() {
-            state.shutting_down = true;
-            self.inner.cv.notify_all();
-        }
-    }
-}
-
 /// One per-frame engine job handed to the [`TrackerCompute`] thread. Owns
 /// the cloned tracker gray so the caller can run the camera upload (which
 /// reads the same frame's RGBA) concurrently without sharing the buffer.
@@ -568,7 +457,7 @@ pub struct LiveTrackerPipeline {
     catalog: Arc<TranslatorSession>,
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
-    worker: Mutex<Option<Worker>>,
+    worker: Mutex<Option<SlotWorker<PendingJob>>>,
     /// Long-lived engine-step thread. `Option` because, like `worker`, it's
     /// spawned after the `Arc<Self>` exists. Driven only by `process_frame`,
     /// so the outer mutex is uncontended.
@@ -606,7 +495,38 @@ impl LiveTrackerPipeline {
             tracker_compute: Mutex::new(None),
             timing: Mutex::new(TimingStats::default()),
         });
-        let worker = Worker::spawn(Arc::clone(&pipeline));
+        let worker = {
+            let pipeline_weak = Arc::downgrade(&pipeline);
+            SlotWorker::spawn("LiveTrackerPipelineWorker", move |job: PendingJob| {
+                let Some(pipeline) = pipeline_weak.upgrade() else {
+                    return;
+                };
+                let telemetry = match job {
+                    PendingJob::Acquire {
+                        frame,
+                        display_crop,
+                        config,
+                        timestamp_ns,
+                        generation,
+                    } => pipeline.run_acquire_inner(
+                        &frame,
+                        display_crop,
+                        &config,
+                        timestamp_ns,
+                        generation,
+                    ),
+                    PendingJob::Refresh {
+                        frame,
+                        display_crop,
+                        config,
+                        generation,
+                    } => pipeline.run_refresh_inner(&frame, display_crop, &config, generation),
+                };
+                if let Ok(mut slot) = pipeline.last_telemetry.lock() {
+                    *slot = Some(telemetry);
+                }
+            })
+        };
         *pipeline.worker.lock().expect("worker slot poisoned") = Some(worker);
         let tracker_compute = TrackerCompute::spawn(Arc::clone(&pipeline));
         *pipeline

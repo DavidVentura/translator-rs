@@ -167,23 +167,22 @@ void main() {
 }
 "#;
 
-/// Tile fragment shader (shares [`VERT_SRC`]): samples a **premultiplied** text
-/// tile (`render_block_tiles` output: rgb = fg×coverage, a = coverage) and emits
-/// **straight** alpha so it composites into the straight-alpha overlay FBO with a
-/// plain straight src-over. `u_overlay_alpha` scales the text opacity.
-const TILE_FRAG_SRC: &str = r#"#version 100
+/// Glyph fragment shader (shares [`VERT_SRC`]): samples an R8 coverage atlas and
+/// outputs straight alpha (fg color × coverage × text_alpha). Each quad covers one
+/// glyph; the vertex transform positions and rotates it in overlay-texel space.
+const GLYPH_FRAG_SRC: &str = r#"#version 100
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
 precision mediump float;
 #endif
-uniform sampler2D u_tex;
-uniform float u_overlay_alpha;
+uniform sampler2D u_atlas;
+uniform vec4 u_color;
+uniform float u_text_alpha;
 varying vec2 v_uv;
 void main() {
-    vec4 t = texture2D(u_tex, v_uv);
-    vec3 straight = t.rgb / max(t.a, 1.0 / 255.0);
-    gl_FragColor = vec4(straight, t.a * u_overlay_alpha);
+    float a = texture2D(u_atlas, v_uv).r;
+    gl_FragColor = vec4(u_color.rgb, a * u_text_alpha);
 }
 "#;
 
@@ -272,18 +271,18 @@ pub struct GlesRenderer {
     present_content: PresentContent,
     /// Lazily-built rounded-rect pill program (the GPU overlay compositor).
     pill: Option<PillProgram>,
-    /// Lazily-built tile program (un-premultiplies text tiles for the
-    /// straight-alpha overlay FBO). Shares [`VERT_SRC`].
-    tile_prog: Option<TileProgram>,
-    /// Overlay-compositor FBO: the baked pills+text overlay texture that the
+    /// Lazily-built glyph atlas program (R8 coverage × fg color → straight alpha).
+    /// Shares [`VERT_SRC`]; only the fragment shader differs from the 2D program.
+    glyph_prog: Option<GlyphProgram>,
+    /// Overlay-compositor FBO: the baked pills+glyphs overlay texture that the
     /// present then warps (camera) / blits (screen). `(fbo, tex, w, h)`.
     overlay_fbo: Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
     /// Pill-layer FBO: opaque rounded pills are unioned here, then composited
     /// into `overlay_fbo` at the pill opacity. `(fbo, tex, w, h)`.
     pill_fbo: Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
-    /// Per-block text tiles uploaded for the compositor, keyed by block id →
-    /// `(content_hash, texture, w, h)`. Skips re-upload while the hash matches.
-    tile_textures: std::collections::HashMap<u64, (u64, glow::Texture, u32, u32)>,
+    /// R8 glyph coverage atlas with shelf packing. Grows until overflow, then
+    /// clears and re-packs the current frame's masks.
+    glyph_atlas: Option<GlyphAtlas>,
 }
 
 /// The rounded-rect pill program (shares nothing with the 2D program — its own
@@ -297,15 +296,29 @@ struct PillProgram {
     a_pos: u32,
 }
 
-/// The tile program (shares [`VERT_SRC`]; [`TILE_FRAG_SRC`] fragment). Built
+/// The glyph program (shares [`VERT_SRC`]; [`GLYPH_FRAG_SRC`] fragment). Built
 /// lazily on first overlay composite.
-struct TileProgram {
+struct GlyphProgram {
     program: glow::Program,
     u_transform: glow::UniformLocation,
     u_uv_xform: glow::UniformLocation,
-    u_tex: glow::UniformLocation,
-    u_overlay_alpha: glow::UniformLocation,
+    u_atlas: glow::UniformLocation,
+    u_color: glow::UniformLocation,
+    u_text_alpha: glow::UniformLocation,
     a_pos: u32,
+}
+
+/// R8 glyph coverage atlas with a shelf packer. Grows to `max_side`×`max_side`;
+/// on overflow clears all slots and re-packs the current frame's glyphs.
+struct GlyphAtlas {
+    texture: glow::Texture,
+    width: u32,
+    height: u32,
+    /// `(atlas_x, atlas_y)` for glyphs already uploaded.
+    slots: std::collections::HashMap<crate::image_render::GlyphKey, (u32, u32)>,
+    shelf_x: u32,
+    shelf_y: u32,
+    shelf_h: u32,
 }
 
 /// The external-OES camera program (shares [`VERT_SRC`] with the 2D program;
@@ -386,10 +399,10 @@ impl GlesRenderer {
                 camera_external: None,
                 present_content: PresentContent::default(),
                 pill: None,
-                tile_prog: None,
+                glyph_prog: None,
                 overlay_fbo: None,
                 pill_fbo: None,
-                tile_textures: std::collections::HashMap::new(),
+                glyph_atlas: None,
             })
         }
     }
@@ -497,33 +510,85 @@ impl GlesRenderer {
         self.pill.is_some()
     }
 
-    /// Build the tile (un-premultiply) program if not already built.
-    fn ensure_tile_program(&mut self) -> bool {
-        if self.tile_prog.is_some() {
+    /// Build the glyph atlas program if not already built.
+    fn ensure_glyph_program(&mut self) -> bool {
+        if self.glyph_prog.is_some() {
             return true;
         }
         let gl = &self.gl;
-        let program = match link_program_vert_frag(gl, VERT_SRC, TILE_FRAG_SRC) {
+        let program = match link_program_vert_frag(gl, VERT_SRC, GLYPH_FRAG_SRC) {
             Ok(p) => p,
             Err(e) => {
-                log::error!("GlesRenderer: tile program link failed: {e:?}");
+                log::error!("GlesRenderer: glyph program link failed: {e:?}");
                 return false;
             }
         };
         unsafe {
-            let tile = (|| {
-                Some(TileProgram {
+            let prog = (|| {
+                Some(GlyphProgram {
                     u_transform: gl.get_uniform_location(program, "u_transform")?,
                     u_uv_xform: gl.get_uniform_location(program, "u_uv_xform")?,
-                    u_tex: gl.get_uniform_location(program, "u_tex")?,
-                    u_overlay_alpha: gl.get_uniform_location(program, "u_overlay_alpha")?,
+                    u_atlas: gl.get_uniform_location(program, "u_atlas")?,
+                    u_color: gl.get_uniform_location(program, "u_color")?,
+                    u_text_alpha: gl.get_uniform_location(program, "u_text_alpha")?,
                     a_pos: gl.get_attrib_location(program, "a_pos")?,
                     program,
                 })
             })();
-            self.tile_prog = tile;
+            self.glyph_prog = prog;
         }
-        self.tile_prog.is_some()
+        self.glyph_prog.is_some()
+    }
+
+    /// Ensure the R8 glyph atlas texture is allocated (1024×1024 fixed). Built once;
+    /// when it overflows (repack needed) `upload_new_glyphs` clears and re-packs.
+    fn ensure_glyph_atlas(&mut self) -> bool {
+        if self.glyph_atlas.is_some() {
+            return true;
+        }
+        const ATLAS_W: u32 = 1024;
+        const ATLAS_H: u32 = 1024;
+        let gl = &self.gl;
+        let texture = match new_texture(gl) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            // Use NEAREST for coverage masks — subpixel sampling of a 1-byte mask
+            // through a linear filter can soften coverage in GLES2 mediump float.
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                R8 as i32,
+                ATLAS_W as i32,
+                ATLAS_H as i32,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+        }
+        self.glyph_atlas = Some(GlyphAtlas {
+            texture,
+            width: ATLAS_W,
+            height: ATLAS_H,
+            slots: std::collections::HashMap::new(),
+            shelf_x: 0,
+            shelf_y: 0,
+            shelf_h: 0,
+        });
+        true
     }
 
     /// Ensure the slot holds an RGBA8 FBO + texture at least `w×h`, **grow-only**:
@@ -790,15 +855,12 @@ impl GlesRenderer {
     }
 
     /// Bake the overlay draw list into [`Self::overlay_fbo`]'s straight-alpha
-    /// texture on the GPU — the replacement for the CPU `render_anchor_canvas`
-    /// build. Two passes: (A) rounded SDF pills unioned opaque into the pill-layer
-    /// FBO, then (B) that layer composited at `pill_alpha` + the per-block text
-    /// tiles src-over at `text_alpha` into the overlay FBO. Text tiles are cached
-    /// by `(block_id, content_hash)` so unchanged blocks skip re-upload. The
-    /// resulting texture is straight-alpha, identical in convention to the old CPU
-    /// canvas, so the present path consumes it unchanged. Returns false on a
-    /// program/build failure (the caller keeps the prior overlay). Must run on the
-    /// GL thread; leaves no framebuffer bound (caller re-targets for present).
+    /// texture on the GPU. Two passes: (A) rounded SDF pills unioned opaque into
+    /// the pill-layer FBO, then (B) that layer composited at `pill_alpha` + glyph
+    /// quads sampled from the R8 atlas src-over at `text_alpha` into the overlay FBO.
+    /// New glyph masks are uploaded to the atlas before the draw; the atlas clears
+    /// and re-packs from scratch when it overflows. Returns false on failure.
+    /// Must run on the GL thread; leaves no framebuffer bound.
     #[cfg(feature = "planar-tracker")]
     pub fn render_overlay_to_texture(
         &mut self,
@@ -809,7 +871,8 @@ impl GlesRenderer {
         if dl.bitmap_w == 0 || dl.bitmap_h == 0 {
             return false;
         }
-        if !self.ensure_pill_program() || !self.ensure_tile_program() {
+        if !self.ensure_pill_program() || !self.ensure_glyph_program() || !self.ensure_glyph_atlas()
+        {
             return false;
         }
         let (bw, bh) = (dl.bitmap_w, dl.bitmap_h);
@@ -818,26 +881,18 @@ impl GlesRenderer {
         // row at v=0 (the convention the present path samples for the CPU canvas).
         let ndc = ndc_from_viewport_no_flip(bw as f32, bh as f32);
 
-        // Refresh the per-block tile texture cache: upload changed/new tiles,
-        // drop tiles whose block vanished.
-        let t_sync = std::time::Instant::now();
-        self.sync_tile_textures(dl);
-        let sync_ms = t_sync.elapsed().as_secs_f64() * 1000.0;
+        // Upload any new glyph masks to the R8 atlas before the draw pass.
+        let t_upload = std::time::Instant::now();
+        let new_glyphs = self.upload_new_glyphs(&dl.glyphs.masks);
+        let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
 
-        // FBO (re)alloc is a synchronous glTexImage2D of two RGBA textures —
-        // measured separately because a per-acquire size change reallocates them
-        // and that, not the compositing, dominates the first present of an
-        // acquire. A fixed FBO size removes this.
+        // FBO (re)alloc: grow-only so the per-acquire size change only pays once.
         let t_alloc = std::time::Instant::now();
-        // Both FBOs grow to the same running-max alloc so the pill→overlay sample
-        // (pass B1) uses one sub-rect scale for both.
         let (pill_fbo, pill_tex, pa_w, pa_h) =
             Self::ensure_rgba_fbo(&mut self.pill_fbo, &self.gl, bw, bh);
         let (overlay_fbo, _overlay_tex, oa_w, oa_h) =
             Self::ensure_rgba_fbo(&mut self.overlay_fbo, &self.gl, bw, bh);
         let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
-        // uv scale to sample only the content sub-rect of the (possibly larger)
-        // pill texture in pass B1.
         let pill_uv_sx = bw as f32 / pa_w as f32;
         let pill_uv_sy = bh as f32 / pa_h as f32;
         let _ = (oa_w, oa_h);
@@ -852,8 +907,6 @@ impl GlesRenderer {
             gl.disable(glow::SCISSOR_TEST);
             gl.enable(glow::BLEND);
             gl.blend_equation(glow::FUNC_ADD);
-            // Straight-alpha source-over: rgb interpolates by src alpha, alpha
-            // accumulates toward coverage. Both FBOs stay straight-alpha.
             gl.blend_func_separate(
                 glow::SRC_ALPHA,
                 glow::ONE_MINUS_SRC_ALPHA,
@@ -882,8 +935,6 @@ impl GlesRenderer {
                     continue;
                 }
                 let radius = (hw.min(hh) * 0.5).min(12.0).max(0.0);
-                // unit quad (0..1) → oriented texel quad (corner0 + axes). Tangent
-                // (cos,sin), perp (-sin,cos); corner0 = centre − hw·t − hh·p.
                 let (tx, ty) = (cos, sin);
                 let (px, py) = (-sin, cos);
                 let c0x = cx - hw * tx - hh * px;
@@ -905,11 +956,6 @@ impl GlesRenderer {
                     false,
                     &to_column_major(&transform),
                 );
-                // Opaque in the pill layer (alpha = coverage only) so overlapping
-                // pills union flat instead of double-darkening; the desired
-                // translucency is applied once as `pill_alpha` when the layer is
-                // composited into the overlay FBO. The per-pill color's own alpha
-                // is intentionally dropped here.
                 gl.uniform_4_f32_slice(
                     Some(&pill.u_color),
                     &[
@@ -924,16 +970,13 @@ impl GlesRenderer {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
 
-            // --- Pass B: composite pill layer at pill_alpha, then text tiles. ---
+            // --- Pass B: pill layer at pill_alpha, then glyph quads at text_alpha. ---
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(overlay_fbo));
             gl.viewport(0, 0, bw as i32, bh as i32);
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
-            // B1: pill layer (straight-alpha) scaled by pill_alpha via the 2D
-            // program; content-sub-rect quad, uv scaled to sample only the used
-            // [0..bw]×[0..bh] region of the (grow-only) pill texture.
-            let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+            // B1: pill layer composited at pill_alpha.
             let pill_uv = to_column_major(&scale(pill_uv_sx, pill_uv_sy));
             let full = mat3_mul(&ndc, &scale(bw as f32, bh as f32));
             gl.use_program(Some(self.program));
@@ -946,32 +989,64 @@ impl GlesRenderer {
             gl.bind_texture(glow::TEXTURE_2D, Some(pill_tex));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-            // B2: text tiles (premultiplied → un-premultiplied to straight by the
-            // tile program), src-over at text_alpha. Each placed at its texel rect.
-            let tile = self.tile_prog.as_ref().expect("tile program present");
-            gl.use_program(Some(tile.program));
-            gl.enable_vertex_attrib_array(tile.a_pos);
-            gl.vertex_attrib_pointer_f32(tile.a_pos, 2, glow::FLOAT, false, 0, 0);
-            gl.uniform_1_i32(Some(&tile.u_tex), 0);
-            gl.uniform_1_f32(Some(&tile.u_overlay_alpha), text_alpha.clamp(0.0, 1.0));
-            gl.uniform_matrix_3_f32_slice(Some(&tile.u_uv_xform), false, &identity_uv);
-            for t in &dl.tiles {
-                if t.width == 0 || t.height == 0 {
-                    continue;
-                }
-                let Some((_, tex, _, _)) = self.tile_textures.get(&t.block_id) else {
+            // B2: glyph quads from the R8 atlas, one draw call per instance.
+            // Each quad is rotated in overlay-texel space by the glyph's line angle,
+            // placed at (pen + rotate(left, top)), and UV-mapped to its atlas slot.
+            let gp = self.glyph_prog.as_ref().expect("glyph program present");
+            let atlas = self.glyph_atlas.as_ref().expect("atlas present");
+            gl.use_program(Some(gp.program));
+            gl.enable_vertex_attrib_array(gp.a_pos);
+            gl.vertex_attrib_pointer_f32(gp.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&gp.u_atlas), 0);
+            gl.uniform_1_f32(Some(&gp.u_text_alpha), text_alpha.clamp(0.0, 1.0));
+            gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture));
+            let (aw, ah) = (atlas.width as f32, atlas.height as f32);
+            for inst in &dl.glyphs.instances {
+                let Some(&(ax, ay)) = atlas.slots.get(&inst.key) else {
                     continue;
                 };
-                let place = mat3_mul(
-                    &mat3_mul(&ndc, &translate(t.left as f32, t.top as f32)),
-                    &scale(t.width as f32, t.height as f32),
+                let Some(mask) = dl.glyphs.masks.get(&inst.key) else {
+                    continue;
+                };
+                let (w, h) = (mask.w as f32, mask.h as f32);
+                let (left, top) = (mask.left as f32, mask.top as f32);
+                // Unit quad → overlay-texel: rotate (left,top)+(u*w,v*h) by (cos,sin).
+                // x(u,v) = pen_x + (left+u*w)*cos - (top+v*h)*sin
+                // y(u,v) = pen_y + (left+u*w)*sin + (top+v*h)*cos
+                let local_to_texel = [
+                    w * inst.cos,
+                    -h * inst.sin,
+                    inst.pen_x + left * inst.cos - top * inst.sin,
+                    w * inst.sin,
+                    h * inst.cos,
+                    inst.pen_y + left * inst.sin + top * inst.cos,
+                    0.0,
+                    0.0,
+                    1.0,
+                ];
+                let transform = mat3_mul(&ndc, &local_to_texel);
+                let u0 = ax as f32 / aw;
+                let v0 = ay as f32 / ah;
+                let uv_xform = [w / aw, 0.0, u0, 0.0, h / ah, v0, 0.0, 0.0, 1.0];
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&gp.u_transform),
+                    false,
+                    &to_column_major(&transform),
                 );
                 gl.uniform_matrix_3_f32_slice(
-                    Some(&tile.u_transform),
+                    Some(&gp.u_uv_xform),
                     false,
-                    &to_column_major(&place),
+                    &to_column_major(&uv_xform),
                 );
-                gl.bind_texture(glow::TEXTURE_2D, Some(*tex));
+                gl.uniform_4_f32_slice(
+                    Some(&gp.u_color),
+                    &[
+                        inst.color[0] as f32 / 255.0,
+                        inst.color[1] as f32 / 255.0,
+                        inst.color[2] as f32 / 255.0,
+                        inst.color[3] as f32 / 255.0,
+                    ],
+                );
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
 
@@ -979,147 +1054,112 @@ impl GlesRenderer {
         }
         let passes_ms = t_passes.elapsed().as_secs_f64() * 1000.0;
         log::info!(
-            "[overlay-bake] {bw}x{bh} (alloc {pa_w}x{pa_h}) sync={sync_ms:.1}ms({} tiles) \
+            "[overlay-bake] {bw}x{bh} (alloc {pa_w}x{pa_h}) \
+             upload={upload_ms:.1}ms({new_glyphs} new glyphs/{} inst) \
              alloc={alloc_ms:.1}ms passes={passes_ms:.1}ms",
-            dl.tiles.len()
+            dl.glyphs.instances.len()
         );
         true
     }
 
-    /// Upload changed/new text tiles into the per-block texture cache and drop
-    /// tiles whose block is no longer in the draw list. Keyed by block id; the
-    /// stored content hash skips re-upload while a block's text is unchanged.
+    /// Upload glyph masks not yet in the atlas. If a mask doesn't fit on the current
+    /// shelf, a new shelf is started; if the atlas overflows entirely, all slots are
+    /// cleared and the current frame's masks are re-uploaded from scratch. Returns
+    /// the count of newly uploaded masks.
     #[cfg(feature = "planar-tracker")]
-    fn sync_tile_textures(&mut self, dl: &OverlayDrawList) {
-        let live: std::collections::HashSet<u64> = dl.tiles.iter().map(|t| t.block_id).collect();
-        let stale: Vec<u64> = self
-            .tile_textures
-            .keys()
-            .filter(|id| !live.contains(id))
-            .copied()
+    fn upload_new_glyphs(
+        &mut self,
+        masks: &std::collections::HashMap<
+            crate::image_render::GlyphKey,
+            crate::image_render::GlyphMaskData,
+        >,
+    ) -> usize {
+        let atlas = match self.glyph_atlas.as_mut() {
+            Some(a) => a,
+            None => return 0,
+        };
+        // Collect masks that are not yet in the atlas.
+        let missing: Vec<&crate::image_render::GlyphMaskData> = masks
+            .values()
+            .filter(|m| !atlas.slots.contains_key(&m.key))
             .collect();
-        for id in stale {
-            if let Some((_, tex, _, _)) = self.tile_textures.remove(&id) {
-                unsafe { self.gl.delete_texture(tex) };
-            }
+        if missing.is_empty() {
+            return 0;
         }
-        for t in &dl.tiles {
-            if t.width == 0 || t.height == 0 {
+        // Try to place each missing mask. If any fails, clear the atlas and retry the
+        // full current-frame mask set (which always fits if no single mask > atlas size).
+        let mut placed: Vec<(&crate::image_render::GlyphMaskData, u32, u32)> = Vec::new();
+        let mut overflow = false;
+        for m in &missing {
+            if m.w == 0 || m.h == 0 {
                 continue;
             }
-            match self.tile_textures.get(&t.block_id) {
-                Some((hash, _, w, h))
-                    if *hash == t.content_hash && *w == t.width && *h == t.height =>
-                {
+            match Self::atlas_place(atlas, m.w, m.h) {
+                Some((x, y)) => placed.push((m, x, y)),
+                None => {
+                    overflow = true;
+                    break;
+                }
+            }
+        }
+        if overflow {
+            // Clear and re-pack all current-frame masks from scratch.
+            atlas.slots.clear();
+            atlas.shelf_x = 0;
+            atlas.shelf_y = 0;
+            atlas.shelf_h = 0;
+            placed.clear();
+            for m in masks.values() {
+                if m.w == 0 || m.h == 0 {
                     continue;
                 }
-                _ => {}
+                if let Some((x, y)) = Self::atlas_place(atlas, m.w, m.h) {
+                    placed.push((m, x, y));
+                }
             }
-            let tex = match self.tile_textures.remove(&t.block_id) {
-                Some((_, tex, _, _)) => tex,
-                None => match new_texture(&self.gl) {
-                    Ok(tex) => tex,
-                    Err(_) => continue,
-                },
-            };
-            let mut size = None;
-            upload_tex(&self.gl, tex, &mut size, &t.rgba, t.width, t.height);
-            self.tile_textures
-                .insert(t.block_id, (t.content_hash, tex, t.width, t.height));
         }
+        let gl = &self.gl;
+        let atlas = self.glyph_atlas.as_mut().expect("atlas present");
+        let count = placed.len();
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture));
+            for (m, ax, ay) in &placed {
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    *ax as i32,
+                    *ay as i32,
+                    m.w as i32,
+                    m.h as i32,
+                    glow::RED,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&m.cov)),
+                );
+                atlas.slots.insert(m.key, (*ax, *ay));
+            }
+        }
+        count
     }
 
-    /// Present the screen overlay canvas straight into the bound framebuffer
-    /// (the EGL window surface of the overlay `TextureView`): one axis-aligned,
-    /// premultiplied-alpha quad over a transparent clear — no camera, no
-    /// homography. The screen path's analogue of [`present`](Self::present), but
-    /// for a CPU-built canvas displayed 1:1 rather than warped onto live camera.
-    ///
-    /// `origin_canonical_*` is the canvas top-left in canonical-frame coords;
-    /// `oversample` is its texel density (canonical → texel). The canvas maps
-    /// canonical → surface px by `surface_/canonical_` and draws at its native
-    /// texel size. The caller binds the window surface (FBO 0) and swaps after.
-    #[allow(clippy::too_many_arguments)]
-    pub fn present_screen_overlay(
-        &mut self,
-        rgba: &[u8],
-        tex_w: u32,
-        tex_h: u32,
-        origin_canonical_x: f32,
-        origin_canonical_y: f32,
-        oversample: f32,
-        canonical_w: u32,
-        canonical_h: u32,
-        surface_w: u32,
-        surface_h: u32,
-    ) {
-        if rgba.is_empty() || tex_w == 0 || tex_h == 0 {
-            return;
+    /// Shelf-packer: try to place a `w×h` rect in the atlas. Advances `shelf_x`
+    /// on success; starts a new shelf if the current one is full. Returns `None` when
+    /// the entire atlas is exhausted (caller should clear and retry).
+    fn atlas_place(atlas: &mut GlyphAtlas, w: u32, h: u32) -> Option<(u32, u32)> {
+        if atlas.shelf_x + w > atlas.width {
+            // New shelf.
+            let new_y = atlas.shelf_y + atlas.shelf_h;
+            if new_y + h > atlas.height {
+                return None;
+            }
+            atlas.shelf_y = new_y;
+            atlas.shelf_x = 0;
+            atlas.shelf_h = 0;
         }
-        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
-        let sx = surface_w as f32 / canonical_w.max(1) as f32;
-        let sy = surface_h as f32 / canonical_h.max(1) as f32;
-        let inv_os = 1.0 / oversample.max(1e-3);
-        // unit quad → canvas footprint (canonical units × canonical→surface) →
-        // origin (in surface px) → clip (top-left origin, y-flipped).
-        let footprint = scale(tex_w as f32 * inv_os * sx, tex_h as f32 * inv_os * sy);
-        let to_surface = translate(origin_canonical_x * sx, origin_canonical_y * sy);
-        let ndc = ndc_from_viewport(surface_w as f32, surface_h as f32);
-        let transform = mat3_mul(&ndc, &mat3_mul(&to_surface, &footprint));
-        let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-        unsafe {
-            let gl = &self.gl;
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
-            gl.active_texture(glow::TEXTURE0);
-            gl.use_program(Some(self.program));
-            gl.enable_vertex_attrib_array(self.a_pos);
-            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
-            gl.uniform_1_i32(Some(&self.u_tex), 0);
-            gl.uniform_1_f32(Some(&self.u_overlay_alpha), self.overlay_alpha);
-            // A prior monitor readback may have left an external texture bound on
-            // unit 0; Adreno/Mali mis-sample a sampler2D while one lingers there,
-            // so clear it before binding the 2D overlay texture.
-            gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
-            gl.disable(glow::CULL_FACE);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.enable(glow::BLEND);
-            gl.blend_equation(glow::FUNC_ADD);
-            // Premultiplied output for the translucent window layer (matches the
-            // overlay-only blend in `draw`).
-            gl.blend_func_separate(
-                glow::SRC_ALPHA,
-                glow::ONE_MINUS_SRC_ALPHA,
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
-            );
-        }
-        // Always re-upload: the screen incremental path mutates the canvas in
-        // place (stable Vec ptr+len across content changes), so a ptr-identity
-        // skip would re-present a stale texture — pills without the text painted
-        // in afterwards. The caller (the GL worker) only presents when the
-        // overlay version changed, so this uploads once per real change, not per
-        // frame. `glTexSubImage2D` reuses storage while the size is unchanged.
-        upload_tex(
-            &self.gl,
-            self.overlay_tex,
-            &mut self.overlay_size,
-            rgba,
-            tex_w,
-            tex_h,
-        );
-        unsafe {
-            let gl = &self.gl;
-            gl.uniform_matrix_3_f32_slice(
-                Some(&self.u_transform),
-                false,
-                &to_column_major(&transform),
-            );
-            gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &identity_uv);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-        }
+        let x = atlas.shelf_x;
+        let y = atlas.shelf_y;
+        atlas.shelf_x += w;
+        atlas.shelf_h = atlas.shelf_h.max(h);
+        Some((x, y))
     }
 
     /// Present the GPU-baked overlay texture ([`Self::render_overlay_to_texture`])
@@ -1530,17 +1570,17 @@ impl Drop for GlesRenderer {
             if let Some(p) = self.pill.take() {
                 self.gl.delete_program(p.program);
             }
-            if let Some(p) = self.tile_prog.take() {
+            if let Some(p) = self.glyph_prog.take() {
                 self.gl.delete_program(p.program);
+            }
+            if let Some(a) = self.glyph_atlas.take() {
+                self.gl.delete_texture(a.texture);
             }
             for (fbo, tex, _, _) in [self.overlay_fbo.take(), self.pill_fbo.take()]
                 .into_iter()
                 .flatten()
             {
                 self.gl.delete_framebuffer(fbo);
-                self.gl.delete_texture(tex);
-            }
-            for (_, (_, tex, _, _)) in self.tile_textures.drain() {
                 self.gl.delete_texture(tex);
             }
         }
