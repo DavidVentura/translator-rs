@@ -1282,17 +1282,7 @@ impl LiveTrackerPipeline {
                 right: 0,
                 bottom: 0,
             });
-        let h_view_to_sensor = [
-            1.0,
-            0.0,
-            cached_sensor_crop.left as f32,
-            0.0,
-            1.0,
-            cached_sensor_crop.top as f32,
-            0.0,
-            0.0,
-            1.0,
-        ];
+        let h_view_to_sensor = view_to_sensor_h(&cached_sensor_crop);
         let scale_down = if tracker_oriented.det_to_full.0 > 0.0 {
             1.0 / tracker_oriented.det_to_full.0
         } else {
@@ -1616,17 +1606,7 @@ impl LiveTrackerPipeline {
             }
         };
         let cancel = || self.generation.load(Ordering::SeqCst) != generation;
-        let h_view_to_sensor = [
-            1.0,
-            0.0,
-            oriented.sensor_crop.left as f32,
-            0.0,
-            1.0,
-            oriented.sensor_crop.top as f32,
-            0.0,
-            0.0,
-            1.0,
-        ];
+        let h_view_to_sensor = view_to_sensor_h(&oriented.sensor_crop);
         let h_view_to_surface_composed =
             homography::mat3_mul(&h_sensor_view_to_surface, &h_view_to_sensor);
         let session_ref: &TranslatorSession = &self.catalog;
@@ -1753,6 +1733,23 @@ fn error_telemetry(msg: &'static str) -> AcquireTelemetry {
 // finalize/LRU) stay in `LiveTrackerPipeline`; these take only what they need.
 // ---------------------------------------------------------------------------
 
+/// `H_view→sensor`: the pure translation by the oriented frame's `sensor_crop`
+/// origin (the view is the cropped region inside the sensor frame). Shared by anchor
+/// registration, refresh, and `run_post_detect`.
+fn view_to_sensor_h(crop: &Rect) -> [f32; 9] {
+    [
+        1.0,
+        0.0,
+        crop.left as f32,
+        0.0,
+        1.0,
+        crop.top as f32,
+        0.0,
+        0.0,
+        1.0,
+    ]
+}
+
 /// Ensure the oriented RGB+gray cache for `display_crop`, run the detector, and
 /// return boxes in full-resolution pixel coords. (Body of
 /// `LiveTrackerPipeline::acquire_stage_detect`.)
@@ -1845,17 +1842,7 @@ pub(crate) fn acquire_rec_translate(
         .as_ref()
         .filter(|oi| oi.display_crop == display_crop)
         .ok_or("oriented cache miss")?;
-    let h_view_to_sensor = [
-        1.0,
-        0.0,
-        oriented.sensor_crop.left as f32,
-        0.0,
-        1.0,
-        oriented.sensor_crop.top as f32,
-        0.0,
-        0.0,
-        1.0,
-    ];
+    let h_view_to_sensor = view_to_sensor_h(&oriented.sensor_crop);
     let outcome = session.run_post_detect(
         PostDetectInput {
             detections: detected,

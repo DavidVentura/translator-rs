@@ -262,10 +262,9 @@ fn validate_rgba_len(
 
 /// Single-pass crop + RGBA→luma in **sensor orientation**. Walks the
 /// sensor-orient crop sequentially row-by-row — no rotation, purely
-/// stride-1 source reads, prefetcher-friendly. Integer BT.709 luma
-/// `(13933·R + 46871·G + 4732·B) >> 16` (matches
-/// `image::imageops::grayscale` to ±1 LSB so downstream FAST+BRIEF
-/// sees bit-identical input to the old path).
+/// stride-1 source reads, prefetcher-friendly. Integer BT.709 luma via
+/// [`bt709_luma`] (matches `image::imageops::grayscale` to ±1 LSB so downstream
+/// FAST+BRIEF sees bit-identical input to the old path).
 ///
 /// `display_crop` is in display-orient coords; we convert to the
 /// equivalent sensor-orient rect via `display_crop_to_sensor` so the
@@ -275,6 +274,14 @@ fn validate_rgba_len(
 /// swap relative to the legacy display-orient gray under R90/R270.
 /// The tracker now operates on this sensor-orient gray; the
 /// per-frame rotation pass is gone (saves ~3 ms at 1.2 MP).
+/// Integer BT.709 luma `(13933·R + 46871·G + 4732·B) >> 16`. The single source of
+/// truth for CPU luma so anchor + per-frame + rec descriptors see consistent values
+/// (matches the GPU `EXT_LUMA` shader and `image::imageops::grayscale` to ±1 LSB).
+#[inline]
+fn bt709_luma(r: u8, g: u8, b: u8) -> u8 {
+    ((13933 * r as u32 + 46871 * g as u32 + 4732 * b as u32) >> 16) as u8
+}
+
 fn build_gray_fused(
     rgba: &[u8],
     sensor_width: u32,
@@ -298,11 +305,7 @@ fn build_gray_fused(
         let dst_row = ((sy - sensor_crop.top) as usize) * crop_w_usize;
         for dx in 0..crop_w_usize {
             let p = src_row + (crop_left + dx) * 4;
-            let rr = rgba[p] as u32;
-            let gg = rgba[p + 1] as u32;
-            let bb = rgba[p + 2] as u32;
-            let luma = ((13933 * rr + 46871 * gg + 4732 * bb) >> 16) as u8;
-            gray[dst_row + dx] = luma;
+            gray[dst_row + dx] = bt709_luma(rgba[p], rgba[p + 1], rgba[p + 2]);
         }
     }
 
@@ -346,13 +349,7 @@ fn build_gray_fused_downsampled(
         let dst_row = (ty as usize) * (target_w as usize);
         for tx in 0..target_w as usize {
             let p = src_row + sx_table[tx] * 4;
-            let rr = rgba[p] as u32;
-            let gg = rgba[p + 1] as u32;
-            let bb = rgba[p + 2] as u32;
-            // Same BT.709 coefficients as `build_gray_fused` so anchor
-            // and per-frame descriptors see consistent luma.
-            let luma = ((13933 * rr + 46871 * gg + 4732 * bb) >> 16) as u8;
-            gray[dst_row + tx] = luma;
+            gray[dst_row + tx] = bt709_luma(rgba[p], rgba[p + 1], rgba[p + 2]);
         }
     }
     GrayImage::from_raw(target_w, target_h, gray).ok_or_else(|| {
@@ -434,7 +431,7 @@ fn rgba_to_rgb_and_luma(
         rgb.push(rr);
         rgb.push(gg);
         rgb.push(bb);
-        *g = ((13933 * rr as u32 + 46871 * gg as u32 + 4732 * bb as u32) >> 16) as u8;
+        *g = bt709_luma(rr, gg, bb);
     }
     let rgb = RgbImage::from_raw(w, h, rgb).ok_or_else(|| {
         TranslatorError::new(TranslatorErrorKind::Internal, "rec rgb size mismatch")
