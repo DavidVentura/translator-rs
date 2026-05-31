@@ -641,6 +641,15 @@ impl LiveScreenPipeline {
             .copy_overlay_canvas_strided(SCREEN_ANCHOR_ID, dst, dst_stride)
     }
 
+    /// Build the GPU overlay draw list (pills + per-block text tiles) from the
+    /// resident screen overlay content. The GL thread bakes this into a texture
+    /// and presents it — no CPU canvas raster. `None` when there's nothing to
+    /// show. Runs on the GL thread.
+    pub fn overlay_draw_list(&self) -> Option<crate::live_session::OverlayDrawList> {
+        self.session
+            .overlay_draw_list(SCREEN_ANCHOR_ID, &*self.font_provider)
+    }
+
     /// Worker-thread body: detect → provisional overlay → rec/translate → full
     /// overlay, bumping [`overlay_version`](Self::overlay_version) after each
     /// upsert so the GL thread presents provisional pills immediately and the
@@ -687,12 +696,9 @@ impl LiveScreenPipeline {
         let strips: Vec<OrientedRect> = detected.iter().map(|d| d.tight_box.clone()).collect();
         self.session
             .upsert_provisional_overlay(SCREEN_ANCHOR_ID, strips, &*self.font_provider);
-        // Force the provisional canvas to render now (one cheap raster — bbox
-        // pills, no glyphs) so it's on screen before the deferred rec blocks
-        // start landing; otherwise its visible window is shorter than the GL
-        // present poll and it gets coalesced straight into the finished overlay.
-        self.session
-            .ensure_anchor_canvas(SCREEN_ANCHOR_ID, &*self.font_provider);
+        // The upsert bumped the content version; the GL present thread builds the
+        // provisional draw list + bakes it on its next poll. No CPU canvas raster
+        // on the worker (the GPU compositor replaced it).
         if cancel() {
             return;
         }

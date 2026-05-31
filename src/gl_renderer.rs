@@ -28,6 +28,8 @@ use crate::homography::mat3_mul;
 use crate::live_compositor::{
     CameraFrame, ComposeTarget, CompositeError, CompositeInput, Renderer,
 };
+#[cfg(feature = "planar-tracker")]
+use crate::live_session::OverlayDrawList;
 
 #[derive(Debug)]
 pub enum GlError {
@@ -121,6 +123,70 @@ void main() {
 }
 "#;
 
+/// Pill vertex shader: the unit quad spans one oriented pill. `a_pos` (0..1) is
+/// passed through as the local uv so the fragment shader can evaluate the rounded
+/// rect SDF in pill-local pixel space; `u_transform` maps the unit quad to clip.
+const PILL_VERT_SRC: &str = r#"#version 100
+attribute vec2 a_pos;
+uniform mat3 u_transform;
+varying vec2 v_local;
+void main() {
+    v_local = a_pos;
+    vec3 clip = u_transform * vec3(a_pos, 1.0);
+    gl_Position = vec4(clip.xy, 0.0, clip.z);
+}
+"#;
+
+/// Pill fragment shader: rounded-rect SDF coverage, the GPU port of
+/// `planar_engine::fill_oriented_rect_blended`. `u_half` is the pill half-extent
+/// in texels, `u_radius` the corner radius (texels); coverage `= clamp(0.5 - sdf,
+/// 0, 1)` with a 1px feather. Output is opaque-coverage (rgb = color, a =
+/// coverage) so overlapping pills union flat in the pill-layer FBO.
+const PILL_FRAG_SRC: &str = r#"#version 100
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec4 u_color;
+uniform vec2 u_half;
+uniform float u_radius;
+varying vec2 v_local;
+void main() {
+    // Local pixel coords centred on the pill (v_local 0..1 → [-half, half]).
+    vec2 p = (v_local - 0.5) * 2.0 * u_half;
+    vec2 q = abs(p) - (u_half - vec2(u_radius));
+    float outside = length(max(q, 0.0));
+    float inside = min(max(q.x, q.y), 0.0);
+    float sdf = outside + inside - u_radius;
+    float coverage = clamp(0.5 - sdf, 0.0, 1.0);
+    if (coverage <= 0.0) {
+        discard;
+    }
+    gl_FragColor = vec4(u_color.rgb, u_color.a * coverage);
+}
+"#;
+
+/// Tile fragment shader (shares [`VERT_SRC`]): samples a **premultiplied** text
+/// tile (`render_block_tiles` output: rgb = fg×coverage, a = coverage) and emits
+/// **straight** alpha so it composites into the straight-alpha overlay FBO with a
+/// plain straight src-over. `u_overlay_alpha` scales the text opacity.
+const TILE_FRAG_SRC: &str = r#"#version 100
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D u_tex;
+uniform float u_overlay_alpha;
+varying vec2 v_uv;
+void main() {
+    vec4 t = texture2D(u_tex, v_uv);
+    vec3 straight = t.rgb / max(t.a, 1.0 / 255.0);
+    gl_FragColor = vec4(straight, t.a * u_overlay_alpha);
+}
+"#;
+
 /// `GL_TEXTURE_EXTERNAL_OES` (not in glow's constant set).
 const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 /// `GL_R8` sized internal format (GLES3) for the single-channel gray FBO.
@@ -141,6 +207,15 @@ fn scale(sx: f32, sy: f32) -> [f32; 9] {
 /// is `[0,0,1]`), so it leaves the homography's perspective divide intact.
 fn ndc_from_viewport(w: f32, h: f32) -> [f32; 9] {
     [2.0 / w, 0.0, -1.0, 0.0, -2.0 / h, 1.0, 0.0, 0.0, 1.0]
+}
+
+/// Like [`ndc_from_viewport`] but **without** the y flip: top-left-origin pixel
+/// coords map to clip with `y` increasing downward landing at texture `v` = 0 for
+/// the top row. Used when rendering *into* the overlay FBO so the baked texture
+/// is stored top-row-at-`v=0`, matching the CPU-uploaded overlay convention the
+/// present path already samples.
+fn ndc_from_viewport_no_flip(w: f32, h: f32) -> [f32; 9] {
+    [2.0 / w, 0.0, -1.0, 0.0, 2.0 / h, -1.0, 0.0, 0.0, 1.0]
 }
 
 /// GLES2 `glUniformMatrix3fv` forbids the transpose flag, so we transpose
@@ -195,6 +270,42 @@ pub struct GlesRenderer {
     /// only the overlays over transparent. Set once for the renderer's
     /// lifetime via [`set_present_content`](Self::set_present_content).
     present_content: PresentContent,
+    /// Lazily-built rounded-rect pill program (the GPU overlay compositor).
+    pill: Option<PillProgram>,
+    /// Lazily-built tile program (un-premultiplies text tiles for the
+    /// straight-alpha overlay FBO). Shares [`VERT_SRC`].
+    tile_prog: Option<TileProgram>,
+    /// Overlay-compositor FBO: the baked pills+text overlay texture that the
+    /// present then warps (camera) / blits (screen). `(fbo, tex, w, h)`.
+    overlay_fbo: Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
+    /// Pill-layer FBO: opaque rounded pills are unioned here, then composited
+    /// into `overlay_fbo` at the pill opacity. `(fbo, tex, w, h)`.
+    pill_fbo: Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
+    /// Per-block text tiles uploaded for the compositor, keyed by block id →
+    /// `(content_hash, texture, w, h)`. Skips re-upload while the hash matches.
+    tile_textures: std::collections::HashMap<u64, (u64, glow::Texture, u32, u32)>,
+}
+
+/// The rounded-rect pill program (shares nothing with the 2D program — its own
+/// SDF fragment shader). Built lazily on first overlay composite.
+struct PillProgram {
+    program: glow::Program,
+    u_transform: glow::UniformLocation,
+    u_color: glow::UniformLocation,
+    u_half: glow::UniformLocation,
+    u_radius: glow::UniformLocation,
+    a_pos: u32,
+}
+
+/// The tile program (shares [`VERT_SRC`]; [`TILE_FRAG_SRC`] fragment). Built
+/// lazily on first overlay composite.
+struct TileProgram {
+    program: glow::Program,
+    u_transform: glow::UniformLocation,
+    u_uv_xform: glow::UniformLocation,
+    u_tex: glow::UniformLocation,
+    u_overlay_alpha: glow::UniformLocation,
+    a_pos: u32,
 }
 
 /// The external-OES camera program (shares [`VERT_SRC`] with the 2D program;
@@ -274,6 +385,11 @@ impl GlesRenderer {
                 ext: None,
                 camera_external: None,
                 present_content: PresentContent::default(),
+                pill: None,
+                tile_prog: None,
+                overlay_fbo: None,
+                pill_fbo: None,
+                tile_textures: std::collections::HashMap::new(),
             })
         }
     }
@@ -349,6 +465,129 @@ impl GlesRenderer {
                 a_pos: gl.get_attrib_location(program, "a_pos")?,
                 program,
             })
+        }
+    }
+
+    /// Build the rounded-rect pill program if not already built.
+    fn ensure_pill_program(&mut self) -> bool {
+        if self.pill.is_some() {
+            return true;
+        }
+        let gl = &self.gl;
+        let program = match link_program_vert_frag(gl, PILL_VERT_SRC, PILL_FRAG_SRC) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("GlesRenderer: pill program link failed: {e:?}");
+                return false;
+            }
+        };
+        unsafe {
+            let pill = (|| {
+                Some(PillProgram {
+                    u_transform: gl.get_uniform_location(program, "u_transform")?,
+                    u_color: gl.get_uniform_location(program, "u_color")?,
+                    u_half: gl.get_uniform_location(program, "u_half")?,
+                    u_radius: gl.get_uniform_location(program, "u_radius")?,
+                    a_pos: gl.get_attrib_location(program, "a_pos")?,
+                    program,
+                })
+            })();
+            self.pill = pill;
+        }
+        self.pill.is_some()
+    }
+
+    /// Build the tile (un-premultiply) program if not already built.
+    fn ensure_tile_program(&mut self) -> bool {
+        if self.tile_prog.is_some() {
+            return true;
+        }
+        let gl = &self.gl;
+        let program = match link_program_vert_frag(gl, VERT_SRC, TILE_FRAG_SRC) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("GlesRenderer: tile program link failed: {e:?}");
+                return false;
+            }
+        };
+        unsafe {
+            let tile = (|| {
+                Some(TileProgram {
+                    u_transform: gl.get_uniform_location(program, "u_transform")?,
+                    u_uv_xform: gl.get_uniform_location(program, "u_uv_xform")?,
+                    u_tex: gl.get_uniform_location(program, "u_tex")?,
+                    u_overlay_alpha: gl.get_uniform_location(program, "u_overlay_alpha")?,
+                    a_pos: gl.get_attrib_location(program, "a_pos")?,
+                    program,
+                })
+            })();
+            self.tile_prog = tile;
+        }
+        self.tile_prog.is_some()
+    }
+
+    /// Ensure the slot holds an RGBA8 FBO + texture at least `w×h`, **grow-only**:
+    /// reused as-is when already big enough, reallocated only when the request
+    /// exceeds the current allocation, never shrunk. The overlay content size
+    /// changes every acquire; growing to the running max (≈ display size after the
+    /// first near-full overlay) means a reallocation happens a couple of times
+    /// early and then never again — vs. a per-acquire realloc of two ~18 MB
+    /// textures, which was the dominant first-present cost. Returns
+    /// `(fbo, tex, alloc_w, alloc_h)`; callers render into the `[0..w]×[0..h]`
+    /// sub-rect and sample it back via the alloc dims.
+    fn ensure_rgba_fbo(
+        slot: &mut Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
+        gl: &glow::Context,
+        w: u32,
+        h: u32,
+    ) -> (glow::Framebuffer, glow::Texture, u32, u32) {
+        if let Some((fbo, tex, sw, sh)) = *slot {
+            if sw >= w && sh >= h {
+                return (fbo, tex, sw, sh);
+            }
+            unsafe {
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(tex);
+            }
+        }
+        // Grow to the max of the request and any prior allocation so the buffer
+        // only ever grows.
+        let (w, h) = match *slot {
+            Some((_, _, sw, sh)) => (w.max(sw), h.max(sh)),
+            None => (w, h),
+        };
+        unsafe {
+            let tex = new_texture(gl).expect("create overlay fbo texture");
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let fbo = gl.create_framebuffer().expect("create overlay framebuffer");
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            assert_eq!(
+                status,
+                glow::FRAMEBUFFER_COMPLETE,
+                "overlay FBO incomplete: status=0x{status:x}"
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            *slot = Some((fbo, tex, w, h));
+            (fbo, tex, w, h)
         }
     }
 
@@ -548,6 +787,414 @@ impl GlesRenderer {
     /// dst→surface fit.
     pub fn present(&mut self, input: &CompositeInput<'_>, display_xform: &[f32; 9]) {
         self.draw(input, display_xform);
+    }
+
+    /// Bake the overlay draw list into [`Self::overlay_fbo`]'s straight-alpha
+    /// texture on the GPU — the replacement for the CPU `render_anchor_canvas`
+    /// build. Two passes: (A) rounded SDF pills unioned opaque into the pill-layer
+    /// FBO, then (B) that layer composited at `pill_alpha` + the per-block text
+    /// tiles src-over at `text_alpha` into the overlay FBO. Text tiles are cached
+    /// by `(block_id, content_hash)` so unchanged blocks skip re-upload. The
+    /// resulting texture is straight-alpha, identical in convention to the old CPU
+    /// canvas, so the present path consumes it unchanged. Returns false on a
+    /// program/build failure (the caller keeps the prior overlay). Must run on the
+    /// GL thread; leaves no framebuffer bound (caller re-targets for present).
+    #[cfg(feature = "planar-tracker")]
+    pub fn render_overlay_to_texture(
+        &mut self,
+        dl: &OverlayDrawList,
+        pill_alpha: f32,
+        text_alpha: f32,
+    ) -> bool {
+        if dl.bitmap_w == 0 || dl.bitmap_h == 0 {
+            return false;
+        }
+        if !self.ensure_pill_program() || !self.ensure_tile_program() {
+            return false;
+        }
+        let (bw, bh) = (dl.bitmap_w, dl.bitmap_h);
+        let os = dl.oversample.max(1e-3);
+        // Render into the FBO without a y flip so the baked texture stores the top
+        // row at v=0 (the convention the present path samples for the CPU canvas).
+        let ndc = ndc_from_viewport_no_flip(bw as f32, bh as f32);
+
+        // Refresh the per-block tile texture cache: upload changed/new tiles,
+        // drop tiles whose block vanished.
+        let t_sync = std::time::Instant::now();
+        self.sync_tile_textures(dl);
+        let sync_ms = t_sync.elapsed().as_secs_f64() * 1000.0;
+
+        // FBO (re)alloc is a synchronous glTexImage2D of two RGBA textures —
+        // measured separately because a per-acquire size change reallocates them
+        // and that, not the compositing, dominates the first present of an
+        // acquire. A fixed FBO size removes this.
+        let t_alloc = std::time::Instant::now();
+        // Both FBOs grow to the same running-max alloc so the pill→overlay sample
+        // (pass B1) uses one sub-rect scale for both.
+        let (pill_fbo, pill_tex, pa_w, pa_h) =
+            Self::ensure_rgba_fbo(&mut self.pill_fbo, &self.gl, bw, bh);
+        let (overlay_fbo, _overlay_tex, oa_w, oa_h) =
+            Self::ensure_rgba_fbo(&mut self.overlay_fbo, &self.gl, bw, bh);
+        let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
+        // uv scale to sample only the content sub-rect of the (possibly larger)
+        // pill texture in pass B1.
+        let pill_uv_sx = bw as f32 / pa_w as f32;
+        let pill_uv_sy = bh as f32 / pa_h as f32;
+        let _ = (oa_w, oa_h);
+        let t_passes = std::time::Instant::now();
+
+        unsafe {
+            let gl = &self.gl;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.active_texture(glow::TEXTURE0);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.enable(glow::BLEND);
+            gl.blend_equation(glow::FUNC_ADD);
+            // Straight-alpha source-over: rgb interpolates by src alpha, alpha
+            // accumulates toward coverage. Both FBOs stay straight-alpha.
+            gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+
+            // --- Pass A: opaque rounded pills unioned into the pill layer. ---
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(pill_fbo));
+            gl.viewport(0, 0, bw as i32, bh as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            let pill = self.pill.as_ref().expect("pill program present");
+            gl.use_program(Some(pill.program));
+            gl.enable_vertex_attrib_array(pill.a_pos);
+            gl.vertex_attrib_pointer_f32(pill.a_pos, 2, glow::FLOAT, false, 0, 0);
+            for p in &dl.pills {
+                let r = &p.rect;
+                let cos = r.angle_radians.cos();
+                let sin = r.angle_radians.sin();
+                let cx = (r.cx - dl.origin_x) * os;
+                let cy = (r.cy - dl.origin_y) * os;
+                let hw = r.width * os * 0.5;
+                let hh = r.height * os * 0.5;
+                if hw <= 0.0 || hh <= 0.0 {
+                    continue;
+                }
+                let radius = (hw.min(hh) * 0.5).min(12.0).max(0.0);
+                // unit quad (0..1) → oriented texel quad (corner0 + axes). Tangent
+                // (cos,sin), perp (-sin,cos); corner0 = centre − hw·t − hh·p.
+                let (tx, ty) = (cos, sin);
+                let (px, py) = (-sin, cos);
+                let c0x = cx - hw * tx - hh * px;
+                let c0y = cy - hw * ty - hh * py;
+                let quad_to_texel = [
+                    2.0 * hw * tx,
+                    2.0 * hh * px,
+                    c0x,
+                    2.0 * hw * ty,
+                    2.0 * hh * py,
+                    c0y,
+                    0.0,
+                    0.0,
+                    1.0,
+                ];
+                let transform = mat3_mul(&ndc, &quad_to_texel);
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&pill.u_transform),
+                    false,
+                    &to_column_major(&transform),
+                );
+                // Opaque in the pill layer (alpha = coverage only) so overlapping
+                // pills union flat instead of double-darkening; the desired
+                // translucency is applied once as `pill_alpha` when the layer is
+                // composited into the overlay FBO. The per-pill color's own alpha
+                // is intentionally dropped here.
+                gl.uniform_4_f32_slice(
+                    Some(&pill.u_color),
+                    &[
+                        p.color[0] as f32 / 255.0,
+                        p.color[1] as f32 / 255.0,
+                        p.color[2] as f32 / 255.0,
+                        1.0,
+                    ],
+                );
+                gl.uniform_2_f32_slice(Some(&pill.u_half), &[hw, hh]);
+                gl.uniform_1_f32(Some(&pill.u_radius), radius);
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
+
+            // --- Pass B: composite pill layer at pill_alpha, then text tiles. ---
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(overlay_fbo));
+            gl.viewport(0, 0, bw as i32, bh as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+
+            // B1: pill layer (straight-alpha) scaled by pill_alpha via the 2D
+            // program; content-sub-rect quad, uv scaled to sample only the used
+            // [0..bw]×[0..bh] region of the (grow-only) pill texture.
+            let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+            let pill_uv = to_column_major(&scale(pill_uv_sx, pill_uv_sy));
+            let full = mat3_mul(&ndc, &scale(bw as f32, bh as f32));
+            gl.use_program(Some(self.program));
+            gl.enable_vertex_attrib_array(self.a_pos);
+            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&self.u_tex), 0);
+            gl.uniform_1_f32(Some(&self.u_overlay_alpha), pill_alpha.clamp(0.0, 1.0));
+            gl.uniform_matrix_3_f32_slice(Some(&self.u_transform), false, &to_column_major(&full));
+            gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &pill_uv);
+            gl.bind_texture(glow::TEXTURE_2D, Some(pill_tex));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+            // B2: text tiles (premultiplied → un-premultiplied to straight by the
+            // tile program), src-over at text_alpha. Each placed at its texel rect.
+            let tile = self.tile_prog.as_ref().expect("tile program present");
+            gl.use_program(Some(tile.program));
+            gl.enable_vertex_attrib_array(tile.a_pos);
+            gl.vertex_attrib_pointer_f32(tile.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&tile.u_tex), 0);
+            gl.uniform_1_f32(Some(&tile.u_overlay_alpha), text_alpha.clamp(0.0, 1.0));
+            gl.uniform_matrix_3_f32_slice(Some(&tile.u_uv_xform), false, &identity_uv);
+            for t in &dl.tiles {
+                if t.width == 0 || t.height == 0 {
+                    continue;
+                }
+                let Some((_, tex, _, _)) = self.tile_textures.get(&t.block_id) else {
+                    continue;
+                };
+                let place = mat3_mul(
+                    &mat3_mul(&ndc, &translate(t.left as f32, t.top as f32)),
+                    &scale(t.width as f32, t.height as f32),
+                );
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&tile.u_transform),
+                    false,
+                    &to_column_major(&place),
+                );
+                gl.bind_texture(glow::TEXTURE_2D, Some(*tex));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        let passes_ms = t_passes.elapsed().as_secs_f64() * 1000.0;
+        log::info!(
+            "[overlay-bake] {bw}x{bh} (alloc {pa_w}x{pa_h}) sync={sync_ms:.1}ms({} tiles) \
+             alloc={alloc_ms:.1}ms passes={passes_ms:.1}ms",
+            dl.tiles.len()
+        );
+        true
+    }
+
+    /// Upload changed/new text tiles into the per-block texture cache and drop
+    /// tiles whose block is no longer in the draw list. Keyed by block id; the
+    /// stored content hash skips re-upload while a block's text is unchanged.
+    #[cfg(feature = "planar-tracker")]
+    fn sync_tile_textures(&mut self, dl: &OverlayDrawList) {
+        let live: std::collections::HashSet<u64> = dl.tiles.iter().map(|t| t.block_id).collect();
+        let stale: Vec<u64> = self
+            .tile_textures
+            .keys()
+            .filter(|id| !live.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            if let Some((_, tex, _, _)) = self.tile_textures.remove(&id) {
+                unsafe { self.gl.delete_texture(tex) };
+            }
+        }
+        for t in &dl.tiles {
+            if t.width == 0 || t.height == 0 {
+                continue;
+            }
+            match self.tile_textures.get(&t.block_id) {
+                Some((hash, _, w, h))
+                    if *hash == t.content_hash && *w == t.width && *h == t.height =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            let tex = match self.tile_textures.remove(&t.block_id) {
+                Some((_, tex, _, _)) => tex,
+                None => match new_texture(&self.gl) {
+                    Ok(tex) => tex,
+                    Err(_) => continue,
+                },
+            };
+            let mut size = None;
+            upload_tex(&self.gl, tex, &mut size, &t.rgba, t.width, t.height);
+            self.tile_textures
+                .insert(t.block_id, (t.content_hash, tex, t.width, t.height));
+        }
+    }
+
+    /// Present the screen overlay canvas straight into the bound framebuffer
+    /// (the EGL window surface of the overlay `TextureView`): one axis-aligned,
+    /// premultiplied-alpha quad over a transparent clear — no camera, no
+    /// homography. The screen path's analogue of [`present`](Self::present), but
+    /// for a CPU-built canvas displayed 1:1 rather than warped onto live camera.
+    ///
+    /// `origin_canonical_*` is the canvas top-left in canonical-frame coords;
+    /// `oversample` is its texel density (canonical → texel). The canvas maps
+    /// canonical → surface px by `surface_/canonical_` and draws at its native
+    /// texel size. The caller binds the window surface (FBO 0) and swaps after.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_screen_overlay(
+        &mut self,
+        rgba: &[u8],
+        tex_w: u32,
+        tex_h: u32,
+        origin_canonical_x: f32,
+        origin_canonical_y: f32,
+        oversample: f32,
+        canonical_w: u32,
+        canonical_h: u32,
+        surface_w: u32,
+        surface_h: u32,
+    ) {
+        if rgba.is_empty() || tex_w == 0 || tex_h == 0 {
+            return;
+        }
+        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
+        let sx = surface_w as f32 / canonical_w.max(1) as f32;
+        let sy = surface_h as f32 / canonical_h.max(1) as f32;
+        let inv_os = 1.0 / oversample.max(1e-3);
+        // unit quad → canvas footprint (canonical units × canonical→surface) →
+        // origin (in surface px) → clip (top-left origin, y-flipped).
+        let footprint = scale(tex_w as f32 * inv_os * sx, tex_h as f32 * inv_os * sy);
+        let to_surface = translate(origin_canonical_x * sx, origin_canonical_y * sy);
+        let ndc = ndc_from_viewport(surface_w as f32, surface_h as f32);
+        let transform = mat3_mul(&ndc, &mat3_mul(&to_surface, &footprint));
+        let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        unsafe {
+            let gl = &self.gl;
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.active_texture(glow::TEXTURE0);
+            gl.use_program(Some(self.program));
+            gl.enable_vertex_attrib_array(self.a_pos);
+            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&self.u_tex), 0);
+            gl.uniform_1_f32(Some(&self.u_overlay_alpha), self.overlay_alpha);
+            // A prior monitor readback may have left an external texture bound on
+            // unit 0; Adreno/Mali mis-sample a sampler2D while one lingers there,
+            // so clear it before binding the 2D overlay texture.
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.enable(glow::BLEND);
+            gl.blend_equation(glow::FUNC_ADD);
+            // Premultiplied output for the translucent window layer (matches the
+            // overlay-only blend in `draw`).
+            gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+        }
+        // Always re-upload: the screen incremental path mutates the canvas in
+        // place (stable Vec ptr+len across content changes), so a ptr-identity
+        // skip would re-present a stale texture — pills without the text painted
+        // in afterwards. The caller (the GL worker) only presents when the
+        // overlay version changed, so this uploads once per real change, not per
+        // frame. `glTexSubImage2D` reuses storage while the size is unchanged.
+        upload_tex(
+            &self.gl,
+            self.overlay_tex,
+            &mut self.overlay_size,
+            rgba,
+            tex_w,
+            tex_h,
+        );
+        unsafe {
+            let gl = &self.gl;
+            gl.uniform_matrix_3_f32_slice(
+                Some(&self.u_transform),
+                false,
+                &to_column_major(&transform),
+            );
+            gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &identity_uv);
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        }
+    }
+
+    /// Present the GPU-baked overlay texture ([`Self::render_overlay_to_texture`])
+    /// straight into the bound EGL window surface (the screen `TextureView`): one
+    /// axis-aligned quad over a transparent clear, no homography. The texture is
+    /// straight-alpha; the window surface wants premultiplied (SurfaceFlinger), so
+    /// the global `overlay_alpha` is applied and the blend leaves premultiplied
+    /// output. `dl` supplies the same geometry the bake used. Returns false when
+    /// there's no baked overlay. The caller binds the window surface + swaps.
+    #[cfg(feature = "planar-tracker")]
+    pub fn present_screen_overlay_fbo(
+        &mut self,
+        dl: &OverlayDrawList,
+        canonical_w: u32,
+        canonical_h: u32,
+        surface_w: u32,
+        surface_h: u32,
+    ) -> bool {
+        let Some((_, overlay_tex, alloc_w, alloc_h)) = self.overlay_fbo else {
+            return false;
+        };
+        if alloc_w == 0 || alloc_h == 0 {
+            return false;
+        }
+        // The overlay FBO is grow-only, so the baked content occupies only the
+        // `[0..bitmap_w]×[0..bitmap_h]` sub-rect of the (larger) texture. The
+        // footprint covers the used content's surface size; the uv samples just
+        // that sub-rect.
+        let (used_w, used_h) = (dl.bitmap_w.max(1), dl.bitmap_h.max(1));
+        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
+        let os = dl.oversample.max(1e-3);
+        let sx = surface_w as f32 / canonical_w.max(1) as f32;
+        let sy = surface_h as f32 / canonical_h.max(1) as f32;
+        let inv_os = 1.0 / os;
+        let footprint = scale(used_w as f32 * inv_os * sx, used_h as f32 * inv_os * sy);
+        let to_surface = translate(dl.origin_x * sx, dl.origin_y * sy);
+        let ndc = ndc_from_viewport(surface_w as f32, surface_h as f32);
+        let transform = mat3_mul(&ndc, &mat3_mul(&to_surface, &footprint));
+        let uv_sub = to_column_major(&scale(
+            used_w as f32 / alloc_w as f32,
+            used_h as f32 / alloc_h as f32,
+        ));
+        unsafe {
+            let gl = &self.gl;
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.active_texture(glow::TEXTURE0);
+            gl.use_program(Some(self.program));
+            gl.enable_vertex_attrib_array(self.a_pos);
+            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&self.u_tex), 0);
+            gl.uniform_1_f32(Some(&self.u_overlay_alpha), self.overlay_alpha);
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.enable(glow::BLEND);
+            gl.blend_equation(glow::FUNC_ADD);
+            gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+            gl.uniform_matrix_3_f32_slice(
+                Some(&self.u_transform),
+                false,
+                &to_column_major(&transform),
+            );
+            gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &uv_sub);
+            gl.bind_texture(glow::TEXTURE_2D, Some(overlay_tex));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        }
+        true
     }
 
     /// Composite the (already-uploaded) camera texture + overlays into the
@@ -880,6 +1527,22 @@ impl Drop for GlesRenderer {
             if let Some(t) = self.fbo_tex {
                 self.gl.delete_texture(t);
             }
+            if let Some(p) = self.pill.take() {
+                self.gl.delete_program(p.program);
+            }
+            if let Some(p) = self.tile_prog.take() {
+                self.gl.delete_program(p.program);
+            }
+            for (fbo, tex, _, _) in [self.overlay_fbo.take(), self.pill_fbo.take()]
+                .into_iter()
+                .flatten()
+            {
+                self.gl.delete_framebuffer(fbo);
+                self.gl.delete_texture(tex);
+            }
+            for (_, (_, tex, _, _)) in self.tile_textures.drain() {
+                self.gl.delete_texture(tex);
+            }
         }
     }
 }
@@ -1049,10 +1712,18 @@ fn link_program(gl: &glow::Context) -> Result<glow::Program, GlError> {
 }
 
 fn link_program_frag(gl: &glow::Context, frag_src: &str) -> Result<glow::Program, GlError> {
+    link_program_vert_frag(gl, VERT_SRC, frag_src)
+}
+
+fn link_program_vert_frag(
+    gl: &glow::Context,
+    vert_src: &str,
+    frag_src: &str,
+) -> Result<glow::Program, GlError> {
     unsafe {
         let program = gl.create_program().map_err(GlError::ProgramLink)?;
         let shaders = [
-            compile_shader(gl, glow::VERTEX_SHADER, VERT_SRC)?,
+            compile_shader(gl, glow::VERTEX_SHADER, vert_src)?,
             compile_shader(gl, glow::FRAGMENT_SHADER, frag_src)?,
         ];
         for s in shaders {

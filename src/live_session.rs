@@ -206,6 +206,11 @@ pub struct AnchorOverlay {
     /// rendered_fingerprint`, so block updates make the canvas
     /// "stale" without dropping it.
     pub rendered_fingerprint: Option<u64>,
+    /// Pill footprints (surface coords) from the most recent GPU draw-list build,
+    /// for the movement monitor's mask when there is no CPU `canvas`. The GPU
+    /// screen path doesn't build an [`AnchorRaster`], so [`Self::overlay_pill_rects`]
+    /// reads this instead of `canvas.painted_pills`.
+    pub gpu_painted_pills: Vec<OrientedRect>,
 }
 
 impl AnchorOverlay {
@@ -216,6 +221,7 @@ impl AnchorOverlay {
             provisional_strips: Vec::new(),
             canvas: None,
             rendered_fingerprint: None,
+            gpu_painted_pills: Vec::new(),
         }
     }
 
@@ -452,12 +458,6 @@ pub struct LiveSession {
     /// (it was O(N²) and stalled rec/translate ~2×). The camera leaves all of this
     /// off and renders on the worker.
     screen_overlay: AtomicBool,
-    /// Serializes screen-overlay canvas renders. The screen mutates its persistent
-    /// canvas in place (incremental block adds), and `ensure_anchor_canvas` is
-    /// called from both the GL thread (every present) and the worker (the one-shot
-    /// provisional render), so the in-place mutation must not interleave. Camera
-    /// renders into fresh buffers and don't take this.
-    screen_render_lock: Mutex<()>,
     /// Persistent glyph cache (parsed faces + glyph alpha-mask atlas) reused across
     /// renders, so repeat acquires and streaming updates find glyphs already
     /// rasterized instead of rebuilding a per-call cache. Font-file-keyed, so it
@@ -493,7 +493,6 @@ impl LiveSession {
             content_version: AtomicU64::new(0),
             block_tiles: Mutex::new(HashMap::new()),
             screen_overlay: AtomicBool::new(false),
-            screen_render_lock: Mutex::new(()),
             glyph_cache: Mutex::new(crate::image_render::FontCache::default()),
         }
     }
@@ -561,6 +560,60 @@ impl LiveSession {
             raster.surface_origin_x,
             raster.surface_origin_y,
         ))
+    }
+
+    /// Run `f` with the mounted overlay canvas of `anchor_id` — `(rgba, width,
+    /// height, surface_origin_x, surface_origin_y, oversample)` — under the held
+    /// lock. `None` when there's no canvas. The GPU screen present uploads `rgba`
+    /// straight to a texture inside `f`; the caller must have rendered the canvas
+    /// first (e.g. via [`Self::ensure_anchor_canvas`]).
+    pub fn with_overlay_canvas<R>(
+        &self,
+        anchor_id: AnchorId,
+        f: impl FnOnce(&[u8], u32, u32, f32, f32, f32) -> R,
+    ) -> Option<R> {
+        let anchors = self.overlay_anchors.lock().ok()?;
+        let raster = anchors.get(&anchor_id)?.canvas.as_ref()?;
+        Some(f(
+            &raster.bitmap,
+            raster.width,
+            raster.height,
+            raster.surface_origin_x,
+            raster.surface_origin_y,
+            raster.oversample,
+        ))
+    }
+
+    /// Build the GPU overlay draw list for `anchor_id` from its current block +
+    /// provisional content (the GPU replacement for [`Self::ensure_anchor_canvas`]).
+    /// Snapshots under the lock, builds outside it (glyph raster), then stashes the
+    /// pill footprints back on the anchor for the movement monitor's mask. `None`
+    /// when there's nothing to show. Runs on the GL thread.
+    pub fn overlay_draw_list(
+        &self,
+        anchor_id: AnchorId,
+        font_provider: &dyn crate::font_provider::FontProvider,
+    ) -> Option<OverlayDrawList> {
+        let (blocks, provisional) = {
+            let anchors = self.overlay_anchors.lock().ok()?;
+            let anchor = anchors.get(&anchor_id)?;
+            (anchor.blocks.clone(), anchor.provisional_strips.clone())
+        };
+        let dl = build_overlay_draw_list(
+            &blocks,
+            &provisional,
+            font_provider,
+            self.overlay_oversample(),
+            self.overlay_bg(),
+            &self.block_tiles,
+            &self.glyph_cache,
+        )?;
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            if let Some(anchor) = anchors.get_mut(&anchor_id) {
+                anchor.gpu_painted_pills = dl.painted_pills.clone();
+            }
+        }
+        Some(dl)
     }
 
     /// Set the overlay-canvas oversample factor (texels per surface
@@ -849,11 +902,15 @@ impl LiveSession {
         let Ok(anchors) = self.overlay_anchors.lock() else {
             return Vec::new();
         };
-        anchors
-            .get(&anchor_id)
-            .and_then(|a| a.canvas.as_ref())
-            .map(|raster| raster.painted_pills.clone())
-            .unwrap_or_default()
+        let Some(anchor) = anchors.get(&anchor_id) else {
+            return Vec::new();
+        };
+        // CPU canvas path (camera) carries the mask on its raster; the GPU
+        // draw-list path (screen) builds no raster and stashes it separately.
+        match anchor.canvas.as_ref() {
+            Some(raster) => raster.painted_pills.clone(),
+            None => anchor.gpu_painted_pills.clone(),
+        }
     }
 
     /// Reset the refresh counter. Call after each fresh acquire so
@@ -1189,7 +1246,14 @@ impl LiveSession {
         font_provider: &dyn crate::font_provider::FontProvider,
     ) {
         if self.screen_overlay.load(Ordering::SeqCst) {
-            self.ensure_anchor_canvas_screen(anchor_id, font_provider);
+            // Screen overlay is composited on the GPU (`overlay_draw_list` →
+            // `render_overlay_to_texture` on the present thread); it builds no CPU
+            // canvas. Any worker-side rebuild request for the screen anchor is a
+            // no-op — bumping `content_version` (done by the callers) is enough to
+            // tell the present thread to re-bake. `_ = font_provider` keeps the
+            // signature shared with the camera path.
+            let _ = font_provider;
+            let _ = anchor_id;
             return;
         }
         let (snapshot_fp, blocks_snapshot, provisional_snapshot) = {
@@ -1240,66 +1304,6 @@ impl LiveSession {
                     anchor.rendered_fingerprint = Some(snapshot_fp);
                     self.canvas_version.fetch_add(1, Ordering::SeqCst);
                 }
-            }
-        }
-    }
-
-    /// Screen variant of [`Self::ensure_anchor_canvas`]. The screen keeps a single
-    /// persistent canvas and updates it *in place* (incremental block adds via the
-    /// `prev` arg to `render_anchor_canvas`), so it must serialize renders — `ensure`
-    /// is called both from the GL thread (every present) and from the worker (the
-    /// one-shot provisional render). `screen_render_lock` guarantees one render at a
-    /// time; the canvas is taken out for the render so concurrent readers
-    /// (copy/monitor) see no canvas briefly and keep their last frame rather than a
-    /// torn one.
-    fn ensure_anchor_canvas_screen(
-        &self,
-        anchor_id: AnchorId,
-        font_provider: &dyn crate::font_provider::FontProvider,
-    ) {
-        let _render = match self.screen_render_lock.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let (snapshot_fp, blocks_snapshot, provisional_snapshot, prev) = {
-            let mut anchors = match self.overlay_anchors.lock() {
-                Ok(a) => a,
-                Err(_) => return,
-            };
-            let anchor = match anchors.get_mut(&anchor_id) {
-                Some(a) => a,
-                None => return,
-            };
-            if anchor.is_canvas_current() {
-                return;
-            }
-            (
-                anchor.content_fingerprint(),
-                anchor.blocks.clone(),
-                anchor.provisional_strips.clone(),
-                anchor.canvas.take(),
-            )
-        };
-        let canvas = render_anchor_canvas(
-            &blocks_snapshot,
-            &provisional_snapshot,
-            font_provider,
-            self.overlay_oversample(),
-            self.overlay_bg(),
-            Some(&self.block_tiles),
-            true,
-            prev,
-            Some(&self.glyph_cache),
-        );
-        if let Ok(mut anchors) = self.overlay_anchors.lock() {
-            if let Some(anchor) = anchors.get_mut(&anchor_id) {
-                anchor.canvas = canvas;
-                // Mark as reflecting the snapshot. If a worker upsert raced in after
-                // the snapshot, `content_fingerprint()` now differs, so the next
-                // present re-renders and incrementally adds the newer block — the
-                // in-place paint we just did stays correct for what it covered.
-                anchor.rendered_fingerprint = Some(snapshot_fp);
-                self.canvas_version.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -3005,6 +3009,300 @@ pub fn normalize_block_visuals_rotated_basis(visuals: &mut [OrientedRect]) {
     }
 }
 
+/// Inflate one block's detector strips into the visible pill rects (surface
+/// coords): pad width, inflate height, snap the shared basis via
+/// [`normalize_block_visuals_rotated_basis`], then snap near-axis angles to 0.
+/// Empty when no strip survives the width/height guard. Shared by the CPU canvas
+/// builder ([`render_anchor_canvas`]) and the GPU draw-list builder
+/// ([`build_screen_draw_list`]) so both produce identical pill geometry.
+fn inflate_block_visuals(spec: &BlockSpec) -> Vec<OrientedRect> {
+    let mut visuals: Vec<OrientedRect> = spec
+        .strips
+        .iter()
+        .filter_map(|s| {
+            let v = OrientedRect {
+                cx: s.cx,
+                cy: s.cy,
+                width: s.width + 2.0 * HORIZONTAL_PAD_PX,
+                height: s.height * TIGHT_VERTICAL_INFLATE,
+                angle_radians: s.angle_radians,
+            };
+            if v.width <= 0.0 || v.height <= 0.0 {
+                None
+            } else {
+                Some(v)
+            }
+        })
+        .collect();
+    if visuals.is_empty() {
+        return visuals;
+    }
+    normalize_block_visuals_rotated_basis(&mut visuals);
+    for v in &mut visuals {
+        if v.angle_radians.abs() < AXIS_SNAP_RAD {
+            v.angle_radians = 0.0;
+        }
+    }
+    visuals
+}
+
+/// Inflate provisional strips into pill rects (surface coords): same width/height
+/// inflation as [`inflate_block_visuals`] but each strip stands alone (no
+/// grouping/normalize), with the axis snap applied to the raw angle first.
+fn inflate_provisional_visuals(strips: &[OrientedRect]) -> Vec<OrientedRect> {
+    strips
+        .iter()
+        .filter_map(|s| {
+            let angle = if s.angle_radians.abs() < AXIS_SNAP_RAD {
+                0.0
+            } else {
+                s.angle_radians
+            };
+            let v = OrientedRect {
+                cx: s.cx,
+                cy: s.cy,
+                width: s.width + 2.0 * HORIZONTAL_PAD_PX,
+                height: s.height * TIGHT_VERTICAL_INFLATE,
+                angle_radians: angle,
+            };
+            if v.width <= 0.0 || v.height <= 0.0 {
+                None
+            } else {
+                Some(v)
+            }
+        })
+        .collect()
+}
+
+/// Union AABB (surface coords) over a set of oriented pills' corners. `None` when
+/// the set is empty (no finite bound).
+fn pills_union_aabb(pills: &[OrientedRect]) -> Option<(f32, f32, f32, f32)> {
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for v in pills {
+        for (x, y) in v.corners() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite() {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
+
+/// Canvas geometry (origin in surface px, bitmap dims in texels) for a pill set,
+/// matching [`render_anchor_canvas`]'s AABB → origin → floor-sized chain exactly
+/// so the GPU draw list places tiles in the same coordinate frame the CPU canvas
+/// would have used.
+fn canvas_geometry(pills: &[OrientedRect], os: f32) -> Option<(f32, f32, u32, u32)> {
+    let (min_x, min_y, max_x, max_y) = pills_union_aabb(pills)?;
+    let pad = ITEM_BITMAP_PAD_PX;
+    let origin_x = (min_x - pad).max(0.0);
+    let origin_y = (min_y - pad).max(0.0);
+    let bitmap_w = (((max_x + pad - origin_x) * os).floor() as i32).max(1) as u32;
+    let bitmap_h = (((max_y + pad - origin_y) * os).floor() as i32).max(1) as u32;
+    Some((origin_x, origin_y, bitmap_w, bitmap_h))
+}
+
+/// One opaque pill the GPU draws as an oriented rounded-rect quad. `rect` is in
+/// **surface (canonical)** coords; the compositor localizes it into the overlay
+/// texture (`(p − origin) * oversample`). `color` is straight RGBA.
+#[derive(Clone, Debug)]
+pub struct OverlayPill {
+    pub rect: OrientedRect,
+    pub color: [u8; 4],
+}
+
+/// One block's translated-text tile, placed in **overlay-texture-local texel**
+/// coords (`left/top`, like [`crate::image_render::BlockTile`]). `rgba` is the
+/// premultiplied straight-alpha tile the GPU uploads as a texture; the compositor
+/// caches it by `(block_id, content_hash)` so an unchanged block skips the
+/// re-upload.
+#[derive(Clone, Debug)]
+pub struct OverlayTile {
+    pub block_id: u64,
+    pub content_hash: u64,
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub left: i32,
+    pub top: i32,
+}
+
+/// Backend-agnostic GPU draw list for one anchor's overlay: oriented pill quads
+/// (surface coords) + per-block text tiles (texture-local coords), plus the
+/// canvas geometry the compositor renders into and the `painted_pills` the
+/// movement monitor masks. The GPU compositor renders this into an overlay
+/// texture (rounded pills + tiles), which the present then warps by the
+/// homography (camera) or identity (screen) — replacing the CPU
+/// [`AnchorRaster`] build for production. Shared by both paths; the camera differs
+/// only in the present transform.
+#[derive(Clone, Debug, Default)]
+pub struct OverlayDrawList {
+    /// Canvas (overlay-texture) origin in surface coords.
+    pub origin_x: f32,
+    pub origin_y: f32,
+    /// Texels per surface unit baked into the texture.
+    pub oversample: f32,
+    /// Overlay texture dims (texels).
+    pub bitmap_w: u32,
+    pub bitmap_h: u32,
+    pub pills: Vec<OverlayPill>,
+    pub tiles: Vec<OverlayTile>,
+    /// Pill footprints (surface coords) for the movement monitor's mask.
+    pub painted_pills: Vec<OrientedRect>,
+}
+
+/// Build the GPU draw list for one anchor's overlay: the GPU counterpart of
+/// [`render_anchor_canvas`], producing oriented pill quads + per-block text tiles
+/// instead of compositing them into a bitmap. Glyph rasterization still happens
+/// on the CPU via [`render_block_tiles`] (per-block, cached in `tile_cache`), but
+/// the pill fill + tile composite move to the GPU. Geometry is computed
+/// identically to `render_anchor_canvas` so the result is pixel-aligned. `None`
+/// when there's nothing to show.
+pub(crate) fn build_overlay_draw_list(
+    blocks: &std::collections::BTreeMap<u64, BlockSpec>,
+    provisional_strips: &[OrientedRect],
+    font_provider: &dyn crate::font_provider::FontProvider,
+    oversample: f32,
+    bg_rgba: [u8; 4],
+    tile_cache: &Mutex<HashMap<u64, (u64, crate::image_render::BlockTile)>>,
+    glyph_cache: &Mutex<crate::image_render::FontCache>,
+) -> Option<OverlayDrawList> {
+    if blocks.is_empty() && provisional_strips.is_empty() {
+        return None;
+    }
+    let os = oversample.max(1.0);
+
+    struct PreparedBlock<'a> {
+        block_id: u64,
+        visuals: Vec<OrientedRect>,
+        spec: &'a BlockSpec,
+    }
+    let mut prepared: Vec<PreparedBlock<'_>> = Vec::with_capacity(blocks.len());
+    for (block_id, spec) in blocks {
+        let visuals = inflate_block_visuals(spec);
+        if visuals.is_empty() {
+            continue;
+        }
+        prepared.push(PreparedBlock {
+            block_id: *block_id,
+            visuals,
+            spec,
+        });
+    }
+    let prepared_provisional = inflate_provisional_visuals(provisional_strips);
+    if prepared.is_empty() && prepared_provisional.is_empty() {
+        return None;
+    }
+
+    let painted_pills: Vec<OrientedRect> = prepared
+        .iter()
+        .flat_map(|pb| pb.visuals.iter().copied())
+        .chain(prepared_provisional.iter().copied())
+        .collect();
+
+    let (origin_x, origin_y, bitmap_w, bitmap_h) = canvas_geometry(&painted_pills, os)?;
+
+    // Pills: block strips (matted/default color per strip index) then provisional
+    // strips (default bg), in surface coords — drawn as oriented rounded quads.
+    let mut pills: Vec<OverlayPill> = Vec::with_capacity(painted_pills.len());
+    for pb in &prepared {
+        for (i, v) in pb.visuals.iter().enumerate() {
+            let color = block_pill_color(pb.spec, i, pb.block_id, bg_rgba);
+            pills.push(OverlayPill { rect: *v, color });
+        }
+    }
+    for v in &prepared_provisional {
+        pills.push(OverlayPill {
+            rect: *v,
+            color: bg_rgba,
+        });
+    }
+
+    // Text tiles: build one PreparedTextBlock per block with text, render (cached)
+    // per-block tiles. Mirrors `composite_block_tiles`' cache discipline (render
+    // changed, retain live). Tile `left/top` are texture-local texel coords.
+    let mut text_blocks: Vec<crate::ocr::PreparedTextBlock> = Vec::new();
+    let mut block_meta: Vec<(u64, u64)> = Vec::new();
+    let mut anchor_lang = String::new();
+    for pb in &prepared {
+        let local = localize_visuals(&pb.visuals, origin_x, origin_y, os);
+        if let Some(tb) =
+            build_block_text_block(pb.spec, &pb.visuals, &local, os, bitmap_w, bitmap_h)
+        {
+            if anchor_lang.is_empty() {
+                anchor_lang = pb.spec.language.clone();
+            }
+            text_blocks.push(tb);
+            block_meta.push((pb.block_id, pb.spec.content_hash));
+        }
+    }
+
+    let mut tiles: Vec<OverlayTile> = Vec::new();
+    {
+        let opts = crate::image_render::RenderOptions {
+            language: anchor_lang,
+            min_font_size_px: 6.0 * os,
+        };
+        let mut cache = tile_cache.lock().expect("tile cache poisoned");
+        let to_render: Vec<usize> = block_meta
+            .iter()
+            .enumerate()
+            .filter(|(_, (bid, hash))| !matches!(cache.get(bid), Some((h, _)) if h == hash))
+            .map(|(i, _)| i)
+            .collect();
+        if !to_render.is_empty() {
+            let subset: Vec<crate::ocr::PreparedTextBlock> =
+                to_render.iter().map(|&i| text_blocks[i].clone()).collect();
+            let rendered = with_glyph_cache(Some(glyph_cache), |gc| {
+                crate::image_render::render_block_tiles(&subset, gc, font_provider, &opts)
+            });
+            for (&i, tile_opt) in to_render.iter().zip(rendered.into_iter()) {
+                let (bid, hash) = block_meta[i];
+                match tile_opt {
+                    Some(tile) => {
+                        cache.insert(bid, (hash, tile));
+                    }
+                    None => {
+                        cache.remove(&bid);
+                    }
+                }
+            }
+        }
+        let live: std::collections::HashSet<u64> = block_meta.iter().map(|(b, _)| *b).collect();
+        cache.retain(|id, _| live.contains(id));
+        for (bid, hash) in &block_meta {
+            if let Some((_, tile)) = cache.get(bid) {
+                tiles.push(OverlayTile {
+                    block_id: *bid,
+                    content_hash: *hash,
+                    rgba: tile.rgba.clone(),
+                    width: tile.width,
+                    height: tile.height,
+                    left: tile.left,
+                    top: tile.top,
+                });
+            }
+        }
+    }
+
+    Some(OverlayDrawList {
+        origin_x,
+        origin_y,
+        oversample: os,
+        bitmap_w,
+        bitmap_h,
+        pills,
+        tiles,
+        painted_pills,
+    })
+}
+
 /// Rasterize one anchor's overlay into a single RGBA canvas.
 ///
 /// Builds the union AABB across *all* blocks, paints each block's
@@ -3259,17 +3557,15 @@ pub(crate) fn render_anchor_canvas(
                 //    have nicked at the edge (re-assert it so no hole is left).
                 let to_repaint: Vec<&PreparedBlock> = prepared
                     .iter()
-                    .filter(|pb| {
-                        match raster.painted_blocks.get(&pb.block_id) {
-                            None => true,
-                            Some((h, pills)) => {
-                                *h != pb.spec.content_hash
-                                    || (!cleared.is_empty()
-                                        && pills.iter().any(|pp| {
-                                            let a = pp.to_aabb();
-                                            cleared.iter().any(|c| aabb_overlaps(&a, c))
-                                        }))
-                            }
+                    .filter(|pb| match raster.painted_blocks.get(&pb.block_id) {
+                        None => true,
+                        Some((h, pills)) => {
+                            *h != pb.spec.content_hash
+                                || (!cleared.is_empty()
+                                    && pills.iter().any(|pp| {
+                                        let a = pp.to_aabb();
+                                        cleared.iter().any(|c| aabb_overlaps(&a, c))
+                                    }))
                         }
                     })
                     .collect();
@@ -3296,7 +3592,8 @@ pub(crate) fn render_anchor_canvas(
                     raster
                         .painted_blocks
                         .insert(pb.block_id, (pb.spec.content_hash, pb.visuals.clone()));
-                    if let Some(tb) = build_block_text_block(pb.spec, &pb.visuals, &local, os, cw, ch)
+                    if let Some(tb) =
+                        build_block_text_block(pb.spec, &pb.visuals, &local, os, cw, ch)
                     {
                         if lang.is_empty() {
                             lang = pb.spec.language.clone();
@@ -3348,12 +3645,21 @@ pub(crate) fn render_anchor_canvas(
                     .painted_provisional_pills
                     .iter()
                     .copied()
-                    .chain(raster.painted_blocks.values().flat_map(|(_, p)| p.iter().copied()))
+                    .chain(
+                        raster
+                            .painted_blocks
+                            .values()
+                            .flat_map(|(_, p)| p.iter().copied()),
+                    )
                     .collect();
                 let st = crate::image_render::take_render_stats();
                 let t_incr = t0.elapsed().as_secs_f64() * 1000.0;
                 let pill_mpx = pill_area_px / 1.0e6;
-                let pill_rate = if pill_mpx > 0.0 { pill_ms / pill_mpx } else { 0.0 };
+                let pill_rate = if pill_mpx > 0.0 {
+                    pill_ms / pill_mpx
+                } else {
+                    0.0
+                };
                 log::info!(
                     "[canvas] {cw}x{ch} incr ~{}blk -{}rm (now {}) {t_incr:.1}ms \
                      [pill={pill_ms:.1}({pill_mpx:.2}Mpx {pill_rate:.0}ms/Mpx) \
@@ -3495,7 +3801,11 @@ pub(crate) fn render_anchor_canvas(
     let cached = tile_cache.is_some();
     let bg_ms = t_bg - t_alloc;
     let pill_mpx = pill_area_px / 1.0e6;
-    let bg_per_mpx = if pill_mpx > 0.0 { bg_ms / pill_mpx } else { 0.0 };
+    let bg_per_mpx = if pill_mpx > 0.0 {
+        bg_ms / pill_mpx
+    } else {
+        0.0
+    };
     log::info!(
         "[canvas] {bitmap_w}x{bitmap_h} blocks={} pills={pill_mpx:.2}Mpx prep+alloc={t_alloc:.1} bg={bg_ms:.1}({bg_per_mpx:.0}ms/Mpx) text={:.1}{} rows={:.1} total={t_rows:.1}ms",
         blocks.len(),
@@ -3602,7 +3912,8 @@ fn build_block_text_block(
             let text_box = OrientedRect {
                 cx: v.cx,
                 cy: v.cy,
-                width: (v.width - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX * os)
+                width: (v.width
+                    - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX * os)
                     .max(1.0),
                 height: v.height,
                 angle_radians: v.angle_radians,

@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use crate::font_provider::{FontHandle, FontProvider, FontRequest};
 use crate::ocr::{
-    OrientedRect, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine, Rect,
+    OrientedRect, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine,
+    Rect,
 };
 use crate::script::Script;
 use crate::text_runs::{ScriptRun, itemize};

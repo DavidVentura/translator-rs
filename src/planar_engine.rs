@@ -2709,7 +2709,13 @@ pub fn fill_oriented_rect_solid(
 /// pill is dropped — the canvas has no content underneath, so transparent is the
 /// correct "uncovered" value. The margin covers sub-pixel overhang of the original
 /// solid fill so no fringe is left behind.
-pub fn clear_oriented_rect(rgba: &mut [u8], w: u32, h: u32, rect: &crate::ocr::OrientedRect, margin: f32) {
+pub fn clear_oriented_rect(
+    rgba: &mut [u8],
+    w: u32,
+    h: u32,
+    rect: &crate::ocr::OrientedRect,
+    margin: f32,
+) {
     let grown = crate::ocr::OrientedRect {
         width: rect.width + 2.0 * margin,
         height: rect.height + 2.0 * margin,
