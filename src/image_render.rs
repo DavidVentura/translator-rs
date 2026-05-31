@@ -17,10 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::font_provider::{FontHandle, FontProvider, FontRequest};
-use crate::ocr::{
-    OrientedRect, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine,
-    Rect,
-};
+use crate::ocr::{OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock};
 use crate::script::Script;
 use crate::text_runs::{ScriptRun, itemize};
 
@@ -107,18 +104,6 @@ pub fn render_overlay(
     Ok(canvas)
 }
 
-/// One block's translated text rasterized into its own transparent
-/// (straight-alpha) tile, sized to the block's bounding box. `left`/`top` are the
-/// tile's top-left in canvas coords. The caller composites the tile (src-over)
-/// onto the overlay canvas.
-pub struct BlockTile {
-    pub rgba: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub left: i32,
-    pub top: i32,
-}
-
 /// `(font_id, glyph_id, size_px)` — the dense key for the CPU glyph atlas and the
 /// GPU atlas. All three dimensions must match for a mask to be reused.
 pub type GlyphKey = (u32, u16, u32);
@@ -171,62 +156,7 @@ pub(crate) enum GlyphSink<'a> {
     Collect(&'a mut GlyphCollector),
 }
 
-/// Render each block's text into its own transparent tile (sized to the block's
-/// bbox, coords shifted tile-local), sharing `cache` across the batch. Returns one
-/// entry per input block (`None` for empty-text blocks). Because blocks don't
-/// interact (independent layout, no cross-block bleed), compositing these tiles is
-/// pixel-identical to a single [`render_overlay`] over all blocks — but a cache can
-/// skip unchanged blocks. Coords in `blocks` are canvas-local (the same the
-/// monolithic path uses).
-///
-/// `cache` may be reused across renders to persist the parsed-`Face` and glyph
-/// atlas (font-file-keyed, provider-independent). The font-chain lookups *are*
-/// provider-dependent, so they're cleared each call and rebuilt for the current
-/// `fonts`.
-pub(crate) fn render_block_tiles(
-    blocks: &[PreparedTextBlock],
-    cache: &mut FontCache,
-    fonts: &dyn FontProvider,
-    opts: &RenderOptions,
-) -> Vec<Option<BlockTile>> {
-    cache.clear_chains();
-    blocks
-        .iter()
-        .map(|block| {
-            if block.translated_text.trim().is_empty() {
-                return None;
-            }
-            let bbox = block.bounding_box;
-            let tw = bbox.right.saturating_sub(bbox.left).max(1);
-            let th = bbox.bottom.saturating_sub(bbox.top).max(1);
-            let shifted = shift_block(block, bbox.left as f32, bbox.top as f32);
-            let mut tile = vec![0u8; (tw as usize) * (th as usize) * 4];
-            let mut sink = GlyphSink::Canvas {
-                canvas: &mut tile,
-                width: tw,
-                height: th,
-            };
-            match shifted.layout_hints.layout_mode {
-                OverlayLayoutMode::PerLine => {
-                    render_per_line(&mut sink, &shifted, cache, fonts, opts)
-                }
-                OverlayLayoutMode::BlockRect => {
-                    render_block_rect(&mut sink, &shifted, cache, fonts, opts)
-                }
-            }
-            Some(BlockTile {
-                rgba: tile,
-                width: tw,
-                height: th,
-                left: bbox.left as i32,
-                top: bbox.top as i32,
-            })
-        })
-        .collect()
-}
-
-/// Collect glyph instances and upright mask data for the GPU atlas compositor,
-/// mirroring [`render_block_tiles`] but without producing per-block RGBA bitmaps.
+/// Collect glyph instances and upright mask data for the GPU atlas compositor.
 /// Blocks must be in canvas-texel coords (not tile-local); pen positions in the
 /// returned [`GlyphCollector`] are canvas-texel coordinates ready for the GPU.
 pub(crate) fn collect_overlay_glyphs(
@@ -248,42 +178,6 @@ pub(crate) fn collect_overlay_glyphs(
         }
     }
     collector
-}
-
-/// Translate a block's geometry by `-(dx, dy)` so it lands in a tile whose origin
-/// is the block's bbox top-left.
-fn shift_block(block: &PreparedTextBlock, dx: f32, dy: f32) -> PreparedTextBlock {
-    let shift_rect = |r: &Rect| Rect {
-        left: (r.left as f32 - dx).max(0.0) as u32,
-        top: (r.top as f32 - dy).max(0.0) as u32,
-        right: (r.right as f32 - dx).max(0.0) as u32,
-        bottom: (r.bottom as f32 - dy).max(0.0) as u32,
-    };
-    let lines = block
-        .lines
-        .iter()
-        .map(|l| PreparedTextLine {
-            text: l.text.clone(),
-            bounding_box: shift_rect(&l.bounding_box),
-            oriented_box: OrientedRect {
-                cx: l.oriented_box.cx - dx,
-                cy: l.oriented_box.cy - dy,
-                ..l.oriented_box
-            },
-            word_rects: l.word_rects.iter().map(shift_rect).collect(),
-            background_argb: l.background_argb,
-            foreground_argb: l.foreground_argb,
-        })
-        .collect();
-    PreparedTextBlock {
-        source_text: block.source_text.clone(),
-        translated_text: block.translated_text.clone(),
-        bounding_box: shift_rect(&block.bounding_box),
-        lines,
-        layout_hints: block.layout_hints,
-        background_argb: block.background_argb,
-        foreground_argb: block.foreground_argb,
-    }
 }
 
 // ---------------------------------------------------------------------------

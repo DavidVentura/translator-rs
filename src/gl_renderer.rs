@@ -1,8 +1,10 @@
-//! GLES2 composite backend: the GPU counterpart to the CPU bilinear warp
-//! in [`crate::live_compositor`]. Same per-frame contract
-//! ([`Renderer`]/[`CompositeInput`]), but the camera passthrough and each
-//! overlay are drawn as textured quads and the homography is applied in
-//! the vertex shader, so the perspective warp + blend run on the GPU.
+//! GLES2 overlay compositor: bakes the translated overlay (pills + glyph quads)
+//! into an FBO texture on the GPU, then presents it — warped by the tracker
+//! homography over the live camera passthrough ([`GlesRenderer::present_camera`]),
+//! or blitted as a translucent window layer for screen capture
+//! ([`GlesRenderer::present_screen_overlay_fbo`]). Both share one bake
+//! ([`GlesRenderer::render_overlay_to_texture`]) and one warp core; the only
+//! difference is the surface→clip transform and whether the camera is drawn under it.
 //!
 //! The crate never creates a GL context: the app owns EGL and the render
 //! thread, and hands in a loader (`eglGetProcAddress`-style) at
@@ -10,24 +12,12 @@
 //! across Android 5+ and Ubuntu Touch — and runs unchanged on GLES3
 //! contexts. `GlesRenderer` holds a `glow::Context`, which is `!Send`, so
 //! it is bound to its owning thread at compile time.
-//!
-//! Two output paths share one `draw`:
-//! - [`GlesRenderer::composite`] (the [`Renderer`] trait) renders into an
-//!   owned FBO and reads the result back into a CPU buffer. Free on CPU,
-//!   expensive on GPU — it exists for tests and the pre-present migration
-//!   step, not the hot path.
-//! - [`GlesRenderer::present`] renders into whatever framebuffer the
-//!   caller bound (the window surface / scene-graph FBO). This is the
-//!   production path; there is no readback.
 
 use std::num::NonZeroU32;
 
 use glow::HasContext;
 
 use crate::homography::mat3_mul;
-use crate::live_compositor::{
-    CameraFrame, ComposeTarget, CompositeError, CompositeInput, Renderer,
-};
 #[cfg(feature = "planar-tracker")]
 use crate::live_session::OverlayDrawList;
 
@@ -223,6 +213,21 @@ fn to_column_major(m: &[f32; 9]) -> [f32; 9] {
     [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
 }
 
+/// Geometry of the overlay last baked into [`GlesRenderer::overlay_fbo`]. Lets the
+/// per-frame present warp/blit the baked texture without rebaking (the camera
+/// presents every frame but rebakes only when content changes).
+#[derive(Clone, Copy)]
+struct BakedOverlay {
+    /// Overlay-texture origin in surface (canonical) coords.
+    origin_x: f32,
+    origin_y: f32,
+    /// Texels per surface unit baked into the texture.
+    oversample: f32,
+    /// Used sub-rect of the (grow-only) overlay FBO, in texels.
+    used_w: u32,
+    used_h: u32,
+}
+
 pub struct GlesRenderer {
     gl: glow::Context,
     program: glow::Program,
@@ -237,17 +242,6 @@ pub struct GlesRenderer {
     /// to control overlay opacity independently of the camera path.
     overlay_alpha: f32,
     quad_vbo: glow::Buffer,
-    camera_tex: glow::Texture,
-    overlay_tex: glow::Texture,
-    /// Allocated size of each texture, so a same-size frame updates in
-    /// place with `glTexSubImage2D` instead of reallocating storage.
-    camera_size: Option<(u32, u32)>,
-    overlay_size: Option<(u32, u32)>,
-    /// Identity (data ptr + len) of the last overlay uploaded. The
-    /// overlay bitmap only changes when the OCR worker rebuilds the
-    /// canvas (new `Vec`, new ptr); unchanged between refreshes, so we
-    /// skip the per-frame re-upload while it matches.
-    overlay_id: Option<(usize, usize)>,
     fbo: Option<glow::Framebuffer>,
     fbo_tex: Option<glow::Texture>,
     fbo_size: Option<(u32, u32)>,
@@ -283,6 +277,12 @@ pub struct GlesRenderer {
     /// R8 glyph coverage atlas with shelf packing. Grows until overflow, then
     /// clears and re-packs the current frame's masks.
     glyph_atlas: Option<GlyphAtlas>,
+    /// Geometry of the overlay last baked into `overlay_fbo`, so the present can
+    /// warp/blit it without rebaking. `None` until the first bake.
+    baked_overlay: Option<BakedOverlay>,
+    /// Session content version the baked overlay reflects. The camera present
+    /// rebakes only when this moves; the screen present rebakes every present.
+    overlay_baked_version: Option<u64>,
 }
 
 /// The rounded-rect pill program (shares nothing with the 2D program — its own
@@ -370,8 +370,6 @@ impl GlesRenderer {
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, verts_bytes, glow::STATIC_DRAW);
 
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            let camera_tex = new_texture(&gl)?;
-            let overlay_tex = new_texture(&gl)?;
 
             Ok(Self {
                 gl,
@@ -383,11 +381,6 @@ impl GlesRenderer {
                 a_pos,
                 overlay_alpha: 1.0,
                 quad_vbo,
-                camera_tex,
-                overlay_tex,
-                camera_size: None,
-                overlay_size: None,
-                overlay_id: None,
                 fbo: None,
                 fbo_tex: None,
                 fbo_size: None,
@@ -403,24 +396,10 @@ impl GlesRenderer {
                 overlay_fbo: None,
                 pill_fbo: None,
                 glyph_atlas: None,
+                baked_overlay: None,
+                overlay_baked_version: None,
             })
         }
-    }
-
-    /// Upload the camera frame into the camera texture. Split out of
-    /// [`draw`](Self::draw) so the pipeline can run this ~3 ms CPU→GPU copy
-    /// concurrently with the (H-independent) tracker; `draw`/`present` then
-    /// sample the already-resident texture. Reuses GL storage in place via
-    /// `glTexSubImage2D` when the frame size is unchanged.
-    pub fn upload_camera_tex(&mut self, camera: &CameraFrame<'_>) {
-        upload_tex(
-            &self.gl,
-            self.camera_tex,
-            &mut self.camera_size,
-            camera.camera_rgba,
-            camera.src_full_w,
-            camera.src_full_h,
-        );
     }
 
     /// Use a borrowed `GL_TEXTURE_EXTERNAL_OES` as the camera source (zero-copy)
@@ -838,22 +817,6 @@ impl GlesRenderer {
         }
     }
 
-    /// Render the composite into whatever framebuffer is currently bound;
-    /// the caller owns FBO binding, viewport, and buffer swap. No
-    /// readback — this is the production present path. Assumes the camera
-    /// frame was already uploaded via [`upload_camera_tex`](Self::upload_camera_tex)
-    /// for this frame.
-    ///
-    /// `display_xform` maps dst-pixel coords (top-left origin, y-down,
-    /// `dst_w`×`dst_h`) to clip space. The caller folds surface size +
-    /// display rotation + FILL_CENTER scale into it — the GL equivalent
-    /// of the old Canvas `drawMatrix`. For an unrotated surface-sized
-    /// blit it is just `ndc_from_viewport(surface_w, surface_h)` times the
-    /// dst→surface fit.
-    pub fn present(&mut self, input: &CompositeInput<'_>, display_xform: &[f32; 9]) {
-        self.draw(input, display_xform);
-    }
-
     /// Bake the overlay draw list into [`Self::overlay_fbo`]'s straight-alpha
     /// texture on the GPU. Two passes: (A) rounded SDF pills unioned opaque into
     /// the pill-layer FBO, then (B) that layer composited at `pill_alpha` + glyph
@@ -867,6 +830,7 @@ impl GlesRenderer {
         dl: &OverlayDrawList,
         pill_alpha: f32,
         text_alpha: f32,
+        smooth_glyphs: bool,
     ) -> bool {
         if dl.bitmap_w == 0 || dl.bitmap_h == 0 {
             return false;
@@ -1000,6 +964,17 @@ impl GlesRenderer {
             gl.uniform_1_i32(Some(&gp.u_atlas), 0);
             gl.uniform_1_f32(Some(&gp.u_text_alpha), text_alpha.clamp(0.0, 1.0));
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture));
+            // Axis-aligned (screen) glyphs map ~1:1 to atlas texels, so NEAREST stays
+            // crisp; the camera rotates each quad by the line angle and then H-warps
+            // the whole overlay, where NEAREST sampling of the upright mask aliases
+            // (1px jaggies). LINEAR anti-aliases the rotated/warped sampling.
+            let filter = if smooth_glyphs {
+                glow::LINEAR
+            } else {
+                glow::NEAREST
+            } as i32;
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
             let (aw, ah) = (atlas.width as f32, atlas.height as f32);
             for inst in &dl.glyphs.instances {
                 let Some(&(ax, ay)) = atlas.slots.get(&inst.key) else {
@@ -1059,7 +1034,31 @@ impl GlesRenderer {
              alloc={alloc_ms:.1}ms passes={passes_ms:.1}ms",
             dl.glyphs.instances.len()
         );
+        self.baked_overlay = Some(BakedOverlay {
+            origin_x: dl.origin_x,
+            origin_y: dl.origin_y,
+            oversample: os,
+            used_w: bw,
+            used_h: bh,
+        });
         true
+    }
+
+    /// Content version the currently-baked overlay reflects (set via
+    /// [`Self::set_overlay_baked_version`]); the camera present rebakes only when
+    /// the session's content version differs from this.
+    pub fn overlay_baked_version(&self) -> Option<u64> {
+        self.overlay_baked_version
+    }
+
+    pub fn set_overlay_baked_version(&mut self, version: u64) {
+        self.overlay_baked_version = Some(version);
+    }
+
+    /// Drop the baked overlay so the next present draws none (the active anchor's
+    /// content was cleared). Cheap: just forgets the geometry; the FBO storage stays.
+    pub fn clear_baked_overlay(&mut self) {
+        self.baked_overlay = None;
     }
 
     /// Upload glyph masks not yet in the atlas. If a mask doesn't fit on the current
@@ -1162,69 +1161,130 @@ impl GlesRenderer {
         Some((x, y))
     }
 
-    /// Present the GPU-baked overlay texture ([`Self::render_overlay_to_texture`])
-    /// straight into the bound EGL window surface (the screen `TextureView`): one
-    /// axis-aligned quad over a transparent clear, no homography. The texture is
-    /// straight-alpha; the window surface wants premultiplied (SurfaceFlinger), so
-    /// the global `overlay_alpha` is applied and the blend leaves premultiplied
-    /// output. `dl` supplies the same geometry the bake used. Returns false when
-    /// there's no baked overlay. The caller binds the window surface + swaps.
+    /// Present the GPU-baked overlay ([`Self::render_overlay_to_texture`]) into the
+    /// window surface as a translucent layer (the screen `TextureView`): one quad
+    /// over a transparent clear, no camera, no homography. Straight-alpha texture →
+    /// premultiplied window output (SurfaceFlinger) via the global `overlay_alpha`.
+    /// Uses the geometry recorded at bake time. The caller swaps after.
     #[cfg(feature = "planar-tracker")]
     pub fn present_screen_overlay_fbo(
         &mut self,
-        dl: &OverlayDrawList,
         canonical_w: u32,
         canonical_h: u32,
         surface_w: u32,
         surface_h: u32,
     ) -> bool {
-        let Some((_, overlay_tex, alloc_w, alloc_h)) = self.overlay_fbo else {
-            return false;
-        };
-        if alloc_w == 0 || alloc_h == 0 {
-            return false;
-        }
-        // The overlay FBO is grow-only, so the baked content occupies only the
-        // `[0..bitmap_w]×[0..bitmap_h]` sub-rect of the (larger) texture. The
-        // footprint covers the used content's surface size; the uv samples just
-        // that sub-rect.
-        let (used_w, used_h) = (dl.bitmap_w.max(1), dl.bitmap_h.max(1));
-        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
-        let os = dl.oversample.max(1e-3);
+        // Canonical surface coords → clip: scale canonical→surface px, then NDC.
         let sx = surface_w as f32 / canonical_w.max(1) as f32;
         let sy = surface_h as f32 / canonical_h.max(1) as f32;
-        let inv_os = 1.0 / os;
-        let footprint = scale(used_w as f32 * inv_os * sx, used_h as f32 * inv_os * sy);
-        let to_surface = translate(dl.origin_x * sx, dl.origin_y * sy);
         let ndc = ndc_from_viewport(surface_w as f32, surface_h as f32);
-        let transform = mat3_mul(&ndc, &mat3_mul(&to_surface, &footprint));
-        let uv_sub = to_column_major(&scale(
-            used_w as f32 / alloc_w as f32,
-            used_h as f32 / alloc_h as f32,
-        ));
+        let base = mat3_mul(&ndc, &scale(sx, sy));
+        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
         unsafe {
             let gl = &self.gl;
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
             gl.active_texture(glow::TEXTURE0);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+        }
+        self.draw_baked_overlay_quad(&base, true)
+    }
+
+    /// Present the live camera for the tracked path: draw the external camera
+    /// passthrough opaque, then (when locked) warp the baked overlay over it by the
+    /// tracker homography. `h_surface_to_viewport` maps the anchor's surface coords
+    /// to canonical view px; `display_xform` maps canonical px to clip. Returns false
+    /// only when there's no external camera source (nothing to show). The caller swaps.
+    #[cfg(feature = "planar-tracker")]
+    pub fn present_camera(
+        &mut self,
+        display_xform: &[f32; 9],
+        h_surface_to_viewport: Option<[f32; 9]>,
+        canonical_w: u32,
+        canonical_h: u32,
+        surface_w: u32,
+        surface_h: u32,
+    ) -> bool {
+        if self.camera_external.is_none() {
+            return false;
+        }
+        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
+        unsafe {
+            let gl = &self.gl;
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.active_texture(glow::TEXTURE0);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+        }
+        self.draw_camera_passthrough_ext(canonical_w as f32, canonical_h as f32, display_xform);
+        if let Some(h) = h_surface_to_viewport {
+            // `read_camera_*` row-flips the readback to a top-down canonical frame, so
+            // overlays are authored vertically mirrored vs the (non-flipped) on-screen
+            // external camera. Undo that flip in canonical space before the warp.
+            let flip_y = [1.0, 0.0, 0.0, 0.0, -1.0, canonical_h as f32, 0.0, 0.0, 1.0];
+            let base = mat3_mul(display_xform, &mat3_mul(&flip_y, &h));
+            self.draw_baked_overlay_quad(&base, false);
+        }
+        true
+    }
+
+    /// Warp the baked overlay texture by `base_surface_to_clip` and draw it as one
+    /// quad with the 2D program. `premultiplied` selects the window-layer blend (true,
+    /// screen) vs plain source-over onto the opaque camera (false). Assumes the caller
+    /// bound the present framebuffer, the quad VBO, and cleared. The grow-only FBO's
+    /// used sub-rect is selected via the uv transform. Returns false if nothing baked.
+    #[cfg(feature = "planar-tracker")]
+    fn draw_baked_overlay_quad(&self, base_surface_to_clip: &[f32; 9], premultiplied: bool) -> bool {
+        let Some(baked) = self.baked_overlay else {
+            return false;
+        };
+        let Some((_, overlay_tex, alloc_w, alloc_h)) = self.overlay_fbo else {
+            return false;
+        };
+        if alloc_w == 0 || alloc_h == 0 || baked.used_w == 0 || baked.used_h == 0 {
+            return false;
+        }
+        let inv_os = 1.0 / baked.oversample.max(1e-3);
+        let footprint = scale(baked.used_w as f32 * inv_os, baked.used_h as f32 * inv_os);
+        let to_surface = translate(baked.origin_x, baked.origin_y);
+        let transform = mat3_mul(base_surface_to_clip, &mat3_mul(&to_surface, &footprint));
+        let uv_sub = to_column_major(&scale(
+            baked.used_w as f32 / alloc_w as f32,
+            baked.used_h as f32 / alloc_h as f32,
+        ));
+        unsafe {
+            let gl = &self.gl;
             gl.use_program(Some(self.program));
             gl.enable_vertex_attrib_array(self.a_pos);
             gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.uniform_1_i32(Some(&self.u_tex), 0);
             gl.uniform_1_f32(Some(&self.u_overlay_alpha), self.overlay_alpha);
-            gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
-            gl.disable(glow::CULL_FACE);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::SCISSOR_TEST);
+            // The passthrough/monitor pass leaves an external texture on unit 0;
+            // Adreno/Mali mis-sample a sampler2D while one lingers there, so clear it.
+            if self.camera_external.is_some() {
+                gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+            }
             gl.enable(glow::BLEND);
             gl.blend_equation(glow::FUNC_ADD);
-            gl.blend_func_separate(
-                glow::SRC_ALPHA,
-                glow::ONE_MINUS_SRC_ALPHA,
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
-            );
+            if premultiplied {
+                // Translucent window layer: leave premultiplied output.
+                gl.blend_func_separate(
+                    glow::SRC_ALPHA,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                );
+            } else {
+                // Overlay composites onto the opaque camera; plain source-over.
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            }
             gl.uniform_matrix_3_f32_slice(
                 Some(&self.u_transform),
                 false,
@@ -1237,195 +1297,35 @@ impl GlesRenderer {
         true
     }
 
-    /// Composite the (already-uploaded) camera texture + overlays into the
-    /// bound framebuffer. The camera upload is the caller's responsibility
-    /// (via [`upload_camera_tex`](Self::upload_camera_tex)); overlay uploads
-    /// stay here because they depend on the per-anchor overlay items.
-    /// Draw the opaque camera passthrough quad: the base layer beneath the
-    /// overlays in [`PresentContent::CameraAndOverlay`]. Either the borrowed
-    /// external-OES texture (zero-copy, sampled through the canonical uv
-    /// transform that carries upright/crop/flip) or the uploaded 2D texture
-    /// sampled through the sensor-crop uv.
-    fn draw_camera_passthrough(&self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
-        let dst_w = input.dst_w as f32;
-        let dst_h = input.dst_h as f32;
+    /// Draw the borrowed external-OES camera as an opaque passthrough quad covering
+    /// the `dst_w×dst_h` canonical frame, mapped to clip by `dst_to_clip` and sampled
+    /// through the stored canonical uv transform (upright/crop/flip). No-op if no
+    /// external source is set. Caller sets blend/clear state.
+    #[cfg(feature = "planar-tracker")]
+    fn draw_camera_passthrough_ext(&self, dst_w: f32, dst_h: f32, dst_to_clip: &[f32; 9]) {
+        let (Some((id, uv)), Some(e)) = (self.camera_external, self.ext.as_ref()) else {
+            return;
+        };
         let cam_transform = mat3_mul(dst_to_clip, &scale(dst_w, dst_h));
-        match self.camera_external {
-            Some((id, uv)) if self.ext.is_some() => unsafe {
-                let gl = &self.gl;
-                let e = self.ext.as_ref().expect("ext program present");
-                gl.use_program(Some(e.program));
-                gl.enable_vertex_attrib_array(e.a_pos);
-                gl.vertex_attrib_pointer_f32(e.a_pos, 2, glow::FLOAT, false, 0, 0);
-                gl.uniform_1_i32(Some(&e.u_tex), 0);
-                if let Some(id) = NonZeroU32::new(id) {
-                    gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(glow::NativeTexture(id)));
-                }
-                gl.uniform_matrix_3_f32_slice(
-                    Some(&e.u_transform),
-                    false,
-                    &to_column_major(&cam_transform),
-                );
-                gl.uniform_matrix_3_f32_slice(Some(&e.u_uv_xform), false, &to_column_major(&uv));
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            },
-            _ => unsafe {
-                let gl = &self.gl;
-                gl.use_program(Some(self.program));
-                gl.enable_vertex_attrib_array(self.a_pos);
-                gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
-                gl.uniform_1_i32(Some(&self.u_tex), 0);
-                gl.uniform_1_f32(Some(&self.u_overlay_alpha), 1.0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.camera_tex));
-                let cam_uv = [
-                    dst_w / input.src_full_w as f32,
-                    0.0,
-                    input.src_offset_x as f32 / input.src_full_w as f32,
-                    0.0,
-                    dst_h / input.src_full_h as f32,
-                    input.src_offset_y as f32 / input.src_full_h as f32,
-                    0.0,
-                    0.0,
-                    1.0,
-                ];
-                gl.uniform_matrix_3_f32_slice(
-                    Some(&self.u_transform),
-                    false,
-                    &to_column_major(&cam_transform),
-                );
-                gl.uniform_matrix_3_f32_slice(
-                    Some(&self.u_uv_xform),
-                    false,
-                    &to_column_major(&cam_uv),
-                );
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            },
+        unsafe {
+            let gl = &self.gl;
+            gl.use_program(Some(e.program));
+            gl.enable_vertex_attrib_array(e.a_pos);
+            gl.vertex_attrib_pointer_f32(e.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&e.u_tex), 0);
+            if let Some(id) = NonZeroU32::new(id) {
+                gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(glow::NativeTexture(id)));
+            }
+            gl.uniform_matrix_3_f32_slice(
+                Some(&e.u_transform),
+                false,
+                &to_column_major(&cam_transform),
+            );
+            gl.uniform_matrix_3_f32_slice(Some(&e.u_uv_xform), false, &to_column_major(&uv));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
     }
 
-    fn draw(&mut self, input: &CompositeInput<'_>, dst_to_clip: &[f32; 9]) {
-        let overlay_only = self.present_content == PresentContent::OverlayOnly;
-        // Fast-clear so tiled GPUs skip loading the previous framebuffer. The
-        // camera path clears to opaque black under the camera quad; overlay-only
-        // clears transparent so the glyphs composite over the live content
-        // behind a translucent window.
-        unsafe {
-            let gl = &self.gl;
-            let clear_a = if overlay_only { 0.0 } else { 1.0 };
-            gl.clear_color(0.0, 0.0, 0.0, clear_a);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
-            gl.active_texture(glow::TEXTURE0);
-            gl.disable(glow::BLEND);
-        }
-        if !overlay_only {
-            self.draw_camera_passthrough(input, dst_to_clip);
-        }
-
-        // Overlays: source-over with straight (non-premultiplied) alpha,
-        // matching the CPU blend. Always the 2D program. Each item warped by the
-        // same H the CPU path uses, composed with its surface origin and size.
-        unsafe {
-            let gl = &self.gl;
-            gl.use_program(Some(self.program));
-            gl.enable_vertex_attrib_array(self.a_pos);
-            gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
-            gl.uniform_1_i32(Some(&self.u_tex), 0);
-            gl.uniform_1_f32(Some(&self.u_overlay_alpha), self.overlay_alpha);
-            // The external-camera pass left a GL_TEXTURE_EXTERNAL_OES bound on
-            // unit 0. Adreno/Mali return nothing when a sampler2D reads a unit
-            // that still has an external texture bound, so clear it before
-            // sampling the 2D overlay texture.
-            if self.camera_external.is_some() {
-                gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
-            }
-            // The scene graph hands us its pipeline state; depth test in
-            // particular is left enabled and rejects the overlay quad (same z=0
-            // as the camera quad under GL_LESS). Establish our own 2D state.
-            gl.disable(glow::CULL_FACE);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.enable(glow::BLEND);
-            gl.blend_equation(glow::FUNC_ADD);
-            // Overlay-only output goes to a translucent window, so the alpha
-            // channel matters: accumulate it with (ONE, ONE_MINUS_SRC_ALPHA)
-            // while RGB stays source-over, leaving the framebuffer premultiplied
-            // (rgb already ×alpha, alpha = coverage) the way SurfaceFlinger
-            // blends a layer. The opaque camera path keeps the plain blend.
-            if overlay_only {
-                gl.blend_func_separate(
-                    glow::SRC_ALPHA,
-                    glow::ONE_MINUS_SRC_ALPHA,
-                    glow::ONE,
-                    glow::ONE_MINUS_SRC_ALPHA,
-                );
-            } else {
-                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-            }
-            // On the external path `read_camera_rgba` row-flips the readback to
-            // give the pipeline a top-down canonical frame, so overlays are
-            // authored vertically mirrored relative to the (non-flipped) on-screen
-            // camera. Undo that flip in canonical space here. The CPU path uploads
-            // an already-top-down frame, so its overlays need no flip.
-            let overlay_to_clip = if self.camera_external.is_some() {
-                let flip_y = [1.0, 0.0, 0.0, 0.0, -1.0, input.dst_h as f32, 0.0, 0.0, 1.0];
-                mat3_mul(dst_to_clip, &flip_y)
-            } else {
-                *dst_to_clip
-            };
-            let identity_uv = to_column_major(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-            for item in input.items {
-                if item.bitmap_rgba.is_empty() || item.bitmap_width == 0 || item.bitmap_height == 0
-                {
-                    continue;
-                }
-                // Skip the upload while the overlay bitmap is unchanged
-                // (same `Vec` ptr+len) — it only changes when the OCR
-                // worker rebuilds the canvas on acquire/refresh.
-                let id = (item.bitmap_rgba.as_ptr() as usize, item.bitmap_rgba.len());
-                if self.overlay_id == Some(id) {
-                    gl.bind_texture(glow::TEXTURE_2D, Some(self.overlay_tex));
-                } else {
-                    upload_tex(
-                        &self.gl,
-                        self.overlay_tex,
-                        &mut self.overlay_size,
-                        item.bitmap_rgba,
-                        item.bitmap_width,
-                        item.bitmap_height,
-                    );
-                    self.overlay_id = Some(id);
-                }
-                let to_surface =
-                    translate(item.bitmap_origin_surface_x, item.bitmap_origin_surface_y);
-                let bitmap_to_viewport = mat3_mul(input.h_surface_to_viewport, &to_surface);
-                // The texture carries `bitmap_width × bitmap_height` texels but
-                // only covers `.../oversample` surface units; scaling the quad to
-                // the surface footprint lets the sampler read the denser texture
-                // across a smaller area, so the warp upscales it less.
-                let inv_os = 1.0 / item.oversample.max(1e-3);
-                let sized = mat3_mul(
-                    &bitmap_to_viewport,
-                    &scale(
-                        item.bitmap_width as f32 * inv_os,
-                        item.bitmap_height as f32 * inv_os,
-                    ),
-                );
-                let transform = mat3_mul(&overlay_to_clip, &sized);
-                gl.uniform_matrix_3_f32_slice(
-                    Some(&self.u_transform),
-                    false,
-                    &to_column_major(&transform),
-                );
-                gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &identity_uv);
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            }
-        }
-    }
-
-    /// (Re)create the readback FBO + color texture to match `w*h`.
-    /// FBO incompleteness with an RGBA8 attachment is a driver/setup
-    /// invariant, not a runtime input error, so it panics loudly.
     fn ensure_fbo(&mut self, w: u32, h: u32) {
         if self.fbo_size == Some((w, h)) {
             return;
@@ -1477,90 +1377,11 @@ impl GlesRenderer {
     }
 }
 
-impl GlesRenderer {
-    /// Render into the owned FBO with an explicit dst→clip transform and
-    /// read the result back (row-flipped to top-down). [`composite`] is
-    /// the `ndc_from_viewport` special case; exposed so the display-xform
-    /// path `present` uses can be exercised under readback in tests.
-    ///
-    /// [`composite`]: Renderer::composite
-    pub fn render_to_buffer(
-        &mut self,
-        input: &CompositeInput<'_>,
-        dst_to_clip: &[f32; 9],
-        out: &mut [u8],
-    ) -> Result<(), CompositeError> {
-        self.upload_camera_tex(&CameraFrame {
-            camera_rgba: input.camera_rgba,
-            src_full_w: input.src_full_w,
-            src_full_h: input.src_full_h,
-        });
-        self.render_to_buffer_prepared(input, dst_to_clip, out)
-    }
-
-    /// [`render_to_buffer`](Self::render_to_buffer) without the camera
-    /// upload — assumes the camera texture is already resident. The
-    /// readback counterpart of [`present`](Self::present) for the split
-    /// (upload-then-draw) target path.
-    fn render_to_buffer_prepared(
-        &mut self,
-        input: &CompositeInput<'_>,
-        dst_to_clip: &[f32; 9],
-        out: &mut [u8],
-    ) -> Result<(), CompositeError> {
-        validate_sizes(input, out)?;
-        self.ensure_fbo(input.dst_w, input.dst_h);
-        let (w, h) = (input.dst_w, input.dst_h);
-        let mut flipped = vec![0u8; out.len()];
-        unsafe {
-            let gl = &self.gl;
-            gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
-            gl.viewport(0, 0, w as i32, h as i32);
-        }
-        // `draw` clears + renders; it needs `&mut self`, so it can't run
-        // inside the `&self.gl` borrow above.
-        self.draw(input, dst_to_clip);
-        unsafe {
-            self.gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut flipped)),
-            );
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-        // glReadPixels is bottom-up; the CPU contract is top-down.
-        let stride = (w as usize) * 4;
-        for y in 0..h as usize {
-            let src = (h as usize - 1 - y) * stride;
-            let dst = y * stride;
-            out[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
-        }
-        Ok(())
-    }
-}
-
-impl Renderer for GlesRenderer {
-    fn composite(
-        &mut self,
-        input: &CompositeInput<'_>,
-        out: &mut [u8],
-    ) -> Result<(), CompositeError> {
-        let ndc = ndc_from_viewport(input.dst_w as f32, input.dst_h as f32);
-        self.render_to_buffer(input, &ndc, out)
-    }
-}
-
 impl Drop for GlesRenderer {
     fn drop(&mut self) {
         unsafe {
             self.gl.delete_program(self.program);
             self.gl.delete_buffer(self.quad_vbo);
-            self.gl.delete_texture(self.camera_tex);
-            self.gl.delete_texture(self.overlay_tex);
             if let Some(fbo) = self.fbo {
                 self.gl.delete_framebuffer(fbo);
             }
@@ -1585,96 +1406,6 @@ impl Drop for GlesRenderer {
             }
         }
     }
-}
-
-/// GPU production target: presents into the framebuffer the caller bound
-/// (window surface / scene-graph FBO). No readback — the display consumes
-/// the result directly. `process_frame` must be called on the thread that
-/// owns the GL context. `display_xform` is the dst→clip transform (see
-/// [`GlesRenderer::present`]).
-pub struct PresentTarget<'a> {
-    pub renderer: &'a mut GlesRenderer,
-    pub display_xform: [f32; 9],
-}
-
-impl ComposeTarget for PresentTarget<'_> {
-    fn upload_camera(&mut self, camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
-        self.renderer.upload_camera_tex(camera);
-        Ok(())
-    }
-
-    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
-        self.renderer.present(input, &self.display_xform);
-        Ok(())
-    }
-}
-
-/// Like [`PresentTarget`] but the camera is a borrowed external-OES texture
-/// (set via [`GlesRenderer::set_camera_external`] before `process_frame`), so
-/// `upload_camera` is a no-op — there's no CPU camera buffer to upload. `draw`
-/// presents the external camera + overlays into the bound framebuffer.
-pub struct ExternalPresentTarget<'a> {
-    pub renderer: &'a mut GlesRenderer,
-    pub display_xform: [f32; 9],
-}
-
-impl ComposeTarget for ExternalPresentTarget<'_> {
-    fn upload_camera(&mut self, _camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
-        Ok(())
-    }
-
-    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
-        self.renderer.present(input, &self.display_xform);
-        Ok(())
-    }
-}
-
-/// GPU readback target: renders into the renderer's own FBO and copies
-/// the result into a CPU slice. Lets the GPU path drive `process_frame`
-/// while still producing the same `&mut [u8]` the CPU path does — used by
-/// tests and the pre-present migration step, not the hot path.
-pub struct ReadbackTarget<'a> {
-    pub renderer: &'a mut GlesRenderer,
-    pub dst: &'a mut [u8],
-}
-
-impl ComposeTarget for ReadbackTarget<'_> {
-    fn upload_camera(&mut self, camera: &CameraFrame<'_>) -> Result<(), CompositeError> {
-        self.renderer.upload_camera_tex(camera);
-        Ok(())
-    }
-
-    fn draw(&mut self, input: &CompositeInput<'_>) -> Result<(), CompositeError> {
-        let ndc = ndc_from_viewport(input.dst_w as f32, input.dst_h as f32);
-        self.renderer
-            .render_to_buffer_prepared(input, &ndc, self.dst)
-    }
-}
-
-/// Mirrors the size/bounds checks of
-/// [`crate::live_compositor::composite_frame_into_cropped`] so both
-/// backends reject identical inputs identically.
-fn validate_sizes(input: &CompositeInput<'_>, out: &[u8]) -> Result<(), CompositeError> {
-    let dst_bytes = (input.dst_w as usize)
-        .checked_mul(input.dst_h as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or(CompositeError::DstBufferSize)?;
-    if out.len() != dst_bytes {
-        return Err(CompositeError::DstBufferSize);
-    }
-    let src_full_bytes = (input.src_full_w as usize)
-        .checked_mul(input.src_full_h as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or(CompositeError::SrcBufferSize)?;
-    if input.camera_rgba.len() != src_full_bytes {
-        return Err(CompositeError::SrcBufferSize);
-    }
-    if input.src_offset_x.saturating_add(input.dst_w) > input.src_full_w
-        || input.src_offset_y.saturating_add(input.dst_h) > input.src_full_h
-    {
-        return Err(CompositeError::SrcBufferSize);
-    }
-    Ok(())
 }
 
 fn new_texture(gl: &glow::Context) -> Result<glow::Texture, GlError> {
@@ -1702,48 +1433,6 @@ fn new_texture(gl: &glow::Context) -> Result<glow::Texture, GlError> {
             glow::CLAMP_TO_EDGE as i32,
         );
         Ok(tex)
-    }
-}
-
-/// Bind `tex` and upload `data`. Reuses the existing GL storage with
-/// `glTexSubImage2D` when the size is unchanged (the common per-frame
-/// case), only reallocating via `glTexImage2D` when the size differs.
-fn upload_tex(
-    gl: &glow::Context,
-    tex: glow::Texture,
-    cached_size: &mut Option<(u32, u32)>,
-    data: &[u8],
-    w: u32,
-    h: u32,
-) {
-    unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        if *cached_size == Some((w, h)) {
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(data)),
-            );
-        } else {
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                w as i32,
-                h as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(data)),
-            );
-            *cached_size = Some((w, h));
-        }
     }
 }
 

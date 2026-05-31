@@ -41,7 +41,6 @@ use crate::color_matting::MattedStrip;
 use crate::coords::Quadrant;
 use crate::font_provider::FontProvider;
 use crate::homography;
-use crate::live_compositor::{self, CameraFrame, ComposeTarget, CompositeError, OverlayItem};
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
     LiveSession, PostDetectInput, PostDetectOutcome, h_view_to_surface_from, project_oriented_rect,
@@ -135,10 +134,13 @@ pub struct ProcessFrameResult {
     /// this into a focus-distance estimate so it can drive
     /// `LENS_FOCUS_DISTANCE` without running autofocus.
     pub scale: f32,
-    /// Number of bytes the compositor wrote into the destination
-    /// slice. `0` means no composite happened (display dims zero,
-    /// frame buffer empty, etc.).
+    /// Number of bytes presented for this frame, set by the GPU present in the
+    /// shell. `0` means nothing was drawn (no external camera, dims zero).
     pub composite_bytes: u32,
+    /// Homography to warp the overlay by at present time (`H_surface→view` for the
+    /// active anchor), or `None` when there's nothing locked to overlay. The shell
+    /// bakes the overlay on content change and warps it over the camera by this.
+    pub compose_h: Option<[f32; 9]>,
     /// `true` when this call spawned an async acquire pipeline job.
     pub started_acquire: bool,
     /// `true` when this call spawned an async refresh pipeline job.
@@ -558,6 +560,12 @@ impl LiveTrackerPipeline {
         self.session.set_overlay_oversample(factor);
     }
 
+    /// The pipeline's overlay session — the GL shell reads its content version +
+    /// draw list to bake/warp the overlay at present time.
+    pub fn session(&self) -> &LiveSession {
+        &self.session
+    }
+
     /// Bump generation, clear engine state + smoothed H + session
     /// state. Any in-flight worker job will observe the new generation
     /// and bail at its next gen-check.
@@ -603,32 +611,23 @@ impl LiveTrackerPipeline {
         self.last_telemetry.lock().ok().and_then(|mut g| g.take())
     }
 
-    /// One-shot per-frame entry. Locks the engine + frame state
-    /// internally, runs the tracker step, sends the composited
-    /// camera+overlay to `target`, and (when needed) materializes the
-    /// frame bytes + dispatches an async acquire/refresh job.
+    /// One-shot per-frame entry. Locks the engine + frame state internally, runs
+    /// the tracker step, and (when needed) materializes the frame bytes +
+    /// dispatches an async acquire/refresh job. It does NOT present — the GPU
+    /// present lives in the shell, which reads `compose_h` from the result and
+    /// warps the baked overlay over the camera. This keeps `process_frame` GL-free
+    /// (the rendezvous test drives it without a GL context).
     ///
-    /// `target` is where the composite goes — a CPU RGBA slice
-    /// ([`SliceTarget`](crate::live_compositor::SliceTarget)) or a GPU
-    /// surface. It is driven while the frame + overlay locks are held, so
-    /// a GPU target's GL calls must run on the thread that owns the
-    /// context (i.e. `process_frame` must be called on the render thread).
-    /// `visible_sensor_w/h` are the visible-region dims in sensor
-    /// coords (typically equal to `dst_w/h` when the SurfaceView uses
-    /// FILL_CENTER on the sensor frame).
-    /// `full_view_w/h` are the *full-display* dims in sensor coords,
-    /// used by the relock decision (which compares the current
-    /// viewport against the anchor's lock viewport in full coords).
+    /// `visible_sensor_w/h` are the visible-region dims in sensor coords (typically
+    /// equal to `dst_w/h` when the SurfaceView uses FILL_CENTER on the sensor
+    /// frame). `full_view_w/h` are the *full-display* dims in sensor coords, used by
+    /// the relock decision (which compares the current viewport against the anchor's
+    /// lock viewport in full coords).
     #[allow(clippy::too_many_arguments)]
     pub fn process_frame(
         &self,
         frame: &Arc<LiveFrame>,
         display_crop: Rect,
-        target: &mut dyn ComposeTarget,
-        dst_w: u32,
-        dst_h: u32,
-        visible_sensor_w: u32,
-        visible_sensor_h: u32,
         full_view_w: u32,
         full_view_h: u32,
         timestamp_ns: u64,
@@ -728,10 +727,6 @@ impl LiveTrackerPipeline {
             .map_err(|_| poisoned())?
             .track(&tracker_gray, frame_idx);
 
-        if let Err(e) = self.upload_camera_to_target(frame, target) {
-            log::warn!("camera upload failed: {e:?}");
-        }
-
         // Dispatch a fresh engine job at cadence boundaries, regardless of
         // whether `track()` succeeded this frame. If KLT failed the eventual
         // Correction lands via `snap` (no ring[frame_idx] entry → `weave`
@@ -807,22 +802,13 @@ impl LiveTrackerPipeline {
             *slot = h_for_compose.map(|h| (tracker_anchor, h));
         }
 
-        let t_composite = Instant::now();
-        let (composite_bytes, overlay_count) = match self.composite_to_target(
-            frame,
-            target,
-            visible_sensor_w,
-            visible_sensor_h,
-            h_for_compose,
-            tracker_anchor,
-        ) {
-            Ok(n) => (dst_w.saturating_mul(dst_h).saturating_mul(4), n),
-            Err(e) => {
-                log::warn!("composite failed: {e:?}");
-                (0, 0)
-            }
-        };
-        let composite_ms = t_composite.elapsed().as_secs_f64() * 1000.0;
+        // Compositing moved to the GPU present in the shell (`live_gpu_tick`):
+        // `process_frame` only decides *what* to present. `compose_h` carries the
+        // homography; the shell bakes the overlay (on content change) and warps it
+        // over the camera passthrough. `composite_bytes` is filled in by the shell
+        // after the present.
+        let overlay_count = 0u32;
+        let composite_ms = 0.0f64;
 
         // Detect-on-tracking refresh trigger. Gated on the engine's lifecycle
         // (not `tracker_state`, which is now Locked-when-coarse-has-a-pose for
@@ -936,7 +922,8 @@ impl LiveTrackerPipeline {
             anchor_id: tracker_anchor,
             inliers: tracker_inliers,
             scale: tracker_scale,
-            composite_bytes,
+            composite_bytes: 0,
+            compose_h: h_for_compose,
             started_acquire,
             started_refresh,
             rgb_request,
@@ -963,23 +950,6 @@ impl LiveTrackerPipeline {
             .expect("ensure_tracker filled cache");
         // Tracker oriented image is isotropic (CPU `build`), so `.0 == .1`.
         Ok((oriented.gray.clone(), oriented.det_to_full.0))
-    }
-
-    /// Read the frame's RGBA and hand it to the target's H-independent
-    /// camera upload. Holds only the frame lock (not the engine lock), so it
-    /// runs concurrently with [`run_engine`](Self::run_engine).
-    fn upload_camera_to_target(
-        &self,
-        frame: &Arc<LiveFrame>,
-        target: &mut dyn ComposeTarget,
-    ) -> Result<(), CompositeError> {
-        let state = frame.state().lock().expect("frame mutex poisoned");
-        let camera = CameraFrame {
-            camera_rgba: state.rgba_bytes(),
-            src_full_w: state.width,
-            src_full_h: state.height,
-        };
-        target.upload_camera(&camera)
     }
 
     /// Run the engine on the pre-built gray. Takes only the engine lock, so
@@ -1026,26 +996,6 @@ impl LiveTrackerPipeline {
                 None
             }
         }
-    }
-
-    fn composite_to_target(
-        &self,
-        frame: &Arc<LiveFrame>,
-        target: &mut dyn ComposeTarget,
-        bitmap_w: u32,
-        bitmap_h: u32,
-        h_surface_to_viewport: Option<[f32; 9]>,
-        active_anchor_id: u64,
-    ) -> Result<u32, CompositeError> {
-        composite_overlays(
-            &self.session,
-            frame,
-            target,
-            bitmap_w,
-            bitmap_h,
-            h_surface_to_viewport,
-            active_anchor_id,
-        )
     }
 
     fn update_refresh_trigger(
@@ -1393,11 +1343,8 @@ impl LiveTrackerPipeline {
             })
             .collect();
         if !surface_strips.is_empty() {
-            self.session.upsert_provisional_overlay(
-                anchor_id,
-                surface_strips,
-                &*self.font_provider,
-            );
+            self.session
+                .upsert_provisional_overlay(anchor_id, surface_strips);
         }
     }
 
@@ -1932,71 +1879,6 @@ pub(crate) fn acquire_rec_translate(
     Ok(outcome)
 }
 
-/// Project anchor `active_anchor_id`'s overlay canvas through
-/// `h_surface_to_viewport` and draw it into `target`. (Body of
-/// `LiveTrackerPipeline::composite_to_target`.)
-pub(crate) fn composite_overlays(
-    session: &LiveSession,
-    frame: &Arc<LiveFrame>,
-    target: &mut dyn ComposeTarget,
-    bitmap_w: u32,
-    bitmap_h: u32,
-    h_surface_to_viewport: Option<[f32; 9]>,
-    active_anchor_id: u64,
-) -> Result<u32, CompositeError> {
-    let state = frame.state().lock().expect("frame mutex poisoned");
-    let sensor_w = state.width;
-    let sensor_h = state.height;
-    let src_offset_x = sensor_w.saturating_sub(bitmap_w) / 2;
-    let src_offset_y = sensor_h.saturating_sub(bitmap_h) / 2;
-    let overlay_guard = session.overlay_anchors.lock().ok();
-    let items_vec: Vec<OverlayItem<'_>> = match (&overlay_guard, h_surface_to_viewport) {
-        (Some(anchors), Some(_)) => anchors
-            .get(&active_anchor_id)
-            .and_then(|a| a.canvas.as_ref())
-            .map(|c| {
-                vec![OverlayItem {
-                    bitmap_rgba: &c.bitmap,
-                    bitmap_width: c.width,
-                    bitmap_height: c.height,
-                    oversample: c.oversample,
-                    bitmap_origin_surface_x: c.surface_origin_x,
-                    bitmap_origin_surface_y: c.surface_origin_y,
-                    row_extents: &c.row_extents,
-                }]
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    let h_for_call = h_surface_to_viewport.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-    let translate = [
-        1.0,
-        0.0,
-        -(src_offset_x as f32),
-        0.0,
-        1.0,
-        -(src_offset_y as f32),
-        0.0,
-        0.0,
-        1.0,
-    ];
-    let h_translated = homography::mat3_mul(&translate, &h_for_call);
-    let overlay_count = items_vec.len() as u32;
-    let camera = state.rgba_bytes();
-    let input = live_compositor::CompositeInput {
-        dst_w: bitmap_w,
-        dst_h: bitmap_h,
-        camera_rgba: camera,
-        src_full_w: sensor_w,
-        src_full_h: sensor_h,
-        src_offset_x,
-        src_offset_y,
-        h_surface_to_viewport: &h_translated,
-        items: &items_vec,
-    };
-    target.draw(&input).map(|()| overlay_count)
-}
-
 /// Scale a detected box by a per-axis `(sx, sy)`, clamped to `max_w×max_h`.
 /// Per-axis (not a single scalar) because the GPU detector input is rendered at
 /// a 32-aligned size whose x/y scales to canonical differ slightly; the CPU
@@ -2051,7 +1933,6 @@ mod tests {
     use super::*;
     use crate::catalog::{CatalogSnapshot, CatalogSourcesV2, LanguageCatalog};
     use crate::font_provider::{FontHandle, FontProvider, FontRequest};
-    use crate::live_compositor::SliceTarget;
     use crate::live_frame::LiveFrame;
     use crate::ocr::Rect;
     use std::collections::HashMap;
@@ -2126,27 +2007,16 @@ mod tests {
                 right: w,
                 bottom: h,
             };
-            let mut dst = vec![0u8; (w * h * 4) as usize];
 
             for i in 0..3u64 {
                 frame.reset_owned(rgba.clone(), w, h, 0);
-                let mut target = SliceTarget { dst: &mut dst };
+                // No GL context here: process_frame is GL-free (the present happens
+                // in the shell), so the test drives the tracker step directly.
                 let r = pipeline
-                    .process_frame(
-                        &frame,
-                        crop,
-                        &mut target,
-                        w,
-                        h,
-                        w,
-                        h,
-                        w,
-                        h,
-                        (i + 1) * 1_000_000,
-                    )
+                    .process_frame(&frame, crop, w, h, (i + 1) * 1_000_000)
                     .expect("process_frame ok");
                 assert_eq!(r.state, PlanarTrackerState::Idle);
-                assert_eq!(r.composite_bytes, w * h * 4);
+                assert!(r.compose_h.is_none());
                 assert!(!r.started_acquire && !r.started_refresh);
             }
             // Implicitly shuts down the compute thread via channel close.

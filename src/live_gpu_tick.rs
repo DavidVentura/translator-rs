@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::api::{TranslatorError, TranslatorErrorKind};
-use crate::gl_renderer::{ExternalPresentTarget, GlesRenderer};
+use crate::gl_renderer::GlesRenderer;
 use crate::live_frame::{LiveFrame, OrientedImage, aligned_det_dims};
 use crate::live_tracker_pipeline::{LiveTrackerPipeline, ProcessFrameResult};
 use crate::ocr::Rect;
@@ -56,20 +56,25 @@ pub fn frame_from_camera_gray(
     Some(frame)
 }
 
-/// Run the tracker for one frame and, if the tracker asked for an
-/// acquire/refresh on this gray-only frame, satisfy the
+/// Run the tracker for one frame, present the result on the GPU (camera
+/// passthrough + the baked overlay warped by the tracker homography), and, if the
+/// tracker asked for an acquire/refresh on this gray-only frame, satisfy the
 /// [`AcquireRequest`](crate::live_tracker_pipeline::AcquireRequest) by reading
-/// back the full-res RGBA from the same external camera texture and handing it
-/// to [`LiveTrackerPipeline::provide_acquire_rgb`].
+/// back the OCR inputs from the same external camera texture and handing them to
+/// [`LiveTrackerPipeline::provide_acquire_rgb`].
 ///
-/// The caller must have bound the present target (framebuffer + viewport)
-/// before calling — that's where [`ExternalPresentTarget`] composites into.
+/// The overlay is rebaked into the renderer's overlay FBO only when the session's
+/// content version moves; every frame just warps that baked texture by the current
+/// `compose_h`. `display_xform` maps the canonical frame to clip; `surface_*` are
+/// the window dims the present renders into.
 pub fn run_tracker_with_acquire(
     pipeline: &LiveTrackerPipeline,
     gles: &mut GlesRenderer,
     frame: &Arc<LiveFrame>,
     canonical_w: u32,
     canonical_h: u32,
+    surface_w: u32,
+    surface_h: u32,
     display_xform: [f32; 9],
     timestamp_ns: u64,
 ) -> Result<ProcessFrameResult, TranslatorError> {
@@ -79,24 +84,43 @@ pub fn run_tracker_with_acquire(
         right: canonical_w,
         bottom: canonical_h,
     };
-    let result = {
-        let mut target = ExternalPresentTarget {
-            renderer: gles,
-            display_xform,
-        };
-        pipeline.process_frame(
-            frame,
-            crop,
-            &mut target,
-            canonical_w,
-            canonical_h,
-            canonical_w,
-            canonical_h,
-            canonical_w,
-            canonical_h,
-            timestamp_ns,
-        )?
+    let mut result = pipeline.process_frame(frame, crop, canonical_w, canonical_h, timestamp_ns)?;
+
+    // GPU present. Rebake the overlay only when the content version moved (new
+    // acquire/refresh); otherwise reuse the texture baked on a prior frame and just
+    // re-warp it by this frame's homography.
+    let version = pipeline.session().content_version();
+    if gles.overlay_baked_version() != Some(version) {
+        match pipeline.session().overlay_draw_list(result.anchor_id) {
+            Some(dl) => {
+                // Camera pills are translucent (the bg's own alpha); text is opaque.
+                let pill_alpha = pipeline.session().overlay_bg()[3] as f32 / 255.0;
+                if gles.render_overlay_to_texture(&dl, pill_alpha, 1.0, true) {
+                    gles.set_overlay_baked_version(version);
+                }
+            }
+            None => {
+                // Anchor has no content (cleared / not yet acquired): drop any stale
+                // bake so the present shows the camera alone.
+                gles.clear_baked_overlay();
+                gles.set_overlay_baked_version(version);
+            }
+        }
+    }
+    let drew = gles.present_camera(
+        &display_xform,
+        result.compose_h,
+        canonical_w,
+        canonical_h,
+        surface_w,
+        surface_h,
+    );
+    result.composite_bytes = if drew {
+        surface_w.saturating_mul(surface_h).saturating_mul(4)
+    } else {
+        0
     };
+
     if let Some(req) = result.rgb_request.clone() {
         // Render the two OCR inputs directly on the GPU instead of reading back
         // full-res RGBA and CPU-resizing: detector gray at the 32-aligned size,

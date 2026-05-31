@@ -18,11 +18,9 @@
 //! assumption that breaks on any tilted text. Dewarping into rectified
 //! coords first restores the assumption.
 //!
-//! At acquire time, the bindings layer (uniffi_catalog) takes the
-//! `MattedStrip` produced here, renders translated text into it, and
-//! then re-warps the textured strip into a canonical-orientation
-//! overlay bitmap via `OverlayItem`. The compositor handles the
-//! per-frame planar-tracker warp from canonical → viewport coords.
+//! At acquire time, the `MattedStrip` produced here feeds the GPU overlay
+//! compositor: its color drives the pill, and the GPU warps the baked overlay
+//! per-frame by the planar-tracker homography (canonical → viewport coords).
 //!
 //! See `FUTURE_SURFACE_MAP.md` ("Color matting") for the full design
 //! and how this slots into the surface-map roadmap.
