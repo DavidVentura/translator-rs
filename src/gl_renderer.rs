@@ -181,6 +181,11 @@ const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 /// `GL_R8` sized internal format (GLES3) for the single-channel gray FBO.
 const R8: u32 = 0x8229;
 
+/// Row-major 3×3 that negates the clip-space y. Pre-multiplied into a readback's
+/// `dst_to_clip` so the FBO renders vertically mirrored; the bottom-up `glReadPixels`
+/// then yields a top-down buffer with no CPU row-flip.
+const Y_FLIP_CLIP: [f32; 9] = [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0];
+
 /// Row-major identity-affine helpers, matching the convention of
 /// [`crate::homography`] (`mat3_mul` is row-major, `a * b`).
 fn translate(tx: f32, ty: f32) -> [f32; 9] {
@@ -699,14 +704,18 @@ impl GlesRenderer {
         }
         self.ext_luma.as_ref()?;
         self.ensure_gray_fbo(w, h);
-        let cam_transform = mat3_mul(dst_to_clip, &scale(w as f32, h as f32));
-        let mut flipped = vec![0u8; (w as usize) * (h as usize)];
+        // Render y-flipped so the bottom-up `glReadPixels` yields a top-down buffer
+        // directly — no second buffer + CPU row-flip. `Y_FLIP_CLIP` negates clip-y.
+        let cam_transform = mat3_mul(&Y_FLIP_CLIP, &mat3_mul(dst_to_clip, &scale(w as f32, h as f32)));
+        let mut gray = vec![0u8; (w as usize) * (h as usize)];
         unsafe {
             let gl = &self.gl;
             let e = self.ext_luma.as_ref().expect("ext_luma program present");
             gl.bind_framebuffer(glow::FRAMEBUFFER, self.gray_fbo);
             gl.viewport(0, 0, w as i32, h as i32);
             gl.disable(glow::BLEND);
+            // The clip-y flip reverses triangle winding; cull would drop the quad.
+            gl.disable(glow::CULL_FACE);
             gl.use_program(Some(e.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
             gl.enable_vertex_attrib_array(e.a_pos);
@@ -732,18 +741,10 @@ impl GlesRenderer {
                 h as i32,
                 glow::RED,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut flipped)),
+                glow::PixelPackData::Slice(Some(&mut gray)),
             );
             gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-        // glReadPixels is bottom-up; the pipeline wants top-down. Flip rows.
-        let stride = w as usize;
-        let mut gray = vec![0u8; flipped.len()];
-        for y in 0..h as usize {
-            let src = (h as usize - 1 - y) * stride;
-            let dst = y * stride;
-            gray[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
         }
         Some(gray)
     }
@@ -760,14 +761,18 @@ impl GlesRenderer {
         let id = NonZeroU32::new(id)?;
         self.ext.as_ref()?;
         self.ensure_fbo(w, h);
-        let cam_transform = mat3_mul(dst_to_clip, &scale(w as f32, h as f32));
-        let mut flipped = vec![0u8; (w as usize) * (h as usize) * 4];
+        // Render y-flipped so the bottom-up `glReadPixels` yields a top-down buffer
+        // directly — no second buffer + CPU row-flip. `Y_FLIP_CLIP` negates clip-y.
+        let cam_transform = mat3_mul(&Y_FLIP_CLIP, &mat3_mul(dst_to_clip, &scale(w as f32, h as f32)));
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
         unsafe {
             let gl = &self.gl;
             let e = self.ext.as_ref().expect("ext program present");
             gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
             gl.viewport(0, 0, w as i32, h as i32);
             gl.disable(glow::BLEND);
+            // The clip-y flip reverses triangle winding; cull would drop the quad.
+            gl.disable(glow::CULL_FACE);
             gl.use_program(Some(e.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
             gl.enable_vertex_attrib_array(e.a_pos);
@@ -789,17 +794,9 @@ impl GlesRenderer {
                 h as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut flipped)),
+                glow::PixelPackData::Slice(Some(&mut rgba)),
             );
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-        // glReadPixels is bottom-up; the pipeline wants top-down. Flip rows.
-        let stride = (w as usize) * 4;
-        let mut rgba = vec![0u8; flipped.len()];
-        for y in 0..h as usize {
-            let src = (h as usize - 1 - y) * stride;
-            let dst = y * stride;
-            rgba[dst..dst + stride].copy_from_slice(&flipped[src..src + stride]);
         }
         Some(rgba)
     }
