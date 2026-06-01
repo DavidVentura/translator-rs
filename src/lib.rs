@@ -53,6 +53,7 @@ pub mod mucab;
 pub mod ocr;
 #[cfg(any(feature = "tesseract", feature = "ppocr"))]
 mod ocr_runtime;
+pub mod screen_monitor;
 #[cfg(feature = "odt")]
 pub mod odt;
 #[cfg(feature = "pdf")]

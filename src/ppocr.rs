@@ -62,6 +62,23 @@ const PPOCR_DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PPOCR_DET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const PPOCR_REC_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 const PPOCR_REC_STD: [f32; 3] = [0.5, 0.5, 0.5];
+/// Per-channel u8 -> normalized-f32 lookup tables for rec preprocessing.
+/// The input is u8, so `(v/255 - mean)/std` has only 256 outputs per channel;
+/// computing them at compile time turns the per-pixel float math into a read.
+const fn rec_norm_lut(mean: f32, std: f32) -> [f32; 256] {
+    let mut t = [0.0f32; 256];
+    let mut v = 0usize;
+    while v < 256 {
+        t[v] = (v as f32 / 255.0 - mean) / std;
+        v += 1;
+    }
+    t
+}
+const REC_NORM_LUT: [[f32; 256]; 3] = [
+    rec_norm_lut(PPOCR_REC_MEAN[0], PPOCR_REC_STD[0]),
+    rec_norm_lut(PPOCR_REC_MEAN[1], PPOCR_REC_STD[1]),
+    rec_norm_lut(PPOCR_REC_MEAN[2], PPOCR_REC_STD[2]),
+];
 const PULC_WIDTH: u32 = 160;
 const PULC_HEIGHT: u32 = 80;
 const PULC_MIN_SCORE: f32 = 0.85;
@@ -1677,14 +1694,15 @@ impl PpocrRecognizer {
         let w_us = (w_exact + REC_WIDTH_BUCKET - 1) / REC_WIDTH_BUCKET * REC_WIDTH_BUCKET;
         let mut buf = vec![0.0f32; 3 * target_h * w_us];
         let plane = target_h * w_us;
+        let raw = rgb.as_raw();
         for y in 0..target_h {
-            for x in 0..w_exact {
-                let pixel = rgb.get_pixel(x as u32, y as u32);
-                let idx = y * w_us + x;
-                buf[idx] = (pixel[0] as f32 / 255.0 - PPOCR_REC_MEAN[0]) / PPOCR_REC_STD[0];
-                buf[plane + idx] = (pixel[1] as f32 / 255.0 - PPOCR_REC_MEAN[1]) / PPOCR_REC_STD[1];
-                buf[2 * plane + idx] =
-                    (pixel[2] as f32 / 255.0 - PPOCR_REC_MEAN[2]) / PPOCR_REC_STD[2];
+            let row = &raw[y * w_exact * 3..(y * w_exact + w_exact) * 3];
+            let base = y * w_us;
+            for (x, px) in row.chunks_exact(3).enumerate() {
+                let idx = base + x;
+                buf[idx] = REC_NORM_LUT[0][px[0] as usize];
+                buf[plane + idx] = REC_NORM_LUT[1][px[1] as usize];
+                buf[2 * plane + idx] = REC_NORM_LUT[2][px[2] as usize];
             }
         }
         timings_us
