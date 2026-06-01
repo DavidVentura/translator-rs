@@ -55,7 +55,11 @@ fn load_engine() -> PpocrEngine {
 
 fn fixture(name: &str) -> RgbaImage {
     let path = PathBuf::from(FIXTURE_DIR).join(name);
-    assert!(path.exists(), "required fixture missing: {}", path.display());
+    assert!(
+        path.exists(),
+        "required fixture missing: {}",
+        path.display()
+    );
     ImageReader::open(&path)
         .expect("open fixture")
         .decode()
@@ -112,7 +116,10 @@ fn make_probe() -> LatticeProbe {
 
 /// Real detect + recognize on a CPU-built frame. Returns the full-res canonical
 /// `gray` (the screen we composite the pill over) plus per-box recognized text.
-fn detect_and_rec(engine: &PpocrEngine, rgba: &RgbaImage) -> (GrayImage, Vec<DetectedTextBox>, Vec<String>) {
+fn detect_and_rec(
+    engine: &PpocrEngine,
+    rgba: &RgbaImage,
+) -> (GrayImage, Vec<DetectedTextBox>, Vec<String>) {
     let (w, h) = (rgba.width(), rgba.height());
     let crop = Rect {
         left: 0,
@@ -142,7 +149,8 @@ fn detect_and_rec(engine: &PpocrEngine, rgba: &RgbaImage) -> (GrayImage, Vec<Det
 /// the frame a MediaProjection capture hands us: pill colour everywhere in the
 /// box, except the lattice hole pixels (a half blend of pill and screen).
 fn composite_capture(source: &[u8], w: u32, h: u32, lat: &Lattice, pill: &PillRegion) -> Vec<u8> {
-    let inside = |x: f32, y: f32| (x - pill.cx).abs() <= pill.half_w && (y - pill.cy).abs() <= pill.half_h;
+    let inside =
+        |x: f32, y: f32| (x - pill.cx).abs() <= pill.half_w && (y - pill.cy).abs() <= pill.half_h;
     let mut cap = source.to_vec();
     for y in 0..h {
         for x in 0..w {
@@ -163,8 +171,14 @@ fn composite_capture(source: &[u8], w: u32, h: u32, lat: &Lattice, pill: &PillRe
 }
 
 fn paste_into_box(dst: &mut RgbaImage, src: &RgbaImage, b: &OrientedRect) {
-    let bw = (b.width.round() as u32).max(1).min(dst.width().saturating_sub((b.cx - b.width / 2.0).max(0.0) as u32));
-    let bh = (b.height.round() as u32).max(1).min(dst.height().saturating_sub((b.cy - b.height / 2.0).max(0.0) as u32));
+    let bw = (b.width.round() as u32).max(1).min(
+        dst.width()
+            .saturating_sub((b.cx - b.width / 2.0).max(0.0) as u32),
+    );
+    let bh = (b.height.round() as u32).max(1).min(
+        dst.height()
+            .saturating_sub((b.cy - b.height / 2.0).max(0.0) as u32),
+    );
     let left = (b.cx - b.width / 2.0).round().max(0.0) as u32;
     let top = (b.cy - b.height / 2.0).round().max(0.0) as u32;
     if bw == 0 || bh == 0 {
@@ -214,7 +228,11 @@ fn subtitle_change_detected_background_motion_ignored() {
     let monitored_box = boxes_a[idx].tight_box.clone();
     let pill = PillRegion::from_oriented(&monitored_box);
     assert!(!text_a.is_empty(), "the monitored box recognized some text");
-    assert!(holes.len() >= cfg().min_glyph_holes, "box lattice coverage: {}", holes.len());
+    assert!(
+        holes.len() >= cfg().min_glyph_holes,
+        "box lattice coverage: {}",
+        holes.len()
+    );
     eprintln!("monitored box text: {text_a:?} ({} holes)", holes.len());
 
     // Baseline: recover screen_est through the pill holes from the composited base.
@@ -226,9 +244,15 @@ fn subtitle_change_detected_background_motion_ignored() {
     // Binarize bootstrap on the recovered baseline.
     let box_lumas: Vec<f32> = holes.iter().map(|&i| baseline[i] as f32).collect();
     let mean = box_lumas.iter().sum::<f32>() / box_lumas.len() as f32;
-    let bootstrap: Vec<bool> = box_lumas.iter().map(|&l| (l - mean).abs() > INK_CONTRAST).collect();
+    let bootstrap: Vec<bool> = box_lumas
+        .iter()
+        .map(|&l| (l - mean).abs() > INK_CONTRAST)
+        .collect();
     let ink = bootstrap.iter().filter(|b| **b).count();
-    assert!(ink >= cfg().min_glyph_holes, "ink holes via recovery: {ink}");
+    assert!(
+        ink >= cfg().min_glyph_holes,
+        "ink holes via recovery: {ink}"
+    );
 
     let mut mon = ScreenMonitor::new(lat, cfg());
     mon.set_box(1, holes.clone(), bootstrap.clone(), &baseline);
@@ -250,7 +274,14 @@ fn subtitle_change_detected_background_motion_ignored() {
                 src[(py * w + px) as usize] = if (f + px) % 2 == 0 { 25 } else { 215 };
             }
         }
-        let rec = probe.recover(&composite_capture(&src, w, h, mon.lattice(), &pill), w, h, mon.lattice(), PILL_LUMA, &[pill]);
+        let rec = probe.recover(
+            &composite_capture(&src, w, h, mon.lattice(), &pill),
+            w,
+            h,
+            mon.lattice(),
+            PILL_LUMA,
+            &[pill],
+        );
         assert_eq!(
             mon.observe(&rec),
             FrameClassification::Quiet,
@@ -262,7 +293,11 @@ fn subtitle_change_detected_background_motion_ignored() {
     let mut changed_rgba = base_rgba.clone();
     paste_into_box(&mut changed_rgba, &other_rgba, &monitored_box);
     let (gray_b, boxes_b, texts_b) = detect_and_rec(&engine, &changed_rgba);
-    assert_eq!((gray_b.width(), gray_b.height()), (w, h), "frame dims stable");
+    assert_eq!(
+        (gray_b.width(), gray_b.height()),
+        (w, h),
+        "frame dims stable"
+    );
 
     let cap_changed = composite_capture(gray_b.as_raw(), w, h, mon.lattice(), &pill);
     let rec_b = probe.recover(&cap_changed, w, h, mon.lattice(), PILL_LUMA, &[pill]);
@@ -303,5 +338,8 @@ fn subtitle_change_detected_background_motion_ignored() {
         .map(|(_, t)| t.trim().to_string())
         .unwrap_or_default();
     eprintln!("text under box after change: {text_b:?}");
-    assert_ne!(text_b, text_a, "recognizer should read different text under the box");
+    assert_ne!(
+        text_b, text_a,
+        "recognizer should read different text under the box"
+    );
 }

@@ -13,6 +13,7 @@
 //! ([`crate::live_tracker_pipeline::acquire_detect`] etc.), so there is no
 //! duplicated OCR/overlay logic — only the orchestration differs.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,24 +23,70 @@ use crate::live_session::{LiveSession, dominant_axis_quadrant};
 use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate};
 use crate::live_worker::SlotWorker;
 use crate::ocr::{OrientedRect, Rect};
+use crate::screen_monitor::{FrameClassification, Lattice, MonitorConfig, ScreenMonitor};
 use crate::session::TranslatorSession;
 
 /// The one anchor the screen pipeline owns; everything composites against it.
 const SCREEN_ANCHOR_ID: u64 = 1;
 
-/// Coarse-diff downscale: the longest side of the gray we diff per frame. Heavy
-/// on purpose — small FX / noise wash out, so only structural change (a real
-/// scroll) crosses [`MOVE_THRESHOLD`] — but fine enough that the pill mask hugs
-/// the strips (a 1-cell-tall pill at 64 leaked past the mask).
-const COARSE_LONG_SIDE: u32 = 128;
-
-/// Mean-abs-diff (0..255) over the coarse gray, vs the window's base frame, that
-/// counts as "the screen moved": resets the base + pushes the settle deadline.
-const MOVE_THRESHOLD: f32 = 8.0;
-
-/// Quiet window: once no frame exceeds [`MOVE_THRESHOLD`] for this long, the
-/// screen is settled → acquire. Purely time-based, never a frame count.
-const SETTLE_QUIET_NS: i64 = 120_000_000;
+/// Pinhole lattice pitch (canonical px) for the v2 under-pill change detector.
+/// Holes are punched here in the overlay and the recovery shader samples here.
+const SCREEN_LATTICE_SPACING: u32 = 5;
+/// Pill colour the screen overlay draws (opaque black), as a 0..1 luma — the
+/// recovery's `pill` term.
+const SCREEN_PILL_LUMA: f32 = 0.0;
+/// Engineered effective screen fraction at a hole (`1 − effective overlay alpha`).
+/// The hole's baked alpha is chosen so the captured blend lands here, keeping the
+/// recovery shader fixed.
+const SCREEN_HOLE_FRAC: f32 = 0.5;
+/// Hole dot radius (canonical px) — a small pinprick around each lattice point,
+/// not a fraction of the cell, so the pill stays mostly opaque and only the
+/// sampled points let the screen through. With the recovery now sampling the
+/// hole's pixel centre (the half-texel offset in `REC_FRAG_SRC`), the hole no
+/// longer needs to be fat to absorb a sub-pixel miss: 0.5 canonical ≈ a 2px
+/// display dot. Shrink toward 0.25 (≈1px) if the recovered grid stays crisp.
+const SCREEN_HOLE_RADIUS: f32 = 0.5;
+/// After a trip drops blocks, ignore further trips for this long so a noisy
+/// recovery can't storm removals.
+const V2_TRIP_COOLDOWN_NS: i64 = 600_000_000;
+/// While settled, run a masked additive acquire at least this often to pick up
+/// new text that appeared in the gaps.
+const V2_PERIODIC_NS: i64 = 1_500_000_000;
+/// After dropping/clearing pills, hold the re-acquire off for this long so the
+/// dropped pills have actually left the captured mirror before OCR runs on it.
+/// MediaProjection composites the overlay window into the mirror a frame or two
+/// after `eglSwapBuffers` returns, so re-OCRing immediately recognises our own
+/// just-removed labels as "new" text. A fixed settle is deterministic where the
+/// old present-timestamp fence raced the compositor and opened ~1-2 frames early.
+const V2_SETTLE_NS: i64 = 150_000_000;
+/// Per-lattice-point inter-frame luma delta that counts a gap point as "moved"
+/// for the global-motion signal (both the scroll trigger and the settle gate).
+const V2_MOTION_THR: i32 = 40;
+/// Fraction of gap (non-pill) lattice points moving frame-to-frame that reads as
+/// a wholesale change (scroll / navigation / app-switch) → drop all + re-acquire.
+/// This is the fast, box-independent path: it fires the same frame the screen
+/// starts moving (before the per-box detectors confirm) and clears even boxes the
+/// per-box monitor can't track (too few holes), which would otherwise persist. A
+/// localized video moves only its own region, staying below this.
+const V2_SCROLL_MOTION_FRAC: f32 = 0.30;
+/// Below this fraction of moving gap points the screen is settled enough to run
+/// the post-drop re-acquire — OCRing mid-scroll just produces garbage that trips
+/// again. The band between this and [`V2_SCROLL_MOTION_FRAC`] is hysteresis.
+const V2_SETTLE_MOTION_FRAC: f32 = 0.10;
+/// Minimum number of gap (non-pill) lattice points needed to trust the motion
+/// fraction. When pills cover almost everything there aren't enough bare screen
+/// samples, so the gate treats the frame as settled.
+const V2_MOTION_MIN_POINTS: usize = 20;
+/// A per-box change touching at least this fraction of the tracked boxes is a
+/// whole-screen change (scroll / navigation): drop everything and re-acquire from
+/// scratch rather than blinking pills off one by one.
+const SCROLL_CHANGED_FRAC: f32 = 0.75;
+/// Binarize threshold (recovered luma units) marking a hole as on-ink for the
+/// bootstrap stroke mask. Lower than the synthetic test's 35 because the
+/// recovered signal under a pill is dimmed/compressed.
+const SCREEN_INK_CONTRAST: f32 = 22.0;
+/// A box needs at least this many lattice holes to be monitored.
+const SCREEN_MIN_BOX_HOLES: usize = 4;
 
 #[derive(Clone)]
 struct ScreenConfig {
@@ -82,218 +129,184 @@ pub enum MonitorAction {
     Acquire,
 }
 
-/// The change-detection state. The base frame is the coarse-gray reference the
-/// current settle window opened with; deltas are measured against it (cumulative
-/// change since the window opened), not against the previous frame.
-enum MonitorState {
-    /// Debouncing toward an acquire (overlay hidden). Also the bootstrap state
-    /// (`base`/`deadline` start `None`), so the first frame opens the window.
-    Settling {
-        base: Option<Vec<u8>>,
-        deadline_ns: Option<i64>,
-    },
-    /// An async acquire (detect/rec/translate) is running on the worker thread.
-    /// `clean_base` is the coarse gray the OCR ran on; each captured frame is
-    /// masked-diffed against it (same pill mask as `Idle`), and real content
-    /// motion → hide + abort + re-acquire. The worker flips this to `Idle` on a
-    /// clean finish; an abort moves it to `Settling` first (guarded so the worker
-    /// won't clobber that).
-    Acquiring { clean_base: Vec<u8> },
-    /// Overlay reflects the current static screen; wait for movement. The diff
-    /// here masks out the pill cells (our own opaque overlay), so our redraw
-    /// never reads as movement and only real content motion in the gaps counts.
-    Idle { base: Option<Vec<u8>> },
-}
-
-fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
-    if a.is_empty() || a.len() != b.len() {
-        return 255.0;
-    }
-    let sum: u64 = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u64).sum();
-    sum as f32 / a.len() as f32
-}
-
-/// Mean-abs-diff over only the cells not flagged in `excluded` (the pill mask).
-/// A fully-masked frame (pills cover everything) yields 0 — no movement.
-fn mean_abs_diff_masked(a: &[u8], b: &[u8], excluded: &[bool]) -> f32 {
-    if a.is_empty() || a.len() != b.len() || excluded.len() != a.len() {
-        return 255.0;
-    }
-    let mut sum = 0u64;
-    let mut n = 0u64;
-    for i in 0..a.len() {
-        if excluded[i] {
-            continue;
-        }
-        sum += a[i].abs_diff(b[i]) as u64;
-        n += 1;
-    }
-    if n == 0 {
-        return 0.0;
-    }
-    sum as f32 / n as f32
-}
-
-/// Whether coarse cell `(px,py)` (centre, with half-extents `half_cx`/`half_cy`)
-/// overlaps the oriented pill `r`. Conservative: tests the cell centre against
-/// `r` inflated by the cell's half-extent projected onto the rect's local axes,
-/// so any cell the pill *touches* is masked (not just centre-inside ones) — the
-/// coarse grid is too sparse for centre-only masking to fully cover a 1-cell-tall
-/// pill, and a leaked pill edge reads as movement.
-fn cell_overlaps_pill(px: f32, py: f32, half_cx: f32, half_cy: f32, r: &OrientedRect) -> bool {
-    let dx = px - r.cx;
-    let dy = py - r.cy;
-    let cos = r.angle_radians.cos();
-    let sin = r.angle_radians.sin();
-    let lx = (dx * cos + dy * sin).abs();
-    let ly = (-dx * sin + dy * cos).abs();
-    let infl_x = half_cx * cos.abs() + half_cy * sin.abs();
-    let infl_y = half_cx * sin.abs() + half_cy * cos.abs();
-    lx <= r.width * 0.5 + infl_x && ly <= r.height * 0.5 + infl_y
-}
-
-/// Coarse `gw×gh` mask (true = excluded) of every cell any pill overlaps.
-/// `cw/ch` are the canonical dims the `rects` are expressed in.
-fn build_pill_mask(rects: &[OrientedRect], gw: u32, gh: u32, cw: u32, ch: u32) -> Vec<bool> {
-    let mut mask = vec![false; (gw as usize) * (gh as usize)];
-    if rects.is_empty() {
-        return mask;
-    }
-    let sx = cw as f32 / gw as f32;
-    let sy = ch as f32 / gh as f32;
-    let half_cx = sx * 0.5;
-    let half_cy = sy * 0.5;
-    for cy in 0..gh {
-        let py = (cy as f32 + 0.5) * sy;
-        for cx in 0..gw {
-            let px = (cx as f32 + 0.5) * sx;
-            if rects
-                .iter()
-                .any(|r| cell_overlaps_pill(px, py, half_cx, half_cy, r))
-            {
-                mask[(cy * gw + cx) as usize] = true;
-            }
-        }
-    }
-    mask
-}
-
-fn settling(base: Vec<u8>, now_ns: i64) -> MonitorState {
-    MonitorState::Settling {
-        base: Some(base),
-        deadline_ns: Some(now_ns + SETTLE_QUIET_NS),
-    }
-}
-
-/// Pure transition for a captured frame; returns the next state + action.
-/// `excluded` is the pill mask, applied only in `Idle` (overlay up) — `None`
-/// while `Settling` (overlay hidden, diff the whole frame).
-fn step_frame(
-    state: MonitorState,
-    gray: &[u8],
-    excluded: Option<&[bool]>,
-    now_ns: i64,
-) -> (MonitorState, MonitorAction) {
-    match state {
-        // Worker running OCR. Masked-diff vs the frame it ran on; real content
-        // motion → hide + re-acquire (the GL thread also aborts the worker). Our
-        // own pills appearing are masked out (same as Idle). The worker flips
-        // this to Idle on clean finish.
-        MonitorState::Acquiring { clean_base } => {
-            let g = match excluded {
-                Some(ex) => mean_abs_diff_masked(&clean_base, gray, ex),
-                None => mean_abs_diff(&clean_base, gray),
-            };
-            if g > MOVE_THRESHOLD {
-                log::info!(
-                    "[screen-monitor] movement g={g:.1} during acquire → abort + re-acquire"
-                );
-                (settling(gray.to_vec(), now_ns), MonitorAction::Hide)
-            } else {
-                (MonitorState::Acquiring { clean_base }, MonitorAction::None)
-            }
-        }
-        MonitorState::Idle { base: None } => (
-            MonitorState::Idle {
-                base: Some(gray.to_vec()),
-            },
-            MonitorAction::None,
-        ),
-        MonitorState::Idle { base: Some(b) } => {
-            let g = match excluded {
-                Some(ex) => mean_abs_diff_masked(&b, gray, ex),
-                None => mean_abs_diff(&b, gray),
-            };
-            log::debug!("[screen-monitor] idle g={g:.1}");
-            if g > MOVE_THRESHOLD {
-                log::info!("[screen-monitor] movement g={g:.1} → hide");
-                (settling(gray.to_vec(), now_ns), MonitorAction::Hide)
-            } else {
-                (MonitorState::Idle { base: Some(b) }, MonitorAction::None)
-            }
-        }
-        MonitorState::Settling { base: None, .. } => {
-            (settling(gray.to_vec(), now_ns), MonitorAction::None)
-        }
-        MonitorState::Settling {
-            base: Some(b),
-            deadline_ns,
-        } => {
-            let g = mean_abs_diff(&b, gray);
-            log::debug!("[screen-monitor] settling g={g:.1}");
-            if g > MOVE_THRESHOLD {
-                (settling(gray.to_vec(), now_ns), MonitorAction::None)
-            } else if deadline_ns.is_some_and(|d| now_ns >= d) {
-                log::info!("[screen-monitor] settled (frame) g={g:.1} → acquire");
-                // Stay Settling until the dispatch actually lands (the worker may
-                // still be draining a just-aborted job); `monitor_confirm_acquire`
-                // flips us to Acquiring on success, else we re-fire next tick.
-                (
-                    MonitorState::Settling {
-                        base: Some(b),
-                        deadline_ns,
-                    },
-                    MonitorAction::Acquire,
-                )
-            } else {
-                (
-                    MonitorState::Settling {
-                        base: Some(b),
-                        deadline_ns,
-                    },
-                    MonitorAction::None,
-                )
-            }
-        }
-    }
-}
-
-/// Pure transition for a timed tick (no new frame): only a pending settle fires.
-fn step_tick(state: MonitorState, now_ns: i64) -> (MonitorState, MonitorAction) {
-    match state {
-        MonitorState::Settling {
-            base: Some(clean_base),
-            deadline_ns: Some(d),
-        } if now_ns >= d => {
-            log::info!("[screen-monitor] settled (tick) → acquire");
-            // Stay Settling until dispatch lands (see step_frame).
-            (
-                MonitorState::Settling {
-                    base: Some(clean_base),
-                    deadline_ns: Some(d),
-                },
-                MonitorAction::Acquire,
-            )
-        }
-        other => (other, MonitorAction::None),
-    }
-}
-
 /// One acquire job: the GPU-rendered OCR frame + the generation it was dispatched
 /// at (so a later `abort`/reset can cancel it mid-flight).
 struct ScreenJob {
     frame: Arc<LiveFrame>,
     generation: u64,
+}
+
+/// Screen-tuned config for the per-box (v2) monitor. Thresholds are in recovered
+/// luma units (0..255); the recovery doubles a black-pill hole, so a stroke
+/// change is a large delta.
+fn screen_monitor_config() -> MonitorConfig {
+    MonitorConfig {
+        warmup_frames: 6,
+        // Tolerant of recovery noise (8-bit, ×2 amplified, mirror-compressed): a
+        // truly-moving video hole swings hundreds (var ≫ this), but a stable
+        // stroke hole shouldn't be dropped just for recovery jitter. std ~20.
+        glyph_var_threshold: 400.0,
+        change_threshold: 40,
+        // A single subtitle line change flips only a minority of its box's holes
+        // (overlapping strokes, padding, between-letter gaps), so the bar is low.
+        box_coherence_frac: 0.15,
+        min_glyph_holes: SCREEN_MIN_BOX_HOLES,
+        // A box with no stable ink holes (low-contrast recovery, short labels) is
+        // judged on all its holes. A real screen change only flips ~20-40% of them
+        // — the rest land on background areas that read similar across screens — so
+        // the bar must be low; on-device logs put stable boxes at ≤11% and changed
+        // boxes at ≥24%, so 0.2 separates them. (Per-hole change_threshold of 40
+        // already rejects noise, so this fraction can be aggressive.)
+        gross_change_frac: 0.2,
+        scroll_frac: 0.7,
+        scroll_min_boxes: 2,
+    }
+}
+
+/// The v2 per-box monitor plus the canonical dims its lattice was built for and
+/// the overlay content version its boxes were last (re)based at.
+struct MonitorV2State {
+    monitor: ScreenMonitor,
+    cw: u32,
+    ch: u32,
+    last_populated: u64,
+    /// block_id → the `content_hash` its box was baselined at, so an unchanged
+    /// block keeps its baseline across unrelated acquires.
+    baselined: HashMap<u64, u64>,
+    /// Observe-driven trips are ignored until this time (warmup after a re-base,
+    /// cooldown after a drop).
+    suppress_trips_until_ns: i64,
+    /// Next time to dispatch the periodic new-text scan (masked additive acquire
+    /// for text that appeared in the gaps). Frame-driven.
+    next_acquire_ns: i64,
+    /// A re-acquire may not run before this time: armed to `now + V2_SETTLE_NS`
+    /// whenever pills are dropped/cleared, so the dropped pills have left the
+    /// captured mirror before OCR runs (replaces the racy present-generation
+    /// fence). `0` = no settle pending.
+    reacquire_not_before_ns: i64,
+    /// A re-acquire is owed (bootstrap, or after a drop/clear) and must fire even
+    /// if no frames arrive — drives `wants_tick` so the GL loop keeps ticking. The
+    /// periodic new-text scan is frame-driven only, so a static screen with a
+    /// stable overlay doesn't tick forever. Cleared once dispatch is *confirmed*
+    /// (the worker goes busy), not optimistically when the action is returned.
+    pending_reacquire: bool,
+    /// Previous frame's recovered samples, for the global inter-frame motion
+    /// (scroll/navigation) signal.
+    prev_samples: Option<Vec<u8>>,
+    /// Previous frame's per-point pill-coverage mask. Motion is compared only at
+    /// points that were a gap last frame *and* this frame, so a pill appearing /
+    /// leaving over a point isn't mistaken for screen motion.
+    prev_covered: Option<Vec<bool>>,
+    /// Currently in a global-motion (scroll/navigation) episode — the overlay has
+    /// been cleared and re-acquire is deferred until motion settles.
+    scrolling: bool,
+    /// Diagnostic frame counter for rate-limited logging.
+    frames: u64,
+}
+
+/// DEBUG: write the recovered `screen_est` lattice, expanded back to canonical
+/// size (each point → a spacing×spacing block), as a grayscale PNG to the app's
+/// external files dir. Compare against `adb exec-out screencap` of the same
+/// screen: if the recovered content under the pills lines up with the real text
+/// positions, the recovery is aligned; if it's shifted/garbled, it's not.
+#[cfg(feature = "ppocr")]
+fn debug_dump_recovered(lattice: &Lattice, samples: &[u8], cw: u32, ch: u32) {
+    if samples.len() != lattice.len() || cw == 0 || ch == 0 {
+        return;
+    }
+    let sp = lattice.spacing().max(1);
+    let mut img = image::GrayImage::new(cw, ch);
+    for (i, p) in lattice.points().iter().enumerate() {
+        let v = image::Luma([samples[i]]);
+        let x0 = (p.x as u32).saturating_sub(sp / 2);
+        let y0 = (p.y as u32).saturating_sub(sp / 2);
+        for yy in y0..(y0 + sp).min(ch) {
+            for xx in x0..(x0 + sp).min(cw) {
+                img.put_pixel(xx, yy, v);
+            }
+        }
+    }
+    let path = "/storage/emulated/0/Android/data/dev.davidv.translator/files/screen_est.png";
+    match img.save(path) {
+        Ok(()) => log::info!("[screen-monitor-v2] dumped recovered grid → {path}"),
+        Err(e) => log::warn!("[screen-monitor-v2] recovered-grid dump failed: {e}"),
+    }
+}
+
+#[cfg(not(feature = "ppocr"))]
+fn debug_dump_recovered(_lattice: &Lattice, _samples: &[u8], _cw: u32, _ch: u32) {}
+
+/// Axis-aligned-bounds overlap of two oriented rects. Used to drop detections
+/// that fall on an existing pill (our own re-captured overlay).
+fn rects_overlap(a: &OrientedRect, b: &OrientedRect) -> bool {
+    let aabb = |r: &OrientedRect| {
+        let (c, s) = (r.angle_radians.cos().abs(), r.angle_radians.sin().abs());
+        let hw = r.width * 0.5 * c + r.height * 0.5 * s;
+        let hh = r.width * 0.5 * s + r.height * 0.5 * c;
+        (r.cx, r.cy, hw, hh)
+    };
+    let (ax, ay, ahw, ahh) = aabb(a);
+    let (bx, by, bhw, bhh) = aabb(b);
+    (ax - bx).abs() <= ahw + bhw && (ay - by).abs() <= ahh + bhh
+}
+
+/// Reconcile the v2 boxes (keyed by `block_id`) against the resident blocks
+/// *incrementally*: a box's baseline + learned stroke mask are **preserved**
+/// while its block's `content_hash` is unchanged, so an unrelated acquire can't
+/// reset a stale block's reference (which is what let stale pills accumulate).
+/// Only new blocks and re-OCR'd blocks (changed hash) are (re)baselined off the
+/// recovered `samples`; boxes for vanished blocks are dropped. `baselined` tracks
+/// the hash each box was baselined at.
+fn reconcile_boxes(
+    monitor: &mut ScreenMonitor,
+    blocks: &[(u64, u64, Vec<OrientedRect>)],
+    glyph_aabbs: &HashMap<u64, Vec<[f32; 4]>>,
+    samples: &[u8],
+    baselined: &mut HashMap<u64, u64>,
+) {
+    let current: std::collections::HashSet<u64> = blocks.iter().map(|b| b.0).collect();
+    for id in monitor.box_ids() {
+        if !current.contains(&id) {
+            monitor.remove_box(id);
+            baselined.remove(&id);
+        }
+    }
+    for (block_id, hash, strips) in blocks {
+        if baselined.get(block_id) == Some(hash) {
+            continue; // unchanged — keep its baseline + frozen mask
+        }
+        let mut holes: Vec<usize> = strips
+            .iter()
+            .flat_map(|s| monitor.lattice().holes_in_rect(s))
+            .collect();
+        holes.sort_unstable();
+        holes.dedup();
+        // Drop holes covered by our own glyphs: they read our opaque text, not the
+        // screen, so they'd never see the underlying content change and would pin
+        // the box. What remains are the pill-background holes that read the screen.
+        if let Some(aabbs) = glyph_aabbs.get(block_id) {
+            if !aabbs.is_empty() {
+                let pts = monitor.lattice().points();
+                holes.retain(|&h| {
+                    let p = pts[h];
+                    !aabbs
+                        .iter()
+                        .any(|g| p.x >= g[0] && p.x <= g[2] && p.y >= g[1] && p.y <= g[3])
+                });
+            }
+        }
+        if holes.len() < SCREEN_MIN_BOX_HOLES {
+            continue;
+        }
+        let lumas: Vec<f32> = holes.iter().map(|&h| samples[h] as f32).collect();
+        let mean = lumas.iter().sum::<f32>() / lumas.len() as f32;
+        let bootstrap: Vec<bool> = lumas
+            .iter()
+            .map(|&l| (l - mean).abs() > SCREEN_INK_CONTRAST)
+            .collect();
+        monitor.set_box(*block_id, holes, bootstrap, samples);
+        baselined.insert(*block_id, *hash);
+    }
 }
 
 pub struct LiveScreenPipeline {
@@ -303,8 +316,9 @@ pub struct LiveScreenPipeline {
     config: Mutex<ScreenConfig>,
     /// Bumped on reset / language change / abort so an in-flight rec/translate bails.
     generation: AtomicU64,
-    /// Movement / settle change-detection state (the v1 "Monitoring" logic).
-    monitor: Mutex<MonitorState>,
+    /// Per-box under-pill change detector; `None` until the first frame establishes
+    /// the canonical dims.
+    monitor_v2: Mutex<Option<MonitorV2State>>,
     /// Background OCR worker; `None` only transiently during `new`.
     worker: Mutex<Option<SlotWorker<ScreenJob>>>,
 }
@@ -325,10 +339,7 @@ impl LiveScreenPipeline {
             font_provider,
             config: Mutex::new(ScreenConfig::default()),
             generation: AtomicU64::new(0),
-            monitor: Mutex::new(MonitorState::Settling {
-                base: None,
-                deadline_ns: None,
-            }),
+            monitor_v2: Mutex::new(None),
             worker: Mutex::new(None),
         });
         let worker = {
@@ -345,109 +356,380 @@ impl LiveScreenPipeline {
     }
 
     fn reset_monitor(&self) {
-        if let Ok(mut m) = self.monitor.lock() {
-            *m = MonitorState::Settling {
-                base: None,
-                deadline_ns: None,
-            };
+        if let Ok(mut m) = self.monitor_v2.lock() {
+            *m = None;
         }
     }
 
-    /// Coarse-diff dims for a `cw×ch` capture: longest side [`COARSE_LONG_SIDE`],
-    /// aspect preserved.
-    pub fn coarse_dims(&self, cw: u32, ch: u32) -> (u32, u32) {
-        let cw = cw.max(1);
-        let ch = ch.max(1);
-        if cw >= ch {
-            let gw = COARSE_LONG_SIDE.min(cw);
-            let gh = ((gw as u64 * ch as u64) / cw as u64).max(1) as u32;
-            (gw, gh)
-        } else {
-            let gh = COARSE_LONG_SIDE.min(ch);
-            let gw = ((gh as u64 * cw as u64) / ch as u64).max(1) as u32;
-            (gw, gh)
-        }
+    /// Pinhole lattice pitch (canonical px) the v2 detector + the overlay holes
+    /// share. The GL caller sizes its recovery readback and punches holes with it.
+    pub fn lattice_spacing(&self) -> u32 {
+        SCREEN_LATTICE_SPACING
     }
 
-    /// Feed one captured frame's coarse gray (`gw×gh`, oriented like the present;
-    /// `cw/ch` are the full canonical dims it samples). Returns what the GL
-    /// worker should do. `now_ns` is a monotonic clock (`System.nanoTime()`).
-    pub fn monitor_frame(
+    /// Lattice grid `(cols, rows)` for a `cw×ch` capture — the size of the
+    /// recovery readback the caller must produce for [`Self::monitor_under_pill_changed`].
+    pub fn lattice_dims(&self, cw: u32, ch: u32) -> (u32, u32) {
+        Lattice::dims(cw, ch, SCREEN_LATTICE_SPACING)
+    }
+
+    /// The pill colour (0..1 luma) and screen fraction the recovery shader uses.
+    pub fn recovery_params(&self) -> (f32, f32) {
+        (SCREEN_PILL_LUMA, SCREEN_HOLE_FRAC)
+    }
+
+    /// Baked pill alpha to use for the pinhole holes given the *effective* opaque
+    /// pill alpha on screen (`present pill_alpha × overlay-window alpha`): chosen
+    /// so the captured blend at a hole lands at [`SCREEN_HOLE_FRAC`], keeping the
+    /// recovery fixed at that fraction. The hole radius is half the pitch.
+    pub fn hole_params(&self, effective_opaque_alpha: f32) -> (f32, f32) {
+        let target_overlay_alpha = 1.0 - SCREEN_HOLE_FRAC;
+        let alpha = (target_overlay_alpha / effective_opaque_alpha.max(1e-3)).clamp(0.0, 1.0);
+        (SCREEN_HOLE_RADIUS, alpha)
+    }
+
+    /// Overlay pill footprints as canonical AABBs `(cx, cy, half_w, half_h)` for
+    /// the recovery shader's per-point pill test — the per-block strip rects (the
+    /// actual holed pills), so recovery only inverts the blend where a hole is.
+    pub fn monitor_pill_aabbs(&self) -> Vec<(f32, f32, f32, f32)> {
+        // One AABB per BLOCK (union of its strips), not per strip: the recovery
+        // shader caps at `REC_MAX_PILLS`, and a multi-line block emits many strips,
+        // so per-strip easily blows past the cap on a dense screen — blocks beyond
+        // the cap then never get their under-pill blend inverted and read a dimmed
+        // near-constant (they can never trip → permanent labels). Per block keeps
+        // the count at ≤ #blocks, comfortably under the cap.
+        self.session
+            .overlay_blocks(SCREEN_ANCHOR_ID)
+            .iter()
+            .filter_map(|(_, _, strips)| {
+                let mut min_x = f32::MAX;
+                let mut min_y = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut max_y = f32::MIN;
+                for r in strips {
+                    let (c, s) = (r.angle_radians.cos().abs(), r.angle_radians.sin().abs());
+                    let hw = r.width * 0.5 * c + r.height * 0.5 * s;
+                    let hh = r.width * 0.5 * s + r.height * 0.5 * c;
+                    min_x = min_x.min(r.cx - hw);
+                    min_y = min_y.min(r.cy - hh);
+                    max_x = max_x.max(r.cx + hw);
+                    max_y = max_y.max(r.cy + hh);
+                }
+                if min_x > max_x {
+                    return None;
+                }
+                Some((
+                    (min_x + max_x) * 0.5,
+                    (min_y + max_y) * 0.5,
+                    (max_x - min_x) * 0.5,
+                    (max_y - min_y) * 0.5,
+                ))
+            })
+            .collect()
+    }
+
+    /// The per-box screen monitor — sole authority for the screen path. Feed
+    /// recovered screen_est `samples` (one byte per lattice point, in
+    /// `Lattice::points()` order, sized to [`Self::lattice_dims`]); returns what
+    /// the GL worker should do:
+    ///   * `Acquire` — run a masked additive acquire (a box's text changed and was
+    ///     dropped here so the acquire re-grabs it; the periodic new-text scan is
+    ///     due; or bootstrap).
+    ///   * `Hide` — a whole-screen change (scroll / navigation: at least
+    ///     [`SCROLL_CHANGED_FRAC`] of the boxes changed at once): the resident
+    ///     overlay is cleared and a re-acquire scheduled after a settle; the GL
+    ///     worker clears the rendered output and aborts any in-flight acquire.
+    ///   * `None` — nothing to do (background motion with stable text is ignored).
+    pub fn monitor_screen_v2(
         &self,
-        gray: &[u8],
-        gw: u32,
-        gh: u32,
+        samples: &[u8],
         cw: u32,
         ch: u32,
         now_ns: i64,
     ) -> MonitorAction {
-        let mut guard = self.monitor.lock().expect("monitor lock");
-        // Mask pill cells whenever the overlay is (or is becoming) visible — Idle,
-        // and Acquiring (our provisional/full pills appear mid-acquire). In
-        // Settling the overlay is hidden and stale rects would wrongly exclude the
-        // very content whose motion we await.
-        let overlay_up = matches!(
-            &*guard,
-            MonitorState::Idle { base: Some(_) } | MonitorState::Acquiring { .. }
-        );
-        let mask = if overlay_up {
-            let rects = self.session.overlay_pill_rects(SCREEN_ANCHOR_ID);
-            Some(build_pill_mask(&rects, gw, gh, cw, ch))
-        } else {
-            None
-        };
-        let state = std::mem::replace(&mut *guard, MonitorState::Idle { base: None });
-        let (next, action) = step_frame(state, gray, mask.as_deref(), now_ns);
-        *guard = next;
-        action
-    }
-
-    /// Timed tick with no new frame; fires a pending settle so the screen settles
-    /// even when the mirror stops emitting frames.
-    pub fn monitor_tick(&self, now_ns: i64) -> MonitorAction {
-        let mut guard = self.monitor.lock().expect("monitor lock");
-        let state = std::mem::replace(&mut *guard, MonitorState::Idle { base: None });
-        let (next, action) = step_tick(state, now_ns);
-        *guard = next;
-        action
-    }
-
-    /// Flip `Settling → Acquiring` once a dispatch actually landed (so a dropped
-    /// dispatch — worker still draining an aborted job — leaves us Settling to
-    /// retry rather than stuck in Acquiring with no worker).
-    fn monitor_confirm_acquire(&self) {
-        let mut guard = self.monitor.lock().expect("monitor lock");
-        let state = std::mem::replace(&mut *guard, MonitorState::Idle { base: None });
-        *guard = match state {
-            MonitorState::Settling { base: Some(b), .. } => {
-                MonitorState::Acquiring { clean_base: b }
-            }
-            other => other,
-        };
-    }
-
-    /// Called by the worker on a clean acquire finish: flip `Acquiring → Idle`
-    /// (the next captured frame rebaselines). Guarded so an abort that already
-    /// moved us to `Settling` isn't clobbered by a worker that hadn't yet seen
-    /// the cancel.
-    fn monitor_set_idle_if_acquiring(&self) {
-        let mut guard = self.monitor.lock().expect("monitor lock");
-        if matches!(&*guard, MonitorState::Acquiring { .. }) {
-            *guard = MonitorState::Idle { base: None };
+        let mut guard = self.monitor_v2.lock().expect("monitor_v2 lock");
+        let stale = guard.as_ref().is_none_or(|s| s.cw != cw || s.ch != ch);
+        if stale {
+            let lattice = Lattice::build(cw, ch, SCREEN_LATTICE_SPACING);
+            *guard = Some(MonitorV2State {
+                monitor: ScreenMonitor::new(lattice, screen_monitor_config()),
+                cw,
+                ch,
+                last_populated: u64::MAX,
+                baselined: HashMap::new(),
+                suppress_trips_until_ns: 0,
+                next_acquire_ns: now_ns,
+                reacquire_not_before_ns: 0,
+                pending_reacquire: true,
+                prev_samples: None,
+                prev_covered: None,
+                scrolling: false,
+                frames: 0,
+            });
         }
+        let st = guard.as_mut().expect("monitor_v2 state");
+        if samples.len() != st.monitor.lattice().len() {
+            return MonitorAction::None;
+        }
+        let version = self.session.content_version();
+        // Inter-frame motion over lattice points NOT under any pill. Two uses: the
+        // fast wholesale-change trigger (> [`V2_SCROLL_MOTION_FRAC`] → drop all,
+        // the same frame the screen starts moving) and the settle gate (the
+        // post-drop re-acquire waits until it falls below
+        // [`V2_SETTLE_MOTION_FRAC`] so OCR runs on a still frame, not mid-scroll).
+        // Gap points sample the raw screen. Points whose coverage changed since
+        // last frame are skipped (a pill just appeared / left).
+        let mut covered = vec![false; samples.len()];
+        st.monitor.fill_covered(&mut covered);
+        let motion_frac = match (&st.prev_samples, &st.prev_covered) {
+            (Some(prev), Some(prev_cov))
+                if prev.len() == samples.len() && prev_cov.len() == samples.len() =>
+            {
+                let mut moved = 0usize;
+                let mut eligible = 0usize;
+                for i in 0..samples.len() {
+                    if covered[i] || prev_cov[i] {
+                        continue;
+                    }
+                    eligible += 1;
+                    if (samples[i] as i32 - prev[i] as i32).abs() > V2_MOTION_THR {
+                        moved += 1;
+                    }
+                }
+                if eligible >= V2_MOTION_MIN_POINTS {
+                    moved as f32 / eligible as f32
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        st.prev_samples = Some(samples.to_vec());
+        st.prev_covered = Some(covered);
+
+        st.frames += 1;
+        if st.frames % 60 == 0 {
+            let lo = samples.iter().copied().min().unwrap_or(0);
+            let hi = samples.iter().copied().max().unwrap_or(0);
+            let mean = samples.iter().map(|&s| s as u32).sum::<u32>() / samples.len().max(1) as u32;
+            let (judged, glyph, dev) = st.monitor.debug_last_stats();
+            let top = st.monitor.debug_top_box();
+            let (tid, tg, td) = top.unwrap_or((0, 0, 0));
+            let tfrac = if tg > 0 {
+                100.0 * td as f32 / tg as f32
+            } else {
+                0.0
+            };
+            log::info!(
+                "[screen-monitor-v2] screen_est min={lo} max={hi} mean={mean} motion={motion_frac:.2} \
+                 boxes={} judged={judged} glyph_holes={glyph} deviating={dev} \
+                 top_box={tid}({td}/{tg}={tfrac:.0}%) ver={}",
+                st.baselined.len(),
+                self.session.content_version(),
+            );
+            // Per-box keep-reason joined with each label's text, so a sticky label
+            // can be read off directly: dev% near 0 = the box sees no change under
+            // it. holes=monitored (non-glyph) holes; gross=judged on all holes.
+            let texts: HashMap<u64, String> = self
+                .session
+                .block_display_texts(SCREEN_ANCHOR_ID)
+                .into_iter()
+                .collect();
+            for (id, holes, dev, gross, max_delta) in st.monitor.debug_boxes() {
+                let pct = if *holes > 0 { 100 * dev / holes } else { 0 };
+                let txt: String = texts
+                    .get(id)
+                    .map(|s| s.chars().take(20).collect())
+                    .unwrap_or_default();
+                log::info!(
+                    "[screen-box] id={id} holes={holes} dev={dev}({pct}%) maxd={max_delta}{} \"{txt}\"",
+                    if *gross { " GROSS" } else { "" },
+                );
+            }
+        }
+        if st.frames % 120 == 0 {
+            debug_dump_recovered(st.monitor.lattice(), samples, cw, ch);
+        }
+
+        // Reconcile boxes against the resident blocks before observing, preserving
+        // the baseline of unchanged blocks (so a stale block can still detect its
+        // own change). Don't touch `next_acquire_ns`: the periodic schedule and the
+        // settle delay are independent of an acquire landing.
+        if st.last_populated != version {
+            let blocks = self.session.overlay_blocks(SCREEN_ANCHOR_ID);
+            let glyph_aabbs: HashMap<u64, Vec<[f32; 4]>> = self
+                .session
+                .overlay_block_glyph_aabbs(SCREEN_ANCHOR_ID)
+                .into_iter()
+                .collect();
+            reconcile_boxes(
+                &mut st.monitor,
+                &blocks,
+                &glyph_aabbs,
+                samples,
+                &mut st.baselined,
+            );
+            st.last_populated = version;
+        }
+        // Always observe so the per-hole variance keeps learning, even while a trip
+        // is suppressed.
+        let classification = st.monitor.observe(samples);
+
+        // Confirm dispatch (review item C): once the worker is busy, the owed
+        // re-acquire is being served, so the flag can drop. Clearing it only here —
+        // not when the action was returned — means a dispatch that never landed
+        // (worker busy / capture failed) keeps the re-acquire owed.
+        let busy = self.acquire_busy();
+        if busy {
+            st.pending_reacquire = false;
+        }
+
+        // Two routes to a drop, feeding one drop-all path (not a separate state
+        // machine):
+        //   * fast wholesale change — global gap-motion (scroll / navigation /
+        //     app-switch). Fires the frame the screen starts moving, and clears
+        //     even boxes the per-box monitor can't track (too few holes), which
+        //     would otherwise persist forever.
+        //   * per-box change — a single box diverging from what it's translating
+        //     (e.g. a subtitle line), dropped + re-acquired in place. A large
+        //     fraction of boxes changing together collapses onto drop-all too.
+        // Act only when settled — NOT while an acquire is in flight: mid-acquire the
+        // capture carries our own provisional pills (which the recovery doesn't
+        // invert), so per-box deviation is contaminated. Acting then aborts the
+        // acquire before it commits, re-presents the provisional pills, and re-trips
+        // on them — an endless self-flash. The cooldown + busy gate stop a storm.
+        let act = !busy && now_ns >= st.suppress_trips_until_ns;
+        let total_boxes = st.baselined.len();
+        let mut full_clear = false;
+        let mut changed: Vec<u64> = Vec::new();
+        if act {
+            if motion_frac > V2_SCROLL_MOTION_FRAC {
+                full_clear = true;
+            }
+            match &classification {
+                FrameClassification::BoxesChanged(ids) => changed.extend_from_slice(ids),
+                FrameClassification::Scroll => full_clear = true,
+                FrameClassification::Quiet => {}
+            }
+            // A large fraction of several boxes changing together is a scroll /
+            // navigation, not a per-pill edit: collapse it onto the drop-all path.
+            // Below 3 boxes, keep the smooth per-box swap (e.g. one subtitle line).
+            if total_boxes >= 3 && changed.len() as f32 >= SCROLL_CHANGED_FRAC * total_boxes as f32
+            {
+                full_clear = true;
+            }
+        }
+
+        if full_clear {
+            if !st.scrolling {
+                log::info!(
+                    "[screen-monitor-v2] whole-screen change (motion={:.2}, {}/{} boxes) → drop all + re-acquire",
+                    motion_frac,
+                    changed.len(),
+                    total_boxes,
+                );
+                // reset_anchor_state (not clear_overlays) so the SurfaceMap OCR cache
+                // is dropped too — otherwise the next detection at the same (x,y) is a
+                // MergedUnchanged cache hit and re-shows the *old* text.
+                self.session.reset_anchor_state(SCREEN_ANCHOR_ID);
+                st.monitor.clear_boxes();
+                st.baselined.clear();
+                st.scrolling = true;
+            }
+            st.suppress_trips_until_ns = now_ns + V2_TRIP_COOLDOWN_NS;
+            // Hold the re-acquire until the cleared pills have left the captured
+            // mirror (settle), and until motion stops (the gate below).
+            st.reacquire_not_before_ns = now_ns + V2_SETTLE_NS;
+            st.pending_reacquire = true;
+            return MonitorAction::Hide;
+        }
+        st.scrolling = false;
+
+        if !changed.is_empty() {
+            changed.sort_unstable();
+            changed.dedup();
+            log::info!(
+                "[screen-monitor-v2] {} block(s) changed under pills → drop + re-acquire",
+                changed.len()
+            );
+            let set: std::collections::HashSet<u64> = changed.iter().copied().collect();
+            let strips: Vec<OrientedRect> = self
+                .session
+                .overlay_blocks(SCREEN_ANCHOR_ID)
+                .into_iter()
+                .filter(|(id, _, _)| set.contains(id))
+                .flat_map(|(_, _, s)| s)
+                .collect();
+            self.session
+                .invalidate_surface_region(SCREEN_ANCHOR_ID, &strips);
+            self.session.remove_blocks(SCREEN_ANCHOR_ID, &changed);
+            st.suppress_trips_until_ns = now_ns + V2_TRIP_COOLDOWN_NS;
+            // Hold the re-acquire until the dropped pills have left the mirror, so
+            // the re-OCR of the now-exposed region can't re-read our own old label.
+            st.reacquire_not_before_ns = now_ns + V2_SETTLE_NS;
+            st.pending_reacquire = true;
+        }
+
+        // Fire a masked additive acquire once any post-drop settle has elapsed, the
+        // screen has stopped moving, and nothing is already in flight. The settle (a
+        // fixed delay after a drop/clear) guarantees the captured frame no longer
+        // shows the dropped pills — deterministic where the old present-generation
+        // fence raced the compositor. The motion gate keeps OCR off a mid-scroll
+        // frame (`motion_frac` is 0 when there aren't enough gap points, so a
+        // pill-covered screen reads as settled).
+        let settled = motion_frac < V2_SETTLE_MOTION_FRAC;
+        if now_ns >= st.reacquire_not_before_ns
+            && settled
+            && !self.acquire_busy()
+            && (st.pending_reacquire || now_ns >= st.next_acquire_ns)
+        {
+            st.next_acquire_ns = now_ns + V2_PERIODIC_NS;
+            st.reacquire_not_before_ns = 0;
+            return MonitorAction::Acquire;
+        }
+        MonitorAction::None
+    }
+
+    /// Timed tick (no new frame): fire an *owed* re-acquire (bootstrap, or the
+    /// scheduled re-grab after a drop/clear) so it still happens when the screen
+    /// goes static and stops emitting frames. The periodic new-text scan is not
+    /// fired here — it's frame-driven, so a stable static overlay won't churn.
+    pub fn monitor_screen_v2_tick(&self, now_ns: i64) -> MonitorAction {
+        let mut guard = self.monitor_v2.lock().expect("monitor_v2 lock");
+        let Some(st) = guard.as_mut() else {
+            return MonitorAction::None;
+        };
+        // No captured frame here, so no motion gate — a tick only happens when the
+        // mirror stopped emitting frames, i.e. the screen is static (settled). Fire
+        // the owed re-acquire once its settle delay has elapsed (bootstrap, or the
+        // scheduled re-grab after a drop/clear on a now-static screen).
+        if st.pending_reacquire
+            && now_ns >= st.reacquire_not_before_ns
+            && !self.acquire_busy()
+            && now_ns >= st.next_acquire_ns
+        {
+            st.next_acquire_ns = now_ns + V2_PERIODIC_NS;
+            st.reacquire_not_before_ns = 0;
+            return MonitorAction::Acquire;
+        }
+        MonitorAction::None
     }
 
     /// Whether the GL worker should poll on a timer: a settle deadline is armed,
     /// or an acquire is in flight (so it picks up the worker's provisional/full
     /// overlays even though the static screen emits no frames).
     pub fn wants_tick(&self) -> bool {
-        matches!(
-            &*self.monitor.lock().expect("monitor lock"),
-            MonitorState::Settling {
-                deadline_ns: Some(_),
-                ..
-            } | MonitorState::Acquiring { .. }
-        )
+        // Keep the GL loop ticking while an acquire is in flight (so streamed
+        // overlays present even on a static screen) or while a re-acquire is owed
+        // (bootstrap / post-drop / post-clear).
+        if self.acquire_busy() {
+            return true;
+        }
+        self.monitor_v2
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.pending_reacquire))
+            .unwrap_or(false)
     }
 
     pub fn set_languages(&self, from: &str, to: &str, is_auto_source: bool) {
@@ -498,9 +780,6 @@ impl LiveScreenPipeline {
             .ok()
             .and_then(|g| g.as_ref().map(|w| w.try_dispatch(job)))
             .unwrap_or(false);
-        if dispatched {
-            self.monitor_confirm_acquire();
-        }
         dispatched
     }
 
@@ -554,9 +833,23 @@ impl LiveScreenPipeline {
             right: cw,
             bottom: ch,
         };
-        // Drop the previous pass's surface map + blocks + canvas so boxes don't
-        // accumulate.
-        self.session.reset_anchor_state(SCREEN_ANCHOR_ID);
+        // Additive + masked acquire: we run with the overlay UP and keep the
+        // resident blocks. Detections overlapping an existing pill are *our own*
+        // translated overlay re-captured in the mirror — drop them so we never
+        // re-OCR ourselves. What survives is new text in the gaps (and any region
+        // whose pill was blinked off by the v2 under-pill detector). A scroll
+        // clears the overlay first (see the Hide path), so this same pass runs
+        // "full" then. `run_post_detect` keys blocks by stable id and never drops
+        // others, so re-detecting unchanged text just upserts it in place.
+        // Use the resident block strips (updated immediately by remove_blocks),
+        // NOT gpu_painted_pills (only refreshed on the GL thread's next bake) — a
+        // just-dropped block must not still mask its now-exposed region.
+        let existing_pills: Vec<OrientedRect> = self
+            .session
+            .overlay_blocks(SCREEN_ANCHOR_ID)
+            .into_iter()
+            .flat_map(|(_, _, strips)| strips)
+            .collect();
         let t_det = std::time::Instant::now();
         let detected = match acquire_detect(&self.catalog, &frame, crop, cfg.det_max_pixels) {
             Ok(d) => d,
@@ -569,10 +862,17 @@ impl LiveScreenPipeline {
         if cancel() {
             return;
         }
+        let detected: Vec<_> = detected
+            .into_iter()
+            .filter(|d| {
+                !existing_pills
+                    .iter()
+                    .any(|p| rects_overlap(&d.tight_box, p))
+            })
+            .collect();
         if detected.is_empty() {
-            self.session.clear_overlays();
-            self.monitor_set_idle_if_acquiring();
-            log::info!("[screen] detect={det_ms:.0}ms boxes=0");
+            // Nothing new under the gaps — keep the resident overlay as-is.
+            log::info!("[screen] detect={det_ms:.0}ms new=0 (kept resident)");
             return;
         }
         // Provisional bbox-only pills the instant detection lands (identity
@@ -586,6 +886,10 @@ impl LiveScreenPipeline {
         // provisional draw list + bakes it on its next poll. No CPU canvas raster
         // on the worker (the GPU compositor replaced it).
         if cancel() {
+            // Cancellation (movement / scroll clear) after we already upserted the
+            // provisional pills must drop them, or they orphan as a stuck overlay
+            // the clear was meant to remove (review item F).
+            self.session.drop_provisional_overlay(SCREEN_ANCHOR_ID);
             return;
         }
         // Geometric 90° quadrant (supports landscape); skip the rec-based 180°
@@ -613,25 +917,14 @@ impl LiveScreenPipeline {
         match rec_result {
             Ok(outcome) => {
                 rec_ok = outcome.rec_ok_count;
-                // Drop placeholders for rec-failed blocks so only translated
-                // text stays resident, and clear the provisional bbox pills —
-                // boxes that never became a surviving block (low detection
-                // confidence, rec/translate failure) were still showing their
-                // provisional pill (the camera drops these in
-                // `acquire_stage_apply_orientation`; the screen path kept them
-                // through streaming for feedback). Then rebuild the canvas
-                // (retain_blocks/drop only mark it stale) so the cleaned-up
-                // overlay — surviving translated blocks only — is presented.
-                // (Canvas raster is deferred to the GL thread's present, so these
-                // just bump content_version; no inline render on the worker.)
-                self.session
-                    .retain_blocks(SCREEN_ANCHOR_ID, &outcome.surviving_block_ids);
+                // Additive: do NOT `retain_blocks` to this pass's survivors —
+                // that would evict the resident blocks we deliberately masked out
+                // of detection. `run_post_detect` already evicts *this run's*
+                // rec-failed blocks by stable id, so only the provisional bbox
+                // pills for non-surviving new detections need clearing.
                 self.session.drop_provisional_overlay(SCREEN_ANCHOR_ID);
             }
             Err(e) => log::warn!("[screen] rec/translate failed: {e}"),
-        }
-        if !cancel() {
-            self.monitor_set_idle_if_acquiring();
         }
         log::info!(
             "[screen] detect={det_ms:.0}ms rec+translate={rec_ms:.0}ms boxes={} rec_ok={rec_ok}",
@@ -644,172 +937,132 @@ impl LiveScreenPipeline {
 mod monitor_tests {
     use super::*;
 
-    const MS: i64 = 1_000_000;
-    const QUIET_MS: i64 = SETTLE_QUIET_NS / MS;
-
-    fn flat(v: u8) -> Vec<u8> {
-        vec![v; 64 * 36]
-    }
-
-    #[test]
-    fn mean_abs_diff_basics() {
-        assert_eq!(mean_abs_diff(&[10, 10, 10], &[10, 10, 10]), 0.0);
-        assert_eq!(mean_abs_diff(&[0], &[255]), 255.0);
-        // length mismatch / empty → treated as max motion
-        assert_eq!(mean_abs_diff(&[1, 2], &[1]), 255.0);
-        assert_eq!(mean_abs_diff(&[], &[]), 255.0);
-    }
-
-    #[test]
-    fn bootstrap_settles_into_first_acquire() {
-        // Start = Settling{None,None}; first frame opens the window.
-        let s = MonitorState::Settling {
-            base: None,
-            deadline_ns: None,
-        };
-        let (s, a) = step_frame(s, &flat(100), None, 0);
-        assert_eq!(a, MonitorAction::None);
-        // Before the deadline: nothing.
-        let (s, a) = step_tick(s, (QUIET_MS - 1) * MS);
-        assert_eq!(a, MonitorAction::None);
-        // At the deadline: emit Acquire but stay Settling — the GL worker confirms
-        // (→ Acquiring) only once the dispatch actually lands.
-        let (s, a) = step_tick(s, QUIET_MS * MS);
-        assert_eq!(a, MonitorAction::Acquire);
-        assert!(matches!(s, MonitorState::Settling { base: Some(_), .. }));
-    }
-
-    #[test]
-    fn acquiring_aborts_on_movement() {
-        // While an acquire runs, a big content change → Hide + back to Settling
-        // (the GL thread aborts the worker). A quiet frame keeps Acquiring.
-        let s = MonitorState::Acquiring {
-            clean_base: flat(100),
-        };
-        let (s, a) = step_frame(s, &flat(101), None, 0);
-        assert_eq!(a, MonitorAction::None);
-        assert!(matches!(s, MonitorState::Acquiring { .. }));
-        let (s, a) = step_frame(s, &flat(220), None, 5 * MS);
-        assert_eq!(a, MonitorAction::Hide);
-        assert!(matches!(
-            s,
-            MonitorState::Settling {
-                deadline_ns: Some(_),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn idle_rebaselines_then_hides_on_movement() {
-        // Post-present: Idle{None} takes the next frame as the new base.
-        let s = MonitorState::Idle { base: None };
-        let (s, a) = step_frame(s, &flat(100), None, 0);
-        assert_eq!(a, MonitorAction::None);
-        assert!(matches!(s, MonitorState::Idle { base: Some(_) }));
-        // A sub-threshold frame keeps us Idle (no hide).
-        let (s, a) = step_frame(s, &flat(102), None, 10 * MS);
-        assert_eq!(a, MonitorAction::None);
-        // A big change → hide + start debouncing.
-        let (s, a) = step_frame(s, &flat(200), None, 20 * MS);
-        assert_eq!(a, MonitorAction::Hide);
-        assert!(matches!(
-            s,
-            MonitorState::Settling {
-                deadline_ns: Some(_),
-                ..
-            }
-        ));
-        // Quiet again → acquire.
-        let (_s, a) = step_tick(s, (20 + QUIET_MS) * MS);
-        assert_eq!(a, MonitorAction::Acquire);
-    }
-
-    #[test]
-    fn pill_mask_excludes_overlay_cells() {
-        // A 64×36 grid; one pill covering the left half. Cells under it are masked.
-        let (gw, gh, cw, ch) = (64u32, 36u32, 1280u32, 720u32);
-        let pill = OrientedRect {
-            cx: cw as f32 * 0.25,
-            cy: ch as f32 * 0.5,
-            width: cw as f32 * 0.5,
-            height: ch as f32,
+    fn band(cx: f32, cy: f32, w: f32, h: f32) -> OrientedRect {
+        OrientedRect {
+            cx,
+            cy,
+            width: w,
+            height: h,
             angle_radians: 0.0,
-        };
-        let mask = build_pill_mask(&[pill], gw, gh, cw, ch);
-        assert!(mask[0], "top-left (under pill) masked");
-        assert!(!mask[(gw - 1) as usize], "top-right (no pill) not masked");
-        let masked_cells = mask.iter().filter(|m| **m).count();
-        assert!(masked_cells > 0 && masked_cells < mask.len());
+        }
+    }
+
+    /// Full-lattice samples: background everywhere; inside each rect, alternate
+    /// holes between `stroke` (ink) and a light value so the box has real contrast.
+    /// Changing a rect's `stroke` simulates the text under that pill changing.
+    fn samples_two(
+        lat: &Lattice,
+        a: &OrientedRect,
+        a_stroke: u8,
+        b: &OrientedRect,
+        b_stroke: u8,
+    ) -> Vec<u8> {
+        let mut v = vec![120u8; lat.len()];
+        for (i, &h) in lat.holes_in_rect(a).iter().enumerate() {
+            v[h] = if i % 2 == 0 { a_stroke } else { 220 };
+        }
+        for (i, &h) in lat.holes_in_rect(b).iter().enumerate() {
+            v[h] = if i % 2 == 0 { b_stroke } else { 220 };
+        }
+        v
     }
 
     #[test]
-    fn masked_diff_ignores_change_under_pill() {
-        // The overlay redraw changes only pill cells; with those masked the diff
-        // is ~0, so our own redraw never reads as movement (no self-change guard).
-        let n = 64 * 36;
-        let mut base = vec![100u8; n];
-        let mut cur = vec![100u8; n];
-        let mut excluded = vec![false; n];
-        for i in 0..n / 2 {
-            excluded[i] = true; // pill covers the first half
-            cur[i] = 255; // pill flips those pixels wildly
+    fn reconcile_keeps_baseline_so_a_stale_block_still_trips() {
+        // The accumulation bug: an unrelated acquire used to rebuild every box and
+        // reset its baseline, so a stale block never noticed its own change.
+        // Reconcile preserves an unchanged block's baseline, so it still trips even
+        // after another acquire reconciled against the *changed* frame.
+        let lat = Lattice::build(100, 100, SCREEN_LATTICE_SPACING);
+        let a = band(50.0, 25.0, 80.0, 20.0);
+        let b = band(50.0, 75.0, 80.0, 20.0);
+        let mut mon = ScreenMonitor::new(
+            Lattice::build(100, 100, SCREEN_LATTICE_SPACING),
+            screen_monitor_config(),
+        );
+        let mut baselined = HashMap::new();
+
+        let base = samples_two(&lat, &a, 30, &b, 60);
+        reconcile_boxes(
+            &mut mon,
+            &[(1, 100, vec![a.clone()])],
+            &HashMap::new(),
+            &base,
+            &mut baselined,
+        );
+        assert!(baselined.contains_key(&1), "block A baselined");
+        // Warm up the variance mask on the stable base so A's holes freeze as glyph.
+        for _ in 0..screen_monitor_config().warmup_frames + 1 {
+            mon.observe(&base);
         }
-        assert_eq!(mean_abs_diff_masked(&base, &cur, &excluded), 0.0);
-        // A real change in an *unmasked* cell is still seen.
-        cur[n - 1] = 200;
-        base[n - 1] = 100;
-        assert!(mean_abs_diff_masked(&base, &cur, &excluded) > 0.0);
+
+        // A's text changes on screen, and an *unrelated* acquire adds block B and
+        // reconciles against the changed frame. A's hash is unchanged → keep its
+        // baseline; B is new → baselined to the changed frame.
+        let changed = samples_two(&lat, &a, 220, &b, 60);
+        reconcile_boxes(
+            &mut mon,
+            &[(1, 100, vec![a]), (2, 200, vec![b])],
+            &HashMap::new(),
+            &changed,
+            &mut baselined,
+        );
+        assert!(baselined.contains_key(&2), "new block B added");
+
+        match mon.observe(&changed) {
+            FrameClassification::BoxesChanged(ids) => {
+                assert!(ids.contains(&1), "stale block A must still trip: {ids:?}");
+                assert!(
+                    !ids.contains(&2),
+                    "freshly-baselined B must not trip: {ids:?}"
+                );
+            }
+            other => panic!("expected A to trip, got {other:?}"),
+        }
     }
 
     #[test]
-    fn idle_masks_pill_self_change() {
-        // Idle with a base; the pill mask excludes the changed region → no hide.
-        let mut excluded = vec![false; 64 * 36];
-        for e in excluded.iter_mut().take(64 * 36 / 2) {
-            *e = true;
-        }
-        let base = flat(100);
-        let mut cur = flat(100);
-        for c in cur.iter_mut().take(64 * 36 / 2) {
-            *c = 255; // huge change, but all under the pill
-        }
-        let s = MonitorState::Idle { base: Some(base) };
-        let (s, a) = step_frame(s, &cur, Some(&excluded), 0);
-        assert_eq!(a, MonitorAction::None);
-        assert!(matches!(s, MonitorState::Idle { base: Some(_) }));
-    }
+    fn reconcile_rebaselines_a_reocrd_block_so_it_stays_quiet() {
+        // When a block is re-OCR'd (content_hash changes), reconcile rebaselines it
+        // to the new content, so it doesn't immediately re-trip (no drop/re-acquire
+        // loop).
+        let lat = Lattice::build(100, 100, SCREEN_LATTICE_SPACING);
+        let a = band(50.0, 25.0, 80.0, 20.0);
+        let b = band(50.0, 75.0, 80.0, 20.0);
+        let mut mon = ScreenMonitor::new(
+            Lattice::build(100, 100, SCREEN_LATTICE_SPACING),
+            screen_monitor_config(),
+        );
+        let mut baselined = HashMap::new();
 
-    #[test]
-    fn constant_subthreshold_frames_still_settle() {
-        // A small animation keeps feeding frames, but each is sub-threshold vs
-        // the window base, so the deadline is never pushed → it still settles.
-        let mut s = settling(flat(100), 0);
-        for t in [20, 40, 60, 80, 100] {
-            let (ns, a) = step_frame(s, &flat(101), None, t * MS);
-            assert_eq!(a, MonitorAction::None, "frame at {t}ms should not fire");
-            s = ns;
+        let base = samples_two(&lat, &a, 30, &b, 60);
+        reconcile_boxes(
+            &mut mon,
+            &[(1, 100, vec![a.clone()])],
+            &HashMap::new(),
+            &base,
+            &mut baselined,
+        );
+        for _ in 0..screen_monitor_config().warmup_frames + 1 {
+            mon.observe(&base);
         }
-        // A frame past the deadline (still sub-threshold) fires the acquire (and
-        // stays Settling until the dispatch is confirmed).
-        let (s, a) = step_frame(s, &flat(101), None, (QUIET_MS + 1) * MS);
-        assert_eq!(a, MonitorAction::Acquire);
-        assert!(matches!(s, MonitorState::Settling { base: Some(_), .. }));
-    }
 
-    #[test]
-    fn movement_pushes_the_deadline() {
-        // Each big-change frame resets base + deadline, so settle waits for quiet.
-        let mut s = settling(flat(0), 0);
-        for (t, v) in [(50, 80u8), (100, 160), (150, 240)] {
-            let (ns, a) = step_frame(s, &flat(v), None, t * MS);
-            assert_eq!(a, MonitorAction::None);
-            s = ns;
-        }
-        // 150ms + quiet still hasn't elapsed relative to the last reset (150ms).
-        let (s, a) = step_tick(s, (150 + QUIET_MS - 1) * MS);
-        assert_eq!(a, MonitorAction::None);
-        let (_s, a) = step_tick(s, (150 + QUIET_MS) * MS);
-        assert_eq!(a, MonitorAction::Acquire);
+        // Re-OCR: same block id, new content_hash → rebaselined to the new frame.
+        let changed = samples_two(&lat, &a, 220, &b, 60);
+        reconcile_boxes(
+            &mut mon,
+            &[(1, 101, vec![a])],
+            &HashMap::new(),
+            &changed,
+            &mut baselined,
+        );
+        assert_eq!(baselined.get(&1), Some(&101), "rebaselined to the new hash");
+
+        // Observing that same (new) frame must not trip — the baseline moved with it.
+        assert_eq!(
+            mon.observe(&changed),
+            FrameClassification::Quiet,
+            "re-OCR'd block should be quiet at its new baseline"
+        );
     }
 }

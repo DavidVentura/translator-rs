@@ -119,9 +119,12 @@ void main() {
 const PILL_VERT_SRC: &str = r#"#version 100
 attribute vec2 a_pos;
 uniform mat3 u_transform;
+uniform mat3 u_quad_to_canon;
 varying vec2 v_local;
+varying vec2 v_canon;
 void main() {
     v_local = a_pos;
+    v_canon = (u_quad_to_canon * vec3(a_pos, 1.0)).xy;
     vec3 clip = u_transform * vec3(a_pos, 1.0);
     gl_Position = vec4(clip.xy, 0.0, clip.z);
 }
@@ -141,7 +144,15 @@ precision mediump float;
 uniform vec4 u_color;
 uniform vec2 u_half;
 uniform float u_radius;
+// Pinhole grid (screen monitor): at lattice points in canonical coords, drop the
+// pill alpha to u_hole_alpha so the captured mirror shows a known blend of pill +
+// screen there, recoverable by the lattice probe. u_hole_spacing <= 0 disables it
+// (camera path), leaving solid pills.
+uniform float u_hole_spacing;
+uniform float u_hole_radius;
+uniform float u_hole_alpha;
 varying vec2 v_local;
+varying vec2 v_canon;
 void main() {
     // Local pixel coords centred on the pill (v_local 0..1 → [-half, half]).
     vec2 p = (v_local - 0.5) * 2.0 * u_half;
@@ -153,13 +164,39 @@ void main() {
     if (coverage <= 0.0) {
         discard;
     }
-    gl_FragColor = vec4(u_color.rgb, u_color.a * coverage);
+    float a = u_color.a;
+    if (u_hole_spacing > 0.0) {
+        vec2 origin = vec2(u_hole_spacing * 0.5);
+        vec2 nearest = floor((v_canon - origin) / u_hole_spacing + 0.5) * u_hole_spacing + origin;
+        if (distance(v_canon, nearest) <= u_hole_radius) {
+            a = u_hole_alpha;
+        }
+    }
+    gl_FragColor = vec4(u_color.rgb, a * coverage);
 }
 "#;
 
 /// Glyph fragment shader (shares [`VERT_SRC`]): samples an R8 coverage atlas and
 /// outputs straight alpha (fg color × coverage × text_alpha). Each quad covers one
 /// glyph; the vertex transform positions and rotates it in overlay-texel space.
+/// Glyph vertex shader: like [`VERT_SRC`] but also emits the fragment's canonical
+/// position so the fragment can punch the same pinhole lattice the pills do.
+const GLYPH_VERT_SRC: &str = r#"#version 100
+attribute vec2 a_pos;
+uniform mat3 u_transform;
+uniform mat3 u_uv_xform;
+uniform mat3 u_quad_to_canon;
+varying vec2 v_uv;
+varying vec2 v_canon;
+void main() {
+    vec3 clip = u_transform * vec3(a_pos, 1.0);
+    vec3 uv = u_uv_xform * vec3(a_pos, 1.0);
+    v_uv = uv.xy;
+    v_canon = (u_quad_to_canon * vec3(a_pos, 1.0)).xy;
+    gl_Position = vec4(clip.xy, 0.0, clip.z);
+}
+"#;
+
 const GLYPH_FRAG_SRC: &str = r#"#version 100
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
@@ -169,8 +206,20 @@ precision mediump float;
 uniform sampler2D u_atlas;
 uniform vec4 u_color;
 uniform float u_text_alpha;
+// Same pinhole lattice as the pills: cut a hole through the translated glyph so
+// the lattice probe reads the *source* under the pill, not our own overlay text.
+uniform float u_hole_spacing;
+uniform float u_hole_radius;
 varying vec2 v_uv;
+varying vec2 v_canon;
 void main() {
+    if (u_hole_spacing > 0.0) {
+        vec2 origin = vec2(u_hole_spacing * 0.5);
+        vec2 nearest = floor((v_canon - origin) / u_hole_spacing + 0.5) * u_hole_spacing + origin;
+        if (distance(v_canon, nearest) <= u_hole_radius) {
+            discard;
+        }
+    }
     float a = texture2D(u_atlas, v_uv).r;
     gl_FragColor = vec4(u_color.rgb, a * u_text_alpha);
 }
@@ -178,6 +227,95 @@ void main() {
 
 /// `GL_TEXTURE_EXTERNAL_OES` (not in glow's constant set).
 const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+
+/// Max pills the lattice recovery shader handles in one pass (uniform array).
+const REC_MAX_PILLS: usize = 64;
+
+/// Vertex shader for the lattice recovery pass: a full-clip quad from the unit
+/// `a_pos`, no transforms — the fragment derives the lattice point from
+/// `gl_FragCoord`.
+const REC_VERT_SRC: &str = r#"#version 100
+attribute vec2 a_pos;
+void main() {
+    gl_Position = vec4(a_pos * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+
+/// Recovery fragment shader: each output texel is one lattice point. Map the
+/// point's canonical position to the camera uv (same `u_uv_xform` the present
+/// uses), sample the external mirror, and where a pill covers the point invert
+/// the known blend `screen = (raw − (1−f)·pill) / f`. Output luma in R.
+const REC_FRAG_SRC: &str = r#"#version 100
+#extension GL_OES_EGL_image_external : require
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform samplerExternalOES u_tex;
+uniform mat3 u_uv_xform;
+uniform vec2 u_canon_size;
+uniform float u_spacing;
+uniform float u_origin;
+uniform float u_pill_luma;   // 0..1
+uniform float u_screen_frac; // f in (0,1]
+uniform int u_pill_count;
+uniform vec4 u_pills[64];     // cx, cy, half_w, half_h (canonical)
+void main() {
+    vec2 cell = floor(gl_FragCoord.xy);
+    // Sample the pinhole pixel's CENTER, not its corner. External textures are
+    // addressed by normalized texture2D (no texelFetch), which points at pixel
+    // corners; with NEAREST that lands on an undefined neighbour and, for a 1px
+    // hole, misses it. The mirror is 2× canonical, so half a mirror texel is 0.25
+    // canonical — add it so the sample lands dead-centre on the hole.
+    vec2 canon = vec2(u_origin) + cell * u_spacing + vec2(0.25);
+    // Flip v: the acquire's readback applies Y_FLIP_CLIP to land a top-down
+    // canonical frame (the space the boxes live in). We sample the camera uv
+    // directly, so without this flip the recovered grid is vertically mirrored
+    // relative to the boxes — every box would monitor the wrong screen row.
+    vec2 a = vec2(canon.x / u_canon_size.x, 1.0 - canon.y / u_canon_size.y);
+    vec3 uv = u_uv_xform * vec3(a, 1.0);
+    vec3 c = texture2D(u_tex, uv.xy).rgb;
+    float raw = dot(c, vec3(0.299, 0.587, 0.114));
+    float rec = raw;
+    for (int i = 0; i < 64; i++) {
+        if (i >= u_pill_count) { break; }
+        vec4 pr = u_pills[i];
+        if (abs(canon.x - pr.x) <= pr.z && abs(canon.y - pr.y) <= pr.w) {
+            rec = clamp((raw - (1.0 - u_screen_frac) * u_pill_luma) / u_screen_frac, 0.0, 1.0);
+            break;
+        }
+    }
+    gl_FragColor = vec4(rec, rec, rec, 1.0);
+}
+"#;
+
+/// Pinhole grid for the screen-monitor overlay: where to drop pill alpha so the
+/// captured mirror exposes a known blend of pill + screen, recoverable by the
+/// lattice probe. `spacing`/`radius` are canonical-coord units; `alpha` is the
+/// baked pill alpha at a hole, chosen so the *effective* on-screen blend (after
+/// the present pill_alpha and the overlay window alpha) lands at the recovery
+/// shader's fixed 50%.
+#[derive(Debug, Clone, Copy)]
+pub struct HoleGrid {
+    pub spacing: f32,
+    pub radius: f32,
+    pub alpha: f32,
+}
+
+struct RecProgram {
+    program: glow::Program,
+    a_pos: u32,
+    u_tex: glow::UniformLocation,
+    u_uv_xform: glow::UniformLocation,
+    u_canon_size: glow::UniformLocation,
+    u_spacing: glow::UniformLocation,
+    u_origin: glow::UniformLocation,
+    u_pill_luma: glow::UniformLocation,
+    u_screen_frac: glow::UniformLocation,
+    u_pill_count: glow::UniformLocation,
+    u_pills: glow::UniformLocation,
+}
 /// `GL_R8` sized internal format (GLES3) for the single-channel gray FBO.
 const R8: u32 = 0x8229;
 
@@ -255,6 +393,9 @@ pub struct GlesRenderer {
     /// Lazily-built external-OES program that outputs luminance, for the
     /// single-channel tracker-gray readback.
     ext_luma: Option<ExtProgram>,
+    /// Lazily-built external-OES program that recovers screen_est at the
+    /// pinhole lattice for the screen monitor.
+    rec_lattice: Option<RecProgram>,
     /// R8 FBO for the gray readback (separate from the RGBA `fbo`).
     gray_fbo: Option<glow::Framebuffer>,
     gray_fbo_tex: Option<glow::Texture>,
@@ -299,6 +440,11 @@ struct PillProgram {
     u_half: glow::UniformLocation,
     u_radius: glow::UniformLocation,
     a_pos: u32,
+    // Pinhole uniforms; `None` if the driver optimized them out (holes disabled).
+    u_quad_to_canon: Option<glow::UniformLocation>,
+    u_hole_spacing: Option<glow::UniformLocation>,
+    u_hole_radius: Option<glow::UniformLocation>,
+    u_hole_alpha: Option<glow::UniformLocation>,
 }
 
 /// The glyph program (shares [`VERT_SRC`]; [`GLYPH_FRAG_SRC`] fragment). Built
@@ -311,6 +457,10 @@ struct GlyphProgram {
     u_color: glow::UniformLocation,
     u_text_alpha: glow::UniformLocation,
     a_pos: u32,
+    // Pinhole uniforms (None if optimized out → holes disabled for glyphs).
+    u_quad_to_canon: Option<glow::UniformLocation>,
+    u_hole_spacing: Option<glow::UniformLocation>,
+    u_hole_radius: Option<glow::UniformLocation>,
 }
 
 /// R8 glyph coverage atlas with a shelf packer. Grows to `max_side`×`max_side`;
@@ -390,6 +540,7 @@ impl GlesRenderer {
                 fbo_tex: None,
                 fbo_size: None,
                 ext_luma: None,
+                rec_lattice: None,
                 gray_fbo: None,
                 gray_fbo_tex: None,
                 gray_fbo_size: None,
@@ -486,6 +637,10 @@ impl GlesRenderer {
                     u_half: gl.get_uniform_location(program, "u_half")?,
                     u_radius: gl.get_uniform_location(program, "u_radius")?,
                     a_pos: gl.get_attrib_location(program, "a_pos")?,
+                    u_quad_to_canon: gl.get_uniform_location(program, "u_quad_to_canon"),
+                    u_hole_spacing: gl.get_uniform_location(program, "u_hole_spacing"),
+                    u_hole_radius: gl.get_uniform_location(program, "u_hole_radius"),
+                    u_hole_alpha: gl.get_uniform_location(program, "u_hole_alpha"),
                     program,
                 })
             })();
@@ -500,7 +655,7 @@ impl GlesRenderer {
             return true;
         }
         let gl = &self.gl;
-        let program = match link_program_vert_frag(gl, VERT_SRC, GLYPH_FRAG_SRC) {
+        let program = match link_program_vert_frag(gl, GLYPH_VERT_SRC, GLYPH_FRAG_SRC) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("GlesRenderer: glyph program link failed: {e:?}");
@@ -516,6 +671,9 @@ impl GlesRenderer {
                     u_color: gl.get_uniform_location(program, "u_color")?,
                     u_text_alpha: gl.get_uniform_location(program, "u_text_alpha")?,
                     a_pos: gl.get_attrib_location(program, "a_pos")?,
+                    u_quad_to_canon: gl.get_uniform_location(program, "u_quad_to_canon"),
+                    u_hole_spacing: gl.get_uniform_location(program, "u_hole_spacing"),
+                    u_hole_radius: gl.get_uniform_location(program, "u_hole_radius"),
                     program,
                 })
             })();
@@ -752,6 +910,123 @@ impl GlesRenderer {
         Some(gray)
     }
 
+    fn ensure_rec_program(&mut self) -> bool {
+        if self.rec_lattice.is_some() {
+            return true;
+        }
+        let gl = &self.gl;
+        let program = match link_program_vert_frag(gl, REC_VERT_SRC, REC_FRAG_SRC) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("GlesRenderer: lattice recovery program link failed: {e:?}");
+                return false;
+            }
+        };
+        unsafe {
+            self.rec_lattice = (|| {
+                Some(RecProgram {
+                    a_pos: gl.get_attrib_location(program, "a_pos")?,
+                    u_tex: gl.get_uniform_location(program, "u_tex")?,
+                    u_uv_xform: gl.get_uniform_location(program, "u_uv_xform")?,
+                    u_canon_size: gl.get_uniform_location(program, "u_canon_size")?,
+                    u_spacing: gl.get_uniform_location(program, "u_spacing")?,
+                    u_origin: gl.get_uniform_location(program, "u_origin")?,
+                    u_pill_luma: gl.get_uniform_location(program, "u_pill_luma")?,
+                    u_screen_frac: gl.get_uniform_location(program, "u_screen_frac")?,
+                    u_pill_count: gl.get_uniform_location(program, "u_pill_count")?,
+                    u_pills: gl.get_uniform_location(program, "u_pills[0]")?,
+                    program,
+                })
+            })();
+        }
+        self.rec_lattice.is_some()
+    }
+
+    /// Recover screen_est at every point of a `cols×rows` lattice over a
+    /// `canon_w×canon_h` canonical frame, sampling the borrowed external camera
+    /// (the captured mirror, which includes our overlay). At points a pill covers
+    /// the recovery inverts the 50%-hole blend; elsewhere it passes the raw luma.
+    /// Returns one byte per lattice point in row-major (`row*cols + col`) order,
+    /// matching `screen_monitor::Lattice`. `pills` are AABBs `(cx, cy, hw, hh)` in
+    /// canonical coords; `pill_luma`/`screen_frac` are 0..1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_lattice_screen_est(
+        &mut self,
+        cols: u32,
+        rows: u32,
+        canon_w: u32,
+        canon_h: u32,
+        spacing: f32,
+        pills: &[(f32, f32, f32, f32)],
+        pill_luma: f32,
+        screen_frac: f32,
+    ) -> Option<Vec<u8>> {
+        let (id, uv) = self.camera_external?;
+        let id = NonZeroU32::new(id)?;
+        if cols == 0 || rows == 0 || !self.ensure_rec_program() {
+            return None;
+        }
+        self.ensure_gray_fbo(cols, rows);
+        let n = pills.len().min(REC_MAX_PILLS);
+        let mut flat = Vec::with_capacity(n * 4);
+        for &(cx, cy, hw, hh) in &pills[..n] {
+            flat.extend_from_slice(&[cx, cy, hw, hh]);
+        }
+        let mut out = vec![0u8; (cols * rows) as usize];
+        unsafe {
+            let gl = &self.gl;
+            let r = self.rec_lattice.as_ref().expect("rec program present");
+            gl.bind_framebuffer(glow::FRAMEBUFFER, self.gray_fbo);
+            gl.viewport(0, 0, cols as i32, rows as i32);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::CULL_FACE);
+            gl.use_program(Some(r.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad_vbo));
+            gl.enable_vertex_attrib_array(r.a_pos);
+            gl.vertex_attrib_pointer_f32(r.a_pos, 2, glow::FLOAT, false, 0, 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(glow::NativeTexture(id)));
+            // NEAREST so each lattice sample reads the exact pinhole pixel — LINEAR
+            // would blend in the surrounding opaque-pill pixels (measuring
+            // non-holes), dimming/compressing the recovered screen_est.
+            gl.tex_parameter_i32(
+                TEXTURE_EXTERNAL_OES,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                TEXTURE_EXTERNAL_OES,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.uniform_1_i32(Some(&r.u_tex), 0);
+            gl.uniform_matrix_3_f32_slice(Some(&r.u_uv_xform), false, &to_column_major(&uv));
+            gl.uniform_2_f32(Some(&r.u_canon_size), canon_w as f32, canon_h as f32);
+            gl.uniform_1_f32(Some(&r.u_spacing), spacing);
+            gl.uniform_1_f32(Some(&r.u_origin), spacing * 0.5);
+            gl.uniform_1_f32(Some(&r.u_pill_luma), pill_luma);
+            gl.uniform_1_f32(Some(&r.u_screen_frac), screen_frac.max(1e-3));
+            gl.uniform_1_i32(Some(&r.u_pill_count), n as i32);
+            if !flat.is_empty() {
+                gl.uniform_4_f32_slice(Some(&r.u_pills), &flat);
+            }
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                cols as i32,
+                rows as i32,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut out)),
+            );
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        Some(out)
+    }
+
     /// Render the borrowed external camera (canonical transform, no overlays)
     /// into the owned FBO at `w×h` and read it back as **top-down RGBA** — the
     /// canonical frame the pipeline's `LiveFrame` carries (replacing the CPU
@@ -834,6 +1109,7 @@ impl GlesRenderer {
         pill_alpha: f32,
         text_alpha: f32,
         smooth_glyphs: bool,
+        holes: Option<HoleGrid>,
     ) -> bool {
         if dl.bitmap_w == 0 || dl.bitmap_h == 0 {
             return false;
@@ -890,6 +1166,20 @@ impl GlesRenderer {
             gl.use_program(Some(pill.program));
             gl.enable_vertex_attrib_array(pill.a_pos);
             gl.vertex_attrib_pointer_f32(pill.a_pos, 2, glow::FLOAT, false, 0, 0);
+            let hg = holes.unwrap_or(HoleGrid {
+                spacing: 0.0,
+                radius: 0.0,
+                alpha: 1.0,
+            });
+            if let Some(l) = &pill.u_hole_spacing {
+                gl.uniform_1_f32(Some(l), hg.spacing);
+            }
+            if let Some(l) = &pill.u_hole_radius {
+                gl.uniform_1_f32(Some(l), hg.radius);
+            }
+            if let Some(l) = &pill.u_hole_alpha {
+                gl.uniform_1_f32(Some(l), hg.alpha);
+            }
             for p in &dl.pills {
                 let r = &p.rect;
                 let cos = r.angle_radians.cos();
@@ -923,6 +1213,23 @@ impl GlesRenderer {
                     false,
                     &to_column_major(&transform),
                 );
+                // Quad → canonical (overlay) coords so the fragment can test the
+                // global pinhole lattice: canon = texel/oversample + overlay origin.
+                if let Some(l) = &pill.u_quad_to_canon {
+                    let inv = 1.0 / os;
+                    let quad_to_canon = [
+                        quad_to_texel[0] * inv,
+                        quad_to_texel[1] * inv,
+                        quad_to_texel[2] * inv + dl.origin_x,
+                        quad_to_texel[3] * inv,
+                        quad_to_texel[4] * inv,
+                        quad_to_texel[5] * inv + dl.origin_y,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ];
+                    gl.uniform_matrix_3_f32_slice(Some(l), false, &to_column_major(&quad_to_canon));
+                }
                 gl.uniform_4_f32_slice(
                     Some(&pill.u_color),
                     &[
@@ -966,6 +1273,16 @@ impl GlesRenderer {
             gl.vertex_attrib_pointer_f32(gp.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.uniform_1_i32(Some(&gp.u_atlas), 0);
             gl.uniform_1_f32(Some(&gp.u_text_alpha), text_alpha.clamp(0.0, 1.0));
+            // No holes in the glyphs — the text stays solid. A hole fine enough not
+            // to shred the text vanishes at this lattice density (the points sit at
+            // sub-pixel positions within the text layer), and one big enough to land
+            // reliably shreds it. So instead of punching the text, the monitor
+            // *excludes* glyph-covered lattice points (see `reconcile_boxes`): those
+            // holes would read our own opaque text, not the screen, and pin the box.
+            // Each box monitors the screen only through the pill-background holes.
+            if let Some(l) = &gp.u_hole_spacing {
+                gl.uniform_1_f32(Some(l), 0.0);
+            }
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture));
             // Axis-aligned (screen) glyphs map ~1:1 to atlas texels, so NEAREST stays
             // crisp; the camera rotates each quad by the line angle and then H-warps
@@ -1011,6 +1328,23 @@ impl GlesRenderer {
                     false,
                     &to_column_major(&transform),
                 );
+                // Same quad→canonical map as the pills so the glyph holes land on
+                // the global lattice (canon = texel/oversample + overlay origin).
+                if let Some(l) = &gp.u_quad_to_canon {
+                    let inv = 1.0 / os;
+                    let quad_to_canon = [
+                        local_to_texel[0] * inv,
+                        local_to_texel[1] * inv,
+                        local_to_texel[2] * inv + dl.origin_x,
+                        local_to_texel[3] * inv,
+                        local_to_texel[4] * inv,
+                        local_to_texel[5] * inv + dl.origin_y,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ];
+                    gl.uniform_matrix_3_f32_slice(Some(l), false, &to_column_major(&quad_to_canon));
+                }
                 gl.uniform_matrix_3_f32_slice(
                     Some(&gp.u_uv_xform),
                     false,

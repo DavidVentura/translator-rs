@@ -66,6 +66,16 @@ impl Lattice {
         }
     }
 
+    /// Grid `(cols, rows)` for a `canon_w×canon_h` frame at `spacing`, without
+    /// allocating the points — the same counts [`build`](Self::build) produces, so
+    /// the GPU readback can be sized to match before a `Lattice` exists.
+    pub fn dims(canon_w: u32, canon_h: u32, spacing: u32) -> (u32, u32) {
+        let spacing = spacing.max(1);
+        let cols = (canon_w.saturating_sub(1) / spacing) + 1;
+        let rows = (canon_h.saturating_sub(1) / spacing) + 1;
+        (cols, rows)
+    }
+
     pub fn len(&self) -> usize {
         self.points.len()
     }
@@ -131,8 +141,16 @@ pub struct MonitorConfig {
     /// Fraction of a box's glyph holes that must change for the box to trip.
     /// Spatial-coherence guard: a few ambiguous holes never trip a box alone.
     pub box_coherence_frac: f32,
-    /// A box needs at least this many glyph holes before we'll judge it at all.
+    /// A box needs at least this many stable ink holes to be judged on its text.
+    /// A box that can't reach this (low-contrast / saturated recovery, no stable
+    /// strokes) falls back to the gross whole-box test below, so it can never
+    /// become an immortal pill that blocks re-OCR of its region.
     pub min_glyph_holes: usize,
+    /// Fallback for a box with too few stable ink holes: fraction of *all* its
+    /// holes that must change vs the baseline to trip it. Higher than
+    /// [`box_coherence_frac`] so partial background motion is tolerated and only a
+    /// wholesale change (scroll / navigation / app-switch) clears it.
+    pub gross_change_frac: f32,
     /// Fraction of *all* judged boxes' glyph holes changing at once that reads as a
     /// scroll (the anchored text itself moved, not just the background).
     pub scroll_frac: f32,
@@ -149,6 +167,7 @@ impl Default for MonitorConfig {
             change_threshold: 40,
             box_coherence_frac: 0.4,
             min_glyph_holes: 4,
+            gross_change_frac: 0.7,
             scroll_frac: 0.7,
             scroll_min_boxes: 2,
         }
@@ -216,23 +235,56 @@ impl BoxMonitor {
     }
 
     fn deviation(&self, samples: &[u8], cfg: &MonitorConfig) -> BoxDeviation {
+        // Not judged until warmup completes: a freshly-added box's baseline is
+        // captured before our overlay has settled into the captured mirror, so
+        // trusting it early reads the overlay appearing as a "change" (self-trip).
+        if self.learned_glyph.is_none() {
+            return BoxDeviation {
+                id: self.id,
+                glyph_holes: 0,
+                deviating: 0,
+                gross: false,
+                max_delta: 0,
+            };
+        }
         let mask = self.effective_glyph();
-        let mut glyph_holes = 0usize;
-        let mut deviating = 0usize;
+        let mut ink_holes = 0usize;
+        let mut ink_dev = 0usize;
+        let mut all_dev = 0usize;
+        let mut max_delta = 0u32;
         for (k, &hi) in self.holes.iter().enumerate() {
-            if !mask[k] {
-                continue;
-            }
-            glyph_holes += 1;
             let delta = (samples[hi] as i32 - self.baseline[k] as i32).unsigned_abs();
-            if delta > cfg.change_threshold as u32 {
-                deviating += 1;
+            max_delta = max_delta.max(delta);
+            let changed = delta > cfg.change_threshold as u32;
+            if changed {
+                all_dev += 1;
+            }
+            if mask[k] {
+                ink_holes += 1;
+                if changed {
+                    ink_dev += 1;
+                }
             }
         }
-        BoxDeviation {
-            id: self.id,
-            glyph_holes,
-            deviating,
+        if ink_holes >= cfg.min_glyph_holes {
+            BoxDeviation {
+                id: self.id,
+                glyph_holes: ink_holes,
+                deviating: ink_dev,
+                gross: false,
+                max_delta,
+            }
+        } else {
+            // No stable text strokes to track (low-contrast / saturated recovery):
+            // fall back to a whole-box change test so the box can still be cleared
+            // and never becomes an immortal pill blocking re-OCR of its region.
+            BoxDeviation {
+                id: self.id,
+                glyph_holes: self.holes.len(),
+                deviating: all_dev,
+                gross: true,
+                max_delta,
+            }
         }
     }
 }
@@ -241,6 +293,12 @@ struct BoxDeviation {
     id: u64,
     glyph_holes: usize,
     deviating: usize,
+    /// Judged on all holes (no stable ink strokes) rather than on the glyph mask.
+    gross: bool,
+    /// Largest single-hole `|current − baseline|` over the box, for debugging: ~0
+    /// means the box reads a constant (recovery isn't tracking the screen there);
+    /// moderate-but-under-threshold means the per-hole threshold is too high.
+    max_delta: u32,
 }
 
 impl BoxDeviation {
@@ -249,8 +307,12 @@ impl BoxDeviation {
     }
 
     fn changed(&self, cfg: &MonitorConfig) -> bool {
-        self.judgeable(cfg)
-            && self.deviating as f32 >= cfg.box_coherence_frac * self.glyph_holes as f32
+        let frac = if self.gross {
+            cfg.gross_change_frac
+        } else {
+            cfg.box_coherence_frac
+        };
+        self.judgeable(cfg) && self.deviating as f32 >= frac * self.glyph_holes as f32
     }
 }
 
@@ -262,6 +324,17 @@ pub struct ScreenMonitor {
     stats: Vec<HoleStats>,
     boxes: Vec<BoxMonitor>,
     cfg: MonitorConfig,
+    /// Diagnostic summary of the last `observe`: (judgeable boxes, total glyph
+    /// holes across them, total deviating). If glyph holes collapse to ~0 after
+    /// warmup, the variance mask is dropping everything (recovery too noisy).
+    last_stats: (usize, usize, usize),
+    /// The judged box with the highest deviating fraction last observe:
+    /// (id, glyph_holes, deviating). Lets us see a subtitle box's own fraction
+    /// rather than the totals (which dilute it across stable boxes).
+    last_top: Option<(u64, usize, usize)>,
+    /// Per-box `(id, monitored_holes, deviating, gross, max_delta)` from the last
+    /// observe, for debug logging joined with each block's text.
+    last_devs: Vec<(u64, usize, usize, bool, u32)>,
 }
 
 impl ScreenMonitor {
@@ -272,7 +345,26 @@ impl ScreenMonitor {
             stats,
             boxes: Vec::new(),
             cfg,
+            last_stats: (0, 0, 0),
+            last_top: None,
+            last_devs: Vec::new(),
         }
+    }
+
+    /// Per-box `(id, monitored_holes, deviating, gross, max_delta)` from last observe.
+    pub fn debug_boxes(&self) -> &[(u64, usize, usize, bool, u32)] {
+        &self.last_devs
+    }
+
+    /// (judgeable boxes, total glyph holes, total deviating) from the last observe.
+    pub fn debug_last_stats(&self) -> (usize, usize, usize) {
+        self.last_stats
+    }
+
+    /// The judged box with the highest deviating fraction last observe:
+    /// (id, glyph_holes, deviating).
+    pub fn debug_top_box(&self) -> Option<(u64, usize, usize)> {
+        self.last_top
     }
 
     pub fn lattice(&self) -> &Lattice {
@@ -324,6 +416,25 @@ impl ScreenMonitor {
         self.boxes.retain(|b| b.id != id);
     }
 
+    /// Drop all boxes (the resident overlay was replaced); per-hole stats are left
+    /// to be reset by the next `set_box`.
+    pub fn clear_boxes(&mut self) {
+        self.boxes.clear();
+    }
+
+    /// Mark `mask[h] = true` for every lattice hole any box covers (our overlay's
+    /// footprint). Used to exclude our own pills from the global-motion signal so
+    /// the overlay's own redraw isn't read as screen motion.
+    pub fn fill_covered(&self, mask: &mut [bool]) {
+        for b in &self.boxes {
+            for &h in &b.holes {
+                if let Some(m) = mask.get_mut(h) {
+                    *m = true;
+                }
+            }
+        }
+    }
+
     pub fn box_ids(&self) -> Vec<u64> {
         self.boxes.iter().map(|b| b.id).collect()
     }
@@ -356,12 +467,36 @@ impl ScreenMonitor {
                     .map(|(&h, &boot)| boot && stats[h].variance() < cfg.glyph_var_threshold)
                     .collect();
                 b.learned_glyph = Some(learned);
+                // Re-baseline to the now-settled frame: the initial baseline was
+                // captured before our overlay reached the captured mirror, so it
+                // held source where the overlay now sits. Snapshot current so a
+                // stable overlay reads as no-change.
+                for (k, &h) in b.holes.iter().enumerate() {
+                    b.baseline[k] = samples[h];
+                }
             }
         }
         let devs: Vec<BoxDeviation> = self
             .boxes
             .iter()
             .map(|b| b.deviation(samples, cfg))
+            .collect();
+        let judged = devs.iter().filter(|d| d.judgeable(cfg)).count();
+        let total_glyph: usize = devs.iter().map(|d| d.glyph_holes).sum();
+        let total_dev: usize = devs.iter().map(|d| d.deviating).sum();
+        self.last_stats = (judged, total_glyph, total_dev);
+        self.last_top = devs
+            .iter()
+            .filter(|d| d.judgeable(cfg))
+            .max_by(|a, b| {
+                let fa = a.deviating as f32 / a.glyph_holes.max(1) as f32;
+                let fb = b.deviating as f32 / b.glyph_holes.max(1) as f32;
+                fa.total_cmp(&fb)
+            })
+            .map(|d| (d.id, d.glyph_holes, d.deviating));
+        self.last_devs = devs
+            .iter()
+            .map(|d| (d.id, d.glyph_holes, d.deviating, d.gross, d.max_delta))
             .collect();
         classify(&devs, cfg)
     }
@@ -370,7 +505,13 @@ impl ScreenMonitor {
 /// Pure decision from the per-box deviations. Scroll is tested first (anchored
 /// text across many boxes all moving at once), then per-box change.
 fn classify(devs: &[BoxDeviation], cfg: &MonitorConfig) -> FrameClassification {
-    let judged: Vec<&BoxDeviation> = devs.iter().filter(|d| d.judgeable(cfg)).collect();
+    // Scroll is an ink-hole signal (anchored strokes moving together); gross boxes
+    // have no strokes to anchor, so they only ever contribute via per-box `changed`
+    // (which the pipeline escalates to a drop-all when enough boxes trip at once).
+    let judged: Vec<&BoxDeviation> = devs
+        .iter()
+        .filter(|d| d.judgeable(cfg) && !d.gross)
+        .collect();
     let total_glyph: usize = judged.iter().map(|d| d.glyph_holes).sum();
     let total_dev: usize = judged.iter().map(|d| d.deviating).sum();
     if judged.len() >= cfg.scroll_min_boxes
@@ -425,6 +566,7 @@ mod tests {
             change_threshold: 40,
             box_coherence_frac: 0.4,
             min_glyph_holes: 3,
+            gross_change_frac: 0.7,
             scroll_frac: 0.7,
             scroll_min_boxes: 2,
         }
@@ -620,7 +762,10 @@ mod tests {
         }
         mon.set_box(1, all1, boot1, &clean);
         mon.set_box(2, all2, boot2, &clean);
-        mon.observe(&clean);
+        // Warm up so the boxes are judged (and re-baselined to the stable frame).
+        for _ in 0..cfg().warmup_frames + 1 {
+            mon.observe(&clean);
+        }
 
         // Only box 1's text changes; box 2 holds.
         let mut frame = clean.clone();
@@ -653,5 +798,47 @@ mod tests {
         );
         mon.set_box(1, all, boot, &clean_b);
         assert_eq!(mon.observe(&clean_b), FrameClassification::Quiet);
+    }
+
+    #[test]
+    fn box_without_ink_holes_still_clears_on_a_wholesale_change() {
+        // A box whose recovered content has no stable strokes (bootstrap marks
+        // nothing as ink) learns zero glyph holes. Without the gross-change
+        // fallback it could never trip → an immortal pill that blocks its region.
+        // With it: stays put while unchanged, tolerates partial motion, and is
+        // cleared by a wholesale change (scroll / app-switch).
+        let lat = Lattice::build(100, 100, 10);
+        let region = rect(50.0, 50.0, 80.0, 80.0);
+        let all = lat.holes_in_rect(&region);
+        assert!(all.len() >= 8, "need enough holes to exercise fractions");
+        let boot = vec![false; all.len()]; // appearance says nothing is ink
+        let mut mon = ScreenMonitor::new(lat, cfg());
+        let clean = vec![BG; mon.lattice().len()];
+        mon.set_box(1, all.clone(), boot, &clean);
+
+        // Warm up on the stable clean frame: must never trip during warmup.
+        for _ in 0..cfg().warmup_frames + 1 {
+            assert_eq!(mon.observe(&clean), FrameClassification::Quiet);
+        }
+
+        // Same content: stays put (the translated label must persist).
+        assert_eq!(mon.observe(&clean), FrameClassification::Quiet);
+
+        // Partial change (a third of the holes) — below gross_change_frac: tolerated.
+        let mut partial = clean.clone();
+        for &h in all.iter().take(all.len() / 3) {
+            partial[h] = 240;
+        }
+        assert_eq!(mon.observe(&partial), FrameClassification::Quiet);
+
+        // Wholesale change (every hole) — a scene swap: clear the box.
+        let mut swapped = vec![BG; mon.lattice().len()];
+        for &h in &all {
+            swapped[h] = 240;
+        }
+        assert_eq!(
+            mon.observe(&swapped),
+            FrameClassification::BoxesChanged(vec![1])
+        );
     }
 }

@@ -95,7 +95,7 @@ pub fn run_tracker_with_acquire(
             Some(dl) => {
                 // Camera pills are translucent (the bg's own alpha); text is opaque.
                 let pill_alpha = pipeline.session().overlay_bg()[3] as f32 / 255.0;
-                if gles.render_overlay_to_texture(&dl, pill_alpha, 1.0, true) {
+                if gles.render_overlay_to_texture(&dl, pill_alpha, 1.0, true, None) {
                     gles.set_overlay_baked_version(version);
                 }
             }

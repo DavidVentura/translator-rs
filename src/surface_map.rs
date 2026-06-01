@@ -174,6 +174,23 @@ impl SurfaceMap {
         &self.lines
     }
 
+    /// Drop cached lines whose bbox overlaps any of `rects`. The screen monitor
+    /// calls this when content under a pill changed (or on a scroll) so the next
+    /// detection at that geometry can't be a `MergedUnchanged` cache hit that
+    /// re-shows stale OCR text.
+    pub fn remove_overlapping(&mut self, rects: &[OrientedRect]) {
+        if rects.is_empty() {
+            return;
+        }
+        let targets: Vec<crate::ocr::Rect> = rects.iter().map(|r| r.to_aabb()).collect();
+        self.lines.retain(|line| {
+            let lb = line.bbox.to_aabb();
+            !targets.iter().any(|t| {
+                lb.left < t.right && t.left < lb.right && lb.top < t.bottom && t.top < lb.bottom
+            })
+        });
+    }
+
     pub fn get(&self, id: SurfaceLineId) -> Option<&SurfaceLine> {
         self.lines.iter().find(|l| l.id == id)
     }

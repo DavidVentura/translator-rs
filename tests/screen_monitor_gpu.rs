@@ -111,7 +111,8 @@ fn source_frame(strokes: bool) -> Vec<u8> {
 /// of pill and screen.
 fn composite_capture(source: &[u8], lat: &Lattice, pill: &PillRegion) -> Vec<u8> {
     let mut cap = source.to_vec();
-    let inside = |x: f32, y: f32| (x - pill.cx).abs() <= pill.half_w && (y - pill.cy).abs() <= pill.half_h;
+    let inside =
+        |x: f32, y: f32| (x - pill.cx).abs() <= pill.half_w && (y - pill.cy).abs() <= pill.half_h;
     for y in 0..H {
         for x in 0..W {
             if inside(x as f32 + 0.5, y as f32 + 0.5) {
@@ -159,7 +160,10 @@ fn shader_recovers_screen_under_the_pill() {
         .max()
         .unwrap();
     eprintln!("recovery max error: {max_err}");
-    assert!(max_err <= 2, "recovered screen_est diverged: max_err={max_err}");
+    assert!(
+        max_err <= 2,
+        "recovered screen_est diverged: max_err={max_err}"
+    );
 }
 
 #[test]
@@ -179,7 +183,14 @@ fn recovered_samples_drive_the_classifier() {
 
     // Baseline: recover from the clean (text present) capture.
     let base_src = source_frame(true);
-    let baseline = probe.recover(&composite_capture(&base_src, &lat, &pill), W, H, &lat, PILL_LUMA, &[pill]);
+    let baseline = probe.recover(
+        &composite_capture(&base_src, &lat, &pill),
+        W,
+        H,
+        &lat,
+        PILL_LUMA,
+        &[pill],
+    );
 
     let holes = lat.holes_in_rect(&band_rect());
     let box_lumas: Vec<f32> = holes.iter().map(|&h| baseline[h] as f32).collect();
@@ -206,7 +217,14 @@ fn recovered_samples_drive_the_classifier() {
                 }
             }
         }
-        let rec = probe.recover(&composite_capture(&src, mon.lattice(), &pill), W, H, mon.lattice(), PILL_LUMA, &[pill]);
+        let rec = probe.recover(
+            &composite_capture(&src, mon.lattice(), &pill),
+            W,
+            H,
+            mon.lattice(),
+            PILL_LUMA,
+            &[pill],
+        );
         assert_eq!(
             mon.observe(&rec),
             FrameClassification::Quiet,
@@ -217,7 +235,14 @@ fn recovered_samples_drive_the_classifier() {
     // Text erased (subtitle advanced to blank): the stroke holes now read
     // background → the box must trip, through the same GPU recovery path.
     let changed_src = source_frame(false);
-    let rec = probe.recover(&composite_capture(&changed_src, mon.lattice(), &pill), W, H, mon.lattice(), PILL_LUMA, &[pill]);
+    let rec = probe.recover(
+        &composite_capture(&changed_src, mon.lattice(), &pill),
+        W,
+        H,
+        mon.lattice(),
+        PILL_LUMA,
+        &[pill],
+    );
     match mon.observe(&rec) {
         FrameClassification::BoxesChanged(ids) => assert!(ids.contains(&1), "{ids:?}"),
         other => panic!("expected the box to trip, got {other:?}"),

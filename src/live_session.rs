@@ -481,6 +481,9 @@ impl LiveSession {
         }
         self.locked_frames_since_acquire.store(0, Ordering::SeqCst);
         self.last_refresh_locked_frame.store(0, Ordering::SeqCst);
+        // Invalidate any baked overlay keyed off the version — without this the GL
+        // layer keeps presenting the last baked frame after the state is gone.
+        self.content_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Wipe per-anchor session state for `anchor_id` — drops the
@@ -500,6 +503,10 @@ impl LiveSession {
         if let Ok(mut anchors) = self.overlay_anchors.lock() {
             anchors.remove(&anchor_id);
         }
+        // Invalidate any baked overlay keyed off the version — without this the GL
+        // layer keeps presenting the dropped anchor's last baked frame (the "old
+        // label sticks in its original position after a scroll" symptom).
+        self.content_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Drop per-anchor state and overlays whose `anchor_id` isn't in
@@ -1085,6 +1092,143 @@ impl LiveSession {
         }
         // Bump the version so the GL present rebakes without the dropped blocks.
         self.content_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Invalidate the cached SurfaceMap lines overlapping `rects` for an anchor,
+    /// so the next detection there forces recognition instead of reusing stale
+    /// OCR text. Paired with [`Self::remove_blocks`] on an under-pill change.
+    pub fn invalidate_surface_region(&self, anchor_id: AnchorId, rects: &[OrientedRect]) {
+        if rects.is_empty() {
+            return;
+        }
+        if let Ok(mut states) = self.anchor_states.lock() {
+            if let Some(state) = states.get_mut(&anchor_id) {
+                state.map.remove_overlapping(rects);
+            }
+        }
+    }
+
+    /// Drop specific resident blocks (the screen monitor blinks a pill off on an
+    /// under-pill change so the next masked acquire re-grabs it). Bumps the
+    /// version so the present rebakes without them.
+    pub fn remove_blocks(&self, anchor_id: AnchorId, ids: &[u64]) {
+        let drop: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        if drop.is_empty() {
+            return;
+        }
+        if let Ok(mut anchors) = self.overlay_anchors.lock() {
+            if let Some(anchor) = anchors.get_mut(&anchor_id) {
+                anchor.blocks.retain(|id, _| !drop.contains(id));
+            }
+        }
+        self.content_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Resident blocks as `(block_id, content_hash, strips)` — the screen monitor
+    /// keys per-box pinhole state by `block_id` and rebaselines only when a block
+    /// is new or its `content_hash` changed (re-OCR'd), so an unrelated acquire
+    /// can't reset a stale block's baseline.
+    pub fn overlay_blocks(&self, anchor_id: AnchorId) -> Vec<(u64, u64, Vec<OrientedRect>)> {
+        let Ok(anchors) = self.overlay_anchors.lock() else {
+            return Vec::new();
+        };
+        let Some(anchor) = anchors.get(&anchor_id) else {
+            return Vec::new();
+        };
+        anchor
+            .blocks
+            .iter()
+            .map(|(id, spec)| (*id, spec.content_hash, spec.strips.clone()))
+            .collect()
+    }
+
+    /// Resident blocks as `(block_id, strip_rect)` pairs — one per strip. The
+    /// screen monitor keys its per-box pinhole state by `block_id` (so a trip maps
+    /// straight to [`Self::remove_blocks`]) and masks the recovery to these rects.
+    pub fn overlay_block_pills(&self, anchor_id: AnchorId) -> Vec<(u64, OrientedRect)> {
+        let Ok(anchors) = self.overlay_anchors.lock() else {
+            return Vec::new();
+        };
+        let Some(anchor) = anchors.get(&anchor_id) else {
+            return Vec::new();
+        };
+        anchor
+            .blocks
+            .iter()
+            .flat_map(|(id, spec)| spec.strips.iter().map(move |s| (*id, s.clone())))
+            .collect()
+    }
+
+    /// `(block_id, display_text)` for each resident block — for debug logging the
+    /// per-box monitor state joined with the label's text.
+    pub fn block_display_texts(&self, anchor_id: AnchorId) -> Vec<(u64, String)> {
+        let Ok(anchors) = self.overlay_anchors.lock() else {
+            return Vec::new();
+        };
+        let Some(anchor) = anchors.get(&anchor_id) else {
+            return Vec::new();
+        };
+        anchor
+            .blocks
+            .iter()
+            .map(|(id, spec)| (*id, spec.display_text.clone()))
+            .collect()
+    }
+
+    /// Per-block axis-aligned footprints of our own translated glyphs in canonical
+    /// (surface) coords: `(block_id, [[min_x, min_y, max_x, max_y]; n])`. The screen
+    /// monitor drops lattice points covered by these — a hole on our opaque text
+    /// reads the text, not the screen behind it, so it never registers the
+    /// underlying content changing and would pin the box (an immortal label). Only
+    /// the pill-background holes between/around the glyphs are monitored.
+    pub fn overlay_block_glyph_aabbs(&self, anchor_id: AnchorId) -> Vec<(u64, Vec<[f32; 4]>)> {
+        let os = self.overlay_oversample().max(1.0);
+        let Ok(anchors) = self.overlay_anchors.lock() else {
+            return Vec::new();
+        };
+        let Some(anchor) = anchors.get(&anchor_id) else {
+            return Vec::new();
+        };
+        anchor
+            .blocks
+            .iter()
+            .map(|(id, spec)| {
+                let visuals = inflate_block_visuals(spec);
+                let Some((ox, oy, _, _)) = canvas_geometry(&visuals, os) else {
+                    return (*id, Vec::new());
+                };
+                let mut rects = Vec::with_capacity(spec.glyph_instances.len());
+                for inst in &spec.glyph_instances {
+                    let Some(mask) = spec.glyph_masks.get(&inst.key) else {
+                        continue;
+                    };
+                    let (w, h) = (mask.w as f32, mask.h as f32);
+                    let (l, t) = (mask.left as f32, mask.top as f32);
+                    // Same unit-quad → canvas-texel map the glyph bake uses, over the
+                    // four corners → texel AABB (covers any line rotation).
+                    let mut min_x = f32::MAX;
+                    let mut min_y = f32::MAX;
+                    let mut max_x = f32::MIN;
+                    let mut max_y = f32::MIN;
+                    for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                        let tx = inst.pen_x + (l + u * w) * inst.cos - (t + v * h) * inst.sin;
+                        let ty = inst.pen_y + (l + u * w) * inst.sin + (t + v * h) * inst.cos;
+                        min_x = min_x.min(tx);
+                        min_y = min_y.min(ty);
+                        max_x = max_x.max(tx);
+                        max_y = max_y.max(ty);
+                    }
+                    // Canvas-texel → canonical: canon = origin + texel / oversample.
+                    rects.push([
+                        ox + min_x / os,
+                        oy + min_y / os,
+                        ox + max_x / os,
+                        oy + max_y / os,
+                    ]);
+                }
+                (*id, rects)
+            })
+            .collect()
     }
 }
 

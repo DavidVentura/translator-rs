@@ -245,8 +245,16 @@ unsafe fn ensure_r8(
         let tex = unsafe { gl.create_texture() }.expect("create texture");
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_WRAP_S,
@@ -280,7 +288,9 @@ unsafe fn ensure_r8(
 
 fn link_program(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Program, String> {
     unsafe {
-        let program = gl.create_program().map_err(|e| format!("create program: {e}"))?;
+        let program = gl
+            .create_program()
+            .map_err(|e| format!("create program: {e}"))?;
         let vs = compile(gl, glow::VERTEX_SHADER, vert)?;
         let fs = compile(gl, glow::FRAGMENT_SHADER, frag)?;
         gl.attach_shader(program, vs);
@@ -299,7 +309,9 @@ fn link_program(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Prog
 
 fn compile(gl: &glow::Context, kind: u32, src: &str) -> Result<glow::Shader, String> {
     unsafe {
-        let shader = gl.create_shader(kind).map_err(|e| format!("create shader: {e}"))?;
+        let shader = gl
+            .create_shader(kind)
+            .map_err(|e| format!("create shader: {e}"))?;
         gl.shader_source(shader, src);
         gl.compile_shader(shader);
         if !gl.get_shader_compile_status(shader) {
