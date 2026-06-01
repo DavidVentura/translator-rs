@@ -125,6 +125,11 @@ path = "tests/gpu_compositor.rs"
 required-features = ["gpu"]
 
 [[test]]
+name = "screen_monitor_gpu"
+path = "tests/screen_monitor_gpu.rs"
+required-features = ["gpu"]
+
+[[test]]
 name = "overpaint_visual"
 path = "tests/overpaint_visual.rs"
 required-features = ["tesseract", "image-render"]

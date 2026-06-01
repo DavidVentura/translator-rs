@@ -30,26 +30,40 @@ pub struct LatticePoint {
 /// point, in `points()` order.
 pub struct Lattice {
     points: Vec<LatticePoint>,
+    cols: u32,
+    rows: u32,
+    spacing: u32,
+    /// Centre offset of the first point: `spacing / 2`. A point's canonical
+    /// position is `(origin + col*spacing, origin + row*spacing)`.
+    origin: f32,
 }
 
 impl Lattice {
     /// A regular `spacing`-pitch grid centred in each cell. Alternating-row /
     /// staggered hole patterns are a rendering concern (hole visibility); the
     /// classifier only needs the point positions, so a plain grid is enough here.
+    /// Points are emitted row-major (y outer, x inner), so index `row*cols + col`
+    /// — the same order the GPU readback grid is read back in.
     pub fn build(canon_w: u32, canon_h: u32, spacing: u32) -> Self {
         let spacing = spacing.max(1);
         let half = spacing as f32 * 0.5;
-        let mut points = Vec::new();
-        let mut y = half;
-        while y < canon_h as f32 {
-            let mut x = half;
-            while x < canon_w as f32 {
+        let cols = (canon_w.saturating_sub(1) / spacing) + 1;
+        let rows = (canon_h.saturating_sub(1) / spacing) + 1;
+        let mut points = Vec::with_capacity((cols * rows) as usize);
+        for row in 0..rows {
+            let y = half + (row * spacing) as f32;
+            for col in 0..cols {
+                let x = half + (col * spacing) as f32;
                 points.push(LatticePoint { x, y });
-                x += spacing as f32;
             }
-            y += spacing as f32;
         }
-        Lattice { points }
+        Lattice {
+            points,
+            cols,
+            rows,
+            spacing,
+            origin: half,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -62,6 +76,22 @@ impl Lattice {
 
     pub fn points(&self) -> &[LatticePoint] {
         &self.points
+    }
+
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    pub fn spacing(&self) -> u32 {
+        self.spacing
+    }
+
+    pub fn origin(&self) -> f32 {
+        self.origin
     }
 
     /// Indices of the lattice points inside oriented rect `r`. Callers use this to

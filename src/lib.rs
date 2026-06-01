@@ -85,6 +85,8 @@ pub mod planar_tracker;
 pub mod ppocr;
 mod routing;
 pub mod screen_monitor;
+#[cfg(feature = "gpu")]
+pub mod screen_monitor_gpu;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod script;
 #[cfg(feature = "ppocr")]
