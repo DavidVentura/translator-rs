@@ -1273,15 +1273,18 @@ impl GlesRenderer {
             gl.vertex_attrib_pointer_f32(gp.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.uniform_1_i32(Some(&gp.u_atlas), 0);
             gl.uniform_1_f32(Some(&gp.u_text_alpha), text_alpha.clamp(0.0, 1.0));
-            // No holes in the glyphs — the text stays solid. A hole fine enough not
-            // to shred the text vanishes at this lattice density (the points sit at
-            // sub-pixel positions within the text layer), and one big enough to land
-            // reliably shreds it. So instead of punching the text, the monitor
-            // *excludes* glyph-covered lattice points (see `reconcile_boxes`): those
-            // holes would read our own opaque text, not the screen, and pin the box.
-            // Each box monitors the screen only through the pill-background holes.
+            // Punch the lattice through the glyphs at the pill radius so the dots
+            // land reliably and read the SCREEN under our text (the *original* ink),
+            // not our own opaque glyphs. This is what lets a small word on a plain
+            // background be monitored: its under-pill holes that fall on the original
+            // ink move when the page scrolls, where the surrounding background holes
+            // (all on the plain colour) never would. Cost: the text is lightly
+            // dotted; cheaper than leaving small labels un-monitorable.
             if let Some(l) = &gp.u_hole_spacing {
-                gl.uniform_1_f32(Some(l), 0.0);
+                gl.uniform_1_f32(Some(l), hg.spacing);
+            }
+            if let Some(l) = &gp.u_hole_radius {
+                gl.uniform_1_f32(Some(l), hg.radius);
             }
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture));
             // Axis-aligned (screen) glyphs map ~1:1 to atlas texels, so NEAREST stays

@@ -31,7 +31,9 @@ const SCREEN_ANCHOR_ID: u64 = 1;
 
 /// Pinhole lattice pitch (canonical px) for the v2 under-pill change detector.
 /// Holes are punched here in the overlay and the recovery shader samples here.
-const SCREEN_LATTICE_SPACING: u32 = 5;
+/// 3 canonical ≈ 6 display px/pinhole — denser than the original 5 so short labels
+/// land enough holes on the moving ink, and the recovered grid is finer.
+const SCREEN_LATTICE_SPACING: u32 = 2;
 /// Pill colour the screen overlay draws (opaque black), as a 0..1 luma — the
 /// recovery's `pill` term.
 const SCREEN_PILL_LUMA: f32 = 0.0;
@@ -43,25 +45,34 @@ const SCREEN_HOLE_FRAC: f32 = 0.5;
 /// not a fraction of the cell, so the pill stays mostly opaque and only the
 /// sampled points let the screen through. With the recovery now sampling the
 /// hole's pixel centre (the half-texel offset in `REC_FRAG_SRC`), the hole no
-/// longer needs to be fat to absorb a sub-pixel miss: 0.5 canonical ≈ a 2px
-/// display dot. Shrink toward 0.25 (≈1px) if the recovered grid stays crisp.
-const SCREEN_HOLE_RADIUS: f32 = 0.5;
+/// longer needs to be fat to absorb a sub-pixel miss: 0.25 canonical ≈ a 1px
+/// display dot — the single nearest pixel to each lattice point, which the
+/// recovery samples directly. Less visible dotting on the text, twice the holes.
+const SCREEN_HOLE_RADIUS: f32 = 0.25;
 /// After a trip drops blocks, ignore further trips for this long so a noisy
 /// recovery can't storm removals.
 const V2_TRIP_COOLDOWN_NS: i64 = 600_000_000;
 /// While settled, run a masked additive acquire at least this often to pick up
 /// new text that appeared in the gaps.
-const V2_PERIODIC_NS: i64 = 1_500_000_000;
+const V2_PERIODIC_NS: i64 = 1_000_000_000;
 /// After dropping/clearing pills, hold the re-acquire off for this long so the
 /// dropped pills have actually left the captured mirror before OCR runs on it.
 /// MediaProjection composites the overlay window into the mirror a frame or two
 /// after `eglSwapBuffers` returns, so re-OCRing immediately recognises our own
 /// just-removed labels as "new" text. A fixed settle is deterministic where the
 /// old present-timestamp fence raced the compositor and opened ~1-2 frames early.
-const V2_SETTLE_NS: i64 = 150_000_000;
+const V2_SETTLE_NS: i64 = 100_000_000;
 /// Per-lattice-point inter-frame luma delta that counts a gap point as "moved"
 /// for the global-motion signal (both the scroll trigger and the settle gate).
 const V2_MOTION_THR: i32 = 40;
+/// Frames a lattice point stays "recently moved" after an inter-frame jump, for
+/// the per-box dynamic-content test. Spans a detection (~a few frames) so a box
+/// detected over a region that moved any time in this window is rejected.
+const V2_MOTION_WINDOW: u16 = 8;
+/// Fraction of a freshly-detected box's lattice points that must be "recently
+/// moved" for the box to count as over dynamic content (video / game / scroll)
+/// and be dropped before commit. Static text scores ~0; a moving region ~all.
+const V2_DYNAMIC_BOX_FRAC: f32 = 0.5;
 /// Fraction of gap (non-pill) lattice points moving frame-to-frame that reads as
 /// a wholesale change (scroll / navigation / app-switch) → drop all + re-acquire.
 /// This is the fast, box-independent path: it fires the same frame the screen
@@ -149,7 +160,10 @@ fn screen_monitor_config() -> MonitorConfig {
         change_threshold: 40,
         // A single subtitle line change flips only a minority of its box's holes
         // (overlapping strokes, padding, between-letter gaps), so the bar is low.
-        box_coherence_frac: 0.15,
+        // A *small* scroll of a big block shifts content only slightly, so only a
+        // tenth of holes cross threshold (on-device a 707-hole block at 13% stayed);
+        // 0.10 catches those while staying above per-hole recovery noise.
+        box_coherence_frac: 0.10,
         min_glyph_holes: SCREEN_MIN_BOX_HOLES,
         // A box with no stable ink holes (low-contrast recovery, short labels) is
         // judged on all its holes. A real screen change only flips ~20-40% of them
@@ -200,41 +214,16 @@ struct MonitorV2State {
     /// Currently in a global-motion (scroll/navigation) episode — the overlay has
     /// been cleared and re-acquire is deferred until motion settles.
     scrolling: bool,
+    /// Per-lattice-point "moved in the last few frames" accumulator (all points,
+    /// not just gaps): bumped to [`V2_MOTION_WINDOW`] when a point's inter-frame
+    /// luma delta exceeds [`V2_MOTION_THR`], decays by 1 otherwise. A freshly
+    /// detected box whose region scores high here is over dynamic content (video /
+    /// game sprite / mid-scroll) and is dropped before commit, so a pill never
+    /// pins to moving content. Empty until sized to the lattice.
+    recent_motion: Vec<u16>,
     /// Diagnostic frame counter for rate-limited logging.
     frames: u64,
 }
-
-/// DEBUG: write the recovered `screen_est` lattice, expanded back to canonical
-/// size (each point → a spacing×spacing block), as a grayscale PNG to the app's
-/// external files dir. Compare against `adb exec-out screencap` of the same
-/// screen: if the recovered content under the pills lines up with the real text
-/// positions, the recovery is aligned; if it's shifted/garbled, it's not.
-#[cfg(feature = "ppocr")]
-fn debug_dump_recovered(lattice: &Lattice, samples: &[u8], cw: u32, ch: u32) {
-    if samples.len() != lattice.len() || cw == 0 || ch == 0 {
-        return;
-    }
-    let sp = lattice.spacing().max(1);
-    let mut img = image::GrayImage::new(cw, ch);
-    for (i, p) in lattice.points().iter().enumerate() {
-        let v = image::Luma([samples[i]]);
-        let x0 = (p.x as u32).saturating_sub(sp / 2);
-        let y0 = (p.y as u32).saturating_sub(sp / 2);
-        for yy in y0..(y0 + sp).min(ch) {
-            for xx in x0..(x0 + sp).min(cw) {
-                img.put_pixel(xx, yy, v);
-            }
-        }
-    }
-    let path = "/storage/emulated/0/Android/data/dev.davidv.translator/files/screen_est.png";
-    match img.save(path) {
-        Ok(()) => log::info!("[screen-monitor-v2] dumped recovered grid → {path}"),
-        Err(e) => log::warn!("[screen-monitor-v2] recovered-grid dump failed: {e}"),
-    }
-}
-
-#[cfg(not(feature = "ppocr"))]
-fn debug_dump_recovered(_lattice: &Lattice, _samples: &[u8], _cw: u32, _ch: u32) {}
 
 /// Axis-aligned-bounds overlap of two oriented rects. Used to drop detections
 /// that fall on an existing pill (our own re-captured overlay).
@@ -260,7 +249,6 @@ fn rects_overlap(a: &OrientedRect, b: &OrientedRect) -> bool {
 fn reconcile_boxes(
     monitor: &mut ScreenMonitor,
     blocks: &[(u64, u64, Vec<OrientedRect>)],
-    glyph_aabbs: &HashMap<u64, Vec<[f32; 4]>>,
     samples: &[u8],
     baselined: &mut HashMap<u64, u64>,
 ) {
@@ -281,20 +269,6 @@ fn reconcile_boxes(
             .collect();
         holes.sort_unstable();
         holes.dedup();
-        // Drop holes covered by our own glyphs: they read our opaque text, not the
-        // screen, so they'd never see the underlying content change and would pin
-        // the box. What remains are the pill-background holes that read the screen.
-        if let Some(aabbs) = glyph_aabbs.get(block_id) {
-            if !aabbs.is_empty() {
-                let pts = monitor.lattice().points();
-                holes.retain(|&h| {
-                    let p = pts[h];
-                    !aabbs
-                        .iter()
-                        .any(|g| p.x >= g[0] && p.x <= g[2] && p.y >= g[1] && p.y <= g[3])
-                });
-            }
-        }
         if holes.len() < SCREEN_MIN_BOX_HOLES {
             continue;
         }
@@ -464,6 +438,7 @@ impl LiveScreenPipeline {
                 prev_samples: None,
                 prev_covered: None,
                 scrolling: false,
+                recent_motion: Vec::new(),
                 frames: 0,
             });
         }
@@ -504,6 +479,28 @@ impl LiveScreenPipeline {
             }
             _ => 0.0,
         };
+        // Per-point recent-motion accumulator over ALL points (incl. under pills, so
+        // a box's own region is measured): bump points that jumped this frame, decay
+        // the rest. `run_screen_acquire` reads this to drop a detection over a region
+        // that's actively moving (video / game / mid-scroll) before it commits a pill.
+        if st.recent_motion.len() != samples.len() {
+            st.recent_motion = vec![0u16; samples.len()];
+        }
+        if let Some(prev) = &st.prev_samples {
+            if prev.len() == samples.len() {
+                for (rm, (&cur, &p)) in st
+                    .recent_motion
+                    .iter_mut()
+                    .zip(samples.iter().zip(prev.iter()))
+                {
+                    if (cur as i32 - p as i32).abs() > V2_MOTION_THR {
+                        *rm = V2_MOTION_WINDOW;
+                    } else {
+                        *rm = rm.saturating_sub(1);
+                    }
+                }
+            }
+        }
         st.prev_samples = Some(samples.to_vec());
         st.prev_covered = Some(covered);
 
@@ -547,9 +544,6 @@ impl LiveScreenPipeline {
                 );
             }
         }
-        if st.frames % 120 == 0 {
-            debug_dump_recovered(st.monitor.lattice(), samples, cw, ch);
-        }
 
         // Reconcile boxes against the resident blocks before observing, preserving
         // the baseline of unchanged blocks (so a stale block can still detect its
@@ -557,18 +551,7 @@ impl LiveScreenPipeline {
         // settle delay are independent of an acquire landing.
         if st.last_populated != version {
             let blocks = self.session.overlay_blocks(SCREEN_ANCHOR_ID);
-            let glyph_aabbs: HashMap<u64, Vec<[f32; 4]>> = self
-                .session
-                .overlay_block_glyph_aabbs(SCREEN_ANCHOR_ID)
-                .into_iter()
-                .collect();
-            reconcile_boxes(
-                &mut st.monitor,
-                &blocks,
-                &glyph_aabbs,
-                samples,
-                &mut st.baselined,
-            );
+            reconcile_boxes(&mut st.monitor, &blocks, samples, &mut st.baselined);
             st.last_populated = version;
         }
         // Always observe so the per-hole variance keeps learning, even while a trip
@@ -815,6 +798,26 @@ impl LiveScreenPipeline {
         self.session.overlay_draw_list(SCREEN_ANCHOR_ID)
     }
 
+    /// Fraction of `rect`'s lattice points that moved in the last few frames — the
+    /// per-box dynamic-content test for [`Self::run_screen_acquire`]. High → the
+    /// region is video / a game sprite / mid-scroll, so a detection there must not
+    /// be committed. `0` when the monitor isn't up yet (nothing known → don't drop).
+    fn region_motion_frac(&self, rect: &OrientedRect) -> f32 {
+        let guard = self.monitor_v2.lock().expect("monitor_v2 lock");
+        let Some(st) = guard.as_ref() else {
+            return 0.0;
+        };
+        if st.recent_motion.len() != st.monitor.lattice().len() {
+            return 0.0;
+        }
+        let holes = st.monitor.lattice().holes_in_rect(rect);
+        if holes.is_empty() {
+            return 0.0;
+        }
+        let moved = holes.iter().filter(|&&h| st.recent_motion[h] > 0).count();
+        moved as f32 / holes.len() as f32
+    }
+
     /// Worker-thread body: detect → provisional overlay → rec/translate → full
     /// overlay, bumping [`overlay_version`](Self::overlay_version) after each
     /// upsert so the GL thread presents provisional pills immediately and the
@@ -870,9 +873,23 @@ impl LiveScreenPipeline {
                     .any(|p| rects_overlap(&d.tight_box, p))
             })
             .collect();
+        // Drop detections over actively-moving content (video / game sprite /
+        // mid-scroll): committing a pill there would pin it to content that's about
+        // to change (a label OCR'd mid-animation, then stuck). Measured per-box from
+        // the monitor's recent-motion accumulator — so static text (a HUD, caption,
+        // or menu) on an otherwise-animated screen is still kept, unlike a global
+        // motion gate which would reject everything while anything on screen moves.
+        let n_before = detected.len();
+        let detected: Vec<_> = detected
+            .into_iter()
+            .filter(|d| self.region_motion_frac(&d.tight_box) <= V2_DYNAMIC_BOX_FRAC)
+            .collect();
+        let n_dynamic = n_before - detected.len();
         if detected.is_empty() {
-            // Nothing new under the gaps — keep the resident overlay as-is.
-            log::info!("[screen] detect={det_ms:.0}ms new=0 (kept resident)");
+            // Nothing new under the gaps (or all over moving content) — keep resident.
+            log::info!(
+                "[screen] detect={det_ms:.0}ms new=0 dropped_moving={n_dynamic} (kept resident)"
+            );
             return;
         }
         // Provisional bbox-only pills the instant detection lands (identity
@@ -986,7 +1003,6 @@ mod monitor_tests {
         reconcile_boxes(
             &mut mon,
             &[(1, 100, vec![a.clone()])],
-            &HashMap::new(),
             &base,
             &mut baselined,
         );
@@ -1003,7 +1019,6 @@ mod monitor_tests {
         reconcile_boxes(
             &mut mon,
             &[(1, 100, vec![a]), (2, 200, vec![b])],
-            &HashMap::new(),
             &changed,
             &mut baselined,
         );
@@ -1039,7 +1054,6 @@ mod monitor_tests {
         reconcile_boxes(
             &mut mon,
             &[(1, 100, vec![a.clone()])],
-            &HashMap::new(),
             &base,
             &mut baselined,
         );
@@ -1049,13 +1063,7 @@ mod monitor_tests {
 
         // Re-OCR: same block id, new content_hash → rebaselined to the new frame.
         let changed = samples_two(&lat, &a, 220, &b, 60);
-        reconcile_boxes(
-            &mut mon,
-            &[(1, 101, vec![a])],
-            &HashMap::new(),
-            &changed,
-            &mut baselined,
-        );
+        reconcile_boxes(&mut mon, &[(1, 101, vec![a])], &changed, &mut baselined);
         assert_eq!(baselined.get(&1), Some(&101), "rebaselined to the new hash");
 
         // Observing that same (new) frame must not trip — the baseline moved with it.

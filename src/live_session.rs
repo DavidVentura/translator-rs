@@ -1174,62 +1174,6 @@ impl LiveSession {
             .map(|(id, spec)| (*id, spec.display_text.clone()))
             .collect()
     }
-
-    /// Per-block axis-aligned footprints of our own translated glyphs in canonical
-    /// (surface) coords: `(block_id, [[min_x, min_y, max_x, max_y]; n])`. The screen
-    /// monitor drops lattice points covered by these — a hole on our opaque text
-    /// reads the text, not the screen behind it, so it never registers the
-    /// underlying content changing and would pin the box (an immortal label). Only
-    /// the pill-background holes between/around the glyphs are monitored.
-    pub fn overlay_block_glyph_aabbs(&self, anchor_id: AnchorId) -> Vec<(u64, Vec<[f32; 4]>)> {
-        let os = self.overlay_oversample().max(1.0);
-        let Ok(anchors) = self.overlay_anchors.lock() else {
-            return Vec::new();
-        };
-        let Some(anchor) = anchors.get(&anchor_id) else {
-            return Vec::new();
-        };
-        anchor
-            .blocks
-            .iter()
-            .map(|(id, spec)| {
-                let visuals = inflate_block_visuals(spec);
-                let Some((ox, oy, _, _)) = canvas_geometry(&visuals, os) else {
-                    return (*id, Vec::new());
-                };
-                let mut rects = Vec::with_capacity(spec.glyph_instances.len());
-                for inst in &spec.glyph_instances {
-                    let Some(mask) = spec.glyph_masks.get(&inst.key) else {
-                        continue;
-                    };
-                    let (w, h) = (mask.w as f32, mask.h as f32);
-                    let (l, t) = (mask.left as f32, mask.top as f32);
-                    // Same unit-quad → canvas-texel map the glyph bake uses, over the
-                    // four corners → texel AABB (covers any line rotation).
-                    let mut min_x = f32::MAX;
-                    let mut min_y = f32::MAX;
-                    let mut max_x = f32::MIN;
-                    let mut max_y = f32::MIN;
-                    for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-                        let tx = inst.pen_x + (l + u * w) * inst.cos - (t + v * h) * inst.sin;
-                        let ty = inst.pen_y + (l + u * w) * inst.sin + (t + v * h) * inst.cos;
-                        min_x = min_x.min(tx);
-                        min_y = min_y.min(ty);
-                        max_x = max_x.max(tx);
-                        max_y = max_y.max(ty);
-                    }
-                    // Canvas-texel → canonical: canon = origin + texel / oversample.
-                    rects.push([
-                        ox + min_x / os,
-                        oy + min_y / os,
-                        ox + max_x / os,
-                        oy + max_y / os,
-                    ]);
-                }
-                (*id, rects)
-            })
-            .collect()
-    }
 }
 
 /// Adapter implementing the live recognition interface. The bindings
