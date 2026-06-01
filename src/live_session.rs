@@ -236,7 +236,6 @@ pub struct BlockSpec {
     pub glyph_masks: HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
 }
 
-
 /// Per-anchor live state. Each acquired anchor (engine
 /// `AnchorId`) gets its own slot so two physical surfaces — sign A
 /// and sign B — never share coord frames, line ids, or "what's been
@@ -1041,7 +1040,11 @@ impl LiveSession {
     /// `sensor_crop`). Stored as a dedicated field on the anchor
     /// overlay so they share the canvas with real blocks but follow
     /// their own clear-all lifecycle.
-    pub fn upsert_provisional_overlay(&self, anchor_id: AnchorId, surface_strips: Vec<OrientedRect>) {
+    pub fn upsert_provisional_overlay(
+        &self,
+        anchor_id: AnchorId,
+        surface_strips: Vec<OrientedRect>,
+    ) {
         {
             let mut anchors = match self.overlay_anchors.lock() {
                 Ok(a) => a,
@@ -1083,7 +1086,6 @@ impl LiveSession {
         // Bump the version so the GL present rebakes without the dropped blocks.
         self.content_version.fetch_add(1, Ordering::SeqCst);
     }
-
 }
 
 /// Adapter implementing the live recognition interface. The bindings

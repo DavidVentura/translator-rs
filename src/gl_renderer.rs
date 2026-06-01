@@ -706,7 +706,10 @@ impl GlesRenderer {
         self.ensure_gray_fbo(w, h);
         // Render y-flipped so the bottom-up `glReadPixels` yields a top-down buffer
         // directly — no second buffer + CPU row-flip. `Y_FLIP_CLIP` negates clip-y.
-        let cam_transform = mat3_mul(&Y_FLIP_CLIP, &mat3_mul(dst_to_clip, &scale(w as f32, h as f32)));
+        let cam_transform = mat3_mul(
+            &Y_FLIP_CLIP,
+            &mat3_mul(dst_to_clip, &scale(w as f32, h as f32)),
+        );
         let mut gray = vec![0u8; (w as usize) * (h as usize)];
         unsafe {
             let gl = &self.gl;
@@ -763,7 +766,10 @@ impl GlesRenderer {
         self.ensure_fbo(w, h);
         // Render y-flipped so the bottom-up `glReadPixels` yields a top-down buffer
         // directly — no second buffer + CPU row-flip. `Y_FLIP_CLIP` negates clip-y.
-        let cam_transform = mat3_mul(&Y_FLIP_CLIP, &mat3_mul(dst_to_clip, &scale(w as f32, h as f32)));
+        let cam_transform = mat3_mul(
+            &Y_FLIP_CLIP,
+            &mat3_mul(dst_to_clip, &scale(w as f32, h as f32)),
+        );
         let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
         unsafe {
             let gl = &self.gl;
@@ -1238,7 +1244,11 @@ impl GlesRenderer {
     /// bound the present framebuffer, the quad VBO, and cleared. The grow-only FBO's
     /// used sub-rect is selected via the uv transform. Returns false if nothing baked.
     #[cfg(feature = "planar-tracker")]
-    fn draw_baked_overlay_quad(&self, base_surface_to_clip: &[f32; 9], premultiplied: bool) -> bool {
+    fn draw_baked_overlay_quad(
+        &self,
+        base_surface_to_clip: &[f32; 9],
+        premultiplied: bool,
+    ) -> bool {
         let Some(baked) = self.baked_overlay else {
             return false;
         };
