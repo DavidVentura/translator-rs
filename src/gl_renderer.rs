@@ -48,11 +48,17 @@ const VERT_SRC: &str = r#"#version 100
 attribute vec2 a_pos;
 uniform mat3 u_transform;
 uniform mat3 u_uv_xform;
+// Quad → canonical (overlay) coords so the present fragment can punch the pinhole
+// lattice at display resolution (crisp), instead of baking soft holes into the
+// overlay texture. Identity for non-overlay draws (camera/luma ignore v_canon).
+uniform mat3 u_quad_to_canon;
 varying vec2 v_uv;
+varying vec2 v_canon;
 void main() {
     vec3 clip = u_transform * vec3(a_pos, 1.0);
     vec3 uv = u_uv_xform * vec3(a_pos, 1.0);
     v_uv = uv.xy;
+    v_canon = (u_quad_to_canon * vec3(a_pos, 1.0)).xy;
     gl_Position = vec4(clip.xy, 0.0, clip.z);
 }
 "#;
@@ -65,9 +71,24 @@ precision mediump float;
 #endif
 uniform sampler2D u_tex;
 uniform float u_overlay_alpha;
+// Pinhole lattice, punched here at display resolution so each hole is one crisp
+// pixel rather than a baked sub-pixel disc smeared by the present's LINEAR upscale.
+// u_hole_spacing <= 0 disables it (camera passthrough). Centre on the mirror texel
+// the recovery reads (lattice + 0.25 — see REC_FRAG) so punch and sample coincide.
+uniform float u_hole_spacing;
+uniform float u_hole_radius;
+uniform float u_hole_alpha;
 varying vec2 v_uv;
+varying vec2 v_canon;
 void main() {
     vec4 c = texture2D(u_tex, v_uv);
+    if (u_hole_spacing > 0.0 && c.a > 0.1) {
+        vec2 origin = vec2(u_hole_spacing * 0.5);
+        vec2 nearest = floor((v_canon - origin) / u_hole_spacing + 0.5) * u_hole_spacing + origin + vec2(0.25);
+        if (distance(v_canon, nearest) <= u_hole_radius) {
+            c.a = u_hole_alpha;
+        }
+    }
     // Parametric overlay opacity (1.0 for camera passthrough). Scaling alpha
     // pre-blend is premultiply-correct: the source-over blend then yields an
     // effective coverage of (texel alpha × u_overlay_alpha).
@@ -119,12 +140,9 @@ void main() {
 const PILL_VERT_SRC: &str = r#"#version 100
 attribute vec2 a_pos;
 uniform mat3 u_transform;
-uniform mat3 u_quad_to_canon;
 varying vec2 v_local;
-varying vec2 v_canon;
 void main() {
     v_local = a_pos;
-    v_canon = (u_quad_to_canon * vec3(a_pos, 1.0)).xy;
     vec3 clip = u_transform * vec3(a_pos, 1.0);
     gl_Position = vec4(clip.xy, 0.0, clip.z);
 }
@@ -144,15 +162,7 @@ precision mediump float;
 uniform vec4 u_color;
 uniform vec2 u_half;
 uniform float u_radius;
-// Pinhole grid (screen monitor): at lattice points in canonical coords, drop the
-// pill alpha to u_hole_alpha so the captured mirror shows a known blend of pill +
-// screen there, recoverable by the lattice probe. u_hole_spacing <= 0 disables it
-// (camera path), leaving solid pills.
-uniform float u_hole_spacing;
-uniform float u_hole_radius;
-uniform float u_hole_alpha;
 varying vec2 v_local;
-varying vec2 v_canon;
 void main() {
     // Local pixel coords centred on the pill (v_local 0..1 → [-half, half]).
     vec2 p = (v_local - 0.5) * 2.0 * u_half;
@@ -164,39 +174,27 @@ void main() {
     if (coverage <= 0.0) {
         discard;
     }
-    float a = u_color.a;
-    if (u_hole_spacing > 0.0) {
-        vec2 origin = vec2(u_hole_spacing * 0.5);
-        vec2 nearest = floor((v_canon - origin) / u_hole_spacing + 0.5) * u_hole_spacing + origin;
-        if (distance(v_canon, nearest) <= u_hole_radius) {
-            a = u_hole_alpha;
-        }
-    }
-    gl_FragColor = vec4(u_color.rgb, a * coverage);
+    gl_FragColor = vec4(u_color.rgb, u_color.a * coverage);
 }
 "#;
 
-/// Glyph fragment shader (shares [`VERT_SRC`]): samples an R8 coverage atlas and
-/// outputs straight alpha (fg color × coverage × text_alpha). Each quad covers one
-/// glyph; the vertex transform positions and rotates it in overlay-texel space.
-/// Glyph vertex shader: like [`VERT_SRC`] but also emits the fragment's canonical
-/// position so the fragment can punch the same pinhole lattice the pills do.
+/// Glyph vertex shader: maps the unit quad to clip and passes the atlas uv.
 const GLYPH_VERT_SRC: &str = r#"#version 100
 attribute vec2 a_pos;
 uniform mat3 u_transform;
 uniform mat3 u_uv_xform;
-uniform mat3 u_quad_to_canon;
 varying vec2 v_uv;
-varying vec2 v_canon;
 void main() {
     vec3 clip = u_transform * vec3(a_pos, 1.0);
     vec3 uv = u_uv_xform * vec3(a_pos, 1.0);
     v_uv = uv.xy;
-    v_canon = (u_quad_to_canon * vec3(a_pos, 1.0)).xy;
     gl_Position = vec4(clip.xy, 0.0, clip.z);
 }
 "#;
 
+/// Glyph fragment shader: samples an R8 coverage atlas and outputs straight alpha
+/// (fg color × coverage × text_alpha). Holes are punched at present time over the
+/// whole overlay (pills + glyphs alike), so the glyph itself bakes solid.
 const GLYPH_FRAG_SRC: &str = r#"#version 100
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
@@ -206,20 +204,8 @@ precision mediump float;
 uniform sampler2D u_atlas;
 uniform vec4 u_color;
 uniform float u_text_alpha;
-// Same pinhole lattice as the pills: cut a hole through the translated glyph so
-// the lattice probe reads the *source* under the pill, not our own overlay text.
-uniform float u_hole_spacing;
-uniform float u_hole_radius;
 varying vec2 v_uv;
-varying vec2 v_canon;
 void main() {
-    if (u_hole_spacing > 0.0) {
-        vec2 origin = vec2(u_hole_spacing * 0.5);
-        vec2 nearest = floor((v_canon - origin) / u_hole_spacing + 0.5) * u_hole_spacing + origin;
-        if (distance(v_canon, nearest) <= u_hole_radius) {
-            discard;
-        }
-    }
     float a = texture2D(u_atlas, v_uv).r;
     gl_FragColor = vec4(u_color.rgb, a * u_text_alpha);
 }
@@ -369,6 +355,10 @@ struct BakedOverlay {
     /// Used sub-rect of the (grow-only) overlay FBO, in texels.
     used_w: u32,
     used_h: u32,
+    /// Pinhole params to punch at present time (canonical units; spacing 0 = none).
+    hole_spacing: f32,
+    hole_radius: f32,
+    hole_alpha: f32,
 }
 
 pub struct GlesRenderer {
@@ -378,6 +368,12 @@ pub struct GlesRenderer {
     u_uv_xform: glow::UniformLocation,
     u_tex: glow::UniformLocation,
     u_overlay_alpha: glow::UniformLocation,
+    // Present-time pinhole punch; `None` if the driver optimized them out (a build
+    // without the holes path). Set per-overlay-draw from the baked hole params.
+    u_quad_to_canon: Option<glow::UniformLocation>,
+    u_hole_spacing: Option<glow::UniformLocation>,
+    u_hole_radius: Option<glow::UniformLocation>,
+    u_hole_alpha: Option<glow::UniformLocation>,
     a_pos: u32,
     /// Parametric overlay opacity for the 2D program, applied to overlay draws
     /// (forced 1.0 for the camera passthrough). Set once per renderer via
@@ -440,11 +436,6 @@ struct PillProgram {
     u_half: glow::UniformLocation,
     u_radius: glow::UniformLocation,
     a_pos: u32,
-    // Pinhole uniforms; `None` if the driver optimized them out (holes disabled).
-    u_quad_to_canon: Option<glow::UniformLocation>,
-    u_hole_spacing: Option<glow::UniformLocation>,
-    u_hole_radius: Option<glow::UniformLocation>,
-    u_hole_alpha: Option<glow::UniformLocation>,
 }
 
 /// The glyph program (shares [`VERT_SRC`]; [`GLYPH_FRAG_SRC`] fragment). Built
@@ -457,10 +448,6 @@ struct GlyphProgram {
     u_color: glow::UniformLocation,
     u_text_alpha: glow::UniformLocation,
     a_pos: u32,
-    // Pinhole uniforms (None if optimized out → holes disabled for glyphs).
-    u_quad_to_canon: Option<glow::UniformLocation>,
-    u_hole_spacing: Option<glow::UniformLocation>,
-    u_hole_radius: Option<glow::UniformLocation>,
 }
 
 /// R8 glyph coverage atlas with a shelf packer. Grows to `max_side`×`max_side`;
@@ -511,6 +498,10 @@ impl GlesRenderer {
             let u_overlay_alpha = gl
                 .get_uniform_location(program, "u_overlay_alpha")
                 .ok_or(GlError::MissingLocation("u_overlay_alpha"))?;
+            let u_quad_to_canon = gl.get_uniform_location(program, "u_quad_to_canon");
+            let u_hole_spacing = gl.get_uniform_location(program, "u_hole_spacing");
+            let u_hole_radius = gl.get_uniform_location(program, "u_hole_radius");
+            let u_hole_alpha = gl.get_uniform_location(program, "u_hole_alpha");
             let a_pos = gl
                 .get_attrib_location(program, "a_pos")
                 .ok_or(GlError::MissingLocation("a_pos"))?;
@@ -533,6 +524,10 @@ impl GlesRenderer {
                 u_uv_xform,
                 u_tex,
                 u_overlay_alpha,
+                u_quad_to_canon,
+                u_hole_spacing,
+                u_hole_radius,
+                u_hole_alpha,
                 a_pos,
                 overlay_alpha: 1.0,
                 quad_vbo,
@@ -637,10 +632,6 @@ impl GlesRenderer {
                     u_half: gl.get_uniform_location(program, "u_half")?,
                     u_radius: gl.get_uniform_location(program, "u_radius")?,
                     a_pos: gl.get_attrib_location(program, "a_pos")?,
-                    u_quad_to_canon: gl.get_uniform_location(program, "u_quad_to_canon"),
-                    u_hole_spacing: gl.get_uniform_location(program, "u_hole_spacing"),
-                    u_hole_radius: gl.get_uniform_location(program, "u_hole_radius"),
-                    u_hole_alpha: gl.get_uniform_location(program, "u_hole_alpha"),
                     program,
                 })
             })();
@@ -671,9 +662,6 @@ impl GlesRenderer {
                     u_color: gl.get_uniform_location(program, "u_color")?,
                     u_text_alpha: gl.get_uniform_location(program, "u_text_alpha")?,
                     a_pos: gl.get_attrib_location(program, "a_pos")?,
-                    u_quad_to_canon: gl.get_uniform_location(program, "u_quad_to_canon"),
-                    u_hole_spacing: gl.get_uniform_location(program, "u_hole_spacing"),
-                    u_hole_radius: gl.get_uniform_location(program, "u_hole_radius"),
                     program,
                 })
             })();
@@ -1166,20 +1154,8 @@ impl GlesRenderer {
             gl.use_program(Some(pill.program));
             gl.enable_vertex_attrib_array(pill.a_pos);
             gl.vertex_attrib_pointer_f32(pill.a_pos, 2, glow::FLOAT, false, 0, 0);
-            let hg = holes.unwrap_or(HoleGrid {
-                spacing: 0.0,
-                radius: 0.0,
-                alpha: 1.0,
-            });
-            if let Some(l) = &pill.u_hole_spacing {
-                gl.uniform_1_f32(Some(l), hg.spacing);
-            }
-            if let Some(l) = &pill.u_hole_radius {
-                gl.uniform_1_f32(Some(l), hg.radius);
-            }
-            if let Some(l) = &pill.u_hole_alpha {
-                gl.uniform_1_f32(Some(l), hg.alpha);
-            }
+            // Pills/glyphs bake SOLID; holes are punched at present time (display res,
+            // crisp). The real params ride on `baked_overlay` below.
             for p in &dl.pills {
                 let r = &p.rect;
                 let cos = r.angle_radians.cos();
@@ -1213,23 +1189,6 @@ impl GlesRenderer {
                     false,
                     &to_column_major(&transform),
                 );
-                // Quad → canonical (overlay) coords so the fragment can test the
-                // global pinhole lattice: canon = texel/oversample + overlay origin.
-                if let Some(l) = &pill.u_quad_to_canon {
-                    let inv = 1.0 / os;
-                    let quad_to_canon = [
-                        quad_to_texel[0] * inv,
-                        quad_to_texel[1] * inv,
-                        quad_to_texel[2] * inv + dl.origin_x,
-                        quad_to_texel[3] * inv,
-                        quad_to_texel[4] * inv,
-                        quad_to_texel[5] * inv + dl.origin_y,
-                        0.0,
-                        0.0,
-                        1.0,
-                    ];
-                    gl.uniform_matrix_3_f32_slice(Some(l), false, &to_column_major(&quad_to_canon));
-                }
                 gl.uniform_4_f32_slice(
                     Some(&pill.u_color),
                     &[
@@ -1260,6 +1219,12 @@ impl GlesRenderer {
             gl.uniform_1_f32(Some(&self.u_overlay_alpha), pill_alpha.clamp(0.0, 1.0));
             gl.uniform_matrix_3_f32_slice(Some(&self.u_transform), false, &to_column_major(&full));
             gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &pill_uv);
+            // Bake compositing must NOT punch — holes happen at present. The 2D
+            // program persists `u_hole_spacing` across draws, so a prior present's
+            // value would leak in here; force it off for this baked-layer blit.
+            if let Some(l) = &self.u_hole_spacing {
+                gl.uniform_1_f32(Some(l), 0.0);
+            }
             gl.bind_texture(glow::TEXTURE_2D, Some(pill_tex));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
@@ -1273,19 +1238,6 @@ impl GlesRenderer {
             gl.vertex_attrib_pointer_f32(gp.a_pos, 2, glow::FLOAT, false, 0, 0);
             gl.uniform_1_i32(Some(&gp.u_atlas), 0);
             gl.uniform_1_f32(Some(&gp.u_text_alpha), text_alpha.clamp(0.0, 1.0));
-            // Punch the lattice through the glyphs at the pill radius so the dots
-            // land reliably and read the SCREEN under our text (the *original* ink),
-            // not our own opaque glyphs. This is what lets a small word on a plain
-            // background be monitored: its under-pill holes that fall on the original
-            // ink move when the page scrolls, where the surrounding background holes
-            // (all on the plain colour) never would. Cost: the text is lightly
-            // dotted; cheaper than leaving small labels un-monitorable.
-            if let Some(l) = &gp.u_hole_spacing {
-                gl.uniform_1_f32(Some(l), hg.spacing);
-            }
-            if let Some(l) = &gp.u_hole_radius {
-                gl.uniform_1_f32(Some(l), hg.radius);
-            }
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture));
             // Axis-aligned (screen) glyphs map ~1:1 to atlas texels, so NEAREST stays
             // crisp; the camera rotates each quad by the line angle and then H-warps
@@ -1331,23 +1283,6 @@ impl GlesRenderer {
                     false,
                     &to_column_major(&transform),
                 );
-                // Same quad→canonical map as the pills so the glyph holes land on
-                // the global lattice (canon = texel/oversample + overlay origin).
-                if let Some(l) = &gp.u_quad_to_canon {
-                    let inv = 1.0 / os;
-                    let quad_to_canon = [
-                        local_to_texel[0] * inv,
-                        local_to_texel[1] * inv,
-                        local_to_texel[2] * inv + dl.origin_x,
-                        local_to_texel[3] * inv,
-                        local_to_texel[4] * inv,
-                        local_to_texel[5] * inv + dl.origin_y,
-                        0.0,
-                        0.0,
-                        1.0,
-                    ];
-                    gl.uniform_matrix_3_f32_slice(Some(l), false, &to_column_major(&quad_to_canon));
-                }
                 gl.uniform_matrix_3_f32_slice(
                     Some(&gp.u_uv_xform),
                     false,
@@ -1374,12 +1309,24 @@ impl GlesRenderer {
              alloc={alloc_ms:.1}ms passes={passes_ms:.1}ms",
             dl.glyphs.instances.len()
         );
+        let hole = holes.unwrap_or(HoleGrid {
+            spacing: 0.0,
+            radius: 0.0,
+            alpha: 1.0,
+        });
         self.baked_overlay = Some(BakedOverlay {
             origin_x: dl.origin_x,
             origin_y: dl.origin_y,
             oversample: os,
             used_w: bw,
             used_h: bh,
+            hole_spacing: hole.spacing,
+            hole_radius: hole.radius,
+            // The old bake punched the hole into the pill layer (`hole.alpha`) which
+            // was then composited at `pill_alpha`; the present overrides the baked
+            // (solid) alpha, so fold that `pill_alpha` in here to reproduce the same
+            // captured blend (SCREEN_HOLE_FRAC) the recovery expects.
+            hole_alpha: hole.alpha * pill_alpha,
         });
         true
     }
@@ -1598,7 +1545,10 @@ impl GlesRenderer {
         let inv_os = 1.0 / baked.oversample.max(1e-3);
         let footprint = scale(baked.used_w as f32 * inv_os, baked.used_h as f32 * inv_os);
         let to_surface = translate(baked.origin_x, baked.origin_y);
-        let transform = mat3_mul(base_surface_to_clip, &mat3_mul(&to_surface, &footprint));
+        // a_pos[0,1] → canonical (overlay) coords, so the present fragment punches the
+        // pinhole lattice at display res. The full transform appends base→clip.
+        let quad_to_canon = mat3_mul(&to_surface, &footprint);
+        let transform = mat3_mul(base_surface_to_clip, &quad_to_canon);
         let uv_sub = to_column_major(&scale(
             baked.used_w as f32 / alloc_w as f32,
             baked.used_h as f32 / alloc_h as f32,
@@ -1635,6 +1585,18 @@ impl GlesRenderer {
                 &to_column_major(&transform),
             );
             gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &uv_sub);
+            if let Some(l) = &self.u_quad_to_canon {
+                gl.uniform_matrix_3_f32_slice(Some(l), false, &to_column_major(&quad_to_canon));
+            }
+            if let Some(l) = &self.u_hole_spacing {
+                gl.uniform_1_f32(Some(l), baked.hole_spacing);
+            }
+            if let Some(l) = &self.u_hole_radius {
+                gl.uniform_1_f32(Some(l), baked.hole_radius);
+            }
+            if let Some(l) = &self.u_hole_alpha {
+                gl.uniform_1_f32(Some(l), baked.hole_alpha);
+            }
             gl.bind_texture(glow::TEXTURE_2D, Some(overlay_tex));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }

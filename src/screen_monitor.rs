@@ -115,6 +115,37 @@ impl Lattice {
             .map(|(i, _)| i)
             .collect()
     }
+
+    /// Indices of the lattice points inside the detection `contour` (flattened
+    /// `[x0,y0,x1,y1,…]`). Tighter than the bounding rect — it hugs the text run, so
+    /// the hole set isn't padded with the box's background margin.
+    pub fn holes_in_polygon(&self, contour: &[f32]) -> Vec<usize> {
+        if contour.len() < 6 {
+            return Vec::new();
+        }
+        self.points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| point_in_polygon(p.x, p.y, contour))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+/// Ray-casting point-in-polygon for a flattened `[x0,y0,…]` contour.
+fn point_in_polygon(px: f32, py: f32, poly: &[f32]) -> bool {
+    let n = poly.len() / 2;
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (poly[2 * i], poly[2 * i + 1]);
+        let (xj, yj) = (poly[2 * j], poly[2 * j + 1]);
+        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 fn point_in_rect(px: f32, py: f32, r: &OrientedRect) -> bool {
@@ -127,35 +158,36 @@ fn point_in_rect(px: f32, py: f32, r: &OrientedRect) -> bool {
     lx <= r.width * 0.5 && ly <= r.height * 0.5
 }
 
+/// The correlation signal needs at least this many contour holes to be meaningful.
+const MIN_NCC_HOLES: usize = 8;
+
 /// Tunables for the classifier. Distances are in `screen_est` luma units (0..255).
+///
+/// Two signals over a box's contour holes vs baseline, OR'd: the Pearson correlation
+/// (the strong scroll/replacement signal — the whole stroke/gap pattern decorrelates;
+/// brightness-shift invariant, so a uniform background change doesn't trip it), and
+/// the hard-swing fraction (a backstop for wholesale removal — full gap↔stroke
+/// crossings). No ink classification, no variance gate.
 #[derive(Debug, Clone, Copy)]
 pub struct MonitorConfig {
-    /// Frames of stable observation after an acquire before the per-hole variance
-    /// mask is frozen. While warming up, the bootstrap (binarize) mask is used.
+    /// Frames after an acquire before a box is judged. The baseline is re-snapshotted
+    /// at the end of this window — by then the overlay has settled into the captured
+    /// mirror — so a stable overlay reads as no-change.
     pub warmup_frames: u32,
-    /// A hole whose observed luma variance is below this is treated as stable
-    /// (candidate glyph); above it the hole tracks the moving background.
-    pub glyph_var_threshold: f32,
-    /// Per-hole `|current − baseline|` luma delta that counts the hole as changed.
-    pub change_threshold: u8,
-    /// Fraction of a box's glyph holes that must change for the box to trip.
-    /// Spatial-coherence guard: a few ambiguous holes never trip a box alone.
-    pub box_coherence_frac: f32,
-    /// A box needs at least this many stable ink holes to be judged on its text.
-    /// A box that can't reach this (low-contrast / saturated recovery, no stable
-    /// strokes) falls back to the gross whole-box test below, so it can never
-    /// become an immortal pill that blocks re-OCR of its region.
-    pub min_glyph_holes: usize,
-    /// Fallback for a box with too few stable ink holes: fraction of *all* its
-    /// holes that must change vs the baseline to trip it. Higher than
-    /// [`box_coherence_frac`] so partial background motion is tolerated and only a
-    /// wholesale change (scroll / navigation / app-switch) clears it.
-    pub gross_change_frac: f32,
-    /// Fraction of *all* judged boxes' glyph holes changing at once that reads as a
-    /// scroll (the anchored text itself moved, not just the background).
+    /// Per-hole `|current − baseline|` luma delta that counts as a *hard* swing. High
+    /// enough that coherent video motion doesn't cross it, low enough that a gap↔stroke
+    /// crossing does.
+    pub hard_threshold: u8,
+    /// Fraction of a box's holes that must swing hard for the hard-count to trip.
+    pub hard_frac: f32,
+    /// Trip when the correlation of current vs baseline over the contour holes falls
+    /// below this — the text pattern has been replaced or scrolled away.
+    pub min_corr: f32,
+    /// Fraction of judged boxes tripping at once that reads as a scroll (anchored text
+    /// moving together) rather than a per-box edit.
     pub scroll_frac: f32,
-    /// Scroll needs at least this many judgeable boxes — a single box can't be told
-    /// apart from an in-place text change, so we don't try.
+    /// Scroll needs at least this many judged boxes — a single box can't be told apart
+    /// from an in-place text change.
     pub scroll_min_boxes: usize,
 }
 
@@ -163,11 +195,9 @@ impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
             warmup_frames: 6,
-            glyph_var_threshold: 50.0,
-            change_threshold: 40,
-            box_coherence_frac: 0.4,
-            min_glyph_holes: 4,
-            gross_change_frac: 0.7,
+            hard_threshold: 110,
+            hard_frac: 0.25,
+            min_corr: 0.5,
             scroll_frac: 0.7,
             scroll_min_boxes: 2,
         }
@@ -186,163 +216,126 @@ pub enum FrameClassification {
     BoxesChanged(Vec<u64>),
 }
 
-/// Welford running mean/variance for one lattice hole. Accumulated only during a
-/// box's warmup window so a later text change can't corrupt the frozen mask.
-#[derive(Clone, Default)]
-struct HoleStats {
-    count: u32,
-    mean: f32,
-    m2: f32,
-}
-
-impl HoleStats {
-    fn observe(&mut self, x: f32) {
-        self.count += 1;
-        let delta = x - self.mean;
-        self.mean += delta / self.count as f32;
-        self.m2 += delta * (x - self.mean);
-    }
-
-    fn variance(&self) -> f32 {
-        if self.count < 2 {
-            return 0.0;
-        }
-        self.m2 / self.count as f32
-    }
-}
-
 struct BoxMonitor {
     id: u64,
-    /// Lattice indices inside this box's region.
+    /// Lattice indices inside this box's contour. Parallel to `baseline`.
     holes: Vec<usize>,
-    /// `screen_est` at the last acquire, parallel to `holes`. The change baseline.
+    /// `screen_est` baseline, re-snapshotted at warmup end.
     baseline: Vec<u8>,
-    /// Appearance mask from binarizing the clean crop, parallel to `holes`. Used
-    /// until the variance mask is frozen.
-    bootstrap_glyph: Vec<bool>,
-    /// Frozen behaviour∩appearance mask, parallel to `holes`. `None` during warmup.
-    learned_glyph: Option<Vec<bool>>,
     /// Frames observed since the baseline was set.
     frames: u32,
 }
 
 impl BoxMonitor {
-    fn effective_glyph(&self) -> &[bool] {
-        match &self.learned_glyph {
-            Some(m) => m,
-            None => &self.bootstrap_glyph,
+    /// Two signals over the box's contour holes vs the baseline: the hard-swing
+    /// fraction (`|Δ| > hard_threshold`) and the Pearson correlation. Either tripping
+    /// = changed. NCC is the strong scroll/replacement signal (and brightness-shift
+    /// invariant, so a uniform background brighten doesn't trip it); the hard count is
+    /// a backstop for wholesale removal. Not judged until warmup elapses (baseline
+    /// re-snapshotted at warmup end, once the overlay has settled into the mirror).
+    fn deviation(&self, samples: &[u8], cfg: &MonitorConfig) -> BoxDeviation {
+        if self.frames < cfg.warmup_frames || self.holes.is_empty() {
+            return BoxDeviation::not_judged(self.id);
+        }
+        let mut hard = 0usize;
+        let mut max_delta = 0u32;
+        let (mut sb, mut sc, mut sbb, mut scc, mut sbc) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
+        for (k, &h) in self.holes.iter().enumerate() {
+            let delta = (samples[h] as i32 - self.baseline[k] as i32).unsigned_abs();
+            max_delta = max_delta.max(delta);
+            if delta > cfg.hard_threshold as u32 {
+                hard += 1;
+            }
+            let (b, c) = (self.baseline[k] as f64, samples[h] as f64);
+            sb += b;
+            sc += c;
+            sbb += b * b;
+            scc += c * c;
+            sbc += b * c;
+        }
+        BoxDeviation {
+            id: self.id,
+            holes: self.holes.len(),
+            frac: hard as f32 / self.holes.len() as f32,
+            corr: pearson(self.holes.len(), sb, sc, sbb, scc, sbc),
+            max_delta,
+            judged: true,
         }
     }
+}
 
-    fn deviation(&self, samples: &[u8], cfg: &MonitorConfig) -> BoxDeviation {
-        // Not judged until warmup completes: a freshly-added box's baseline is
-        // captured before our overlay has settled into the captured mirror, so
-        // trusting it early reads the overlay appearing as a "change" (self-trip).
-        if self.learned_glyph.is_none() {
-            return BoxDeviation {
-                id: self.id,
-                glyph_holes: 0,
-                deviating: 0,
-                gross: false,
-                max_delta: 0,
-            };
-        }
-        let mask = self.effective_glyph();
-        let mut ink_holes = 0usize;
-        let mut ink_dev = 0usize;
-        let mut all_dev = 0usize;
-        let mut max_delta = 0u32;
-        for (k, &hi) in self.holes.iter().enumerate() {
-            let delta = (samples[hi] as i32 - self.baseline[k] as i32).unsigned_abs();
-            max_delta = max_delta.max(delta);
-            let changed = delta > cfg.change_threshold as u32;
-            if changed {
-                all_dev += 1;
-            }
-            if mask[k] {
-                ink_holes += 1;
-                if changed {
-                    ink_dev += 1;
-                }
-            }
-        }
-        if ink_holes >= cfg.min_glyph_holes {
-            BoxDeviation {
-                id: self.id,
-                glyph_holes: ink_holes,
-                deviating: ink_dev,
-                gross: false,
-                max_delta,
-            }
-        } else {
-            // No stable text strokes to track (low-contrast / saturated recovery):
-            // fall back to a whole-box change test so the box can still be cleared
-            // and never becomes an immortal pill blocking re-OCR of its region.
-            BoxDeviation {
-                id: self.id,
-                glyph_holes: self.holes.len(),
-                deviating: all_dev,
-                gross: true,
-                max_delta,
-            }
-        }
+/// Pearson correlation of (baseline, current) over `n` holes from running sums. A
+/// constant baseline (no pattern) returns 1.0 → the hard-count carries it, not this.
+fn pearson(n: usize, sb: f64, sc: f64, sbb: f64, scc: f64, sbc: f64) -> f32 {
+    if n < 2 {
+        return 1.0;
+    }
+    let nf = n as f64;
+    let cov = sbc - sb * sc / nf;
+    let vb = sbb - sb * sb / nf;
+    let vc = scc - sc * sc / nf;
+    let denom = (vb * vc).sqrt();
+    if denom < 1e-3 {
+        1.0
+    } else {
+        (cov / denom).clamp(-1.0, 1.0) as f32
     }
 }
 
 struct BoxDeviation {
     id: u64,
-    glyph_holes: usize,
-    deviating: usize,
-    /// Judged on all holes (no stable ink strokes) rather than on the glyph mask.
-    gross: bool,
-    /// Largest single-hole `|current − baseline|` over the box, for debugging: ~0
-    /// means the box reads a constant (recovery isn't tracking the screen there);
-    /// moderate-but-under-threshold means the per-hole threshold is too high.
+    /// Contour holes this box has (for the correlation's min-holes guard).
+    holes: usize,
+    /// Fraction of holes swinging hard this frame.
+    frac: f32,
+    /// Pearson correlation of current vs baseline over the holes.
+    corr: f32,
+    /// Largest single-hole `|current − baseline|`, for debug.
     max_delta: u32,
+    /// False while the box is still in its warmup window.
+    judged: bool,
 }
 
 impl BoxDeviation {
-    fn judgeable(&self, cfg: &MonitorConfig) -> bool {
-        self.glyph_holes >= cfg.min_glyph_holes
+    fn not_judged(id: u64) -> Self {
+        BoxDeviation {
+            id,
+            holes: 0,
+            frac: 0.0,
+            corr: 1.0,
+            max_delta: 0,
+            judged: false,
+        }
     }
 
     fn changed(&self, cfg: &MonitorConfig) -> bool {
-        let frac = if self.gross {
-            cfg.gross_change_frac
-        } else {
-            cfg.box_coherence_frac
-        };
-        self.judgeable(cfg) && self.deviating as f32 >= frac * self.glyph_holes as f32
+        self.judged
+            && (self.frac > cfg.hard_frac
+                || (self.holes >= MIN_NCC_HOLES && self.corr < cfg.min_corr))
     }
 }
 
-/// Holds the resident box state + per-hole stats and classifies each frame.
-/// Stateful shell around the pure [`classify`] core: `observe` updates the
-/// running stats, then defers the decision to `classify`.
+/// Holds the resident box state and classifies each frame. Stateful shell around the
+/// pure [`classify`] core.
 pub struct ScreenMonitor {
     lattice: Lattice,
-    stats: Vec<HoleStats>,
     boxes: Vec<BoxMonitor>,
     cfg: MonitorConfig,
-    /// Diagnostic summary of the last `observe`: (judgeable boxes, total glyph
-    /// holes across them, total deviating). If glyph holes collapse to ~0 after
-    /// warmup, the variance mask is dropping everything (recovery too noisy).
+    /// Diagnostic summary of the last `observe`: (judged boxes, changed boxes, max
+    /// hard-fraction across boxes, as a percent).
     last_stats: (usize, usize, usize),
-    /// The judged box with the highest deviating fraction last observe:
-    /// (id, glyph_holes, deviating). Lets us see a subtitle box's own fraction
-    /// rather than the totals (which dilute it across stable boxes).
+    /// The judged box with the highest hard-fraction last observe:
+    /// (id, holes, hard_fraction_pct).
     last_top: Option<(u64, usize, usize)>,
-    /// Per-box `(id, monitored_holes, deviating, gross, max_delta)` from the last
-    /// observe, for debug logging joined with each block's text.
-    last_devs: Vec<(u64, usize, usize, bool, u32)>,
+    /// Per-box `(id, holes, hard_frac_pct, max_delta, changed)` from the last observe,
+    /// for debug logging joined with each block's text.
+    last_devs: Vec<(u64, usize, usize, u32, i32, bool)>,
 }
 
 impl ScreenMonitor {
     pub fn new(lattice: Lattice, cfg: MonitorConfig) -> Self {
-        let stats = vec![HoleStats::default(); lattice.len()];
         ScreenMonitor {
             lattice,
-            stats,
             boxes: Vec::new(),
             cfg,
             last_stats: (0, 0, 0),
@@ -351,18 +344,18 @@ impl ScreenMonitor {
         }
     }
 
-    /// Per-box `(id, monitored_holes, deviating, gross, max_delta)` from last observe.
-    pub fn debug_boxes(&self) -> &[(u64, usize, usize, bool, u32)] {
+    /// Per-box `(id, holes, hard_frac_pct, max_delta, changed)` from last observe.
+    pub fn debug_boxes(&self) -> &[(u64, usize, usize, u32, i32, bool)] {
         &self.last_devs
     }
 
-    /// (judgeable boxes, total glyph holes, total deviating) from the last observe.
+    /// (judged boxes, changed boxes, max hard-fraction pct) from the last observe.
     pub fn debug_last_stats(&self) -> (usize, usize, usize) {
         self.last_stats
     }
 
-    /// The judged box with the highest deviating fraction last observe:
-    /// (id, glyph_holes, deviating).
+    /// The judged box with the highest hard-fraction last observe:
+    /// (id, holes, hard_frac_pct).
     pub fn debug_top_box(&self) -> Option<(u64, usize, usize)> {
         self.last_top
     }
@@ -371,39 +364,20 @@ impl ScreenMonitor {
         &self.lattice
     }
 
-    /// Register or replace a box after an acquire. `holes` and `bootstrap_glyph`
-    /// must be the same length and in the same order (the caller gets `holes` from
-    /// [`Lattice::holes_in_rect`] and samples its binarized crop at those points);
-    /// `clean_samples` is the full-lattice `screen_est` of the clean read, from
-    /// which the per-hole baseline is snapshotted. Resets the variance for this
-    /// box's holes so the glyph mask is relearned for the new text.
-    pub fn set_box(
-        &mut self,
-        id: u64,
-        holes: Vec<usize>,
-        bootstrap_glyph: Vec<bool>,
-        clean_samples: &[u8],
-    ) {
-        assert_eq!(
-            holes.len(),
-            bootstrap_glyph.len(),
-            "holes and bootstrap_glyph must align"
-        );
+    /// Register or replace a box after an acquire. `holes` are the lattice indices
+    /// inside the box's contour; `clean_samples` is the full-lattice `screen_est` of
+    /// the clean read, from which the per-hole baseline is snapshotted.
+    pub fn set_box(&mut self, id: u64, holes: Vec<usize>, clean_samples: &[u8]) {
         assert_eq!(
             clean_samples.len(),
             self.lattice.len(),
             "clean_samples must cover the whole lattice"
         );
-        let baseline = holes.iter().map(|&h| clean_samples[h]).collect();
-        for &h in &holes {
-            self.stats[h] = HoleStats::default();
-        }
+        let baseline: Vec<u8> = holes.iter().map(|&h| clean_samples[h]).collect();
         let monitor = BoxMonitor {
             id,
             holes,
             baseline,
-            bootstrap_glyph,
-            learned_glyph: None,
             frames: 0,
         };
         match self.boxes.iter_mut().find(|b| b.id == id) {
@@ -440,37 +414,19 @@ impl ScreenMonitor {
     }
 
     /// One monitoring frame. `samples` is the recovered `screen_est`, one byte per
-    /// lattice point in `points()` order. Updates per-hole variance, freezes any
-    /// box whose warmup just elapsed, then classifies.
+    /// lattice point in `points()` order.
     pub fn observe(&mut self, samples: &[u8]) -> FrameClassification {
         assert_eq!(
             samples.len(),
             self.lattice.len(),
             "samples must cover the whole lattice"
         );
-        for (stat, &s) in self.stats.iter_mut().zip(samples) {
-            stat.observe(s as f32);
-        }
-        // Disjoint field borrows: variance is read off `stats` while `boxes` is
-        // mutated. The intersection (appearance ∩ stability) drops both video
-        // misread as ink (high variance) and stable non-ink like bar gaps (not in
-        // the bootstrap).
-        let stats = &self.stats;
-        let cfg = &self.cfg;
+        let cfg = self.cfg;
         for b in self.boxes.iter_mut() {
             b.frames += 1;
-            if b.learned_glyph.is_none() && b.frames >= cfg.warmup_frames {
-                let learned = b
-                    .holes
-                    .iter()
-                    .zip(&b.bootstrap_glyph)
-                    .map(|(&h, &boot)| boot && stats[h].variance() < cfg.glyph_var_threshold)
-                    .collect();
-                b.learned_glyph = Some(learned);
-                // Re-baseline to the now-settled frame: the initial baseline was
-                // captured before our overlay reached the captured mirror, so it
-                // held source where the overlay now sits. Snapshot current so a
-                // stable overlay reads as no-change.
+            // Re-baseline once, at warmup end: the initial baseline was captured before
+            // our overlay reached the captured mirror, so snapshot the now-settled frame.
+            if b.frames == cfg.warmup_frames {
                 for (k, &h) in b.holes.iter().enumerate() {
                     b.baseline[k] = samples[h];
                 }
@@ -479,52 +435,56 @@ impl ScreenMonitor {
         let devs: Vec<BoxDeviation> = self
             .boxes
             .iter()
-            .map(|b| b.deviation(samples, cfg))
+            .map(|b| b.deviation(samples, &cfg))
             .collect();
-        let judged = devs.iter().filter(|d| d.judgeable(cfg)).count();
-        let total_glyph: usize = devs.iter().map(|d| d.glyph_holes).sum();
-        let total_dev: usize = devs.iter().map(|d| d.deviating).sum();
-        self.last_stats = (judged, total_glyph, total_dev);
+        let judged = devs.iter().filter(|d| d.judged).count();
+        let changed_n = devs.iter().filter(|d| d.changed(&cfg)).count();
+        let max_frac = devs.iter().map(|d| d.frac).fold(0.0f32, f32::max);
+        self.last_stats = (judged, changed_n, (max_frac * 100.0).round() as usize);
         self.last_top = devs
             .iter()
-            .filter(|d| d.judgeable(cfg))
-            .max_by(|a, b| {
-                let fa = a.deviating as f32 / a.glyph_holes.max(1) as f32;
-                let fb = b.deviating as f32 / b.glyph_holes.max(1) as f32;
-                fa.total_cmp(&fb)
-            })
-            .map(|d| (d.id, d.glyph_holes, d.deviating));
-        self.last_devs = devs
+            .filter(|d| d.judged)
+            .max_by(|a, b| a.frac.total_cmp(&b.frac))
+            .map(|d| {
+                let holes = self.boxes.iter().find(|b| b.id == d.id).map_or(0, |b| b.holes.len());
+                (d.id, holes, (d.frac * 100.0).round() as usize)
+            });
+        self.last_devs = self
+            .boxes
             .iter()
-            .map(|d| (d.id, d.glyph_holes, d.deviating, d.gross, d.max_delta))
+            .zip(&devs)
+            .map(|(b, d)| {
+                (
+                    d.id,
+                    b.holes.len(),
+                    (d.frac * 100.0).round() as usize,
+                    d.max_delta,
+                    (d.corr * 100.0).round() as i32,
+                    d.changed(&cfg),
+                )
+            })
             .collect();
-        classify(&devs, cfg)
+        classify(&devs, &cfg)
     }
 }
 
 /// Pure decision from the per-box deviations. Scroll is tested first (anchored
 /// text across many boxes all moving at once), then per-box change.
 fn classify(devs: &[BoxDeviation], cfg: &MonitorConfig) -> FrameClassification {
-    // Scroll is an ink-hole signal (anchored strokes moving together); gross boxes
-    // have no strokes to anchor, so they only ever contribute via per-box `changed`
-    // (which the pipeline escalates to a drop-all when enough boxes trip at once).
-    let judged: Vec<&BoxDeviation> = devs
-        .iter()
-        .filter(|d| d.judgeable(cfg) && !d.gross)
-        .collect();
-    let total_glyph: usize = judged.iter().map(|d| d.glyph_holes).sum();
-    let total_dev: usize = judged.iter().map(|d| d.deviating).sum();
-    if judged.len() >= cfg.scroll_min_boxes
-        && total_glyph > 0
-        && total_dev as f32 >= cfg.scroll_frac * total_glyph as f32
-    {
-        return FrameClassification::Scroll;
-    }
+    let judged = devs.iter().filter(|d| d.judged).count();
     let changed: Vec<u64> = devs
         .iter()
         .filter(|d| d.changed(cfg))
         .map(|d| d.id)
         .collect();
+    // Many boxes changing together is the whole view moving (scroll / navigation),
+    // not a per-pill edit.
+    if changed.len() >= cfg.scroll_min_boxes
+        && judged > 0
+        && changed.len() as f32 >= cfg.scroll_frac * judged as f32
+    {
+        return FrameClassification::Scroll;
+    }
     if changed.is_empty() {
         FrameClassification::Quiet
     } else {
@@ -536,8 +496,8 @@ fn classify(devs: &[BoxDeviation], cfg: &MonitorConfig) -> FrameClassification {
 mod tests {
     use super::*;
 
-    const GLYPH: u8 = 230; // opaque white stroke
     const BG: u8 = 100; // resting background luma
+    const HARD: u8 = 255; // a full swing vs BG (delta 155 > hard_threshold)
 
     fn rect(cx: f32, cy: f32, w: f32, h: f32) -> OrientedRect {
         OrientedRect {
@@ -549,8 +509,6 @@ mod tests {
         }
     }
 
-    /// Full-lattice sample buffer at `default`, with the listed (index, value)
-    /// overrides applied.
     fn samples(len: usize, default: u8, overrides: &[(usize, u8)]) -> Vec<u8> {
         let mut v = vec![default; len];
         for &(i, val) in overrides {
@@ -562,283 +520,179 @@ mod tests {
     fn cfg() -> MonitorConfig {
         MonitorConfig {
             warmup_frames: 4,
-            glyph_var_threshold: 50.0,
-            change_threshold: 40,
-            box_coherence_frac: 0.4,
-            min_glyph_holes: 3,
-            gross_change_frac: 0.7,
+            hard_threshold: 110,
+            hard_frac: 0.25,
+            min_corr: 0.5,
             scroll_frac: 0.7,
             scroll_min_boxes: 2,
         }
     }
 
-    #[test]
-    fn lattice_grid_and_membership() {
-        let lat = Lattice::build(100, 100, 10);
-        assert_eq!(lat.len(), 100); // 10×10 centred points
-        // A band covering y∈[70,90], x∈[10,90].
-        let band = rect(50.0, 80.0, 80.0, 20.0);
-        let holes = lat.holes_in_rect(&band);
-        // x ∈ {15..85} = 8 columns, y ∈ {75,85} = 2 rows.
-        assert_eq!(holes.len(), 16);
-        for &h in &holes {
-            let p = lat.points()[h];
-            assert!(p.x >= 10.0 && p.x <= 90.0 && p.y >= 70.0 && p.y <= 90.0);
+    fn warm(mon: &mut ScreenMonitor, clean: &[u8]) {
+        for _ in 0..cfg().warmup_frames + 1 {
+            mon.observe(clean);
         }
     }
 
-    #[test]
-    fn hole_variance_separates_stable_from_moving() {
-        let mut stable = HoleStats::default();
-        let mut moving = HoleStats::default();
-        for f in 0..8 {
-            stable.observe(GLYPH as f32);
-            moving.observe(if f % 2 == 0 { 60.0 } else { 200.0 });
-        }
-        assert!(stable.variance() < 1.0);
-        assert!(moving.variance() > 50.0);
-    }
-
-    /// Split a box's holes into a glyph half and a background half. Returns
-    /// `(all_holes, glyph_holes, video_holes, bootstrap)` where `bootstrap` is the
-    /// glyph mask aligned to `all_holes`.
-    fn split_box(
-        lat: &Lattice,
-        r: &OrientedRect,
-    ) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<bool>) {
-        let all = lat.holes_in_rect(r);
-        let half = all.len() / 2;
-        let glyph: Vec<usize> = all[..half].to_vec();
-        let video: Vec<usize> = all[half..].to_vec();
-        let bootstrap: Vec<bool> = (0..all.len()).map(|k| k < half).collect();
-        (all, glyph, video, bootstrap)
-    }
-
-    fn clean_frame(lat: &Lattice, glyph_holes: &[usize]) -> Vec<u8> {
+    /// A frame (over a `BG` field) where `frac` of `holes` swing hard to `HARD`.
+    fn swing(len: usize, holes: &[usize], frac: f32) -> Vec<u8> {
+        let n = (holes.len() as f32 * frac).round() as usize;
         samples(
-            lat.len(),
+            len,
             BG,
-            &glyph_holes.iter().map(|&h| (h, GLYPH)).collect::<Vec<_>>(),
+            &holes[..n.min(holes.len())]
+                .iter()
+                .map(|&h| (h, HARD))
+                .collect::<Vec<_>>(),
         )
     }
 
     #[test]
-    fn subtitle_text_change_trips_only_its_box() {
+    fn lattice_grid_and_membership() {
         let lat = Lattice::build(100, 100, 10);
-        let sub = rect(50.0, 80.0, 80.0, 20.0);
-        let (all, glyph, video, boot) = split_box(&lat, &sub);
-        let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = clean_frame(mon.lattice(), &glyph);
-        mon.set_box(1, all, boot, &clean);
+        assert_eq!(lat.len(), 100);
+        let band = rect(50.0, 80.0, 80.0, 20.0);
+        let holes = lat.holes_in_rect(&band);
+        assert_eq!(holes.len(), 16);
+    }
 
-        // A square moving outside the box, plus video flicker on the box's
-        // background holes — text held steady. Always Quiet.
-        for f in 0..8 {
-            let mut ovr: Vec<(usize, u8)> = glyph.iter().map(|&h| (h, GLYPH)).collect();
-            for (j, &h) in video.iter().enumerate() {
-                ovr.push((h, if (f + j) % 2 == 0 { 70 } else { 150 }));
-            }
-            ovr.push((0, if f % 2 == 0 { 30 } else { 220 })); // square, far from box
-            let s = samples(mon.lattice().len(), BG, &ovr);
-            assert_eq!(
-                mon.observe(&s),
-                FrameClassification::Quiet,
-                "frame {f}: only background/square moved"
-            );
+    #[test]
+    fn holes_in_polygon_hugs_the_contour() {
+        let lat = Lattice::build(100, 100, 10);
+        // A diamond centred at (50,50): its bounding rect includes corners the polygon
+        // excludes, so the polygon hole set is strictly smaller.
+        let diamond = [50.0, 20.0, 80.0, 50.0, 50.0, 80.0, 20.0, 50.0];
+        let poly = lat.holes_in_polygon(&diamond);
+        let bbox = lat.holes_in_rect(&rect(50.0, 50.0, 60.0, 60.0));
+        assert!(!poly.is_empty());
+        assert!(poly.len() < bbox.len(), "polygon excludes the rect corners");
+        for &h in &poly {
+            let p = lat.points()[h];
+            assert!((p.x - 50.0).abs() + (p.y - 50.0).abs() <= 30.5);
         }
+    }
 
-        // Subtitle advances: the glyph holes now read background — large delta on
-        // every glyph hole.
-        let changed = samples(
-            mon.lattice().len(),
-            BG,
-            &glyph.iter().map(|&h| (h, 50)).collect::<Vec<_>>(),
-        );
+    #[test]
+    fn static_and_moderate_drift_held() {
+        let lat = Lattice::build(100, 100, 10);
+        let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
+        let mut mon = ScreenMonitor::new(lat, cfg());
+        let clean = vec![BG; mon.lattice().len()];
+        mon.set_box(1, holes, &clean);
+        warm(&mut mon, &clean);
+        // Unchanged.
+        assert_eq!(mon.observe(&clean), FrameClassification::Quiet);
+        // Uniform moderate shift (delta 50 < hard 110) — background brightening or
+        // temporally-coherent video — never crosses the hard threshold → held.
         assert_eq!(
-            mon.observe(&changed),
-            FrameClassification::BoxesChanged(vec![1])
+            mon.observe(&vec![150u8; mon.lattice().len()]),
+            FrameClassification::Quiet,
         );
     }
 
     #[test]
-    fn moving_background_never_trips_a_still_subtitle() {
+    fn hard_swing_fraction_trips() {
         let lat = Lattice::build(100, 100, 10);
-        let sub = rect(50.0, 80.0, 80.0, 20.0);
-        let (all, glyph, video, boot) = split_box(&lat, &sub);
+        let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
+        let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = clean_frame(mon.lattice(), &glyph);
-        mon.set_box(1, all, boot, &clean);
-
-        for f in 0..30 {
-            let mut ovr: Vec<(usize, u8)> = glyph.iter().map(|&h| (h, GLYPH)).collect();
-            for (j, &h) in video.iter().enumerate() {
-                // Wide-swinging background, never the text.
-                ovr.push((h, ((f * 37 + j * 53) % 256) as u8));
-            }
-            let s = samples(mon.lattice().len(), BG, &ovr);
-            assert_eq!(mon.observe(&s), FrameClassification::Quiet, "frame {f}");
-        }
-    }
-
-    #[test]
-    fn learned_mask_drops_video_holes_the_bootstrap_misread_as_ink() {
-        // Bootstrap marks ALL of the box's holes as glyph, but half of them are
-        // actually moving background. After warmup, variance must drop those, so a
-        // pure-background frame is Quiet (it would have tripped on the bootstrap).
-        let lat = Lattice::build(100, 100, 10);
-        let sub = rect(50.0, 80.0, 80.0, 20.0);
-        let all = lat.holes_in_rect(&sub);
-        let half = all.len() / 2;
-        let real_glyph: Vec<usize> = all[..half].to_vec();
-        let video: Vec<usize> = all[half..].to_vec();
-        let boot = vec![true; all.len()]; // appearance says everything is ink
-
-        let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = clean_frame(mon.lattice(), &real_glyph); // video holes baseline = BG
-        mon.set_box(1, all, boot, &clean);
-
-        // Warm up: real glyph steady at GLYPH, video holes swing hard.
-        for f in 0..cfg().warmup_frames as usize {
-            let mut ovr: Vec<(usize, u8)> = real_glyph.iter().map(|&h| (h, GLYPH)).collect();
-            for (j, &h) in video.iter().enumerate() {
-                ovr.push((h, ((f * 41 + j * 17) % 256) as u8));
-            }
-            let s = samples(mon.lattice().len(), BG, &ovr);
-            mon.observe(&s);
-        }
-
-        // Post-warmup background-only swing: the learned mask has excluded the
-        // video holes, so the steady real glyph keeps it Quiet.
-        for f in 0..10 {
-            let mut ovr: Vec<(usize, u8)> = real_glyph.iter().map(|&h| (h, GLYPH)).collect();
-            for (j, &h) in video.iter().enumerate() {
-                ovr.push((h, ((f * 91 + j * 7) % 256) as u8));
-            }
-            let s = samples(mon.lattice().len(), BG, &ovr);
-            assert_eq!(mon.observe(&s), FrameClassification::Quiet, "frame {f}");
-        }
-    }
-
-    #[test]
-    fn all_boxes_moving_together_is_a_scroll() {
-        let lat = Lattice::build(100, 100, 10);
-        let b1 = rect(50.0, 30.0, 80.0, 20.0);
-        let b2 = rect(50.0, 70.0, 80.0, 20.0);
-        let (all1, g1, _v1, boot1) = split_box(&lat, &b1);
-        let (all2, g2, _v2, boot2) = split_box(&lat, &b2);
-        let mut mon = ScreenMonitor::new(lat, cfg());
-        let mut clean = clean_frame(mon.lattice(), &g1);
-        for &h in &g2 {
-            clean[h] = GLYPH;
-        }
-        mon.set_box(1, all1, boot1, &clean);
-        mon.set_box(2, all2, boot2, &clean);
-
-        // Hold steady through warmup so the glyph mask freezes on stable frames.
-        for _ in 0..cfg().warmup_frames {
-            assert_eq!(mon.observe(&clean), FrameClassification::Quiet);
-        }
-
-        // Everything translates: every glyph hole in both boxes now reads
-        // background.
-        let mut scrolled = vec![BG; mon.lattice().len()];
-        for &h in g1.iter().chain(&g2) {
-            scrolled[h] = 40;
-        }
-        assert_eq!(mon.observe(&scrolled), FrameClassification::Scroll);
-    }
-
-    #[test]
-    fn one_box_changing_among_many_is_not_a_scroll() {
-        let lat = Lattice::build(100, 100, 10);
-        let b1 = rect(50.0, 30.0, 80.0, 20.0);
-        let b2 = rect(50.0, 70.0, 80.0, 20.0);
-        let (all1, g1, _v1, boot1) = split_box(&lat, &b1);
-        let (all2, g2, _v2, boot2) = split_box(&lat, &b2);
-        let mut mon = ScreenMonitor::new(lat, cfg());
-        let mut clean = clean_frame(mon.lattice(), &g1);
-        for &h in &g2 {
-            clean[h] = GLYPH;
-        }
-        mon.set_box(1, all1, boot1, &clean);
-        mon.set_box(2, all2, boot2, &clean);
-        // Warm up so the boxes are judged (and re-baselined to the stable frame).
-        for _ in 0..cfg().warmup_frames + 1 {
-            mon.observe(&clean);
-        }
-
-        // Only box 1's text changes; box 2 holds.
-        let mut frame = clean.clone();
-        for &h in &g1 {
-            frame[h] = 40;
-        }
+        let clean = vec![BG; mon.lattice().len()];
+        mon.set_box(1, holes.clone(), &clean);
+        warm(&mut mon, &clean);
+        // A few hard holes (a moving video edge) — below the fraction → held.
         assert_eq!(
-            mon.observe(&frame),
-            FrameClassification::BoxesChanged(vec![1])
+            mon.observe(&swing(len, &holes, 0.10)),
+            FrameClassification::Quiet,
+        );
+        // Many holes swing hard (a scroll sweeping gap↔stroke) → trip.
+        assert_eq!(
+            mon.observe(&swing(len, &holes, 0.40)),
+            FrameClassification::BoxesChanged(vec![1]),
         );
     }
 
     #[test]
-    fn re_acquire_resets_baseline_and_relearns() {
+    fn all_boxes_swinging_hard_is_a_scroll() {
         let lat = Lattice::build(100, 100, 10);
-        let sub = rect(50.0, 80.0, 80.0, 20.0);
-        let (all, glyph, _video, boot) = split_box(&lat, &sub);
+        let h1 = lat.holes_in_rect(&rect(30.0, 30.0, 40.0, 40.0));
+        let h2 = lat.holes_in_rect(&rect(70.0, 70.0, 40.0, 40.0));
+        let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
+        let clean = vec![BG; mon.lattice().len()];
+        mon.set_box(1, h1.clone(), &clean);
+        mon.set_box(2, h2.clone(), &clean);
+        warm(&mut mon, &clean);
 
-        let clean_a = clean_frame(mon.lattice(), &glyph);
-        mon.set_box(1, all.clone(), boot.clone(), &clean_a);
-        mon.observe(&clean_a);
+        let mut f = clean.clone();
+        for &h in &h1[..(h1.len() * 2 / 5)] {
+            f[h] = HARD;
+        }
+        for &h in &h2[..(h2.len() * 2 / 5)] {
+            f[h] = HARD;
+        }
+        assert_eq!(mon.observe(&f), FrameClassification::Scroll);
+    }
 
-        // New text after the targeted re-OCR: new baseline where glyph holes read
-        // a different stroke value. Observing that same frame is then Quiet.
-        let clean_b = samples(
-            mon.lattice().len(),
-            BG,
-            &glyph.iter().map(|&h| (h, 50)).collect::<Vec<_>>(),
-        );
-        mon.set_box(1, all, boot, &clean_b);
+    #[test]
+    fn one_box_swinging_is_per_box_not_scroll() {
+        let lat = Lattice::build(100, 100, 10);
+        let h1 = lat.holes_in_rect(&rect(30.0, 30.0, 40.0, 40.0));
+        let h2 = lat.holes_in_rect(&rect(70.0, 70.0, 40.0, 40.0));
+        let mut mon = ScreenMonitor::new(lat, cfg());
+        let clean = vec![BG; mon.lattice().len()];
+        mon.set_box(1, h1.clone(), &clean);
+        mon.set_box(2, h2.clone(), &clean);
+        warm(&mut mon, &clean);
+
+        let mut f = clean.clone();
+        for &h in &h1[..(h1.len() * 2 / 5)] {
+            f[h] = HARD;
+        }
+        assert_eq!(mon.observe(&f), FrameClassification::BoxesChanged(vec![1]));
+    }
+
+    #[test]
+    fn re_acquire_resets_baseline() {
+        let lat = Lattice::build(100, 100, 10);
+        let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
+        let len = lat.len();
+        let mut mon = ScreenMonitor::new(lat, cfg());
+        let clean_a = vec![BG; len];
+        mon.set_box(1, holes.clone(), &clean_a);
+        warm(&mut mon, &clean_a);
+
+        // New content after re-OCR (half the holes now bright): re-baseline, then the
+        // same frame reads as no-change.
+        let clean_b = swing(len, &holes, 0.5);
+        mon.set_box(1, holes, &clean_b);
+        warm(&mut mon, &clean_b);
         assert_eq!(mon.observe(&clean_b), FrameClassification::Quiet);
     }
 
     #[test]
-    fn box_without_ink_holes_still_clears_on_a_wholesale_change() {
-        // A box whose recovered content has no stable strokes (bootstrap marks
-        // nothing as ink) learns zero glyph holes. Without the gross-change
-        // fallback it could never trip → an immortal pill that blocks its region.
-        // With it: stays put while unchanged, tolerates partial motion, and is
-        // cleared by a wholesale change (scroll / app-switch).
+    fn similar_luma_reshuffle_trips_via_correlation() {
+        // Low-contrast text (ink 60 / bg 120, Δ60 < hard_threshold) replaced by
+        // different text: no hole swings hard (count = 0), but the pattern reshuffles
+        // so the correlation collapses → NCC trips.
         let lat = Lattice::build(100, 100, 10);
-        let region = rect(50.0, 50.0, 80.0, 80.0);
-        let all = lat.holes_in_rect(&region);
-        assert!(all.len() >= 8, "need enough holes to exercise fractions");
-        let boot = vec![false; all.len()]; // appearance says nothing is ink
+        let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
+        let n = holes.len();
+        let k = n / 5;
+        let ink = holes[..k].to_vec();
+        let other = holes[k..2 * k].to_vec();
+        let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = vec![BG; mon.lattice().len()];
-        mon.set_box(1, all.clone(), boot, &clean);
+        let clean = samples(len, 120, &ink.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>());
+        mon.set_box(1, holes, &clean);
+        warm(&mut mon, &clean);
 
-        // Warm up on the stable clean frame: must never trip during warmup.
-        for _ in 0..cfg().warmup_frames + 1 {
-            assert_eq!(mon.observe(&clean), FrameClassification::Quiet);
-        }
-
-        // Same content: stays put (the translated label must persist).
-        assert_eq!(mon.observe(&clean), FrameClassification::Quiet);
-
-        // Partial change (a third of the holes) — below gross_change_frac: tolerated.
-        let mut partial = clean.clone();
-        for &h in all.iter().take(all.len() / 3) {
-            partial[h] = 240;
-        }
-        assert_eq!(mon.observe(&partial), FrameClassification::Quiet);
-
-        // Wholesale change (every hole) — a scene swap: clear the box.
-        let mut swapped = vec![BG; mon.lattice().len()];
-        for &h in &all {
-            swapped[h] = 240;
-        }
+        // The "60" content moves from `ink` holes to `other` holes — every Δ is 60
+        // (< hard_threshold 110), so the hard count is zero, but the pattern inverts.
+        let moved = samples(len, 120, &other.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>());
         assert_eq!(
-            mon.observe(&swapped),
-            FrameClassification::BoxesChanged(vec![1])
+            mon.observe(&moved),
+            FrameClassification::BoxesChanged(vec![1]),
+            "correlation collapse should trip even with sub-hard-threshold deltas"
         );
     }
 }

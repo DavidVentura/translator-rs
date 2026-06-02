@@ -25,7 +25,9 @@ use crate::screen_monitor::Lattice;
 /// `GL_R8` sized internal format (not in glow's constant set).
 const R8: u32 = 0x8229;
 /// Max pills the recovery shader handles in one pass (uniform array bound).
-const MAX_PILLS: usize = 16;
+/// Matches the device recovery (`gl_renderer::RecProgram`, `REC_MAX_PILLS = 64`)
+/// so the host stand-in monitors the same number of boxes as prod.
+const MAX_PILLS: usize = 64;
 
 /// Vertex shader: a single full-screen triangle from `gl_VertexID`, no buffers.
 const PROBE_VERT_SRC: &str = r#"#version 300 es
@@ -47,7 +49,7 @@ uniform float u_spacing;   // lattice pitch
 uniform float u_origin;    // first-point centre offset (spacing/2)
 uniform float u_pill_luma; // overlay pill luma (0..255)
 uniform int u_pill_count;
-uniform vec4 u_pills[16];   // (cx, cy, half_w, half_h) in canonical coords
+uniform vec4 u_pills[64];   // (cx, cy, half_w, half_h) in canonical coords
 out vec4 frag;
 void main() {
     float col = floor(gl_FragCoord.x);

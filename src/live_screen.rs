@@ -41,14 +41,15 @@ const SCREEN_PILL_LUMA: f32 = 0.0;
 /// The hole's baked alpha is chosen so the captured blend lands here, keeping the
 /// recovery shader fixed.
 const SCREEN_HOLE_FRAC: f32 = 0.5;
-/// Hole dot radius (canonical px) — a small pinprick around each lattice point,
-/// not a fraction of the cell, so the pill stays mostly opaque and only the
-/// sampled points let the screen through. With the recovery now sampling the
-/// hole's pixel centre (the half-texel offset in `REC_FRAG_SRC`), the hole no
-/// longer needs to be fat to absorb a sub-pixel miss: 0.25 canonical ≈ a 1px
-/// display dot — the single nearest pixel to each lattice point, which the
-/// recovery samples directly. Less visible dotting on the text, twice the holes.
-const SCREEN_HOLE_RADIUS: f32 = 0.25;
+/// Hole dot radius (canonical px). The holes are punched at present time, per
+/// display pixel (see the present fragment shader), centred on the same lattice +
+/// 0.25 texel the recovery samples — so the sampled texel sits at distance 0 and is
+/// always inside the hole, while the radius just sets how many *display* pixels
+/// around it also open up. 0.3 canonical ≈ 0.6 display px, which resolves to a
+/// single crisp pixel: enough to guarantee the read texel (needs ≥ 0.25), small
+/// enough to stay one dot. No fat disc is needed now that there's no LINEAR-upscale
+/// smear to fight (that was the old baked-hole problem).
+const SCREEN_HOLE_RADIUS: f32 = 0.3;
 /// After a trip drops blocks, ignore further trips for this long so a noisy
 /// recovery can't storm removals.
 const V2_TRIP_COOLDOWN_NS: i64 = 600_000_000;
@@ -84,6 +85,14 @@ const V2_SCROLL_MOTION_FRAC: f32 = 0.30;
 /// the post-drop re-acquire — OCRing mid-scroll just produces garbage that trips
 /// again. The band between this and [`V2_SCROLL_MOTION_FRAC`] is hysteresis.
 const V2_SETTLE_MOTION_FRAC: f32 = 0.10;
+/// Companion settle gate over the recent-motion accumulator across *all* lattice
+/// points (gaps and under-pill recovery alike). `motion_frac` only sees the bare
+/// gap points, so a densely-pilled page reads as settled mid-scroll and the
+/// re-acquire grabs transient lines; this catches that, since the now-faithful
+/// under-pill recovery makes `recent_motion` trustworthy everywhere. Kept as a
+/// separate, higher threshold than the gap gate because `recent_motion` lingers
+/// for [`V2_MOTION_WINDOW`] frames after each jump. Both gates must read settled.
+const V2_SETTLE_CONTENT_FRAC: f32 = 0.15;
 /// Minimum number of gap (non-pill) lattice points needed to trust the motion
 /// fraction. When pills cover almost everything there aren't enough bare screen
 /// samples, so the gate treats the frame as settled.
@@ -92,10 +101,6 @@ const V2_MOTION_MIN_POINTS: usize = 20;
 /// whole-screen change (scroll / navigation): drop everything and re-acquire from
 /// scratch rather than blinking pills off one by one.
 const SCROLL_CHANGED_FRAC: f32 = 0.75;
-/// Binarize threshold (recovered luma units) marking a hole as on-ink for the
-/// bootstrap stroke mask. Lower than the synthetic test's 35 because the
-/// recovered signal under a pill is dimmed/compressed.
-const SCREEN_INK_CONTRAST: f32 = 22.0;
 /// A box needs at least this many lattice holes to be monitored.
 const SCREEN_MIN_BOX_HOLES: usize = 4;
 
@@ -153,25 +158,12 @@ struct ScreenJob {
 fn screen_monitor_config() -> MonitorConfig {
     MonitorConfig {
         warmup_frames: 6,
-        // Tolerant of recovery noise (8-bit, ×2 amplified, mirror-compressed): a
-        // truly-moving video hole swings hundreds (var ≫ this), but a stable
-        // stroke hole shouldn't be dropped just for recovery jitter. std ~20.
-        glyph_var_threshold: 400.0,
-        change_threshold: 40,
-        // A single subtitle line change flips only a minority of its box's holes
-        // (overlapping strokes, padding, between-letter gaps), so the bar is low.
-        // A *small* scroll of a big block shifts content only slightly, so only a
-        // tenth of holes cross threshold (on-device a 707-hole block at 13% stayed);
-        // 0.10 catches those while staying above per-hole recovery noise.
-        box_coherence_frac: 0.10,
-        min_glyph_holes: SCREEN_MIN_BOX_HOLES,
-        // A box with no stable ink holes (low-contrast recovery, short labels) is
-        // judged on all its holes. A real screen change only flips ~20-40% of them
-        // — the rest land on background areas that read similar across screens — so
-        // the bar must be low; on-device logs put stable boxes at ≤11% and changed
-        // boxes at ≥24%, so 0.2 separates them. (Per-hole change_threshold of 40
-        // already rejects noise, so this fraction can be aggressive.)
-        gross_change_frac: 0.2,
+        // Per-hole luma jump counted as a hard (gap↔stroke) swing; above coherent video.
+        hard_threshold: 110,
+        // Fraction of a box's holes that must swing hard to trip (backstop for removal).
+        hard_frac: 0.25,
+        // Correlation floor: below it the text pattern has scrolled away / been replaced.
+        min_corr: 0.5,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     }
@@ -272,13 +264,7 @@ fn reconcile_boxes(
         if holes.len() < SCREEN_MIN_BOX_HOLES {
             continue;
         }
-        let lumas: Vec<f32> = holes.iter().map(|&h| samples[h] as f32).collect();
-        let mean = lumas.iter().sum::<f32>() / lumas.len() as f32;
-        let bootstrap: Vec<bool> = lumas
-            .iter()
-            .map(|&l| (l - mean).abs() > SCREEN_INK_CONTRAST)
-            .collect();
-        monitor.set_box(*block_id, holes, bootstrap, samples);
+        monitor.set_box(*block_id, holes, samples);
         baselined.insert(*block_id, *hash);
     }
 }
@@ -501,6 +487,14 @@ impl LiveScreenPipeline {
                 }
             }
         }
+        // Fraction of all lattice points (gaps + under-pill) that moved within the
+        // recent-motion window — the dense-page settle signal `motion_frac` can't see.
+        let content_motion_frac = if st.recent_motion.is_empty() {
+            0.0
+        } else {
+            st.recent_motion.iter().filter(|&&m| m > 0).count() as f32
+                / st.recent_motion.len() as f32
+        };
         st.prev_samples = Some(samples.to_vec());
         st.prev_covered = Some(covered);
 
@@ -509,38 +503,31 @@ impl LiveScreenPipeline {
             let lo = samples.iter().copied().min().unwrap_or(0);
             let hi = samples.iter().copied().max().unwrap_or(0);
             let mean = samples.iter().map(|&s| s as u32).sum::<u32>() / samples.len().max(1) as u32;
-            let (judged, glyph, dev) = st.monitor.debug_last_stats();
-            let top = st.monitor.debug_top_box();
-            let (tid, tg, td) = top.unwrap_or((0, 0, 0));
-            let tfrac = if tg > 0 {
-                100.0 * td as f32 / tg as f32
-            } else {
-                0.0
-            };
+            let (judged, changed, max_frac) = st.monitor.debug_last_stats();
+            let (tid, _, tfrac) = st.monitor.debug_top_box().unwrap_or((0, 0, 0));
             log::info!(
                 "[screen-monitor-v2] screen_est min={lo} max={hi} mean={mean} motion={motion_frac:.2} \
-                 boxes={} judged={judged} glyph_holes={glyph} deviating={dev} \
-                 top_box={tid}({td}/{tg}={tfrac:.0}%) ver={}",
+                 cmotion={content_motion_frac:.2} \
+                 boxes={} judged={judged} changed={changed} max_frac={max_frac}% \
+                 top_box={tid}(frac={tfrac}%) ver={}",
                 st.baselined.len(),
                 self.session.content_version(),
             );
-            // Per-box keep-reason joined with each label's text, so a sticky label
-            // can be read off directly: dev% near 0 = the box sees no change under
-            // it. holes=monitored (non-glyph) holes; gross=judged on all holes.
+            // Per-box keep-reason joined with each label's text: frac% = stable holes
+            // that jumped; corr% = pattern correlation vs baseline (low = replaced).
             let texts: HashMap<u64, String> = self
                 .session
                 .block_display_texts(SCREEN_ANCHOR_ID)
                 .into_iter()
                 .collect();
-            for (id, holes, dev, gross, max_delta) in st.monitor.debug_boxes() {
-                let pct = if *holes > 0 { 100 * dev / holes } else { 0 };
+            for (id, holes, frac, max_delta, corr, changed) in st.monitor.debug_boxes() {
                 let txt: String = texts
                     .get(id)
                     .map(|s| s.chars().take(20).collect())
                     .unwrap_or_default();
                 log::info!(
-                    "[screen-box] id={id} holes={holes} dev={dev}({pct}%) maxd={max_delta}{} \"{txt}\"",
-                    if *gross { " GROSS" } else { "" },
+                    "[screen-box] id={id} holes={holes} hard={frac}% maxd={max_delta} corr={corr}%{} \"{txt}\"",
+                    if *changed { " CHANGED" } else { "" },
                 );
             }
         }
@@ -658,9 +645,12 @@ impl LiveScreenPipeline {
         // fixed delay after a drop/clear) guarantees the captured frame no longer
         // shows the dropped pills — deterministic where the old present-generation
         // fence raced the compositor. The motion gate keeps OCR off a mid-scroll
-        // frame (`motion_frac` is 0 when there aren't enough gap points, so a
-        // pill-covered screen reads as settled).
-        let settled = motion_frac < V2_SETTLE_MOTION_FRAC;
+        // frame: `motion_frac` (gap points) catches motion before there's any text,
+        // and `content_motion_frac` (recent motion over all points incl. under-pill
+        // recovery) catches it once pills cover the page, where `motion_frac` goes
+        // blind. Both must read settled.
+        let settled = motion_frac < V2_SETTLE_MOTION_FRAC
+            && content_motion_frac < V2_SETTLE_CONTENT_FRAC;
         if now_ns >= st.reacquire_not_before_ns
             && settled
             && !self.acquire_busy()

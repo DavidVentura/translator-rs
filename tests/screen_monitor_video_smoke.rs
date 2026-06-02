@@ -48,9 +48,8 @@ use translator::screen_monitor_gpu::{LatticeProbe, PillRegion};
 // (kept in sync by hand so the baseline matches the device; see the plan)
 const LATTICE_SPACING: u32 = 2; // SCREEN_LATTICE_SPACING
 const PILL_LUMA: u8 = 0; // SCREEN_PILL_LUMA = 0.0
-const INK_CONTRAST: f32 = 22.0; // SCREEN_INK_CONTRAST
 const MIN_BOX_HOLES: usize = 4; // SCREEN_MIN_BOX_HOLES
-const MAX_BOXES: usize = 16; // MAX_PILLS in screen_monitor_gpu
+const MAX_BOXES: usize = 64; // MAX_PILLS in screen_monitor_gpu (= device REC_MAX_PILLS)
 const V2_MOTION_THR: i32 = 40;
 const V2_MOTION_MIN_POINTS: usize = 20;
 const V2_SCROLL_MOTION_FRAC: f32 = 0.30;
@@ -58,7 +57,7 @@ const V2_SETTLE_MOTION_FRAC: f32 = 0.10;
 const SCROLL_CHANGED_FRAC: f32 = 0.75;
 const V2_SETTLE_NS: i64 = 100_000_000;
 const V2_PERIODIC_NS: i64 = 1_000_000_000;
-const V2_TRIP_COOLDOWN_NS: i64 = 600_000_000;
+const V2_TRIP_COOLDOWN_NS: i64 = 100_000_000;
 const DET_MAX_PIXELS: u32 = 1_000_000;
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_MODEL_DIR: &str = "/home/david/AndroidStudioProjects/bucket/ocr/1/PP-OCRv5";
@@ -68,11 +67,11 @@ const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
 fn prod_monitor_config() -> MonitorConfig {
     MonitorConfig {
         warmup_frames: 6,
-        glyph_var_threshold: 400.0,
-        change_threshold: 40,
-        box_coherence_frac: 0.10,
-        min_glyph_holes: MIN_BOX_HOLES,
-        gross_change_frac: 0.2,
+        hard_threshold: 110,
+        // Backstop for wholesale removal; NCC carries scroll now.
+        hard_frac: 0.25,
+        // Correlation floor — the strong scroll/replacement signal over the contour.
+        min_corr: 0.5,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     }
@@ -221,6 +220,26 @@ fn composite_capture(
     cap
 }
 
+/// The captured COLOR mirror with our opaque pills laid over each footprint — what the
+/// device's detection pass actually sees (text under a pill is occluded). Holes are
+/// omitted: they're sub-pixel and don't help the detector, only the recovery.
+fn composite_overlay_rgba(src: &RgbaImage, pills: &[PillRegion]) -> RgbaImage {
+    let mut img = src.clone();
+    let (w, h) = (img.width(), img.height());
+    for p in pills {
+        let l = (p.cx - p.half_w).floor().max(0.0) as u32;
+        let t = (p.cy - p.half_h).floor().max(0.0) as u32;
+        let r = ((p.cx + p.half_w).ceil() as u32).min(w);
+        let b = ((p.cy + p.half_h).ceil() as u32).min(h);
+        for y in t..b {
+            for x in l..r {
+                img.put_pixel(x, y, Rgba([PILL_LUMA, PILL_LUMA, PILL_LUMA, 255]));
+            }
+        }
+    }
+    img
+}
+
 /// Axis-aligned bbox of an oriented rect, clamped to the frame, as (x, y, w, h).
 fn aabb(r: &OrientedRect, w: u32, h: u32) -> (u32, u32, u32, u32) {
     let (c, s) = (r.angle_radians.cos().abs(), r.angle_radians.sin().abs());
@@ -343,6 +362,39 @@ struct ResidentBox {
     pill: PillRegion,
     text: String,
     acquired_frame: usize,
+    /// Lattice holes inside this box, and the *raw* gray at those holes at acquire.
+    /// Lets us measure actual content change (gray-now vs gray-then) independent of
+    /// the recovery, to tell "content moved" from "monitor didn't see it".
+    holes: Vec<usize>,
+    base_gray: Vec<u8>,
+}
+
+/// Pearson correlation of two equal-length byte vectors, in [-1, 1] (1.0 if either is
+/// constant). Mirrors the monitor's, for the harness's raw-content check.
+fn pearson_u8(a: &[u8], b: &[u8]) -> f32 {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return 1.0;
+    }
+    let nf = n as f64;
+    let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
+    for i in 0..n {
+        let (x, y) = (a[i] as f64, b[i] as f64);
+        sa += x;
+        sb += y;
+        saa += x * x;
+        sbb += y * y;
+        sab += x * y;
+    }
+    let cov = sab - sa * sb / nf;
+    let va = saa - sa * sa / nf;
+    let vb = sbb - sb * sb / nf;
+    let d = (va * vb).sqrt();
+    if d < 1e-3 {
+        1.0
+    } else {
+        (cov / d).clamp(-1.0, 1.0) as f32
+    }
 }
 
 /// Run a (full or masked-additive) acquire on `gray`: detect + recognise, recover a
@@ -366,11 +418,16 @@ fn run_acquire(
         monitor.clear_boxes();
         resident.clear();
     }
-    let (_g, boxes, texts) = detect_and_rec(engine, color);
+    // Detect on the captured mirror, not the clean frame: opaque pills over the
+    // surviving boxes occlude their text (so it isn't re-detected — the device's masked
+    // periodic detect), while freshly-exposed/dropped regions read through. "The
+    // capture includes our overlay."
+    let cur_pills: Vec<PillRegion> = resident.iter().map(|b| b.pill).collect();
+    let det_input = composite_overlay_rgba(color, &cur_pills);
+    let (_g, boxes, texts) = detect_and_rec(engine, &det_input);
     // Clean read: recover screen_est with the CURRENT overlay up. Freshly-exposed
     // regions (full clear, or a dropped pill) read as raw screen; surviving pills are
     // inverted through their holes. This is the baseline the new boxes bind to.
-    let cur_pills: Vec<PillRegion> = resident.iter().map(|b| b.pill).collect();
     let clean = probe.recover(
         &composite_capture(gray.as_raw(), w, h, monitor.lattice(), &cur_pills),
         w,
@@ -394,25 +451,39 @@ fn run_acquire(
         if !full_rebuild && covered_by_resident(center, resident, w, h) {
             continue; // survivor owns this region (masked-additive)
         }
-        let holes = monitor.lattice().holes_in_rect(&b.tight_box);
+        // Monitor the detection CONTOUR (tight to the text run), not the box — so the
+        // hole set isn't padded with background margin that dilutes the hard fraction.
+        // Fall back to the box if the contour is missing/degenerate.
+        let holes = {
+            let c = monitor.lattice().holes_in_polygon(&b.contour);
+            if c.len() >= MIN_BOX_HOLES {
+                c
+            } else {
+                monitor.lattice().holes_in_rect(&b.tight_box)
+            }
+        };
         if holes.len() < MIN_BOX_HOLES {
             continue;
         }
-        let lumas: Vec<f32> = holes.iter().map(|&i| clean[i] as f32).collect();
-        let mean = lumas.iter().sum::<f32>() / lumas.len() as f32;
-        let bootstrap: Vec<bool> = lumas
+        let base_gray: Vec<u8> = holes
             .iter()
-            .map(|&l| (l - mean).abs() > INK_CONTRAST)
+            .map(|&hi| {
+                let p = monitor.lattice().points()[hi];
+                gray.get_pixel((p.x as u32).min(w - 1), (p.y as u32).min(h - 1))[0]
+            })
             .collect();
         let id = *next_id;
         *next_id += 1;
-        monitor.set_box(id, holes, bootstrap, &clean);
+        let box_holes = holes.clone();
+        monitor.set_box(id, holes, &clean);
         resident.push(ResidentBox {
             id,
             rect: b.tight_box.clone(),
             pill: PillRegion::from_oriented(&b.tight_box),
             text: text.trim().to_string(),
             acquired_frame: frame_idx,
+            holes: box_holes,
+            base_gray,
         });
         added += 1;
     }
@@ -664,10 +735,11 @@ fn screen_monitor_video_smoke() {
         }
 
         // 6. Annotate + record.
-        let devs: HashMap<u64, (usize, usize, bool, u32)> = mon
+        // Per-box debug: (holes, hard_frac_pct, max_delta, changed).
+        let devs: HashMap<u64, (usize, usize, u32, bool)> = mon
             .debug_boxes()
             .iter()
-            .map(|&(id, holes, dev, gross, maxd)| (id, (holes, dev, gross, maxd)))
+            .map(|&(id, holes, frac, maxd, changed)| (id, (holes, frac, maxd, changed)))
             .collect();
         let changed_set: Vec<u64> = changed.clone();
         let frame_img = annotate(
@@ -689,10 +761,23 @@ fn screen_monitor_video_smoke() {
         let boxes_json: Vec<String> = resident
             .iter()
             .map(|b| {
-                let (holes, dev, gross, maxd) = devs.get(&b.id).copied().unwrap_or((0, 0, false, 0));
-                let pct = if holes > 0 { 100 * dev / holes } else { 0 };
+                let (holes, frac, _maxd, changed_box) =
+                    devs.get(&b.id).copied().unwrap_or((0, 0, 0, false));
+                // Raw content change: current gray vs gray-at-acquire at the box's
+                // holes — independent of the monitor. Low raw_corr = the content
+                // genuinely moved here; if it drops but `frac` (hard-swing %) stays low,
+                // the monitor isn't seeing a real change.
+                let cur_gray: Vec<u8> = b
+                    .holes
+                    .iter()
+                    .map(|&hi| {
+                        let p = mon.lattice().points()[hi];
+                        gray.get_pixel((p.x as u32).min(gw - 1), (p.y as u32).min(gh - 1))[0]
+                    })
+                    .collect();
+                let raw_corr = (pearson_u8(&cur_gray, &b.base_gray) * 100.0) as i32;
                 format!(
-                    "{{\"id\":{},\"holes\":{holes},\"dev\":{dev},\"pct\":{pct},\"gross\":{gross},\"maxd\":{maxd},\"text\":{:?}}}",
+                    "{{\"id\":{},\"holes\":{holes},\"raw_corr\":{raw_corr},\"frac\":{frac},\"changed\":{changed_box},\"text\":{:?}}}",
                     b.id, b.text
                 )
             })
@@ -755,7 +840,7 @@ fn screen_monitor_video_smoke() {
 fn annotate(
     rgba: &RgbaImage,
     resident: &[ResidentBox],
-    devs: &HashMap<u64, (usize, usize, bool, u32)>,
+    devs: &HashMap<u64, (usize, usize, u32, bool)>,
     changed: &[u64],
     action: &str,
     idx: usize,
@@ -769,6 +854,20 @@ fn annotate(
     const GRAY: Rgba<u8> = Rgba([140, 140, 140, 255]);
     let (w, h) = (rgba.width(), rgba.height());
     let mut img = rgba.clone();
+
+    // Render the pill footprints (what the recovery sees): darken the page under each
+    // resident box so the pills are visible over the content, the way they are on screen.
+    for b in resident {
+        let (x, y, bw, bh) = aabb(&b.rect, w, h);
+        for yy in y..(y + bh).min(h) {
+            for xx in x..(x + bw).min(w) {
+                let px = img.get_pixel_mut(xx, yy);
+                px.0[0] = (px.0[0] as u32 * 3 / 10) as u8;
+                px.0[1] = (px.0[1] as u32 * 3 / 10) as u8;
+                px.0[2] = (px.0[2] as u32 * 3 / 10) as u8;
+            }
+        }
+    }
 
     for b in resident {
         let (x, y, bw, bh) = aabb(&b.rect, w, h);
@@ -785,19 +884,18 @@ fn annotate(
             IpRect::at(x as i32, y as i32).of_size(bw, bh),
             color,
         );
-        // Deviation bar along the box bottom: width ∝ dev fraction.
-        if let Some(&(holes, dev, _gross, _maxd)) = devs.get(&b.id) {
-            if holes > 0 {
-                let frac = (dev as f32 / holes as f32).clamp(0.0, 1.0);
-                let barw = ((bw as f32 * frac) as u32).max(1).min(bw);
-                let bar = if frac > 0.2 { RED } else { GREEN };
-                let by = (y + bh).min(h.saturating_sub(2));
-                draw_filled_rect_mut(
-                    &mut img,
-                    IpRect::at(x as i32, by as i32).of_size(barw, 2),
-                    bar,
-                );
-            }
+        // Bar along the box bottom: width ∝ change-fraction vs its trip threshold.
+        if let Some(&(_holes, frac_pct, _maxd, changed_box)) = devs.get(&b.id) {
+            let thr = prod_monitor_config().hard_frac * 100.0;
+            let fill = (frac_pct as f32 / (thr * 2.0)).clamp(0.0, 1.0);
+            let barw = ((bw as f32 * fill) as u32).max(1).min(bw);
+            let bar = if changed_box { RED } else { GREEN };
+            let by = (y + bh).min(h.saturating_sub(2));
+            draw_filled_rect_mut(
+                &mut img,
+                IpRect::at(x as i32, by as i32).of_size(barw, 2),
+                bar,
+            );
         }
     }
 

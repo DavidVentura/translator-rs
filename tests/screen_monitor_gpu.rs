@@ -20,8 +20,8 @@ const W: u32 = 120;
 const H: u32 = 90;
 const SPACING: u32 = 5;
 const PILL_LUMA: u8 = 0; // opaque black pill, matching the screen overlay
-const BG: u8 = 120; // band background between strokes
-const INK: u8 = 30; // dark text strokes
+const BG: u8 = 230; // band background between strokes (high contrast, like a page)
+const INK: u8 = 20; // dark text strokes
 
 fn make_probe() -> LatticeProbe {
     let lib = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
@@ -96,8 +96,9 @@ fn source_frame(strokes: bool) -> Vec<u8> {
     for y in 0..H {
         for x in 0..W {
             if in_band(x, y) {
-                // 8px dark / 8px light vertical stripes = the "letters".
-                let ink = strokes && (x / 8) % 2 == 0;
+                // 4px dark ink / 12px light gap = bg-dominated "letters" (the median
+                // sits on the background, so ink holes carry the weight).
+                let ink = strokes && (x % 16) < 4;
                 v[(y * W + x) as usize] = if ink { INK } else { BG };
             }
         }
@@ -173,10 +174,11 @@ fn recovered_samples_drive_the_classifier() {
     let pill = pill();
     let cfg = MonitorConfig {
         warmup_frames: 4,
-        glyph_var_threshold: 60.0,
-        change_threshold: 45,
-        box_coherence_frac: 0.35,
-        min_glyph_holes: 3,
+        hard_threshold: 110,
+        // The synthetic band is sparse ink (~25% of holes), so erasing it flips ~25%;
+        // keep the trip fraction below that.
+        hard_frac: 0.15,
+        min_corr: 0.5,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     };
@@ -193,17 +195,8 @@ fn recovered_samples_drive_the_classifier() {
     );
 
     let holes = lat.holes_in_rect(&band_rect());
-    let box_lumas: Vec<f32> = holes.iter().map(|&h| baseline[h] as f32).collect();
-    let mid = (box_lumas.iter().cloned().fold(f32::MAX, f32::min)
-        + box_lumas.iter().cloned().fold(f32::MIN, f32::max))
-        / 2.0;
-    // Dark-on-light: ink = below the band midpoint.
-    let bootstrap: Vec<bool> = box_lumas.iter().map(|&l| l < mid).collect();
-    let ink = bootstrap.iter().filter(|b| **b).count();
-    assert!(ink >= cfg.min_glyph_holes, "ink holes via recovery: {ink}");
-
     let mut mon = ScreenMonitor::new(lat, cfg);
-    mon.set_box(1, holes.clone(), bootstrap, &baseline);
+    mon.set_box(1, holes.clone(), &baseline);
 
     // Warmup + background jitter between the letters (the strokes hold), all
     // routed through the GPU recovery. Must stay Quiet.
@@ -211,9 +204,11 @@ fn recovered_samples_drive_the_classifier() {
         let mut src = base_src.clone();
         for y in 60..80 {
             for x in 0..W {
-                if (x / 8) % 2 != 0 {
+                if (x % 16) >= 4 {
                     // a non-stroke (background) column: jitter it
-                    src[(y * W + x) as usize] = if (f + x) % 2 == 0 { 40 } else { 210 };
+                    // Moderate, temporally-coherent background motion (Δ frame-to-frame
+                    // < hard_threshold) — a playing video, not a full-range strobe.
+                    src[(y * W + x) as usize] = if (f + x) % 2 == 0 { 180 } else { 255 };
                 }
             }
         }
