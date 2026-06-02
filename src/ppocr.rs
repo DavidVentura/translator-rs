@@ -1188,7 +1188,7 @@ impl PpocrDetector {
             })
             .collect();
         let boxes = extract_boxes(
-            &binary, &mask, out_w, out_h, scaled_w, scaled_h, orig_w, orig_h, thresholds,
+            &binary, &mask, out_w, out_h, content_w, content_h, orig_w, orig_h, thresholds,
         );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
         log::info!(
@@ -1504,8 +1504,8 @@ fn extract_boxes(
     heatmap: &[f32],
     mask_w: u32,
     mask_h: u32,
-    valid_w: u32,
-    valid_h: u32,
+    content_w: u32,
+    content_h: u32,
     orig_w: u32,
     orig_h: u32,
     thresholds: PpocrThresholds,
@@ -1514,8 +1514,14 @@ fn extract_boxes(
         return Vec::new();
     };
     let contours = find_contours::<i32>(&gray);
-    let scale_x = orig_w as f32 / valid_w as f32;
-    let scale_y = orig_h as f32 / valid_h as f32;
+    // Map mask coordinates back to the original image. The mask shares the model-input grid,
+    // where the resized content sits top-left inside a buffer padded up to a multiple of 32. The
+    // padding carries no text, so the content region — not the padded buffer — is what maps onto
+    // the original: scaling by `orig / content`. Using the padded height here instead would shrink
+    // every coordinate by `content / padded`, dragging detections upward by an amount that grows
+    // with y (a fraction of a line at the top of the page, ~half a line at the bottom).
+    let scale_x = orig_w as f32 / content_w as f32;
+    let scale_y = orig_h as f32 / content_h as f32;
     let mut boxes = Vec::new();
     let mut weak_score_count = 0usize;
 
@@ -1538,13 +1544,13 @@ fn extract_boxes(
                 max_y = p.y;
             }
         }
-        if min_x >= valid_w as i32 || min_y >= valid_h as i32 {
+        if min_x >= content_w as i32 || min_y >= content_h as i32 {
             continue;
         }
         let min_x = min_x.max(0);
         let min_y = min_y.max(0);
-        let max_x = max_x.min(valid_w as i32);
-        let max_y = max_y.min(valid_h as i32);
+        let max_x = max_x.min(content_w as i32);
+        let max_y = max_y.min(content_h as i32);
         let box_w = (max_x - min_x) as u32;
         let box_h = (max_y - min_y) as u32;
         if box_w * box_h < thresholds.det_min_area {
@@ -1588,8 +1594,8 @@ fn extract_boxes(
         let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0);
         let ex_min_x = (min_x as f32 - expand_dist).max(0.0) as i32;
         let ex_min_y = (min_y as f32 - expand_dist).max(0.0) as i32;
-        let ex_max_x = (max_x as f32 + expand_dist).min(valid_w as f32) as i32;
-        let ex_max_y = (max_y as f32 + expand_dist).min(valid_h as f32) as i32;
+        let ex_max_x = (max_x as f32 + expand_dist).min(content_w as f32) as i32;
+        let ex_max_y = (max_y as f32 + expand_dist).min(content_h as f32) as i32;
         let ex_w = (ex_max_x - ex_min_x) as u32;
         let ex_h = (ex_max_y - ex_min_y) as u32;
 
@@ -2034,29 +2040,36 @@ fn linear_regression_slope(pts: &[(f32, f32)]) -> f32 {
 /// box keeps its own measured tilt.
 const TILT_CONSENSUS_MIN_VOTERS: usize = 3;
 
-/// A committed box within this of the consensus is already co-aligned; it keeps its own precise
-/// angle rather than being flattened to the median. ~4°.
-const TILT_SNAP_TOLERANCE: f32 = 0.07;
-
-/// Upper edge of the "phantom lean" band. A committed box that deviates from the consensus by
-/// more than `TILT_SNAP_TOLERANCE` but less than this is treated as a measurement artefact
-/// (asymmetric short word picking up a few spurious degrees) and snapped to the scene. Beyond
-/// this the deviation is too large to be measurement error — the box is intentionally rotated
-/// (a stamp, a vertical caption, a skewed callout) and keeps its own angle. ~15°, which cleanly
-/// separates spurious sub-10° leans from deliberate rotations.
+/// Deviation from the consensus beyond which a committed box is treated as intentionally rotated
+/// (a stamp, a vertical caption, a skewed callout) and keeps its own angle rather than snapping to
+/// the scene. Below it, a committed lean is treated as a measurement artefact — a tilted DB mask
+/// or an asymmetric short word picking up a few spurious degrees — and flattened to the consensus.
+/// ~15°, which cleanly separates spurious sub-10° leans from deliberate rotations.
 const TILT_BREAKAWAY: f32 = 0.26;
 
-/// Robust frame reading-direction from per-box votes: the median of the agreeing boxes' angles.
-/// `None` when too few boxes voted to trust a shared direction. Angles here are all
-/// near-horizontal (the ±90° reading-axis swap happens later in `build_oriented_boxes`), so a
-/// plain median needs no angular wrap handling.
+/// A scene whose consensus reading-direction is within this of image-horizontal is snapped to
+/// exactly horizontal. The median of the per-box votes carries sub-degree noise even on a page
+/// that is visibly upright, and every committed box then snaps to that noisy value (see
+/// `resolve_box_angle`), tilting all the text by a fraction of a degree and softening it under the
+/// render rotation. Collapsing a near-upright scene to 0° keeps that text crisp. ~1°; a genuinely
+/// tilted scene (a held phone, a skewed scan) sits well beyond this and keeps its measured angle.
+const TILT_CONSENSUS_DEADZONE: f32 = 0.0175;
+
+/// Robust frame reading-direction from per-box votes: the median of the agreeing boxes' angles,
+/// snapped to exactly horizontal inside `TILT_CONSENSUS_DEADZONE`. `None` when too few boxes voted
+/// to trust a shared direction. Angles here are all near-horizontal (the ±90° reading-axis swap
+/// happens later in `build_oriented_boxes`), so a plain median needs no angular wrap handling.
 fn frame_consensus_angle(votes: &[f32]) -> Option<f32> {
     if votes.len() < TILT_CONSENSUS_MIN_VOTERS {
         return None;
     }
     let mut sorted = votes.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).expect("tilt votes are finite"));
-    Some(sorted[sorted.len() / 2])
+    let median = sorted[sorted.len() / 2];
+    if median.abs() < TILT_CONSENSUS_DEADZONE {
+        return Some(0.0);
+    }
+    Some(median)
 }
 
 /// Reconcile a box's own tilt with the frame consensus.
@@ -2064,10 +2077,11 @@ fn frame_consensus_angle(votes: &[f32]) -> Option<f32> {
 /// - No consensus → the box's own measured angle stands.
 /// - Box did not commit to a tilt (edges disagreed, or the lean was sub-visible) → it has no
 ///   opinion of its own, so it adopts the scene direction.
-/// - Committed box within `TILT_SNAP_TOLERANCE` of the scene → already co-aligned, keep its own
-///   precise value.
-/// - Committed box in the phantom band (`TILT_SNAP_TOLERANCE`..`TILT_BREAKAWAY`) → a spurious
-///   few-degree lean against a co-aligned scene; snap to the scene.
+/// - Committed box within `TILT_BREAKAWAY` of the scene → its lean is measurement error (a tilted
+///   DB mask or an asymmetric short word picking up a few spurious degrees against a co-aligned
+///   scene), so it snaps to the consensus. The scene's median over many boxes is a better estimate
+///   of the shared reading direction than any one box's noisy measurement, so there is nothing to
+///   gain by keeping a near-consensus box's own value.
 /// - Committed box past `TILT_BREAKAWAY` → too far to be measurement error; an intentionally
 ///   rotated box, kept as measured. This is what stops a deliberately-skewed 35° label from
 ///   being dragged flat by an otherwise horizontal page.
@@ -2079,7 +2093,7 @@ fn resolve_box_angle(est: &TiltEstimate, consensus: Option<f32>) -> f32 {
         return c;
     }
     let delta = (est.angle - c).abs();
-    if delta <= TILT_SNAP_TOLERANCE || delta >= TILT_BREAKAWAY {
+    if delta >= TILT_BREAKAWAY {
         est.angle
     } else {
         c
@@ -2779,6 +2793,19 @@ mod tests {
     }
 
     #[test]
+    fn near_horizontal_consensus_snaps_to_exactly_flat() {
+        // A visibly-upright page whose votes carry sub-degree median noise (~0.5°) collapses to
+        // exactly 0° so every box renders crisp, rather than inheriting the fractional tilt.
+        let half_deg = 0.5f32.to_radians();
+        let votes = [half_deg; 5];
+        assert_eq!(frame_consensus_angle(&votes), Some(0.0));
+        // A genuinely tilted scene (~5°) is past the deadzone and keeps its measured direction.
+        let five_deg = 5.0f32.to_radians();
+        let m = frame_consensus_angle(&[five_deg; 5]).expect("quorum reached");
+        assert!((m - five_deg).abs() < 1e-6);
+    }
+
+    #[test]
     fn box_without_a_committed_tilt_adopts_the_scene() {
         // A content-asymmetric / sub-visible box (angle 0, no commitment) should follow the
         // frame rather than snap to image-horizontal: in a 15° scene it becomes 15°.
@@ -2808,11 +2835,16 @@ mod tests {
     }
 
     #[test]
-    fn committed_box_close_to_scene_keeps_its_own_precise_angle() {
-        // Within tolerance of a 12° scene, a box at 13° keeps 13° (real per-line scatter), not
-        // the median — the snap only fires inside the phantom band.
-        let scene = Some(12.0f32.to_radians());
-        let near = committed(13.0);
-        assert!((resolve_box_angle(&near, scene) - 13.0f32.to_radians()).abs() < 1e-6);
+    fn small_committed_lean_on_a_flat_page_snaps_to_the_scene() {
+        // Regression for "Storage": a visually-horizontal heading whose DB mask comes back as a
+        // slightly tilted parallelogram commits to a real ~2.6° lean (both edges slope the same
+        // way, so the disagreement guard never fires). On a page of flat body text the consensus
+        // is ~0°, and the box must adopt it rather than keep its own measurement noise.
+        let scene = Some(0.0f32);
+        let storage = committed(2.6);
+        assert!(
+            resolve_box_angle(&storage, scene).abs() < 1e-6,
+            "a sub-break-away lean against a flat scene should flatten to the consensus",
+        );
     }
 }
