@@ -23,7 +23,9 @@ use crate::live_session::{LiveSession, dominant_axis_quadrant};
 use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate};
 use crate::live_worker::SlotWorker;
 use crate::ocr::{OrientedRect, Rect};
-use crate::screen_monitor::{FrameClassification, Lattice, MonitorConfig, ScreenMonitor};
+use crate::screen_monitor::{
+    FrameClassification, Lattice, MonitorConfig, Rgb, ScreenMonitor, channel_delta,
+};
 use crate::session::TranslatorSession;
 
 /// The one anchor the screen pipeline owns; everything composites against it.
@@ -37,10 +39,13 @@ const SCREEN_LATTICE_SPACING: u32 = 2;
 /// Pill colour the screen overlay draws (opaque black), as a 0..1 luma — the
 /// recovery's `pill` term.
 const SCREEN_PILL_LUMA: f32 = 0.0;
-/// Engineered effective screen fraction at a hole (`1 − effective overlay alpha`).
-/// The hole's baked alpha is chosen so the captured blend lands here, keeping the
-/// recovery shader fixed.
-const SCREEN_HOLE_FRAC: f32 = 0.5;
+/// Engineered effective screen fraction at a hole (`1 − effective overlay alpha`):
+/// the hole reads 70% screen / 30% pill. Higher is cleaner recovery — the shader
+/// inverts `rec = raw / frac`, so a larger fraction amplifies capture noise less
+/// (×1.43 here vs ×2 at 0.5) — which the crisp 1px present-time holes can afford
+/// since they're barely visible. The hole's baked alpha is chosen so the captured
+/// blend lands here, keeping the recovery shader fixed.
+const SCREEN_HOLE_FRAC: f32 = 0.7;
 /// Hole dot radius (canonical px). The holes are punched at present time, per
 /// display pixel (see the present fragment shader), centred on the same lattice +
 /// 0.25 texel the recovery samples — so the sampled texel sits at distance 0 and is
@@ -52,10 +57,10 @@ const SCREEN_HOLE_FRAC: f32 = 0.5;
 const SCREEN_HOLE_RADIUS: f32 = 0.3;
 /// After a trip drops blocks, ignore further trips for this long so a noisy
 /// recovery can't storm removals.
-const V2_TRIP_COOLDOWN_NS: i64 = 600_000_000;
+const V2_TRIP_COOLDOWN_NS: i64 = 500_000_000;
 /// While settled, run a masked additive acquire at least this often to pick up
 /// new text that appeared in the gaps.
-const V2_PERIODIC_NS: i64 = 1_000_000_000;
+const V2_PERIODIC_NS: i64 = 1_500_000_000;
 /// After dropping/clearing pills, hold the re-acquire off for this long so the
 /// dropped pills have actually left the captured mirror before OCR runs on it.
 /// MediaProjection composites the overlay window into the mirror a frame or two
@@ -65,7 +70,7 @@ const V2_PERIODIC_NS: i64 = 1_000_000_000;
 const V2_SETTLE_NS: i64 = 100_000_000;
 /// Per-lattice-point inter-frame luma delta that counts a gap point as "moved"
 /// for the global-motion signal (both the scroll trigger and the settle gate).
-const V2_MOTION_THR: i32 = 40;
+const V2_MOTION_THR: u32 = 30;
 /// Frames a lattice point stays "recently moved" after an inter-frame jump, for
 /// the per-box dynamic-content test. Spans a detection (~a few frames) so a box
 /// detected over a region that moved any time in this window is rejected.
@@ -73,7 +78,7 @@ const V2_MOTION_WINDOW: u16 = 8;
 /// Fraction of a freshly-detected box's lattice points that must be "recently
 /// moved" for the box to count as over dynamic content (video / game / scroll)
 /// and be dropped before commit. Static text scores ~0; a moving region ~all.
-const V2_DYNAMIC_BOX_FRAC: f32 = 0.5;
+const V2_DYNAMIC_BOX_FRAC: f32 = 0.4;
 /// Fraction of gap (non-pill) lattice points moving frame-to-frame that reads as
 /// a wholesale change (scroll / navigation / app-switch) → drop all + re-acquire.
 /// This is the fast, box-independent path: it fires the same frame the screen
@@ -84,7 +89,7 @@ const V2_SCROLL_MOTION_FRAC: f32 = 0.30;
 /// Below this fraction of moving gap points the screen is settled enough to run
 /// the post-drop re-acquire — OCRing mid-scroll just produces garbage that trips
 /// again. The band between this and [`V2_SCROLL_MOTION_FRAC`] is hysteresis.
-const V2_SETTLE_MOTION_FRAC: f32 = 0.10;
+const V2_SETTLE_MOTION_FRAC: f32 = 0.15;
 /// Companion settle gate over the recent-motion accumulator across *all* lattice
 /// points (gaps and under-pill recovery alike). `motion_frac` only sees the bare
 /// gap points, so a densely-pilled page reads as settled mid-scroll and the
@@ -92,7 +97,7 @@ const V2_SETTLE_MOTION_FRAC: f32 = 0.10;
 /// under-pill recovery makes `recent_motion` trustworthy everywhere. Kept as a
 /// separate, higher threshold than the gap gate because `recent_motion` lingers
 /// for [`V2_MOTION_WINDOW`] frames after each jump. Both gates must read settled.
-const V2_SETTLE_CONTENT_FRAC: f32 = 0.15;
+const V2_SETTLE_CONTENT_FRAC: f32 = 0.20;
 /// Minimum number of gap (non-pill) lattice points needed to trust the motion
 /// fraction. When pills cover almost everything there aren't enough bare screen
 /// samples, so the gate treats the frame as settled.
@@ -158,12 +163,14 @@ struct ScreenJob {
 fn screen_monitor_config() -> MonitorConfig {
     MonitorConfig {
         warmup_frames: 6,
-        // Per-hole luma jump counted as a hard (gap↔stroke) swing; above coherent video.
-        hard_threshold: 110,
-        // Fraction of a box's holes that must swing hard to trip (backstop for removal).
-        hard_frac: 0.25,
-        // Correlation floor: below it the text pattern has scrolled away / been replaced.
-        min_corr: 0.5,
+        // Per-channel RGB delta counted as a hard swing (cf. playtranslate's per-channel
+        // SPLATTER_THRESHOLD=60). Above the recovery noise floor (~20) and benign drift
+        // (~50), under a real stroke↔gap / colour swing (150+).
+        hard_threshold: 60,
+        // Fraction of a box's holes that must swing hard to trip. 0.10 (vs playtranslate's
+        // 0.05) is the floor our recovery's noise allows for now — sparse-text scroll moves
+        // ~10–25% of holes, which the old 0.25 left stranded.
+        hard_frac: 0.10,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     }
@@ -198,7 +205,7 @@ struct MonitorV2State {
     pending_reacquire: bool,
     /// Previous frame's recovered samples, for the global inter-frame motion
     /// (scroll/navigation) signal.
-    prev_samples: Option<Vec<u8>>,
+    prev_samples: Option<Vec<Rgb>>,
     /// Previous frame's per-point pill-coverage mask. Motion is compared only at
     /// points that were a gap last frame *and* this frame, so a pill appearing /
     /// leaving over a point isn't mistaken for screen motion.
@@ -241,7 +248,7 @@ fn rects_overlap(a: &OrientedRect, b: &OrientedRect) -> bool {
 fn reconcile_boxes(
     monitor: &mut ScreenMonitor,
     blocks: &[(u64, u64, Vec<OrientedRect>)],
-    samples: &[u8],
+    samples: &[Rgb],
     baselined: &mut HashMap<u64, u64>,
 ) {
     let current: std::collections::HashSet<u64> = blocks.iter().map(|b| b.0).collect();
@@ -402,7 +409,7 @@ impl LiveScreenPipeline {
     ///   * `None` — nothing to do (background motion with stable text is ignored).
     pub fn monitor_screen_v2(
         &self,
-        samples: &[u8],
+        samples: &[Rgb],
         cw: u32,
         ch: u32,
         now_ns: i64,
@@ -453,7 +460,7 @@ impl LiveScreenPipeline {
                         continue;
                     }
                     eligible += 1;
-                    if (samples[i] as i32 - prev[i] as i32).abs() > V2_MOTION_THR {
+                    if channel_delta(samples[i], prev[i]) > V2_MOTION_THR {
                         moved += 1;
                     }
                 }
@@ -479,7 +486,7 @@ impl LiveScreenPipeline {
                     .iter_mut()
                     .zip(samples.iter().zip(prev.iter()))
                 {
-                    if (cur as i32 - p as i32).abs() > V2_MOTION_THR {
+                    if channel_delta(cur, p) > V2_MOTION_THR {
                         *rm = V2_MOTION_WINDOW;
                     } else {
                         *rm = rm.saturating_sub(1);
@@ -500,9 +507,10 @@ impl LiveScreenPipeline {
 
         st.frames += 1;
         if st.frames % 60 == 0 {
-            let lo = samples.iter().copied().min().unwrap_or(0);
-            let hi = samples.iter().copied().max().unwrap_or(0);
-            let mean = samples.iter().map(|&s| s as u32).sum::<u32>() / samples.len().max(1) as u32;
+            let luma = |p: Rgb| (p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8;
+            let lo = samples.iter().map(|&s| luma(s)).min().unwrap_or(0);
+            let hi = samples.iter().map(|&s| luma(s)).max().unwrap_or(0);
+            let mean = samples.iter().map(|&s| luma(s)).sum::<u32>() / samples.len().max(1) as u32;
             let (judged, changed, max_frac) = st.monitor.debug_last_stats();
             let (tid, _, tfrac) = st.monitor.debug_top_box().unwrap_or((0, 0, 0));
             log::info!(
@@ -513,20 +521,20 @@ impl LiveScreenPipeline {
                 st.baselined.len(),
                 self.session.content_version(),
             );
-            // Per-box keep-reason joined with each label's text: frac% = stable holes
-            // that jumped; corr% = pattern correlation vs baseline (low = replaced).
+            // Per-box keep-reason joined with each label's text: hard% = holes whose
+            // per-channel RGB delta crossed the threshold; mean = mean per-channel delta.
             let texts: HashMap<u64, String> = self
                 .session
                 .block_display_texts(SCREEN_ANCHOR_ID)
                 .into_iter()
                 .collect();
-            for (id, holes, frac, max_delta, corr, changed) in st.monitor.debug_boxes() {
+            for (id, holes, frac, max_delta, mean, changed) in st.monitor.debug_boxes() {
                 let txt: String = texts
                     .get(id)
                     .map(|s| s.chars().take(20).collect())
                     .unwrap_or_default();
                 log::info!(
-                    "[screen-box] id={id} holes={holes} hard={frac}% maxd={max_delta} corr={corr}%{} \"{txt}\"",
+                    "[screen-box] id={id} holes={holes} hard={frac}% maxd={max_delta} mean={mean}{} \"{txt}\"",
                     if *changed { " CHANGED" } else { "" },
                 );
             }
@@ -963,13 +971,13 @@ mod monitor_tests {
         a_stroke: u8,
         b: &OrientedRect,
         b_stroke: u8,
-    ) -> Vec<u8> {
-        let mut v = vec![120u8; lat.len()];
+    ) -> Vec<Rgb> {
+        let mut v = vec![[120u8; 3]; lat.len()];
         for (i, &h) in lat.holes_in_rect(a).iter().enumerate() {
-            v[h] = if i % 2 == 0 { a_stroke } else { 220 };
+            v[h] = if i % 2 == 0 { [a_stroke; 3] } else { [220; 3] };
         }
         for (i, &h) in lat.holes_in_rect(b).iter().enumerate() {
-            v[h] = if i % 2 == 0 { b_stroke } else { 220 };
+            v[h] = if i % 2 == 0 { [b_stroke; 3] } else { [220; 3] };
         }
         v
     }

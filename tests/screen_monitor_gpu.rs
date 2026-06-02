@@ -157,7 +157,7 @@ fn shader_recovers_screen_under_the_pill() {
     let max_err = recovered
         .iter()
         .zip(&want)
-        .map(|(r, w)| (*r as i32 - *w as i32).unsigned_abs())
+        .map(|(r, w)| (r[0] as i32 - *w as i32).unsigned_abs())
         .max()
         .unwrap();
     eprintln!("recovery max error: {max_err}");
@@ -178,7 +178,6 @@ fn recovered_samples_drive_the_classifier() {
         // The synthetic band is sparse ink (~25% of holes), so erasing it flips ~25%;
         // keep the trip fraction below that.
         hard_frac: 0.15,
-        min_corr: 0.5,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     };

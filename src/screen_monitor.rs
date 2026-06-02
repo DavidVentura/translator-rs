@@ -158,16 +158,26 @@ fn point_in_rect(px: f32, py: f32, r: &OrientedRect) -> bool {
     lx <= r.width * 0.5 && ly <= r.height * 0.5
 }
 
-/// The correlation signal needs at least this many contour holes to be meaningful.
-const MIN_NCC_HOLES: usize = 8;
+/// One recovered sample per lattice point: the screen RGB under the overlay (or the
+/// raw screen at a gap point). Per-channel so an isoluminant change — different colour
+/// at the same brightness — still registers, which a luma-only delta would miss.
+pub type Rgb = [u8; 3];
 
-/// Tunables for the classifier. Distances are in `screen_est` luma units (0..255).
+/// Max per-channel absolute delta between two samples.
+pub fn channel_delta(a: Rgb, b: Rgb) -> u32 {
+    (0..3)
+        .map(|i| (a[i] as i32 - b[i] as i32).unsigned_abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Tunables for the classifier. Distances are per-channel RGB units (0..255).
 ///
-/// Two signals over a box's contour holes vs baseline, OR'd: the Pearson correlation
-/// (the strong scroll/replacement signal — the whole stroke/gap pattern decorrelates;
-/// brightness-shift invariant, so a uniform background change doesn't trip it), and
-/// the hard-swing fraction (a backstop for wholesale removal — full gap↔stroke
-/// crossings). No ink classification, no variance gate.
+/// One signal over a box's contour holes vs baseline: the fraction whose per-channel
+/// RGB delta exceeds `hard_threshold`. RGB (not luma) so an isoluminant change still
+/// registers; one signal so there's nothing to balance against — a scroll/replacement
+/// moves the strokes (and a coloured background wholesale), a benign sub-threshold
+/// drift scores ~0.
 #[derive(Debug, Clone, Copy)]
 pub struct MonitorConfig {
     /// Frames after an acquire before a box is judged. The baseline is re-snapshotted
@@ -178,11 +188,8 @@ pub struct MonitorConfig {
     /// enough that coherent video motion doesn't cross it, low enough that a gap↔stroke
     /// crossing does.
     pub hard_threshold: u8,
-    /// Fraction of a box's holes that must swing hard for the hard-count to trip.
+    /// Fraction of a box's holes that must swing hard for the box to trip.
     pub hard_frac: f32,
-    /// Trip when the correlation of current vs baseline over the contour holes falls
-    /// below this — the text pattern has been replaced or scrolled away.
-    pub min_corr: f32,
     /// Fraction of judged boxes tripping at once that reads as a scroll (anchored text
     /// moving together) rather than a per-box edit.
     pub scroll_frac: f32,
@@ -197,7 +204,6 @@ impl Default for MonitorConfig {
             warmup_frames: 6,
             hard_threshold: 110,
             hard_frac: 0.25,
-            min_corr: 0.5,
             scroll_frac: 0.7,
             scroll_min_boxes: 2,
         }
@@ -220,77 +226,50 @@ struct BoxMonitor {
     id: u64,
     /// Lattice indices inside this box's contour. Parallel to `baseline`.
     holes: Vec<usize>,
-    /// `screen_est` baseline, re-snapshotted at warmup end.
-    baseline: Vec<u8>,
+    /// Recovered screen RGB baseline, re-snapshotted at warmup end.
+    baseline: Vec<Rgb>,
     /// Frames observed since the baseline was set.
     frames: u32,
 }
 
 impl BoxMonitor {
-    /// Two signals over the box's contour holes vs the baseline: the hard-swing
-    /// fraction (`|Δ| > hard_threshold`) and the Pearson correlation. Either tripping
-    /// = changed. NCC is the strong scroll/replacement signal (and brightness-shift
-    /// invariant, so a uniform background brighten doesn't trip it); the hard count is
-    /// a backstop for wholesale removal. Not judged until warmup elapses (baseline
-    /// re-snapshotted at warmup end, once the overlay has settled into the mirror).
-    fn deviation(&self, samples: &[u8], cfg: &MonitorConfig) -> BoxDeviation {
+    /// One signal over the box's contour holes vs the baseline: the fraction whose
+    /// per-channel RGB delta exceeds `hard_threshold`. A scroll / content replacement
+    /// moves the strokes (and, for a coloured background, the whole patch); a benign
+    /// uniform drift under the threshold scores ~0. Not judged until warmup elapses
+    /// (baseline re-snapshotted at warmup end, once the overlay has settled).
+    fn deviation(&self, samples: &[Rgb], cfg: &MonitorConfig) -> BoxDeviation {
         if self.frames < cfg.warmup_frames || self.holes.is_empty() {
             return BoxDeviation::not_judged(self.id);
         }
         let mut hard = 0usize;
         let mut max_delta = 0u32;
-        let (mut sb, mut sc, mut sbb, mut scc, mut sbc) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
+        let mut sum_delta = 0u64;
         for (k, &h) in self.holes.iter().enumerate() {
-            let delta = (samples[h] as i32 - self.baseline[k] as i32).unsigned_abs();
+            let delta = channel_delta(samples[h], self.baseline[k]);
             max_delta = max_delta.max(delta);
+            sum_delta += delta as u64;
             if delta > cfg.hard_threshold as u32 {
                 hard += 1;
             }
-            let (b, c) = (self.baseline[k] as f64, samples[h] as f64);
-            sb += b;
-            sc += c;
-            sbb += b * b;
-            scc += c * c;
-            sbc += b * c;
         }
         BoxDeviation {
             id: self.id,
-            holes: self.holes.len(),
             frac: hard as f32 / self.holes.len() as f32,
-            corr: pearson(self.holes.len(), sb, sc, sbb, scc, sbc),
+            mean_delta: sum_delta as f32 / self.holes.len() as f32,
             max_delta,
             judged: true,
         }
     }
 }
 
-/// Pearson correlation of (baseline, current) over `n` holes from running sums. A
-/// constant baseline (no pattern) returns 1.0 → the hard-count carries it, not this.
-fn pearson(n: usize, sb: f64, sc: f64, sbb: f64, scc: f64, sbc: f64) -> f32 {
-    if n < 2 {
-        return 1.0;
-    }
-    let nf = n as f64;
-    let cov = sbc - sb * sc / nf;
-    let vb = sbb - sb * sb / nf;
-    let vc = scc - sc * sc / nf;
-    let denom = (vb * vc).sqrt();
-    if denom < 1e-3 {
-        1.0
-    } else {
-        (cov / denom).clamp(-1.0, 1.0) as f32
-    }
-}
-
 struct BoxDeviation {
     id: u64,
-    /// Contour holes this box has (for the correlation's min-holes guard).
-    holes: usize,
     /// Fraction of holes swinging hard this frame.
     frac: f32,
-    /// Pearson correlation of current vs baseline over the holes.
-    corr: f32,
-    /// Largest single-hole `|current − baseline|`, for debug.
+    /// Mean per-channel delta over all holes — diagnostic only (logged).
+    mean_delta: f32,
+    /// Largest single-hole per-channel delta, for debug.
     max_delta: u32,
     /// False while the box is still in its warmup window.
     judged: bool,
@@ -300,18 +279,15 @@ impl BoxDeviation {
     fn not_judged(id: u64) -> Self {
         BoxDeviation {
             id,
-            holes: 0,
             frac: 0.0,
-            corr: 1.0,
+            mean_delta: 0.0,
             max_delta: 0,
             judged: false,
         }
     }
 
     fn changed(&self, cfg: &MonitorConfig) -> bool {
-        self.judged
-            && (self.frac > cfg.hard_frac
-                || (self.holes >= MIN_NCC_HOLES && self.corr < cfg.min_corr))
+        self.judged && self.frac > cfg.hard_frac
     }
 }
 
@@ -329,7 +305,7 @@ pub struct ScreenMonitor {
     last_top: Option<(u64, usize, usize)>,
     /// Per-box `(id, holes, hard_frac_pct, max_delta, changed)` from the last observe,
     /// for debug logging joined with each block's text.
-    last_devs: Vec<(u64, usize, usize, u32, i32, bool)>,
+    last_devs: Vec<(u64, usize, usize, u32, u32, bool)>,
 }
 
 impl ScreenMonitor {
@@ -345,7 +321,7 @@ impl ScreenMonitor {
     }
 
     /// Per-box `(id, holes, hard_frac_pct, max_delta, changed)` from last observe.
-    pub fn debug_boxes(&self) -> &[(u64, usize, usize, u32, i32, bool)] {
+    pub fn debug_boxes(&self) -> &[(u64, usize, usize, u32, u32, bool)] {
         &self.last_devs
     }
 
@@ -367,13 +343,13 @@ impl ScreenMonitor {
     /// Register or replace a box after an acquire. `holes` are the lattice indices
     /// inside the box's contour; `clean_samples` is the full-lattice `screen_est` of
     /// the clean read, from which the per-hole baseline is snapshotted.
-    pub fn set_box(&mut self, id: u64, holes: Vec<usize>, clean_samples: &[u8]) {
+    pub fn set_box(&mut self, id: u64, holes: Vec<usize>, clean_samples: &[Rgb]) {
         assert_eq!(
             clean_samples.len(),
             self.lattice.len(),
             "clean_samples must cover the whole lattice"
         );
-        let baseline: Vec<u8> = holes.iter().map(|&h| clean_samples[h]).collect();
+        let baseline: Vec<Rgb> = holes.iter().map(|&h| clean_samples[h]).collect();
         let monitor = BoxMonitor {
             id,
             holes,
@@ -413,9 +389,9 @@ impl ScreenMonitor {
         self.boxes.iter().map(|b| b.id).collect()
     }
 
-    /// One monitoring frame. `samples` is the recovered `screen_est`, one byte per
-    /// lattice point in `points()` order.
-    pub fn observe(&mut self, samples: &[u8]) -> FrameClassification {
+    /// One monitoring frame. `samples` is the recovered screen RGB, one per lattice
+    /// point in `points()` order.
+    pub fn observe(&mut self, samples: &[Rgb]) -> FrameClassification {
         assert_eq!(
             samples.len(),
             self.lattice.len(),
@@ -463,7 +439,7 @@ impl ScreenMonitor {
                     b.holes.len(),
                     (d.frac * 100.0).round() as usize,
                     d.max_delta,
-                    (d.corr * 100.0).round() as i32,
+                    d.mean_delta.round() as u32,
                     d.changed(&cfg),
                 )
             })
@@ -513,10 +489,11 @@ mod tests {
         }
     }
 
-    fn samples(len: usize, default: u8, overrides: &[(usize, u8)]) -> Vec<u8> {
-        let mut v = vec![default; len];
+    /// Grayscale samples: every point `[v,v,v]`, with per-hole overrides.
+    fn samples(len: usize, default: u8, overrides: &[(usize, u8)]) -> Vec<Rgb> {
+        let mut v = vec![[default; 3]; len];
         for &(i, val) in overrides {
-            v[i] = val;
+            v[i] = [val; 3];
         }
         v
     }
@@ -525,21 +502,21 @@ mod tests {
         MonitorConfig {
             warmup_frames: 4,
             hard_threshold: 110,
-            hard_frac: 0.25,
-            min_corr: 0.5,
+            // Between the 10% "video edge" (held) and a ~20% sparse-ink scroll (trips).
+            hard_frac: 0.15,
             scroll_frac: 0.7,
             scroll_min_boxes: 2,
         }
     }
 
-    fn warm(mon: &mut ScreenMonitor, clean: &[u8]) {
+    fn warm(mon: &mut ScreenMonitor, clean: &[Rgb]) {
         for _ in 0..cfg().warmup_frames + 1 {
             mon.observe(clean);
         }
     }
 
     /// A frame (over a `BG` field) where `frac` of `holes` swing hard to `HARD`.
-    fn swing(len: usize, holes: &[usize], frac: f32) -> Vec<u8> {
+    fn swing(len: usize, holes: &[usize], frac: f32) -> Vec<Rgb> {
         let n = (holes.len() as f32 * frac).round() as usize;
         samples(
             len,
@@ -581,7 +558,8 @@ mod tests {
         let lat = Lattice::build(100, 100, 10);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = vec![BG; mon.lattice().len()];
+        let len = mon.lattice().len();
+        let clean = samples(len, BG, &[]);
         mon.set_box(1, holes, &clean);
         warm(&mut mon, &clean);
         // Unchanged.
@@ -589,7 +567,7 @@ mod tests {
         // Uniform moderate shift (delta 50 < hard 110) — background brightening or
         // temporally-coherent video — never crosses the hard threshold → held.
         assert_eq!(
-            mon.observe(&vec![150u8; mon.lattice().len()]),
+            mon.observe(&samples(len, 150, &[])),
             FrameClassification::Quiet,
         );
     }
@@ -600,7 +578,7 @@ mod tests {
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = vec![BG; mon.lattice().len()];
+        let clean = samples(mon.lattice().len(), BG, &[]);
         mon.set_box(1, holes.clone(), &clean);
         warm(&mut mon, &clean);
         // A few hard holes (a moving video edge) — below the fraction → held.
@@ -620,19 +598,18 @@ mod tests {
         let lat = Lattice::build(100, 100, 10);
         let h1 = lat.holes_in_rect(&rect(30.0, 30.0, 40.0, 40.0));
         let h2 = lat.holes_in_rect(&rect(70.0, 70.0, 40.0, 40.0));
-        let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = vec![BG; mon.lattice().len()];
+        let clean = samples(mon.lattice().len(), BG, &[]);
         mon.set_box(1, h1.clone(), &clean);
         mon.set_box(2, h2.clone(), &clean);
         warm(&mut mon, &clean);
 
         let mut f = clean.clone();
         for &h in &h1[..(h1.len() * 2 / 5)] {
-            f[h] = HARD;
+            f[h] = [HARD; 3];
         }
         for &h in &h2[..(h2.len() * 2 / 5)] {
-            f[h] = HARD;
+            f[h] = [HARD; 3];
         }
         assert_eq!(mon.observe(&f), FrameClassification::Scroll);
     }
@@ -643,14 +620,14 @@ mod tests {
         let h1 = lat.holes_in_rect(&rect(30.0, 30.0, 40.0, 40.0));
         let h2 = lat.holes_in_rect(&rect(70.0, 70.0, 40.0, 40.0));
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = vec![BG; mon.lattice().len()];
+        let clean = samples(mon.lattice().len(), BG, &[]);
         mon.set_box(1, h1.clone(), &clean);
         mon.set_box(2, h2.clone(), &clean);
         warm(&mut mon, &clean);
 
         let mut f = clean.clone();
         for &h in &h1[..(h1.len() * 2 / 5)] {
-            f[h] = HARD;
+            f[h] = [HARD; 3];
         }
         assert_eq!(mon.observe(&f), FrameClassification::BoxesChanged(vec![1]));
     }
@@ -661,7 +638,7 @@ mod tests {
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean_a = vec![BG; len];
+        let clean_a = samples(len, BG, &[]);
         mon.set_box(1, holes.clone(), &clean_a);
         warm(&mut mon, &clean_a);
 
@@ -674,37 +651,60 @@ mod tests {
     }
 
     #[test]
-    fn similar_luma_reshuffle_trips_via_correlation() {
-        // Low-contrast text (ink 60 / bg 120, Δ60 < hard_threshold) replaced by
-        // different text: no hole swings hard (count = 0), but the pattern reshuffles
-        // so the correlation collapses → NCC trips.
+    fn black_on_white_scroll_trips() {
+        // The sticky-label case: black-on-white. Most holes are white background and
+        // never move; only the sparse ink strokes change on a scroll. With the single
+        // RGB hard-fraction signal this works because `hard_frac` is low enough that
+        // the ~20% ink crossing clears it — no ink/NCC heuristic needed.
+        const WHITE: u8 = 255;
+        const INK: u8 = 20;
         let lat = Lattice::build(100, 100, 10);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
-        let n = holes.len();
-        let k = n / 5;
-        let ink = holes[..k].to_vec();
-        let other = holes[k..2 * k].to_vec();
         let len = lat.len();
+        let ink_n = holes.len() / 5; // ~20% ink
+        let inked: Vec<(usize, u8)> = holes[..ink_n].iter().map(|&h| (h, INK)).collect();
+        let baseline = samples(len, WHITE, &inked);
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = samples(
-            len,
-            120,
-            &ink.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>(),
-        );
-        mon.set_box(1, holes, &clean);
-        warm(&mut mon, &clean);
+        mon.set_box(1, holes.clone(), &baseline);
+        warm(&mut mon, &baseline);
 
-        // The "60" content moves from `ink` holes to `other` holes — every Δ is 60
-        // (< hard_threshold 110), so the hard count is zero, but the pattern inverts.
-        let moved = samples(
-            len,
-            120,
-            &other.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>(),
-        );
+        // Static page: ink holds in place → held.
+        assert_eq!(mon.observe(&baseline), FrameClassification::Quiet);
+
+        // Scroll: the strokes move on, so the old ink holes read white now → the ~20%
+        // that swing hard clears the (low) hard fraction.
+        let scrolled = samples(len, WHITE, &[]);
         assert_eq!(
-            mon.observe(&moved),
+            mon.observe(&scrolled),
             FrameClassification::BoxesChanged(vec![1]),
-            "correlation collapse should trip even with sub-hard-threshold deltas"
+        );
+    }
+
+    #[test]
+    fn isoluminant_colour_change_trips() {
+        // Content scrolls onto a different colour at ~the same brightness: a luma-only
+        // delta would be ~0 (blind), but the per-channel RGB delta is large.
+        let lat = Lattice::build(100, 100, 10);
+        let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
+        let len = lat.len();
+        // hard_threshold 60 so the Δ70 colour swing counts; the point is the channel
+        // delta, not the magnitude.
+        let cfg = MonitorConfig {
+            hard_threshold: 60,
+            ..cfg()
+        };
+        let base = vec![[100u8, 100, 100]; len];
+        let mut mon = ScreenMonitor::new(lat, cfg);
+        mon.set_box(1, holes.clone(), &base);
+        for _ in 0..cfg.warmup_frames + 1 {
+            mon.observe(&base);
+        }
+        // [30,150,70]: luma ≈ 105 (Δ5 — a luma monitor shrugs), channel Δ = 70.
+        let recoloured = vec![[30u8, 150, 70]; len];
+        assert_eq!(
+            mon.observe(&recoloured),
+            FrameClassification::BoxesChanged(vec![1]),
+            "an isoluminant colour change should trip on the per-channel RGB delta",
         );
     }
 }

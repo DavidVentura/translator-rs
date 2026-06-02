@@ -179,7 +179,7 @@ impl LatticeProbe {
         lat: &Lattice,
         pill_luma: u8,
         pills: &[PillRegion],
-    ) -> Vec<u8> {
+    ) -> Vec<[u8; 3]> {
         assert_eq!(captured_luma.len(), (w * h) as usize, "captured size");
         let (cols, rows) = (lat.cols(), lat.rows());
         let n = pills.len().min(MAX_PILLS);
@@ -230,7 +230,9 @@ impl LatticeProbe {
             );
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-        out
+        // The synthetic sources are grayscale; the monitor compares per-channel RGB,
+        // so replicate the recovered luma into the three channels.
+        out.iter().map(|&v| [v, v, v]).collect()
     }
 }
 

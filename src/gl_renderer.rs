@@ -262,17 +262,18 @@ void main() {
     vec2 a = vec2(canon.x / u_canon_size.x, 1.0 - canon.y / u_canon_size.y);
     vec3 uv = u_uv_xform * vec3(a, 1.0);
     vec3 c = texture2D(u_tex, uv.xy).rgb;
-    float raw = dot(c, vec3(0.299, 0.587, 0.114));
-    float rec = raw;
+    // Per-channel recovery (RGB, not luma): under a pill, invert the hole blend per
+    // channel; elsewhere pass the raw colour. RGB so an isoluminant change registers.
+    vec3 rec = c;
     for (int i = 0; i < 64; i++) {
         if (i >= u_pill_count) { break; }
         vec4 pr = u_pills[i];
         if (abs(canon.x - pr.x) <= pr.z && abs(canon.y - pr.y) <= pr.w) {
-            rec = clamp((raw - (1.0 - u_screen_frac) * u_pill_luma) / u_screen_frac, 0.0, 1.0);
+            rec = clamp((c - vec3((1.0 - u_screen_frac) * u_pill_luma)) / u_screen_frac, 0.0, 1.0);
             break;
         }
     }
-    gl_FragColor = vec4(rec, rec, rec, 1.0);
+    gl_FragColor = vec4(rec, 1.0);
 }
 "#;
 
@@ -392,6 +393,8 @@ pub struct GlesRenderer {
     /// Lazily-built external-OES program that recovers screen_est at the
     /// pinhole lattice for the screen monitor.
     rec_lattice: Option<RecProgram>,
+    /// RGBA FBO for the lattice recovery readback (`read_lattice_screen_est`), grow-only.
+    rec_rgba_fbo: Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
     /// R8 FBO for the gray readback (separate from the RGBA `fbo`).
     gray_fbo: Option<glow::Framebuffer>,
     gray_fbo_tex: Option<glow::Texture>,
@@ -536,6 +539,7 @@ impl GlesRenderer {
                 fbo_size: None,
                 ext_luma: None,
                 rec_lattice: None,
+                rec_rgba_fbo: None,
                 gray_fbo: None,
                 gray_fbo_tex: None,
                 gray_fbo_size: None,
@@ -948,23 +952,24 @@ impl GlesRenderer {
         pills: &[(f32, f32, f32, f32)],
         pill_luma: f32,
         screen_frac: f32,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Vec<[u8; 3]>> {
         let (id, uv) = self.camera_external?;
         let id = NonZeroU32::new(id)?;
         if cols == 0 || rows == 0 || !self.ensure_rec_program() {
             return None;
         }
-        self.ensure_gray_fbo(cols, rows);
+        let (rec_fbo, _, _, _) =
+            Self::ensure_rgba_fbo(&mut self.rec_rgba_fbo, &self.gl, cols, rows);
         let n = pills.len().min(REC_MAX_PILLS);
         let mut flat = Vec::with_capacity(n * 4);
         for &(cx, cy, hw, hh) in &pills[..n] {
             flat.extend_from_slice(&[cx, cy, hw, hh]);
         }
-        let mut out = vec![0u8; (cols * rows) as usize];
+        let mut rgba = vec![0u8; (cols * rows * 4) as usize];
         unsafe {
             let gl = &self.gl;
             let r = self.rec_lattice.as_ref().expect("rec program present");
-            gl.bind_framebuffer(glow::FRAMEBUFFER, self.gray_fbo);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(rec_fbo));
             gl.viewport(0, 0, cols as i32, rows as i32);
             gl.disable(glow::BLEND);
             gl.disable(glow::CULL_FACE);
@@ -1005,14 +1010,14 @@ impl GlesRenderer {
                 0,
                 cols as i32,
                 rows as i32,
-                glow::RED,
+                glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut out)),
+                glow::PixelPackData::Slice(Some(&mut rgba)),
             );
             gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-        Some(out)
+        Some(rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect())
     }
 
     /// Render the borrowed external camera (canonical transform, no overlays)

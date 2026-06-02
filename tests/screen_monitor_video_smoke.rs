@@ -70,8 +70,6 @@ fn prod_monitor_config() -> MonitorConfig {
         hard_threshold: 110,
         // Backstop for wholesale removal; NCC carries scroll now.
         hard_frac: 0.25,
-        // Correlation floor — the strong scroll/replacement signal over the contour.
-        min_corr: 0.5,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     }
@@ -556,7 +554,7 @@ fn screen_monitor_video_smoke() {
     let mut next_id: u64 = 1;
 
     // Mirror of MonitorV2State's scheduling fields.
-    let mut prev_samples: Option<Vec<u8>> = None;
+    let mut prev_samples: Option<Vec<[u8; 3]>> = None;
     let mut prev_covered: Option<Vec<bool>> = None;
     let mut suppress_trips_until_ns: i64 = 0;
     let mut reacquire_not_before_ns: i64 = 0;
@@ -637,7 +635,7 @@ fn screen_monitor_video_smoke() {
                         continue;
                     }
                     eligible += 1;
-                    if (samples[i] as i32 - prev[i] as i32).abs() > V2_MOTION_THR {
+                    if (samples[i][0] as i32 - prev[i][0] as i32).abs() > V2_MOTION_THR {
                         moved += 1;
                     }
                 }
@@ -739,7 +737,7 @@ fn screen_monitor_video_smoke() {
         let devs: HashMap<u64, (usize, usize, u32, bool)> = mon
             .debug_boxes()
             .iter()
-            .map(|&(id, holes, frac, maxd, changed)| (id, (holes, frac, maxd, changed)))
+            .map(|&(id, holes, frac, maxd, _mean, changed)| (id, (holes, frac, maxd, changed)))
             .collect();
         let changed_set: Vec<u64> = changed.clone();
         let frame_img = annotate(

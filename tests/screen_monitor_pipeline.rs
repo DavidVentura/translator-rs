@@ -200,7 +200,6 @@ fn cfg() -> MonitorConfig {
         // is kept well under it.
         hard_threshold: 55,
         hard_frac: 0.15,
-        min_corr: 0.5,
         scroll_frac: 0.7,
         scroll_min_boxes: 2,
     }
@@ -255,7 +254,7 @@ fn subtitle_change_detected_background_motion_ignored() {
     let baseline = probe.recover(&cap_base, w, h, &lat, PILL_LUMA, &[pill]);
 
     // Binarize bootstrap on the recovered baseline.
-    let box_lumas: Vec<f32> = holes.iter().map(|&i| baseline[i] as f32).collect();
+    let box_lumas: Vec<f32> = holes.iter().map(|&i| baseline[i][0] as f32).collect();
     let mean = box_lumas.iter().sum::<f32>() / box_lumas.len() as f32;
     let bootstrap: Vec<bool> = box_lumas
         .iter()
@@ -328,9 +327,21 @@ fn subtitle_change_detected_background_motion_ignored() {
         save("01_input.png", &src_a, w, h);
         save("02_pills_holes.png", &cap_base, w, h);
         save("03_pills_holes_new_text.png", &cap_changed, w, h);
-        // What the shader reads back (recovered screen_est at the lattice).
-        save("04_recovered_baseline.png", &baseline, grid_cols, grid_rows);
-        save("05_recovered_changed.png", &rec_b, grid_cols, grid_rows);
+        // What the shader reads back (recovered screen_est at the lattice). RGB → take
+        // a channel for the gray dump (the synthetic fixtures are grayscale).
+        let chan = |v: &[[u8; 3]]| v.iter().map(|p| p[0]).collect::<Vec<u8>>();
+        save(
+            "04_recovered_baseline.png",
+            &chan(&baseline),
+            grid_cols,
+            grid_rows,
+        );
+        save(
+            "05_recovered_changed.png",
+            &chan(&rec_b),
+            grid_cols,
+            grid_rows,
+        );
         eprintln!("dumped screen-monitor artifacts to {dir}");
     }
 
