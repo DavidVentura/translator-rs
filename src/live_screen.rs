@@ -649,8 +649,8 @@ impl LiveScreenPipeline {
         // and `content_motion_frac` (recent motion over all points incl. under-pill
         // recovery) catches it once pills cover the page, where `motion_frac` goes
         // blind. Both must read settled.
-        let settled = motion_frac < V2_SETTLE_MOTION_FRAC
-            && content_motion_frac < V2_SETTLE_CONTENT_FRAC;
+        let settled =
+            motion_frac < V2_SETTLE_MOTION_FRAC && content_motion_frac < V2_SETTLE_CONTENT_FRAC;
         if now_ns >= st.reacquire_not_before_ns
             && settled
             && !self.acquire_busy()

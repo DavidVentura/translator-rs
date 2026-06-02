@@ -446,7 +446,11 @@ impl ScreenMonitor {
             .filter(|d| d.judged)
             .max_by(|a, b| a.frac.total_cmp(&b.frac))
             .map(|d| {
-                let holes = self.boxes.iter().find(|b| b.id == d.id).map_or(0, |b| b.holes.len());
+                let holes = self
+                    .boxes
+                    .iter()
+                    .find(|b| b.id == d.id)
+                    .map_or(0, |b| b.holes.len());
                 (d.id, holes, (d.frac * 100.0).round() as usize)
             });
         self.last_devs = self
@@ -682,13 +686,21 @@ mod tests {
         let other = holes[k..2 * k].to_vec();
         let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
-        let clean = samples(len, 120, &ink.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>());
+        let clean = samples(
+            len,
+            120,
+            &ink.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>(),
+        );
         mon.set_box(1, holes, &clean);
         warm(&mut mon, &clean);
 
         // The "60" content moves from `ink` holes to `other` holes — every Δ is 60
         // (< hard_threshold 110), so the hard count is zero, but the pattern inverts.
-        let moved = samples(len, 120, &other.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>());
+        let moved = samples(
+            len,
+            120,
+            &other.iter().map(|&h| (h, 60u8)).collect::<Vec<_>>(),
+        );
         assert_eq!(
             mon.observe(&moved),
             FrameClassification::BoxesChanged(vec![1]),
