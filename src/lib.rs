@@ -22,7 +22,6 @@ pub mod font_provider;
 pub mod gl_renderer;
 //#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod homography;
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod homography_ekf;
 #[cfg(feature = "html")]
 pub mod html_translate;
@@ -87,17 +86,14 @@ mod routing;
 pub mod screen_monitor;
 #[cfg(feature = "gpu")]
 pub mod screen_monitor_gpu;
-#[cfg(any(feature = "pdf", feature = "image-render", feature = "transliterate"))]
 pub mod script;
-#[cfg(feature = "ppocr")]
-mod script_normalize;
+pub mod script_normalize;
 mod sentence_split;
 pub mod session;
 pub mod settings;
 #[cfg(feature = "tts")]
 mod speech;
 mod styled;
-#[cfg(feature = "planar-tracker")]
 pub mod surface_map;
 #[cfg(feature = "dictionary")]
 pub mod tarkka;

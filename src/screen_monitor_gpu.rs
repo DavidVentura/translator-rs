@@ -54,7 +54,11 @@ void main() {
     float row = floor(gl_FragCoord.y);
     float wx = u_origin + col * u_spacing;
     float wy = u_origin + row * u_spacing;
-    vec2 uv = vec2(wx, wy) / u_tex_size;
+    // Sample the CENTRE of the hole's texel, not its corner: at even lattice
+    // spacing wx is an integer (a texel boundary) and `wx/size` rounds to the
+    // neighbouring opaque-pill texel, reading a constant. floor()+0.5 lands dead
+    // on the hole pixel (the device recovery centres for the same reason).
+    vec2 uv = (floor(vec2(wx, wy)) + 0.5) / u_tex_size;
     float raw = texture(u_captured, uv).r * 255.0;
     float rec = raw;
     for (int i = 0; i < u_pill_count; i++) {
