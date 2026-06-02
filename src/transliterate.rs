@@ -1,5 +1,6 @@
 use icu_experimental::transliterate::Transliterator;
 use icu_locale_core::Locale;
+use unicode_script::{Script, UnicodeScript};
 
 use crate::api::{LanguageCode, ScriptCode};
 
@@ -21,6 +22,92 @@ fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
             let t = make_transliterator(source_script.as_str())?;
             Some(t.transliterate(text.to_string()))
         }
+    }
+}
+
+/// ICU source script subtag that romanizes a given run, or `None` for runs we
+/// leave untouched (Latin, punctuation, marks). Scripts ICU has no transform
+/// for still fall back to pass-through via `transliterate` returning `None`.
+fn romanizable_source_code(script: Script) -> Option<String> {
+    use crate::script::Script as S;
+    match S::from(script) {
+        S::Latin | S::Common | S::Inherited | S::Other => None,
+        // Both kana share the Japanese transform (katakana then hiragana).
+        S::Hiragana | S::Katakana => Some("Jpan".to_owned()),
+        other => Some(other.iso15924().to_owned()),
+    }
+}
+
+/// Punctuation, whitespace, digits and combining marks carry no script of their
+/// own; they belong to whichever run surrounds them.
+fn is_neutral(script: Script) -> bool {
+    matches!(script, Script::Common | Script::Inherited)
+}
+
+/// Assign every char a concrete script, letting neutral chars inherit from the
+/// run they sit in (preceding run first, leading neutrals from the following
+/// one).
+fn resolve_char_scripts(text: &str) -> Vec<(char, Script)> {
+    let mut chars: Vec<(char, Script)> = text.chars().map(|ch| (ch, ch.script())).collect();
+
+    let mut last_concrete: Option<Script> = None;
+    for (_, script) in chars.iter_mut() {
+        if is_neutral(*script) {
+            if let Some(prev) = last_concrete {
+                *script = prev;
+            }
+        } else {
+            last_concrete = Some(*script);
+        }
+    }
+
+    if let Some(first_concrete) = chars.iter().map(|(_, s)| *s).find(|s| !is_neutral(*s)) {
+        for (_, script) in chars.iter_mut() {
+            if !is_neutral(*script) {
+                break;
+            }
+            *script = first_concrete;
+        }
+    }
+
+    chars
+}
+
+/// Romanize the non-Latin runs of a mixed-script string, leaving Latin text,
+/// punctuation and whitespace as they are. Used when the requested output is a
+/// Latin-script voice but the text carries foreign names ("Your line 'Сливница
+/// - Летище София' is arriving" → "Your line 'Slivnitsa - Letishte Sofiya' is
+/// arriving").
+pub fn transliterate_mixed_to_latin(text: &str) -> String {
+    let resolved = resolve_char_scripts(text);
+
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let mut run_script: Option<Script> = None;
+
+    for (ch, script) in resolved {
+        if run_script != Some(script) {
+            flush_run(&mut out, &run, run_script);
+            run.clear();
+            run_script = Some(script);
+        }
+        run.push(ch);
+    }
+    flush_run(&mut out, &run, run_script);
+
+    out
+}
+
+fn flush_run(out: &mut String, run: &str, run_script: Option<Script>) {
+    if run.is_empty() {
+        return;
+    }
+    let romanized = run_script
+        .and_then(romanizable_source_code)
+        .and_then(|source| transliterate(run, &ScriptCode::from(source)));
+    match romanized {
+        Some(romanized) => out.push_str(&romanized),
+        None => out.push_str(run),
     }
 }
 
@@ -186,6 +273,35 @@ mod tests {
         // Simulate: "東京タワー" → mucab → "とうきょう タワー"
         // Then ICU should produce: "toukyou tawā"
         assert_eq!(translit("Jpan", "とうきょう タワー"), "toukyou tawā");
+    }
+
+    #[test]
+    fn test_mixed_cyrillic_in_latin_sentence() {
+        assert_eq!(
+            transliterate_mixed_to_latin("Your line 'Сливница - Летище София' is arriving"),
+            "Your line 'Slivnica - Letiŝe Sofiâ' is arriving"
+        );
+    }
+
+    #[test]
+    fn test_mixed_pure_latin_unchanged() {
+        assert_eq!(
+            transliterate_mixed_to_latin("Just a plain ASCII sentence."),
+            "Just a plain ASCII sentence."
+        );
+    }
+
+    #[test]
+    fn test_mixed_pure_cyrillic() {
+        assert_eq!(transliterate_mixed_to_latin("Привет мир"), "Privet mir");
+    }
+
+    #[test]
+    fn test_mixed_multiple_scripts() {
+        assert_eq!(
+            transliterate_mixed_to_latin("hello Привет and Αθήνα done"),
+            "hello Privet and Athḗna done"
+        );
     }
 
     #[test]

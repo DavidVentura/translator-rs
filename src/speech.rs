@@ -356,6 +356,22 @@ fn piper_length_scale_for_speed(speech_speed: f32) -> f32 {
     1.0 / clamp_speech_speed(speech_speed)
 }
 
+/// When the TTS voice writes a Latin script, romanize any foreign-script runs
+/// in the text so eSpeak pronounces them instead of skipping them. Voices that
+/// natively render the source script (Cyrillic, CJK, …) keep the text intact.
+#[cfg(feature = "transliterate")]
+fn romanize_foreign_runs_for_voice(text: &str, language_code: &str) -> String {
+    if crate::script::Script::from_bcp47(language_code) != crate::script::Script::Latin {
+        return text.to_owned();
+    }
+    crate::transliterate::transliterate_mixed_to_latin(text)
+}
+
+#[cfg(not(feature = "transliterate"))]
+fn romanize_foreign_runs_for_voice(text: &str, _language_code: &str) -> String {
+    text.to_owned()
+}
+
 fn missing_tts_asset(language_code: &LanguageCode) -> TranslatorError {
     TranslatorError::missing_asset(format!(
         "TTS voice not installed for {}",
@@ -809,6 +825,9 @@ fn synthesize_pcm(
     configure_support_data_root(support_data_root);
     let support_data_root = support_data_root.unwrap_or_default();
 
+    let romanized = (!is_phonemes).then(|| romanize_foreign_runs_for_voice(text, language_code));
+    let text = romanized.as_deref().unwrap_or(text);
+
     log_debug(format!(
         "Synthesizing speech with engine={engine} model={model_path}"
     ));
@@ -964,7 +983,8 @@ fn plan_speech_chunks_for_text(
     language_code: &str,
     text: &str,
 ) -> Result<Vec<SpeechChunk>, String> {
-    plan_speech_chunks(text, |chunk_text| {
+    let text = romanize_foreign_runs_for_voice(text, language_code);
+    plan_speech_chunks(&text, |chunk_text| {
         phonemize_chunks(
             cache,
             engine,

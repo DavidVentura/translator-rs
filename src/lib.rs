@@ -87,7 +87,7 @@ mod routing;
 pub mod screen_monitor;
 #[cfg(feature = "gpu")]
 pub mod screen_monitor_gpu;
-#[cfg(any(feature = "pdf", feature = "image-render"))]
+#[cfg(any(feature = "pdf", feature = "image-render", feature = "transliterate"))]
 pub mod script;
 #[cfg(feature = "ppocr")]
 mod script_normalize;
