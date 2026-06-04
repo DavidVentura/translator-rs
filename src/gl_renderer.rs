@@ -83,8 +83,19 @@ varying vec2 v_canon;
 void main() {
     vec4 c = texture2D(u_tex, v_uv);
     if (u_hole_spacing > 0.0 && c.a > 0.1) {
-        vec2 origin = vec2(u_hole_spacing * 0.5);
-        vec2 nearest = floor((v_canon - origin) / u_hole_spacing + 0.5) * u_hole_spacing + origin + vec2(0.25);
+        float origin = u_hole_spacing * 0.5;
+        // Per-row stagger (see Lattice::build): each row's holes shift right by
+        // row mod pitch (1 canonical px/row = 2 display px after the 2× present
+        // upscale), turning solid hole-columns into a sheared lattice so the grid's
+        // moiré against the display pixels rotates off the vertical axis.
+        float row = floor((v_canon.y - origin) / u_hole_spacing + 0.5);
+        float phase = mod(row, u_hole_spacing);
+        vec2 base = vec2(
+            floor((v_canon.x - origin - phase) / u_hole_spacing + 0.5) * u_hole_spacing + origin + phase,
+            row * u_hole_spacing + origin);
+        // Snap to the nearest mirror-texel centre so punch and recovery land on the
+        // same hole pixel even at a fractional pitch (see REC_FRAG for the why).
+        vec2 nearest = (floor(base * 2.0) + 0.5) / 2.0;
         if (distance(v_canon, nearest) <= u_hole_radius) {
             c.a = u_hole_alpha;
         }
@@ -249,12 +260,16 @@ uniform int u_pill_count;
 uniform vec4 u_pills[64];     // cx, cy, half_w, half_h (canonical)
 void main() {
     vec2 cell = floor(gl_FragCoord.xy);
-    // Sample the pinhole pixel's CENTER, not its corner. External textures are
-    // addressed by normalized texture2D (no texelFetch), which points at pixel
-    // corners; with NEAREST that lands on an undefined neighbour and, for a 1px
-    // hole, misses it. The mirror is 2× canonical, so half a mirror texel is 0.25
-    // canonical — add it so the sample lands dead-centre on the hole.
-    vec2 canon = vec2(u_origin) + cell * u_spacing + vec2(0.25);
+    vec2 base = vec2(u_origin) + cell * u_spacing;
+    base.x += mod(cell.y, u_spacing); // per-row stagger, see Lattice::build
+    // Snap each hole to the nearest mirror-texel CENTRE, then sample there. External
+    // textures sample by normalized texture2D (no texelFetch): an integer-canonical
+    // position lands on a mirror texel boundary, where NEAREST grabs a neighbour and,
+    // for a 1px hole, misses it. The mirror is 2× canonical, so floor(base*2)+0.5 is
+    // the containing texel's centre; /2 returns to canonical. For an integer pitch
+    // this equals the old fixed +0.25 nudge; for a fractional pitch (2.5) it still
+    // lands dead-centre instead of on a boundary. The punch snaps identically.
+    vec2 canon = (floor(base * 2.0) + 0.5) / 2.0;
     // Flip v: the acquire's readback applies Y_FLIP_CLIP to land a top-down
     // canonical frame (the space the boxes live in). We sample the camera uv
     // directly, so without this flip the recovered grid is vertically mirrored

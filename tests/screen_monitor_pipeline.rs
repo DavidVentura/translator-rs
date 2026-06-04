@@ -32,7 +32,7 @@ use translator::screen_monitor_gpu::{LatticeProbe, PillRegion};
 const DET_MAX_PIXELS: u32 = 1_000_000;
 const MODEL_DIR: &str = "/home/david/AndroidStudioProjects/bucket/ocr/1/PP-OCRv5";
 const FIXTURE_DIR: &str = "files/live-overlay";
-const LATTICE_SPACING: u32 = 5;
+const LATTICE_SPACING: f32 = 5.0;
 const PILL_LUMA: u8 = 0; // opaque black pill, matching the screen overlay
 /// Luma distance from the box mean that marks a lattice hole as on-ink.
 const INK_CONTRAST: f32 = 35.0;

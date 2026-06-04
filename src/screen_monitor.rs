@@ -32,28 +32,36 @@ pub struct Lattice {
     points: Vec<LatticePoint>,
     cols: u32,
     rows: u32,
-    spacing: u32,
+    spacing: f32,
     /// Centre offset of the first point: `spacing / 2`. A point's canonical
-    /// position is `(origin + col*spacing, origin + row*spacing)`.
+    /// position is `(origin + col*spacing + row_phase, origin + row*spacing)`,
+    /// where `row_phase = row % spacing` staggers each row (see `build`).
     origin: f32,
 }
 
 impl Lattice {
-    /// A regular `spacing`-pitch grid centred in each cell. Alternating-row /
-    /// staggered hole patterns are a rendering concern (hole visibility); the
-    /// classifier only needs the point positions, so a plain grid is enough here.
+    /// A `spacing`-pitch grid (canonical px, fractional allowed — e.g. 2.5 ≈ 5
+    /// display px) with each row shifted right by `row % spacing`, so the holes
+    /// form a sheared lattice rather than solid columns. A straight grid beats
+    /// against the display's pixel grid into a visible axis-aligned moiré; the
+    /// per-row stagger rotates that beat off the vertical axis. The step is 1
+    /// canonical px/row (2 display px after the present's 2× upscale), which walks
+    /// a fresh column phase each row, cycling every `spacing` rows. The renderer's
+    /// punch and recovery shaders apply the identical shift and snap to the mirror
+    /// texel grid, so a fractional pitch still samples each hole pixel-exact.
     /// Points are emitted row-major (y outer, x inner), so index `row*cols + col`
-    /// — the same order the GPU readback grid is read back in.
-    pub fn build(canon_w: u32, canon_h: u32, spacing: u32) -> Self {
-        let spacing = spacing.max(1);
-        let half = spacing as f32 * 0.5;
-        let cols = (canon_w.saturating_sub(1) / spacing) + 1;
-        let rows = (canon_h.saturating_sub(1) / spacing) + 1;
+    /// — the order the GPU readback grid is read in.
+    pub fn build(canon_w: u32, canon_h: u32, spacing: f32) -> Self {
+        let spacing = spacing.max(1.0);
+        let half = spacing * 0.5;
+        let cols = ((canon_w.saturating_sub(1) as f32) / spacing).floor() as u32 + 1;
+        let rows = ((canon_h.saturating_sub(1) as f32) / spacing).floor() as u32 + 1;
         let mut points = Vec::with_capacity((cols * rows) as usize);
         for row in 0..rows {
-            let y = half + (row * spacing) as f32;
+            let y = half + row as f32 * spacing;
+            let phase = (row as f32) % spacing;
             for col in 0..cols {
-                let x = half + (col * spacing) as f32;
+                let x = half + col as f32 * spacing + phase;
                 points.push(LatticePoint { x, y });
             }
         }
@@ -69,10 +77,10 @@ impl Lattice {
     /// Grid `(cols, rows)` for a `canon_w×canon_h` frame at `spacing`, without
     /// allocating the points — the same counts [`build`](Self::build) produces, so
     /// the GPU readback can be sized to match before a `Lattice` exists.
-    pub fn dims(canon_w: u32, canon_h: u32, spacing: u32) -> (u32, u32) {
-        let spacing = spacing.max(1);
-        let cols = (canon_w.saturating_sub(1) / spacing) + 1;
-        let rows = (canon_h.saturating_sub(1) / spacing) + 1;
+    pub fn dims(canon_w: u32, canon_h: u32, spacing: f32) -> (u32, u32) {
+        let spacing = spacing.max(1.0);
+        let cols = ((canon_w.saturating_sub(1) as f32) / spacing).floor() as u32 + 1;
+        let rows = ((canon_h.saturating_sub(1) as f32) / spacing).floor() as u32 + 1;
         (cols, rows)
     }
 
@@ -96,7 +104,7 @@ impl Lattice {
         self.rows
     }
 
-    pub fn spacing(&self) -> u32 {
+    pub fn spacing(&self) -> f32 {
         self.spacing
     }
 
@@ -530,7 +538,7 @@ mod tests {
 
     #[test]
     fn lattice_grid_and_membership() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         assert_eq!(lat.len(), 100);
         let band = rect(50.0, 80.0, 80.0, 20.0);
         let holes = lat.holes_in_rect(&band);
@@ -539,7 +547,7 @@ mod tests {
 
     #[test]
     fn holes_in_polygon_hugs_the_contour() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         // A diamond centred at (50,50): its bounding rect includes corners the polygon
         // excludes, so the polygon hole set is strictly smaller.
         let diamond = [50.0, 20.0, 80.0, 50.0, 50.0, 80.0, 20.0, 50.0];
@@ -555,7 +563,7 @@ mod tests {
 
     #[test]
     fn static_and_moderate_drift_held() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let mut mon = ScreenMonitor::new(lat, cfg());
         let len = mon.lattice().len();
@@ -574,7 +582,7 @@ mod tests {
 
     #[test]
     fn hard_swing_fraction_trips() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
@@ -595,7 +603,7 @@ mod tests {
 
     #[test]
     fn all_boxes_swinging_hard_is_a_scroll() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let h1 = lat.holes_in_rect(&rect(30.0, 30.0, 40.0, 40.0));
         let h2 = lat.holes_in_rect(&rect(70.0, 70.0, 40.0, 40.0));
         let mut mon = ScreenMonitor::new(lat, cfg());
@@ -616,7 +624,7 @@ mod tests {
 
     #[test]
     fn one_box_swinging_is_per_box_not_scroll() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let h1 = lat.holes_in_rect(&rect(30.0, 30.0, 40.0, 40.0));
         let h2 = lat.holes_in_rect(&rect(70.0, 70.0, 40.0, 40.0));
         let mut mon = ScreenMonitor::new(lat, cfg());
@@ -634,7 +642,7 @@ mod tests {
 
     #[test]
     fn re_acquire_resets_baseline() {
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let len = lat.len();
         let mut mon = ScreenMonitor::new(lat, cfg());
@@ -658,7 +666,7 @@ mod tests {
         // the ~20% ink crossing clears it — no ink/NCC heuristic needed.
         const WHITE: u8 = 255;
         const INK: u8 = 20;
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let len = lat.len();
         let ink_n = holes.len() / 5; // ~20% ink
@@ -684,7 +692,7 @@ mod tests {
     fn isoluminant_colour_change_trips() {
         // Content scrolls onto a different colour at ~the same brightness: a luma-only
         // delta would be ~0 (blind), but the per-channel RGB delta is large.
-        let lat = Lattice::build(100, 100, 10);
+        let lat = Lattice::build(100, 100, 10.0);
         let holes = lat.holes_in_rect(&rect(50.0, 50.0, 80.0, 80.0));
         let len = lat.len();
         // hard_threshold 60 so the Δ70 colour swing counts; the point is the channel

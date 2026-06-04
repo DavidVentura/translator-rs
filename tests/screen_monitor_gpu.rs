@@ -18,7 +18,7 @@ const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
 
 const W: u32 = 120;
 const H: u32 = 90;
-const SPACING: u32 = 5;
+const SPACING: f32 = 5.0;
 const PILL_LUMA: u8 = 0; // opaque black pill, matching the screen overlay
 const BG: u8 = 230; // band background between strokes (high contrast, like a page)
 const INK: u8 = 20; // dark text strokes

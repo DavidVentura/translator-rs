@@ -46,7 +46,7 @@ use translator::screen_monitor_gpu::{LatticeProbe, PillRegion};
 
 // ── prod constants mirrored from src/live_screen.rs + src/screen_monitor_gpu.rs ──
 // (kept in sync by hand so the baseline matches the device; see the plan)
-const LATTICE_SPACING: u32 = 2; // SCREEN_LATTICE_SPACING
+const LATTICE_SPACING: f32 = 2.0; // SCREEN_LATTICE_SPACING
 const PILL_LUMA: u8 = 0; // SCREEN_PILL_LUMA = 0.0
 const MIN_BOX_HOLES: usize = 4; // SCREEN_MIN_BOX_HOLES
 const MAX_BOXES: usize = 64; // MAX_PILLS in screen_monitor_gpu (= device REC_MAX_PILLS)

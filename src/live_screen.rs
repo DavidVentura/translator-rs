@@ -33,9 +33,11 @@ const SCREEN_ANCHOR_ID: u64 = 1;
 
 /// Pinhole lattice pitch (canonical px) for the v2 under-pill change detector.
 /// Holes are punched here in the overlay and the recovery shader samples here.
-/// 3 canonical ≈ 6 display px/pinhole — denser than the original 5 so short labels
-/// land enough holes on the moving ink, and the recovered grid is finer.
-const SCREEN_LATTICE_SPACING: u32 = 2;
+/// 2.5 canonical ≈ 5 display px/pinhole: the present's 2× upscale turns this into
+/// an integer 5px display pitch (1px hole + 4px content), which with the 2px
+/// per-row stagger pushes the lattice's moiré off-axis. Fractional canonical is
+/// fine — the punch/recovery snap each hole to the mirror texel grid.
+const SCREEN_LATTICE_SPACING: f32 = 2.0;
 /// Pill colour the screen overlay draws (opaque black), as a 0..1 luma — the
 /// recovery's `pill` term.
 const SCREEN_PILL_LUMA: f32 = 0.0;
@@ -330,7 +332,7 @@ impl LiveScreenPipeline {
 
     /// Pinhole lattice pitch (canonical px) the v2 detector + the overlay holes
     /// share. The GL caller sizes its recovery readback and punches holes with it.
-    pub fn lattice_spacing(&self) -> u32 {
+    pub fn lattice_spacing(&self) -> f32 {
         SCREEN_LATTICE_SPACING
     }
 

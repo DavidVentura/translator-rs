@@ -54,7 +54,10 @@ out vec4 frag;
 void main() {
     float col = floor(gl_FragCoord.x);
     float row = floor(gl_FragCoord.y);
-    float wx = u_origin + col * u_spacing;
+    // Per-row stagger (see Lattice::build): shift x by row mod pitch so the
+    // probe samples land on the same holes the renderer punches.
+    float phase = mod(row, u_spacing);
+    float wx = u_origin + col * u_spacing + phase;
     float wy = u_origin + row * u_spacing;
     // Sample the CENTRE of the hole's texel, not its corner: at even lattice
     // spacing wx is an integer (a texel boundary) and `wx/size` rounds to the
@@ -209,7 +212,7 @@ impl LatticeProbe {
             gl.bind_texture(glow::TEXTURE_2D, Some(captured));
             gl.uniform_1_i32(Some(&self.u_captured), 0);
             gl.uniform_2_f32(Some(&self.u_tex_size), w as f32, h as f32);
-            gl.uniform_1_f32(Some(&self.u_spacing), lat.spacing() as f32);
+            gl.uniform_1_f32(Some(&self.u_spacing), lat.spacing());
             gl.uniform_1_f32(Some(&self.u_origin), lat.origin());
             gl.uniform_1_f32(Some(&self.u_pill_luma), pill_luma as f32);
             gl.uniform_1_i32(Some(&self.u_pill_count), n as i32);
