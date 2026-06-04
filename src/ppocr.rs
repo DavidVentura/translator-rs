@@ -2319,17 +2319,30 @@ fn contour_strip_warp(
     let mut uy = ey / norm;
     // PCA gives a sign-ambiguous principal axis; we have to pick which
     // way along it the strip's +x should point. Without a reference,
-    // `ux >= 0` is the only deterministic choice — but it's also
-    // *wrong* for any scene whose reading direction is along -x (R180)
-    // or has a vertical component pointing camera-down (a chunk of
-    // R90/R270 cases). When the scene's reading direction is known
-    // (canonical_quadrant), align the strip's +x with that direction
-    // instead, by flipping when the dot product against canonical is
-    // negative. Falls back to `ux >= 0` when canonical isn't supplied.
+    // `ux >= 0` is the only deterministic choice — and it must stay
+    // exactly that, because `estimate_canonical_quadrant` deskews by
+    // the `ux >= 0`-canonicalised `contour_principal_axis_angle` and
+    // relies on this dewarp agreeing with it sign-for-sign. When the
+    // scene's reading direction is known (canonical_quadrant), align
+    // the strip's +x with it by dot-product sign instead. That works
+    // while the axis has a meaningful component along the reference,
+    // but a *vertical* text column (CJK top-to-bottom) is nearly
+    // perpendicular to it, so the dot product is ≈0 and its sign is
+    // per-column noise — adjacent columns of one page dewarp in
+    // opposite directions and half of them recognize as empty. For
+    // those cross-axis strips we align against the reference rotated
+    // 90° CW in screen coords instead (reading-frame "down"), which
+    // pins vertical columns to top-char-first — the orientation
+    // PaddleOCR's recognizer was trained on (`np.rot90` of the crop).
     let need_flip = match canonical_quadrant {
         Some(q) => {
             let theta = q.radians();
-            ux * theta.cos() + uy * theta.sin() < 0.0
+            let along = ux * theta.cos() + uy * theta.sin();
+            if along.abs() >= std::f32::consts::FRAC_1_SQRT_2 {
+                along < 0.0
+            } else {
+                ux * -theta.sin() + uy * theta.cos() < 0.0
+            }
         }
         None => ux < 0.0,
     };

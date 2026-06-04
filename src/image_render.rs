@@ -95,8 +95,8 @@ pub fn render_overlay(
             OverlayLayoutMode::PerLine => {
                 render_per_line(&mut sink, block, &mut cache, fonts, opts)
             }
-            OverlayLayoutMode::BlockRect => {
-                render_block_rect(&mut sink, block, &mut cache, fonts, opts)
+            OverlayLayoutMode::VerticalBlockRect => {
+                render_vertical_block_rect(&mut sink, block, &mut cache, fonts, opts)
             }
         }
     }
@@ -174,7 +174,9 @@ pub(crate) fn collect_overlay_glyphs(
         let mut sink = GlyphSink::Collect(&mut collector);
         match block.layout_hints.layout_mode {
             OverlayLayoutMode::PerLine => render_per_line(&mut sink, block, cache, fonts, opts),
-            OverlayLayoutMode::BlockRect => render_block_rect(&mut sink, block, cache, fonts, opts),
+            OverlayLayoutMode::VerticalBlockRect => {
+                render_vertical_block_rect(&mut sink, block, cache, fonts, opts)
+            }
         }
     }
     collector
@@ -1028,9 +1030,14 @@ fn break_into_lines_by_words(
 }
 
 // ---------------------------------------------------------------------------
-// Layout — BlockRect
+// Layout — VerticalBlockRect
 
-fn render_block_rect(
+/// Vertical (CJK top-to-bottom) blocks keep their vertical layout: the
+/// translation is rendered rotated 90° CW, each line reading down the image,
+/// successive lines advancing right-to-left — the same direction the source
+/// columns flow. Layout happens in the transposed rect (wrap width = block
+/// height, line stack capped by block width); the rotation maps it back.
+fn render_vertical_block_rect(
     sink: &mut GlyphSink<'_>,
     block: &PreparedTextBlock,
     cache: &mut FontCache,
@@ -1060,13 +1067,13 @@ fn render_block_rect(
     }
 
     let lines = loop {
-        let candidate = wrap_into_block(translated, bw, size);
+        let candidate = wrap_into_block(translated, bh, size);
         let line_h = estimate_line_height(translated, size, &language, cache, fonts);
         if line_h <= 0.0 {
             return;
         }
-        let max_lines = (bh / line_h).floor() as usize;
-        if candidate.len() <= max_lines.max(1) && all_lines_fit(&candidate, bw, size) {
+        let max_lines = (bw / line_h).floor() as usize;
+        if candidate.len() <= max_lines.max(1) && all_lines_fit(&candidate, bh, size) {
             break candidate;
         }
         if size <= opts.min_font_size_px {
@@ -1076,10 +1083,13 @@ fn render_block_rect(
     };
 
     let line_h = estimate_line_height(translated, size, &language, cache, fonts);
-    let mut baseline_y = block.bounding_box.top as f32 + line_h * 0.8;
+    // Baseline offset within the transposed rect; in image space it advances
+    // leftward from the block's right edge. 0.8 leaves the same ascender room
+    // the horizontal block layout reserves below the top edge.
+    let mut baseline_offset = line_h * 0.8;
     for line_text in lines {
         if line_text.trim().is_empty() {
-            baseline_y += line_h;
+            baseline_offset += line_h;
             continue;
         }
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
@@ -1089,23 +1099,22 @@ fn render_block_rect(
         let mut chain_fn = chain_fn;
         let line_shape = shape_line(&line_text, &mut chain_fn, cache);
         if line_shape.runs.is_empty() {
-            baseline_y += line_h;
+            baseline_offset += line_h;
             continue;
         }
-        // Block-rect layout (CJK vertical / multi-line block) never rotates — block boxes are
-        // axis-aligned. Pass identity rotation (cos=1, sin=0).
+        // Reading direction is image +y: rotation (cos, sin) = (0, 1).
         draw_shaped_line(
             sink,
             &line_shape,
             cache,
-            block.bounding_box.left as f32,
-            baseline_y,
-            1.0,
+            block.bounding_box.right as f32 - baseline_offset,
+            block.bounding_box.top as f32,
             0.0,
+            1.0,
             size,
             block.foreground_argb,
         );
-        baseline_y += line_h;
+        baseline_offset += line_h;
     }
 }
 

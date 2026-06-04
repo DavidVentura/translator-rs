@@ -140,7 +140,7 @@ impl Rect {
 pub enum ReadingOrder {
     #[default]
     LeftToRight,
-    TopToBottomLeftToRight,
+    TopToBottomRightToLeft,
 }
 
 /// Source-language selection for OCR.
@@ -176,7 +176,7 @@ impl OcrSourceSelection {
 pub enum OverlayLayoutMode {
     #[default]
     PerLine,
-    BlockRect,
+    VerticalBlockRect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -944,6 +944,146 @@ pub fn group_lines_into_paragraphs(
     paragraphs
 }
 
+/// Vertical (CJK top-to-bottom, columns right-to-left) counterpart of
+/// [`group_lines_into_paragraphs`]. Rather than duplicating the grouping
+/// heuristics with swapped axes, lines are mapped into the vertical reading
+/// frame — reading direction becomes +x, column progression becomes +y — via
+/// the rigid transform `(x, y) → (y, X − x)` (with `X` the lines' max right
+/// edge, keeping the integer rects non-negative), grouped with the horizontal
+/// grouper, and mapped back. Right-to-left column order falls out of the
+/// grouper's top-to-bottom sort: the rightmost column has the smallest
+/// transposed top. The same-row pre-merge also transfers: two detections that
+/// split one visual column rejoin exactly like a kerning-split horizontal row.
+pub fn group_vertical_lines_into_paragraphs(
+    lines: Vec<TextLine>,
+    opts: ParagraphGroupingOptions,
+) -> Vec<TextBlock> {
+    let Some(frame_x) = lines.iter().map(|l| l.bounding_box.right).max() else {
+        return Vec::new();
+    };
+    let transposed = lines
+        .into_iter()
+        .map(|l| transpose_line(l, frame_x))
+        .collect();
+    group_lines_into_paragraphs(transposed, opts)
+        .into_iter()
+        .map(|block| TextBlock {
+            lines: block
+                .lines
+                .into_iter()
+                .map(|l| untranspose_line(l, frame_x))
+                .collect(),
+        })
+        .collect()
+}
+
+fn transpose_line(line: TextLine, frame_x: u32) -> TextLine {
+    TextLine {
+        text: line.text,
+        bounding_box: transpose_rect(line.bounding_box, frame_x),
+        oriented_box: transpose_oriented(line.oriented_box, frame_x as f32),
+        tight_box: transpose_oriented(line.tight_box, frame_x as f32),
+        word_rects: line
+            .word_rects
+            .into_iter()
+            .map(|r| transpose_rect(r, frame_x))
+            .collect(),
+    }
+}
+
+fn untranspose_line(line: TextLine, frame_x: u32) -> TextLine {
+    TextLine {
+        text: line.text,
+        bounding_box: untranspose_rect(line.bounding_box, frame_x),
+        oriented_box: untranspose_oriented(line.oriented_box, frame_x as f32),
+        tight_box: untranspose_oriented(line.tight_box, frame_x as f32),
+        word_rects: line
+            .word_rects
+            .into_iter()
+            .map(|r| untranspose_rect(r, frame_x))
+            .collect(),
+    }
+}
+
+fn transpose_rect(rect: Rect, frame_x: u32) -> Rect {
+    Rect {
+        left: rect.top,
+        top: frame_x.saturating_sub(rect.right),
+        right: rect.bottom,
+        bottom: frame_x.saturating_sub(rect.left),
+    }
+}
+
+fn untranspose_rect(rect: Rect, frame_x: u32) -> Rect {
+    Rect {
+        left: frame_x.saturating_sub(rect.bottom),
+        top: rect.left,
+        right: frame_x.saturating_sub(rect.top),
+        bottom: rect.right,
+    }
+}
+
+/// `width`/`height` stay put — they live along/across the box's own axis,
+/// which the angle rotates with the frame.
+fn transpose_oriented(o: OrientedRect, frame_x: f32) -> OrientedRect {
+    OrientedRect {
+        cx: o.cy,
+        cy: frame_x - o.cx,
+        width: o.width,
+        height: o.height,
+        angle_radians: o.angle_radians - std::f32::consts::FRAC_PI_2,
+    }
+}
+
+fn untranspose_oriented(o: OrientedRect, frame_x: f32) -> OrientedRect {
+    OrientedRect {
+        cx: frame_x - o.cy,
+        cy: o.cx,
+        width: o.width,
+        height: o.height,
+        angle_radians: o.angle_radians + std::f32::consts::FRAC_PI_2,
+    }
+}
+
+/// Minimum long/short aspect for a detection to vote on the page's reading
+/// orientation. Near-square boxes (single characters, square logos) have an
+/// unstable PCA axis, so their orientation is noise — they abstain.
+const READING_ORIENTATION_MIN_ASPECT: f32 = 1.5;
+
+/// Length-weighted vote over the detections' long-axis orientations: do the
+/// detected lines read vertically? Used to auto-resolve the reading order for
+/// CJK pages, where the detector fuses a vertical column into one tall box
+/// (see `group_vertical_lines_into_paragraphs`) and a horizontal line into a
+/// wide one. Weighting by long-axis length keeps one long body column from
+/// being outvoted by a few short horizontal scraps (page numbers, headers).
+pub fn detected_lines_read_vertically(boxes: &[DetectedTextBox]) -> bool {
+    let mut vertical = 0.0f32;
+    let mut horizontal = 0.0f32;
+    for b in boxes {
+        let t = &b.tight_box;
+        let long = t.width.max(t.height);
+        let short = t.width.min(t.height).max(1.0);
+        if long / short < READING_ORIENTATION_MIN_ASPECT {
+            continue;
+        }
+        // `width` lies along the box's own angle; the long axis is vertical
+        // when that axis points vertically (for the usual width ≥ height
+        // case) or when the box is taller than wide along a horizontal axis.
+        let axis_vertical = t.angle_radians.sin().abs() > t.angle_radians.cos().abs();
+        let long_axis_vertical = if t.width >= t.height {
+            axis_vertical
+        } else {
+            !axis_vertical
+        };
+        if long_axis_vertical {
+            vertical += long;
+        } else {
+            horizontal += long;
+        }
+    }
+    vertical > horizontal
+}
+
 /// Live camera overlays see more centered packaging/signage text than document paragraphs.
 /// This keeps the conservative document grouper intact and adds a simpler visual grouping pass
 /// for stacked, center-aligned labels such as product names and compact package claims.
@@ -1221,12 +1361,12 @@ fn truncate_for_log(text: &str) -> String {
 fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> OverlayLayoutHints {
     let layout_mode = match reading_order {
         ReadingOrder::LeftToRight => OverlayLayoutMode::PerLine,
-        ReadingOrder::TopToBottomLeftToRight => OverlayLayoutMode::BlockRect,
+        ReadingOrder::TopToBottomRightToLeft => OverlayLayoutMode::VerticalBlockRect,
     };
     let suggested_font_size_px = if block.lines.is_empty() {
         match reading_order {
             ReadingOrder::LeftToRight => block.bounds().height() as f32,
-            ReadingOrder::TopToBottomLeftToRight => block.bounds().width() as f32,
+            ReadingOrder::TopToBottomRightToLeft => block.bounds().width() as f32,
         }
     } else {
         // For per-line layout, use the oriented box's height (perpendicular to reading
@@ -1238,7 +1378,7 @@ fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> Overl
             .iter()
             .map(|line| match reading_order {
                 ReadingOrder::LeftToRight => line.oriented_box.height,
-                ReadingOrder::TopToBottomLeftToRight => line.bounding_box.width() as f32,
+                ReadingOrder::TopToBottomRightToLeft => line.bounding_box.width() as f32,
             })
             .sum::<f32>();
         total / block.lines.len() as f32
@@ -2005,7 +2145,7 @@ pub fn prepare_overlay_image(
                     foreground_argb: block_foreground,
                 });
             }
-            ReadingOrder::TopToBottomLeftToRight => {
+            ReadingOrder::TopToBottomRightToLeft => {
                 // Block-rect (CJK vertical) layout: the per-block region is the union of
                 // possibly differently-rotated lines, so rotation doesn't carry up. Erase the
                 // block AABB unrotated.
@@ -2277,9 +2417,39 @@ mod tests {
     use super::{
         DetectedWord, OrientedRect, OverlayLayoutMode, ParagraphGroupingOptions, Rect, TextBlock,
         TextLine, build_text_blocks, group_lines_into_paragraphs, group_live_lines_into_blocks,
-        prepare_overlay_image,
+        group_vertical_lines_into_paragraphs, prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
+
+    /// A vertical text column the way the ppocr still path delivers it: AABB
+    /// around the column, tight box with `width` along the (vertical) reading
+    /// axis, `height` the cross-axis ink thickness, angle 90°.
+    fn vline(text: &str, left: u32, top: u32, right: u32, bottom: u32, tight_w: f32) -> TextLine {
+        let rect = Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let tight = OrientedRect {
+            cx: (left + right) as f32 * 0.5,
+            cy: (top + bottom) as f32 * 0.5,
+            width: (bottom - top) as f32,
+            height: tight_w,
+            angle_radians: std::f32::consts::FRAC_PI_2,
+        };
+        TextLine {
+            text: text.to_string(),
+            bounding_box: rect,
+            oriented_box: OrientedRect {
+                width: (bottom - top) as f32,
+                height: (right - left) as f32,
+                ..tight
+            },
+            tight_box: tight,
+            word_rects: vec![rect],
+        }
+    }
 
     fn line(text: &str, left: u32, top: u32, right: u32, bottom: u32, tight_h: f32) -> TextLine {
         let rect = Rect {
@@ -2468,6 +2638,124 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].lines.len(), 1);
         assert_eq!(blocks[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn vertical_grouping_merges_columns_right_to_left() {
+        // Mirrors files/japanese-vertical.png: three columns of one sentence,
+        // detector order is arbitrary, reading order is rightmost-first.
+        let lines = vec![
+            vline("複数の列に", 34, 0, 78, 169, 14.0),
+            vline("この日本語の文章は", 70, 0, 113, 272, 14.0),
+            vline("分かれています", 0, 1, 43, 216, 14.0),
+        ];
+        let blocks = group_vertical_lines_into_paragraphs(lines, Default::default());
+        assert_eq!(blocks.len(), 1);
+        let texts: Vec<&str> = blocks[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["この日本語の文章は", "複数の列に", "分かれています"]
+        );
+        assert_eq!(
+            blocks[0].translation_text(),
+            "この日本語の文章は複数の列に分かれています"
+        );
+        // Geometry survives the reading-frame round trip.
+        assert_eq!(
+            blocks[0].lines[0].bounding_box,
+            Rect {
+                left: 70,
+                top: 0,
+                right: 113,
+                bottom: 272,
+            }
+        );
+        assert_eq!(blocks[0].lines[0].tight_box.cx, 91.5);
+        assert_eq!(blocks[0].lines[0].tight_box.width, 272.0);
+    }
+
+    fn det_box(
+        cx: f32,
+        cy: f32,
+        along: f32,
+        across: f32,
+        angle_deg: f32,
+    ) -> super::DetectedTextBox {
+        let tight = OrientedRect {
+            cx,
+            cy,
+            width: along,
+            height: across,
+            angle_radians: angle_deg.to_radians(),
+        };
+        super::DetectedTextBox {
+            rect: tight.to_aabb(),
+            oriented_box: tight,
+            tight_box: tight,
+            contour: Vec::new(),
+            score: 0.9,
+        }
+    }
+
+    #[test]
+    fn reading_orientation_vote_detects_vertical_columns() {
+        let boxes = vec![
+            det_box(91.5, 136.0, 243.0, 14.0, 90.0),
+            det_box(56.0, 84.5, 140.0, 15.0, 90.0),
+            det_box(21.5, 108.5, 186.0, 14.0, 90.0),
+        ];
+        assert!(super::detected_lines_read_vertically(&boxes));
+    }
+
+    #[test]
+    fn reading_orientation_vote_detects_horizontal_lines() {
+        let boxes = vec![
+            det_box(100.0, 20.0, 180.0, 12.0, 0.0),
+            det_box(100.0, 40.0, 180.0, 12.0, -1.5),
+            det_box(100.0, 60.0, 90.0, 12.0, 1.0),
+        ];
+        assert!(!super::detected_lines_read_vertically(&boxes));
+    }
+
+    #[test]
+    fn reading_orientation_vote_long_column_outweighs_short_scraps() {
+        // One long vertical body column vs two short horizontal scraps
+        // (header + page number): the length weighting keeps the page
+        // vertical even though horizontal boxes are the majority.
+        let boxes = vec![
+            det_box(50.0, 150.0, 280.0, 14.0, 90.0),
+            det_box(40.0, 10.0, 60.0, 12.0, 0.0),
+            det_box(90.0, 290.0, 30.0, 12.0, 0.0),
+        ];
+        assert!(super::detected_lines_read_vertically(&boxes));
+    }
+
+    #[test]
+    fn reading_orientation_vote_square_boxes_abstain() {
+        // Near-square single-character detections have a noise PCA axis and
+        // must not flip the page vertical.
+        let boxes = vec![
+            det_box(20.0, 20.0, 16.0, 14.0, 90.0),
+            det_box(60.0, 20.0, 15.0, 14.0, 88.0),
+            det_box(100.0, 20.0, 120.0, 12.0, 0.0),
+        ];
+        assert!(!super::detected_lines_read_vertically(&boxes));
+    }
+
+    #[test]
+    fn vertical_grouping_breaks_on_wide_column_gap() {
+        // Two adjacent columns plus a third far to the left (gap ≈ 9 ×
+        // column thickness) — the far column is a separate block.
+        let lines = vec![
+            vline("右の段", 200, 0, 230, 200, 14.0),
+            vline("続きの段", 160, 0, 190, 200, 14.0),
+            vline("別の段", 20, 0, 50, 200, 14.0),
+        ];
+        let blocks = group_vertical_lines_into_paragraphs(lines, Default::default());
+        assert_eq!(blocks.len(), 2);
+        let texts: Vec<&str> = blocks[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["右の段", "続きの段"]);
+        assert_eq!(blocks[1].lines[0].text, "別の段");
     }
 
     #[test]

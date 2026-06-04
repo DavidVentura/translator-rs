@@ -242,7 +242,7 @@ fn emit_block_text(
         OverlayLayoutMode::PerLine => {
             emit_per_line(builder, block, page, metrics, embed);
         }
-        OverlayLayoutMode::BlockRect => {
+        OverlayLayoutMode::VerticalBlockRect => {
             emit_block_rect(builder, block, page, metrics, embed);
         }
     }
@@ -272,8 +272,11 @@ fn emit_per_line(
     }
 }
 
-/// Translated text fills the block as one wrapped paragraph. Used for
-/// vertical (TopToBottomLeftToRight) reading order.
+/// Translated text fills the block as one wrapped horizontal paragraph.
+/// The image renderer draws VerticalBlockRect blocks rotated 90° CW; this
+/// PDF path keeps them horizontal because rotated text matrices aren't
+/// wired up here, and the PDF image pipeline only requests LeftToRight
+/// today so the arm is effectively unreachable.
 fn emit_block_rect(
     builder: &mut ContentStreamBuilder,
     block: &PreparedTextBlock,

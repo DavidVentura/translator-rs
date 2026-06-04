@@ -42,7 +42,7 @@ fn main() {
                 translator::OcrSourceSelection::specific(translator::LanguageCode::from("en")),
                 "nl",
                 75,
-                ReadingOrder::LeftToRight,
+                Some(ReadingOrder::LeftToRight),
                 BackgroundMode::AutoDetect,
                 translator::PreferredOcrEngine::default(),
             );

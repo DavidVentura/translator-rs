@@ -151,7 +151,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     source_selection: &OcrSourceSelection,
     target_code: &LanguageCode,
     background_mode: BackgroundMode,
-    reading_order: ReadingOrder,
+    reading_order: Option<ReadingOrder>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
     let full_rect = Rect {
         left: 0,
@@ -179,10 +179,19 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
         .collect();
 
+    // Still images are display-oriented, so the canonical reading frame is R0.
+    // Passing it explicitly (instead of None) pins the dewarp direction of
+    // near-vertical strips — CJK vertical columns — to top-char-first; with
+    // None the PCA sign for those strips is per-column noise.
     let scripts = match source_selection {
         OcrSourceSelection::Auto => {
             let predictions = ppocr
-                .classify_text_boxes_image(rgb, &gray_display, &det_boxes, None)
+                .classify_text_boxes_image(
+                    rgb,
+                    &gray_display,
+                    &det_boxes,
+                    Some(crate::coords::Quadrant::R0),
+                )
                 .map_err(|e| {
                     TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
                 })?;
@@ -194,6 +203,27 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         }
     };
 
+    // No requested reading order: infer it. Only CJK pages can read
+    // vertically (modern Korean is horizontal, so the gate is the shared
+    // Chinese+Japanese recognizer script, not "any CJK language"), and within
+    // those the detections' own long-axis orientations carry the answer.
+    let reading_order = reading_order.unwrap_or_else(|| {
+        let cj_boxes = scripts.iter().filter(|s| **s == PpocrScript::Cj).count();
+        let cjk_dominant = cj_boxes * 2 >= scripts.len() && !scripts.is_empty();
+        let resolved = if cjk_dominant && crate::ocr::detected_lines_read_vertically(&det_boxes) {
+            ReadingOrder::TopToBottomRightToLeft
+        } else {
+            ReadingOrder::LeftToRight
+        };
+        log::info!(
+            "ppocr auto reading order: {} cj boxes of {} → {:?}",
+            cj_boxes,
+            scripts.len(),
+            resolved,
+        );
+        resolved
+    });
+
     let lines = ppocr
         .recognize_text_in_boxes_image(
             rgb,
@@ -201,11 +231,11 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
             &det_boxes,
             &scripts,
             PpocrProfile::Still,
-            None,
+            Some(crate::coords::Quadrant::R0),
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
-    let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines);
+    let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines, reading_order);
     let source_code = match source_selection {
         OcrSourceSelection::Specific { language_code } => language_code.clone(),
         OcrSourceSelection::Auto => {
@@ -292,11 +322,11 @@ fn build_tesseract_blocks(
 
     let page_seg_mode = match reading_order {
         ReadingOrder::LeftToRight => PageSegMode::PsmAutoOsd,
-        ReadingOrder::TopToBottomLeftToRight => PageSegMode::PsmSingleBlockVertText,
+        ReadingOrder::TopToBottomRightToLeft => PageSegMode::PsmSingleBlockVertText,
     };
 
     let join_without_spaces = source_code.as_str() == "ja";
-    let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomLeftToRight;
+    let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomRightToLeft;
 
     let mut cache_guard = ocr_pool.lease();
     with_ocr_engine(
@@ -340,6 +370,7 @@ fn build_tesseract_blocks(
 fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
+    reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
     let text_lines: Vec<TextLine> = boxes
         .iter()
@@ -353,7 +384,14 @@ fn still_ppocr_lines_to_blocks(
             word_rects: vec![line.rect],
         })
         .collect();
-    crate::ocr::group_lines_into_paragraphs(text_lines, Default::default())
+    match reading_order {
+        ReadingOrder::LeftToRight => {
+            crate::ocr::group_lines_into_paragraphs(text_lines, Default::default())
+        }
+        ReadingOrder::TopToBottomRightToLeft => {
+            crate::ocr::group_vertical_lines_into_paragraphs(text_lines, Default::default())
+        }
+    }
 }
 
 /// Map a PULC script class to the best installed PPOCR recognizer script. Tries the
@@ -748,7 +786,7 @@ where
     let has_japanese_vertical_model =
         source_code == "ja" && tessdata_path.join("jpn_vert.traineddata").exists();
     let language_spec = match (source_code, reading_order, has_japanese_vertical_model) {
-        ("ja", ReadingOrder::TopToBottomLeftToRight, true) => "jpn_vert".to_string(),
+        ("ja", ReadingOrder::TopToBottomRightToLeft, true) => "jpn_vert".to_string(),
         _ => format!("{}+eng", language.tess_name),
     };
 

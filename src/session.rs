@@ -363,7 +363,7 @@ impl TranslatorSession {
         source_selection: OcrSourceSelection,
         target_code: &str,
         min_confidence: u32,
-        reading_order: ReadingOrder,
+        reading_order: Option<ReadingOrder>,
         background_mode: BackgroundMode,
         preferred_engine: PreferredOcrEngine,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
@@ -419,6 +419,9 @@ impl TranslatorSession {
             log::info!("ocr engine: tesseract (source={})", language_code.as_str());
             let _ = max_image_size;
 
+            // Tesseract has no pre-OCR detection geometry to vote on — the
+            // page-segmentation mode must be chosen up front, so auto means
+            // horizontal here.
             translate_image_rgba_in_snapshot(
                 self.engine(),
                 &self.ocr,
@@ -429,7 +432,7 @@ impl TranslatorSession {
                 language_code,
                 &tgt,
                 min_confidence,
-                reading_order,
+                reading_order.unwrap_or(ReadingOrder::LeftToRight),
                 background_mode,
             )
             .map_err(|e| {

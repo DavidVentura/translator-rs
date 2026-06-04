@@ -816,7 +816,7 @@ fn translate_one_xobject(
             crate::ocr::OcrSourceSelection::specific(LanguageCode::from(source_code)),
             target_code,
             DEFAULT_MIN_CONFIDENCE,
-            ReadingOrder::LeftToRight,
+            Some(ReadingOrder::LeftToRight),
             BackgroundMode::AutoDetect,
             crate::settings::PreferredOcrEngine::default(),
         )
@@ -1766,7 +1766,7 @@ fn ocr_page(
             crate::ocr::OcrSourceSelection::specific(LanguageCode::from(source_code)),
             target_code,
             DEFAULT_MIN_CONFIDENCE,
-            ReadingOrder::LeftToRight,
+            Some(ReadingOrder::LeftToRight),
             BackgroundMode::AutoDetect,
             crate::settings::PreferredOcrEngine::default(),
         )
