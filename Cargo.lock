@@ -3086,6 +3086,7 @@ dependencies = [
  "khronos-egl",
  "log",
  "lopdf",
+ "markup5ever",
  "markup5ever_rcdom",
  "minifb",
  "mnn-sys",
@@ -3109,6 +3110,7 @@ dependencies = [
  "unicode-linebreak",
  "unicode-script",
  "uniffi",
+ "xml5ever",
  "zeno",
  "zip",
 ]

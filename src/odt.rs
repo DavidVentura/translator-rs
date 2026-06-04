@@ -10,13 +10,13 @@ use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::TranslationWithAlignment;
 use crate::api::{LanguageCode, TranslatorError};
 use crate::language_detect::detect_language_robust_code;
 use crate::session::TranslatorSession;
-use crate::{TokenAlignment, TranslationWithAlignment};
 
 const ODT_MIMETYPE: &str = "application/vnd.oasis.opendocument.text";
-const ODT_TRANSLATION_BATCH_SIZE: usize = 8;
+const ODT_TRANSLATION_BATCH_SIZE: usize = 32;
 
 pub enum OdtTranslateProgress {
     TranslatingBlock { current: usize, total: usize },
@@ -135,7 +135,7 @@ impl OdtTextTranslator for SessionOdtTranslator<'_> {
                 .map(|text| TranslationWithAlignment {
                     source_text: text.clone(),
                     translated_text: text.clone(),
-                    alignments: identity_char_alignments(text),
+                    alignments: crate::translate::identity_char_alignments(text),
                 })
                 .collect());
         }
@@ -979,18 +979,6 @@ fn escape_xml_attr(input: &str) -> String {
     escape_xml_text(input).replace('"', "&quot;")
 }
 
-fn identity_char_alignments(text: &str) -> Vec<TokenAlignment> {
-    let count = text.chars().count() as u64;
-    (0..count)
-        .map(|idx| TokenAlignment {
-            src_begin: idx,
-            src_end: idx + 1,
-            tgt_begin: idx,
-            tgt_end: idx + 1,
-        })
-        .collect()
-}
-
 fn char_to_byte_offsets(s: &str) -> Vec<usize> {
     let mut table: Vec<usize> = s.char_indices().map(|(byte, _)| byte).collect();
     table.push(s.len());
@@ -1059,6 +1047,7 @@ fn is_word_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TokenAlignment;
 
     struct FakeTranslator {
         outputs: Vec<TranslationWithAlignment>,

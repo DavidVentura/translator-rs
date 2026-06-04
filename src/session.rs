@@ -15,7 +15,7 @@ use crate::catalog::{
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
 use crate::styled::{OverlayScreenshot, StructuredTranslationResult, StyledFragment};
-#[cfg(feature = "odt")]
+#[cfg(any(feature = "odt", feature = "epub"))]
 use crate::translate::TranslationWithAlignment;
 use crate::translate::Translator;
 
@@ -340,7 +340,7 @@ impl TranslatorSession {
         )
     }
 
-    #[cfg(feature = "odt")]
+    #[cfg(any(feature = "odt", feature = "epub"))]
     pub(crate) fn translate_texts_with_alignment(
         &self,
         from_code: &LanguageCode,

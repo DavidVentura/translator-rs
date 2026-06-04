@@ -201,7 +201,7 @@ impl<'a> Translator<'a> {
         .map_err(TranslatorError::translation)
     }
 
-    #[cfg(feature = "odt")]
+    #[cfg(any(feature = "odt", feature = "epub"))]
     pub(crate) fn translate_texts_with_alignment(
         &mut self,
         from_code: &LanguageCode,
@@ -236,6 +236,22 @@ pub struct TranslationWithAlignment {
     pub source_text: String,
     pub translated_text: String,
     pub alignments: Vec<TokenAlignment>,
+}
+
+/// One-to-one character alignment for an untranslated passthrough (e.g. source
+/// language equals target): char `i` of the source maps to char `i` of the
+/// "translation". Used by the document translators when no model is run.
+#[cfg(any(feature = "odt", feature = "epub"))]
+pub(crate) fn identity_char_alignments(text: &str) -> Vec<TokenAlignment> {
+    let count = text.chars().count() as u64;
+    (0..count)
+        .map(|idx| TokenAlignment {
+            src_begin: idx,
+            src_end: idx + 1,
+            tgt_begin: idx,
+            tgt_end: idx + 1,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

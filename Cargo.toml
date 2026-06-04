@@ -44,7 +44,9 @@ tts = ["dep:piper-rs"]
 transliterate = ["dep:icu_locale_core", "dep:icu_experimental", "dep:unicode-script"]
 pdf = ["dep:mupdf", "dep:lopdf", "dep:ttf-parser", "dep:subsetter"]
 odt = ["dep:zip"]
-html = ["dep:html5ever", "dep:markup5ever_rcdom"]
+dom-translate = ["dep:markup5ever", "dep:markup5ever_rcdom"]
+html = ["dom-translate", "dep:html5ever"]
+epub = ["dom-translate", "dep:zip", "dep:xml5ever"]
 image-render = [
     "dep:ttf-parser",
     "dep:rustybuzz",
@@ -105,7 +107,9 @@ env_logger = { version = "0.11", optional = true }
 
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
 html5ever = { version = "0.38", optional = true }
+markup5ever = { version = "0.38", optional = true }
 markup5ever_rcdom = { version = "0.38", optional = true }
+xml5ever = { version = "0.38", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

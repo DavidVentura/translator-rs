@@ -21,6 +21,10 @@ pub mod font_provider;
 #[cfg(feature = "gpu")]
 pub mod gl_renderer;
 //#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+#[cfg(feature = "dom-translate")]
+mod dom_translate;
+#[cfg(feature = "epub")]
+pub mod epub;
 pub mod homography;
 pub mod homography_ekf;
 #[cfg(feature = "html")]
