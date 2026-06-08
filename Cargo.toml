@@ -46,7 +46,7 @@ pdf = ["dep:mupdf", "dep:lopdf", "dep:ttf-parser", "dep:subsetter"]
 odt = ["dep:zip"]
 dom-translate = ["dep:markup5ever", "dep:markup5ever_rcdom"]
 html = ["dom-translate", "dep:html5ever"]
-epub = ["dom-translate", "dep:zip", "dep:xml5ever"]
+epub = ["dom-translate", "dep:zip", "dep:xml5ever", "dep:ttf-parser"]
 image-render = [
     "dep:ttf-parser",
     "dep:rustybuzz",
