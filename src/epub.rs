@@ -19,7 +19,7 @@
 use std::fmt;
 use std::io::{Cursor, Read, Write};
 
-use markup5ever_rcdom::{RcDom, SerializableHandle};
+use markup5ever_rcdom::{NodeData, RcDom, SerializableHandle};
 use xml5ever::driver::{XmlParseOpts, parse_document};
 use xml5ever::serialize::{SerializeOpts, TraversalScope, serialize};
 use xml5ever::tendril::TendrilSink;
@@ -302,8 +302,9 @@ pub fn translate_epub_with_translator_and_progress(
     for doc in &prepared {
         apply_indexed(&doc.scopes, &doc.translation_idx, &translations);
         let serialized = serialize_xml_document(&doc.dom)?;
-        // xml5ever does not re-emit the XML declaration (it isn't a tree node),
-        // so restore the original one verbatim when the source had it.
+        // `parse_xml_document` drops the source `<?xml?>` declaration node, so
+        // serialization never emits one; restore the captured declaration as
+        // the single source of truth when the source had it.
         let output = match &doc.xml_declaration {
             Some(declaration) => format!("{declaration}\n{serialized}"),
             None => serialized,
@@ -401,7 +402,21 @@ fn extract_xml_declaration(xml: &str) -> Option<String> {
 }
 
 fn parse_xml_document(xml: &str) -> RcDom {
-    parse_document(RcDom::default(), XmlParseOpts::default()).one(xml)
+    let dom = parse_document(RcDom::default(), XmlParseOpts::default()).one(xml);
+    // xml5ever parses a leading `<?xml?>` declaration into a document-level
+    // processing instruction; drop it so serialization can't re-emit a
+    // declaration that we restore ourselves from `xml_declaration`. Two of them,
+    // with the second on line 2, is fatal for strict XML readers (Android epub
+    // viewers reject "processing instructions must not start with xml").
+    dom.document
+        .children
+        .borrow_mut()
+        .retain(|child| !is_xml_declaration_pi(&child.data));
+    dom
+}
+
+fn is_xml_declaration_pi(data: &NodeData) -> bool {
+    matches!(data, NodeData::ProcessingInstruction { target, .. } if target.as_ref() == "xml")
 }
 
 fn serialize_xml_document(dom: &RcDom) -> Result<String, EpubTranslateError> {
@@ -503,6 +518,11 @@ mod tests {
 
         let out = chapter_text(&translated, "OEBPS/chapter1.xhtml");
         assert!(out.starts_with("<?xml"), "xml declaration preserved: {out}");
+        assert_eq!(
+            out.matches("<?xml").count(),
+            1,
+            "exactly one xml declaration, none re-emitted on line 2: {out}"
+        );
         assert!(out.contains("HELLO"), "block text translated: {out}");
         assert!(out.contains("BRAVE"), "inline text translated: {out}");
         assert!(out.contains("WORLD"));
@@ -511,6 +531,11 @@ mod tests {
         assert!(out.contains("<p"), "block element preserved: {out}");
 
         let ncx = chapter_text(&translated, "OEBPS/toc.ncx");
+        assert_eq!(
+            ncx.matches("<?xml").count(),
+            1,
+            "exactly one xml declaration in the ncx: {ncx}"
+        );
         assert!(ncx.contains("MY BOOK"), "ncx doc title translated: {ncx}");
         assert!(
             ncx.contains("CHAPTER ONE"),
