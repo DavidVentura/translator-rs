@@ -36,10 +36,6 @@ use crate::translate::identity_char_alignments;
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
 
-pub enum EpubTranslateProgress {
-    TranslatingBlock { current: usize, total: usize },
-}
-
 #[derive(Debug)]
 pub enum EpubTranslateError {
     InvalidInput(String),
@@ -99,8 +95,8 @@ pub trait EpubTextTranslator {
     ) -> Result<Vec<TranslationWithAlignment>, EpubTranslateError>;
 
     /// Cancellable, progress-reporting variant. `on_progress` is called from
-    /// slimt worker threads with `(sentences_done, sentences_total)`. The
-    /// default ignores progress and delegates to the plain method.
+    /// slimt worker threads with byte-weighted `(bytes_done, bytes_total)`.
+    /// The default ignores progress and delegates to the plain method.
     fn translate_texts_with_alignment_ctx(
         &mut self,
         texts: &[String],
@@ -225,7 +221,7 @@ pub fn translate_epub_with_progress(
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
-    on_progress: impl Fn(EpubTranslateProgress) + Sync,
+    on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<u8>, EpubTranslateError> {
     session.begin_document_translation();
     let mut translator = SessionEpubTranslator::new(
@@ -247,7 +243,7 @@ pub fn translate_epub_with_translator(
 pub fn translate_epub_with_translator_and_progress(
     epub_bytes: &[u8],
     translator: &mut dyn EpubTextTranslator,
-    on_progress: impl Fn(EpubTranslateProgress) + Sync,
+    on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<u8>, EpubTranslateError> {
     let mut archive = ZipArchive::new(Cursor::new(epub_bytes))?;
     let mut entries = Vec::with_capacity(archive.len());
@@ -317,29 +313,16 @@ pub fn translate_epub_with_translator_and_progress(
     }
 
     // The whole book's blocks are collected into `all_texts`, so translate
-    // them in one slimt call. Per-sentence worker progress maps onto the
-    // block bar by fraction.
-    let total_blocks = all_texts.len();
-    on_progress(EpubTranslateProgress::TranslatingBlock {
-        current: 0,
-        total: total_blocks,
-    });
-    let report = |sentences_done: usize, sentences_total: usize| {
-        let current = if sentences_total == 0 {
-            0
-        } else {
-            sentences_done * total_blocks / sentences_total
-        };
-        on_progress(EpubTranslateProgress::TranslatingBlock {
-            current,
-            total: total_blocks,
-        });
+    // them in one slimt call; the worker callback's byte-weighted fraction is
+    // the document fraction directly.
+    on_progress(0.0);
+    let report = |bytes_done: usize, bytes_total: usize| {
+        if bytes_total > 0 {
+            on_progress(bytes_done as f32 / bytes_total as f32);
+        }
     };
     let translations = translator.translate_texts_with_alignment_ctx(&all_texts, &report)?;
-    on_progress(EpubTranslateProgress::TranslatingBlock {
-        current: total_blocks,
-        total: total_blocks,
-    });
+    on_progress(1.0);
 
     for doc in &prepared {
         apply_indexed(&doc.scopes, &doc.translation_idx, &translations);

@@ -7,10 +7,6 @@ use crate::session::TranslatorSession;
 use crate::settings::BackgroundMode;
 use crate::styled::TranslatedStyledBlock;
 
-pub enum PdfTranslateProgress {
-    TranslatingPage { current: usize, total: usize },
-}
-
 #[derive(Debug, Clone)]
 pub struct PageTranslationResult {
     pub page_index: usize,
@@ -92,28 +88,24 @@ pub fn translate_pdf_with_progress(
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
-    on_progress: impl Fn(PdfTranslateProgress) + Sync,
+    on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
     session.begin_document_translation();
     let extracted = extract_text(pdf_bytes)?;
-    let total = extracted.len();
     if extracted.iter().all(|page| page.fragments.is_empty()) {
         return Err(PdfTranslateError::NoTextFound);
     }
 
-    on_progress(PdfTranslateProgress::TranslatingPage { current: 0, total });
+    on_progress(0.0);
 
     let pages_fragments = extracted
         .iter()
         .map(|page| page.fragments.as_slice())
         .collect::<Vec<_>>();
-    let report = |sentences_done: usize, sentences_total: usize| {
-        let current = if sentences_total == 0 {
-            0
-        } else {
-            sentences_done * total / sentences_total
-        };
-        on_progress(PdfTranslateProgress::TranslatingPage { current, total });
+    let report = |done: usize, total: usize| {
+        if total > 0 {
+            on_progress(done as f32 / total as f32);
+        }
     };
     let translated = session
         .translate_structured_fragments_batch_ctx(
@@ -144,10 +136,7 @@ pub fn translate_pdf_with_progress(
         })
         .collect();
 
-    on_progress(PdfTranslateProgress::TranslatingPage {
-        current: total,
-        total,
-    });
+    on_progress(1.0);
 
     Ok(results)
 }

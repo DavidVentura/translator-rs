@@ -24,10 +24,6 @@ pub enum TxtLayout {
     Reflow { wrap: Option<NonZeroU32> },
 }
 
-pub enum TxtTranslateProgress {
-    TranslatingParagraph { current: usize, total: usize },
-}
-
 #[derive(Debug)]
 pub enum TxtTranslateError {
     Translation(String),
@@ -48,9 +44,9 @@ enum Plan {
     },
 }
 
-/// Translate a `.txt` document in a single slimt call. Progress is reported
-/// per sentence from slimt worker threads via `on_progress` (which must be
-/// cheap, non-blocking and thread-safe); `current`/`total` count sentences.
+/// Translate a `.txt` document in a single slimt call. `on_progress` receives a
+/// smooth `[0.0, 1.0]` completion fraction (source-length weighted), reported
+/// from slimt worker threads — it must be cheap, non-blocking and thread-safe.
 /// Cancellation is requested out-of-band via
 /// [`TranslatorSession::cancel_ongoing_work`] and surfaces here as
 /// [`TxtTranslateError::Cancelled`].
@@ -60,7 +56,7 @@ pub fn translate_txt_with_progress(
     source_code: &str,
     target_code: &str,
     layout: TxtLayout,
-    on_progress: impl Fn(TxtTranslateProgress) + Sync,
+    on_progress: impl Fn(f32) + Sync,
 ) -> Result<String, TxtTranslateError> {
     session.begin_document_translation();
     let (units, plan) = build_units(text, layout);
@@ -71,8 +67,10 @@ pub fn translate_txt_with_progress(
     let translated = if source_code == target_code {
         units.clone()
     } else {
-        let report = |current, total| {
-            on_progress(TxtTranslateProgress::TranslatingParagraph { current, total });
+        let report = |done: usize, total: usize| {
+            if total > 0 {
+                on_progress(done as f32 / total as f32);
+            }
         };
         session
             .translate_texts_ctx(source_code, target_code, &units, &report)

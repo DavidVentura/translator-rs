@@ -333,11 +333,11 @@ pub(crate) fn translate_structured_fragments_batch_ctx_in_snapshot(
         };
         let batch_blocks = texts.len();
         let base = blocks_done;
-        let batch_progress = |sentences_done: usize, sentences_total: usize| {
-            let filled = if sentences_total == 0 {
+        let batch_progress = |bytes_done: usize, bytes_total: usize| {
+            let filled = if bytes_total == 0 {
                 batch_blocks
             } else {
-                sentences_done * batch_blocks / sentences_total
+                bytes_done * batch_blocks / bytes_total
             };
             (ctx.on_progress)(base + filled, total_blocks);
         };

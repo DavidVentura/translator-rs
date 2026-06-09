@@ -1,14 +1,16 @@
 //! Lightweight sentence splitter — replaces slimt's PCRE2-backed Splitter.
 //!
 //! Splits on terminal punctuation (`.`, `!`, `?`, including ellipses) when
-//! followed by whitespace and a Unicode uppercase letter. This matches
-//! ssplit-cpp's regex-fallback heuristic (the path it takes when no
-//! abbreviation prefix file is loaded), which works well on modern web /
-//! ebook prose. Edge cases like "Mr. Smith. He went..." will mis-split;
-//! we'd close those by adding a curated abbreviation list later if a
-//! real document hits regressions. The split layer used to live in
-//! slimt and pulled PCRE2 into the build (~1 MB binary, 13 MB source);
-//! moving it here removes both.
+//! followed by whitespace and a Unicode uppercase letter — optionally with an
+//! opening delimiter (`"`, `“`, `(`, `¿`, `«`, …) in front of that letter, so
+//! a new sentence that opens with quoted dialogue still splits (`bed. “In
+//! judging…”`). This matches ssplit-cpp's regex-fallback heuristic (the path it
+//! takes when no abbreviation prefix file is loaded), which works well on
+//! modern web / ebook prose. Edge cases like "Mr. Smith. He went..." will
+//! mis-split; we'd close those by adding a curated abbreviation list later if a
+//! real document hits regressions. The split layer used to live in slimt and
+//! pulled PCRE2 into the build (~1 MB binary, 13 MB source); moving it here
+//! removes both.
 //!
 //! The splitter returns `&str` slices borrowed from the input. Callers
 //! recover each sentence's byte offset via pointer arithmetic
@@ -24,12 +26,23 @@ fn boundary_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // One or more of `.`, `!`, `?` (handles ellipses and `!?` mixes),
-        // followed by ASCII whitespace, with the next non-space char being
-        // any Unicode uppercase letter (covers accented Spanish/French/etc.
-        // and full-width CJK Latin). The two captures let us identify
-        // where the sentence ends (after the punctuation) and where the
-        // next one starts (at the uppercase letter).
-        Regex::new(r"([.!?]+)\s+(\p{Lu})").expect("valid sentence-boundary regex")
+        // optionally followed by *closing* delimiters that belong to the
+        // sentence just ended (`wake!”`, `(done.)`), then whitespace, then the
+        // start of the next sentence: any run of *opening* delimiters
+        // (straight/curly quotes, parens, brackets, Spanish `¿`/`¡`,
+        // guillemets) followed by a Unicode uppercase letter (covers accented
+        // Spanish/French/etc. and full-width CJK Latin).
+        //
+        // The trailing uppercase letter is the load-bearing guard against
+        // false splits on the overloaded `.` (decimals `3.14`, `e.g.`,
+        // lowercase parentheticals `(or so I thought)`). The delimiter runs
+        // only let quotes/brackets sit around the boundary, so dialogue like
+        // `tomahawk! “Queequeg!” At length…` splits while `it. (or so…)` does
+        // not. Group 1 ends after the closing delimiters (they stay with the
+        // current sentence); group 2 starts at the first opening delimiter, so
+        // it joins the next sentence.
+        Regex::new(r#"([.!?]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*\p{Lu})"#)
+            .expect("valid sentence-boundary regex")
     })
 }
 
@@ -165,6 +178,84 @@ mod tests {
             parts,
             vec!["Mr.", "Smith arrived."],
             "abbreviation handling not implemented; matches ssplit-cpp's regex fallback"
+        );
+    }
+
+    #[test]
+    fn quoted_dialogue_after_period_splits() {
+        // The dialogue case that previously merged: an opening curly quote
+        // sits between the period and the capital. The quote joins the new
+        // sentence.
+        let p = "He toasts for bed. “In judging of that wind,” he said.";
+        let parts = split_sentences(p);
+        assert_eq!(
+            parts,
+            vec!["He toasts for bed.", "“In judging of that wind,” he said."]
+        );
+        assert!(
+            parts[1].starts_with('“'),
+            "quote belongs to the new sentence"
+        );
+    }
+
+    #[test]
+    fn bang_then_quote_splits() {
+        // Splits twice: at the opening quote, and again after the closing
+        // quote — the bracketed exclamation is its own sentence.
+        let p = "with a tomahawk! “Queequeg!” At length he woke.";
+        assert_eq!(
+            split_sentences(p),
+            vec!["with a tomahawk!", "“Queequeg!”", "At length he woke."]
+        );
+    }
+
+    #[test]
+    fn closing_quote_then_capital_splits() {
+        // Terminal punctuation inside a closing quote (`wake!” At…`): the
+        // close-quote stays with the sentence that ended.
+        let p = "“Queequeg, wake!” At length he stirred.";
+        let parts = split_sentences(p);
+        assert_eq!(parts, vec!["“Queequeg, wake!”", "At length he stirred."]);
+        assert!(
+            parts[0].ends_with('”'),
+            "closing quote stays with its sentence"
+        );
+    }
+
+    #[test]
+    fn straight_quote_and_paren_openers_split() {
+        assert_eq!(
+            split_sentences("Done. \"Next one starts here.\""),
+            vec!["Done.", "\"Next one starts here.\""]
+        );
+        assert_eq!(
+            split_sentences("He left. (See the footnote.)"),
+            vec!["He left.", "(See the footnote.)"]
+        );
+    }
+
+    #[test]
+    fn spanish_inverted_opener_splits() {
+        // `¿`/`¡` precede the capital in Spanish; both should still split.
+        assert_eq!(
+            split_sentences("Dijo algo. ¿Vienes conmigo?"),
+            vec!["Dijo algo.", "¿Vienes conmigo?"]
+        );
+    }
+
+    #[test]
+    fn lowercase_opener_does_not_split() {
+        // The reason the boundary is "openers* THEN capital" rather than
+        // "capital OR punctuation": a delimiter followed by lowercase is a
+        // mid-sentence aside, not a new sentence. A plain `\p{Punct}` branch
+        // would wrongly split all of these.
+        assert_eq!(
+            split_sentences("I saw it. (or so I thought) and moved on."),
+            vec!["I saw it. (or so I thought) and moved on."]
+        );
+        assert_eq!(
+            split_sentences("She paused. \"and then nothing\""),
+            vec!["She paused. \"and then nothing\""]
         );
     }
 }

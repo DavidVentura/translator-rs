@@ -14,9 +14,11 @@ use crate::translate::{TokenAlignment, TranslationWithAlignment};
 /// Per-call cancellation + progress, plumbed from the document layer down to
 /// the single slimt call. `cancel` is polled by slimt worker threads, which
 /// abort within ~one batch once it is set. `on_progress` is invoked from those
-/// worker threads — once per sentence, with `(sentences_done, sentences_total)`
-/// — so it must be cheap and non-blocking (it bumps an atomic / posts to the
-/// UI; it must not take a contended lock).
+/// worker threads as each input completes, with `(bytes_done, bytes_total)`
+/// weighted by source length — longer inputs cost proportionally more decode
+/// time, so a length-weighted fraction climbs at a near-constant rate rather
+/// than decelerating as the batcher drains short→long. It must be cheap and
+/// non-blocking (bump an atomic / post to the UI; no contended lock).
 pub struct TranslateCtx<'a> {
     pub cancel: &'a AtomicBool,
     pub on_progress: &'a (dyn Fn(usize, usize) + Sync),
@@ -110,7 +112,7 @@ impl BergamotEngine {
     ) -> Result<Option<Vec<String>>, String> {
         let model = self.model(key)?;
         self.translate_split(inputs, |sentences| {
-            let total = sentences.len();
+            let total: usize = sentences.iter().map(|s| s.len()).sum();
             let done = AtomicUsize::new(0);
             self.service
                 .translate_with_progress(model, sentences, ctx.cancel, |delta| {
@@ -142,7 +144,7 @@ impl BergamotEngine {
     ) -> Result<Option<Vec<TranslationWithAlignment>>, String> {
         let model = self.model(key)?;
         self.translate_split_with_alignment(inputs, |sentences| {
-            let total = sentences.len();
+            let total: usize = sentences.iter().map(|s| s.len()).sum();
             let done = AtomicUsize::new(0);
             self.service
                 .translate_with_alignment_progress(model, sentences, ctx.cancel, |delta| {
@@ -179,7 +181,7 @@ impl BergamotEngine {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
         self.translate_split(inputs, |sentences| {
-            let total = sentences.len();
+            let total: usize = sentences.iter().map(|s| s.len()).sum();
             let done = AtomicUsize::new(0);
             self.service.pivot_with_progress(
                 first_model,
@@ -223,7 +225,7 @@ impl BergamotEngine {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
         self.translate_split_with_alignment(inputs, |sentences| {
-            let total = sentences.len();
+            let total: usize = sentences.iter().map(|s| s.len()).sum();
             let done = AtomicUsize::new(0);
             self.service.pivot_with_alignment_progress(
                 first_model,
