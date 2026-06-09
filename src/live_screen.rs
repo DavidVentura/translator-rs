@@ -69,7 +69,11 @@ const V2_PERIODIC_NS: i64 = 1_500_000_000;
 /// after `eglSwapBuffers` returns, so re-OCRing immediately recognises our own
 /// just-removed labels as "new" text. A fixed settle is deterministic where the
 /// old present-timestamp fence raced the compositor and opened ~1-2 frames early.
-const V2_SETTLE_NS: i64 = 100_000_000;
+/// Also rides out a content transition (e.g. a subtitle crossfade): a re-acquire
+/// fired mid-fade OCRs half-faded glyphs and gets rejected on confidence, then
+/// has to wait out the ~1.5s periodic scan — so the settle is the cheaper place
+/// to absorb the transition than adding a retry loop.
+const V2_SETTLE_NS: i64 = 300_000_000;
 /// Per-lattice-point inter-frame luma delta that counts a gap point as "moved"
 /// for the global-motion signal (both the scroll trigger and the settle gate).
 const V2_MOTION_THR: u32 = 30;
@@ -111,6 +115,43 @@ const SCROLL_CHANGED_FRAC: f32 = 0.75;
 /// A box needs at least this many lattice holes to be monitored.
 const SCREEN_MIN_BOX_HOLES: usize = 4;
 
+/// A capture region in normalized `[0,1]` coordinates (origin top-left), so it
+/// survives capture-resolution and rotation changes unchanged. Mapped to pixels
+/// at acquire time against the live canonical dimensions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl NormRect {
+    /// Map to a pixel [`Rect`] within a `w×h` frame: clamped in-bounds, edges
+    /// ordered, and at least one pixel wide/tall.
+    pub fn to_px(&self, w: u32, h: u32) -> Rect {
+        let c01 = |v: f32| v.clamp(0.0, 1.0);
+        let (l, r) = (
+            c01(self.left.min(self.right)),
+            c01(self.left.max(self.right)),
+        );
+        let (t, b) = (
+            c01(self.top.min(self.bottom)),
+            c01(self.top.max(self.bottom)),
+        );
+        let left = ((l * w as f32).round() as u32).min(w.saturating_sub(1));
+        let top = ((t * h as f32).round() as u32).min(h.saturating_sub(1));
+        let right = ((r * w as f32).round() as u32).clamp(left + 1, w);
+        let bottom = ((b * h as f32).round() as u32).clamp(top + 1, h);
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ScreenConfig {
     from_lang: String,
@@ -118,6 +159,8 @@ struct ScreenConfig {
     is_auto_source: bool,
     det_max_pixels: u32,
     rec_batch_size: usize,
+    /// Restrict OCR (detect + rec/translate) to this region; `None` = full screen.
+    region: Option<NormRect>,
 }
 
 impl Default for ScreenConfig {
@@ -128,6 +171,7 @@ impl Default for ScreenConfig {
             is_auto_source: true,
             det_max_pixels: 650_000,
             rec_batch_size: 4,
+            region: None,
         }
     }
 }
@@ -222,6 +266,10 @@ struct MonitorV2State {
     /// game sprite / mid-scroll) and is dropped before commit, so a pill never
     /// pins to moving content. Empty until sized to the lattice.
     recent_motion: Vec<u16>,
+    /// Per-lattice-point "inside the OCR region" mask, in `points()` order. Empty
+    /// when there's no region (full screen). The motion signals only sample points
+    /// where this is set, so movement outside the crop can't trip a clear/re-acquire.
+    in_region: Vec<bool>,
     /// Diagnostic frame counter for rate-limited logging.
     frames: u64,
 }
@@ -420,6 +468,25 @@ impl LiveScreenPipeline {
         let stale = guard.as_ref().is_none_or(|s| s.cw != cw || s.ch != ch);
         if stale {
             let lattice = Lattice::build(cw, ch, SCREEN_LATTICE_SPACING);
+            // Mask the motion signals to the OCR region (if any): a point counts
+            // only when it sits inside the crop, so a video / animation outside the
+            // region can't trip the scroll/settle gates.
+            let in_region = match self.config.lock().ok().and_then(|c| c.region) {
+                Some(r) => {
+                    let px = r.to_px(cw, ch);
+                    lattice
+                        .points()
+                        .iter()
+                        .map(|p| {
+                            p.x >= px.left as f32
+                                && p.x < px.right as f32
+                                && p.y >= px.top as f32
+                                && p.y < px.bottom as f32
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
             *guard = Some(MonitorV2State {
                 monitor: ScreenMonitor::new(lattice, screen_monitor_config()),
                 cw,
@@ -434,6 +501,7 @@ impl LiveScreenPipeline {
                 prev_covered: None,
                 scrolling: false,
                 recent_motion: Vec::new(),
+                in_region,
                 frames: 0,
             });
         }
@@ -461,6 +529,9 @@ impl LiveScreenPipeline {
                     if covered[i] || prev_cov[i] {
                         continue;
                     }
+                    if !st.in_region.is_empty() && !st.in_region[i] {
+                        continue;
+                    }
                     eligible += 1;
                     if channel_delta(samples[i], prev[i]) > V2_MOTION_THR {
                         moved += 1;
@@ -483,26 +554,32 @@ impl LiveScreenPipeline {
         }
         if let Some(prev) = &st.prev_samples {
             if prev.len() == samples.len() {
-                for (rm, (&cur, &p)) in st
-                    .recent_motion
-                    .iter_mut()
-                    .zip(samples.iter().zip(prev.iter()))
-                {
-                    if channel_delta(cur, p) > V2_MOTION_THR {
-                        *rm = V2_MOTION_WINDOW;
+                let masked = !st.in_region.is_empty();
+                for i in 0..samples.len() {
+                    if masked && !st.in_region[i] {
+                        st.recent_motion[i] = 0;
+                        continue;
+                    }
+                    if channel_delta(samples[i], prev[i]) > V2_MOTION_THR {
+                        st.recent_motion[i] = V2_MOTION_WINDOW;
                     } else {
-                        *rm = rm.saturating_sub(1);
+                        st.recent_motion[i] = st.recent_motion[i].saturating_sub(1);
                     }
                 }
             }
         }
-        // Fraction of all lattice points (gaps + under-pill) that moved within the
+        // Fraction of lattice points (gaps + under-pill) that moved within the
         // recent-motion window — the dense-page settle signal `motion_frac` can't see.
+        // Out-of-region points are forced to 0 above, so the denominator is the
+        // in-region point count when a crop is active.
         let content_motion_frac = if st.recent_motion.is_empty() {
             0.0
-        } else {
+        } else if st.in_region.is_empty() {
             st.recent_motion.iter().filter(|&&m| m > 0).count() as f32
                 / st.recent_motion.len() as f32
+        } else {
+            let total = st.in_region.iter().filter(|&&b| b).count().max(1);
+            st.recent_motion.iter().filter(|&&m| m > 0).count() as f32 / total as f32
         };
         st.prev_samples = Some(samples.to_vec());
         st.prev_covered = Some(covered);
@@ -620,6 +697,10 @@ impl LiveScreenPipeline {
             // Hold the re-acquire until the cleared pills have left the captured
             // mirror (settle), and until motion stops (the gate below).
             st.reacquire_not_before_ns = now_ns + V2_SETTLE_NS;
+            // Pull the periodic deadline forward to the settle so an owed re-acquire
+            // on a now-static screen fires right after the settle (the tick path ANDs
+            // `next_acquire_ns`) instead of waiting out the leftover periodic window.
+            st.next_acquire_ns = st.reacquire_not_before_ns;
             st.pending_reacquire = true;
             return MonitorAction::Hide;
         }
@@ -647,6 +728,10 @@ impl LiveScreenPipeline {
             // Hold the re-acquire until the dropped pills have left the mirror, so
             // the re-OCR of the now-exposed region can't re-read our own old label.
             st.reacquire_not_before_ns = now_ns + V2_SETTLE_NS;
+            // Pull the periodic deadline forward so the owed re-acquire fires right
+            // after the settle on a now-static screen (the tick path ANDs
+            // `next_acquire_ns`), not at the leftover periodic slot up to ~1.5s out.
+            st.next_acquire_ns = st.reacquire_not_before_ns;
             st.pending_reacquire = true;
         }
 
@@ -726,6 +811,22 @@ impl LiveScreenPipeline {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.session.clear_overlays();
         self.reset_monitor();
+    }
+
+    /// Restrict OCR + the motion monitor to `region` (normalized), or `None` for
+    /// the full screen. Like a language change, drops stale overlays and resets
+    /// the monitor so the next acquire rebuilds against the new bounds.
+    pub fn set_region(&self, region: Option<NormRect>) {
+        if let Ok(mut cfg) = self.config.lock() {
+            cfg.region = region;
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.session.clear_overlays();
+        self.reset_monitor();
+    }
+
+    pub fn region(&self) -> Option<NormRect> {
+        self.config.lock().ok().and_then(|c| c.region)
     }
 
     pub fn set_overlay_oversample(&self, factor: f32) {
@@ -826,15 +927,31 @@ impl LiveScreenPipeline {
     fn run_screen_acquire(&self, frame: Arc<LiveFrame>, generation: u64) {
         let cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
         let cancel = || self.generation.load(Ordering::SeqCst) != generation;
-        let (cw, ch) = {
+        // The crop the frame was rendered with: full-screen, or the region sub-rect
+        // (in full-frame canonical coords) the GPU readback already cropped to. The
+        // worker is agnostic — detection runs on whatever the cached oriented holds,
+        // and `view_to_sensor_h(sensor_crop)` re-offsets surviving boxes to their
+        // full-frame screen position.
+        let crop = {
             let s = frame.state().lock().expect("frame state poisoned");
-            (s.width, s.height)
+            s.cached.as_ref().map(|oi| oi.display_crop).unwrap_or(Rect {
+                left: 0,
+                top: 0,
+                right: s.width,
+                bottom: s.height,
+            })
         };
-        let crop = Rect {
-            left: 0,
-            top: 0,
-            right: cw,
-            bottom: ch,
+        // The detector ran on the (possibly cropped) region, so `detected` boxes are
+        // in region-local canonical coords. The resident overlay blocks, the motion
+        // lattice and the provisional overlay all live in full-frame surface coords,
+        // so lift a box into surface space (a no-op for a full-screen crop) before
+        // using it in any of those. Recognition keeps the region-local boxes — they
+        // index the region-sized rgb, and `run_post_detect` applies this same offset
+        // via `view_to_sensor_h` when it places the committed blocks.
+        let to_surface = |b: &OrientedRect| OrientedRect {
+            cx: b.cx + crop.left as f32,
+            cy: b.cy + crop.top as f32,
+            ..*b
         };
         // Additive + masked acquire: we run with the overlay UP and keep the
         // resident blocks. Detections overlapping an existing pill are *our own*
@@ -868,9 +985,8 @@ impl LiveScreenPipeline {
         let detected: Vec<_> = detected
             .into_iter()
             .filter(|d| {
-                !existing_pills
-                    .iter()
-                    .any(|p| rects_overlap(&d.tight_box, p))
+                let s = to_surface(&d.tight_box);
+                !existing_pills.iter().any(|p| rects_overlap(&s, p))
             })
             .collect();
         // Drop detections over actively-moving content (video / game sprite /
@@ -882,7 +998,7 @@ impl LiveScreenPipeline {
         let n_before = detected.len();
         let detected: Vec<_> = detected
             .into_iter()
-            .filter(|d| self.region_motion_frac(&d.tight_box) <= V2_DYNAMIC_BOX_FRAC)
+            .filter(|d| self.region_motion_frac(&to_surface(&d.tight_box)) <= V2_DYNAMIC_BOX_FRAC)
             .collect();
         let n_dynamic = n_before - detected.len();
         if detected.is_empty() {
@@ -892,11 +1008,12 @@ impl LiveScreenPipeline {
             );
             return;
         }
-        // Provisional bbox-only pills the instant detection lands (identity
-        // transform → the detected tight boxes are already in canonical/surface
-        // coords). The canvas rebuild bumps the session version, so the GL thread
-        // presents these before rec/translate finishes.
-        let strips: Vec<OrientedRect> = detected.iter().map(|d| d.tight_box.clone()).collect();
+        // Provisional bbox-only pills the instant detection lands, lifted to surface
+        // coords (the screen anchor composites at identity, so a region-local box
+        // would otherwise flash at the screen's top-left instead of inside the crop).
+        // The canvas rebuild bumps the session version, so the GL thread presents
+        // these before rec/translate finishes.
+        let strips: Vec<OrientedRect> = detected.iter().map(|d| to_surface(&d.tight_box)).collect();
         self.session
             .upsert_provisional_overlay(SCREEN_ANCHOR_ID, strips);
         // The upsert bumped the content version; the GL present thread builds the
@@ -953,6 +1070,52 @@ impl LiveScreenPipeline {
 #[cfg(test)]
 mod monitor_tests {
     use super::*;
+
+    #[test]
+    fn norm_rect_maps_to_pixels_clamped_and_ordered() {
+        // Half-width centred region on a 1000×500 frame.
+        let r = NormRect {
+            left: 0.25,
+            top: 0.2,
+            right: 0.75,
+            bottom: 0.8,
+        };
+        assert_eq!(
+            r.to_px(1000, 500),
+            Rect {
+                left: 250,
+                top: 100,
+                right: 750,
+                bottom: 400
+            }
+        );
+        // Swapped/out-of-range edges are ordered and clamped in-bounds.
+        let inv = NormRect {
+            left: 1.5,
+            top: 0.9,
+            right: -0.5,
+            bottom: 0.1,
+        };
+        let px = inv.to_px(200, 200);
+        assert_eq!(
+            px,
+            Rect {
+                left: 0,
+                top: 20,
+                right: 200,
+                bottom: 180
+            }
+        );
+        // A degenerate region still yields a ≥1px rect.
+        let dot = NormRect {
+            left: 0.5,
+            top: 0.5,
+            right: 0.5,
+            bottom: 0.5,
+        };
+        let px = dot.to_px(100, 100);
+        assert!(px.right > px.left && px.bottom > px.top);
+    }
 
     fn band(cx: f32, cy: f32, w: f32, h: f32) -> OrientedRect {
         OrientedRect {

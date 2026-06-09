@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::gl_renderer::GlesRenderer;
 use crate::live_frame::{LiveFrame, OrientedImage, aligned_det_dims};
+use crate::live_screen::NormRect;
 use crate::live_tracker_pipeline::{LiveTrackerPipeline, ProcessFrameResult};
 use crate::ocr::Rect;
 
@@ -30,6 +31,24 @@ pub fn clip_xform(w: u32, h: u32) -> [f32; 9] {
     let w = w.max(1) as f32;
     let h = h.max(1) as f32;
     [2.0 / w, 0.0, -1.0, 0.0, 2.0 / h, -1.0, 0.0, 0.0, 1.0]
+}
+
+/// Crop a tightly-packed `src_w`-wide image of `channels` bytes/pixel to the
+/// pixel sub-rect `sub`, returning the packed sub-image and its dims.
+fn crop_packed(src: &[u8], src_w: u32, channels: usize, sub: Rect) -> (Vec<u8>, u32, u32) {
+    let (l, t) = (sub.left as usize, sub.top as usize);
+    let (w, h) = (
+        (sub.right - sub.left) as usize,
+        (sub.bottom - sub.top) as usize,
+    );
+    let stride = src_w as usize * channels;
+    let row_bytes = w * channels;
+    let mut out = Vec::with_capacity(row_bytes * h);
+    for row in 0..h {
+        let start = (t + row) * stride + l * channels;
+        out.extend_from_slice(&src[start..start + row_bytes]);
+    }
+    (out, w as u32, h as u32)
 }
 
 /// Borrow the external camera texture, GPU-render the canonical luma into a
@@ -189,6 +208,7 @@ pub fn screen_acquire_frame(
     canonical_h: u32,
     uv_xform: [f32; 9],
     det_max_pixels: u32,
+    region: Option<NormRect>,
 ) -> Option<Arc<LiveFrame>> {
     gles.set_camera_external(camera_tex, uv_xform);
     let (det_w, det_h) = aligned_det_dims(canonical_w, canonical_h, det_max_pixels);
@@ -196,22 +216,47 @@ pub fn screen_acquire_frame(
     let t_readback = std::time::Instant::now();
     let det_gray = gles.read_camera_gray(det_w, det_h, &clip_xform(det_w, det_h))?;
     let rec_rgba = gles.read_camera_rgba(rec_w, rec_h, &clip_xform(rec_w, rec_h))?;
-    let crop = Rect {
-        left: 0,
-        top: 0,
-        right: canonical_w,
-        bottom: canonical_h,
+    // Restrict OCR to a region by cropping the detector + recognition buffers to
+    // its sub-rect before inference, so the detector NN only sees those pixels (and
+    // never produces boxes outside it). `crop` carries the region in full-frame
+    // canonical coords; the worker's `view_to_sensor_h(crop)` re-offsets surviving
+    // boxes back to their true screen position.
+    let (det_gray, det_w, det_h, rec_rgba, rec_w, rec_h, canon_w, canon_h, crop) = match region {
+        Some(r) => {
+            let crop = r.to_px(canonical_w, canonical_h);
+            let (det_gray, det_w, det_h) = crop_packed(&det_gray, det_w, 1, r.to_px(det_w, det_h));
+            let (rec_rgba, rec_w, rec_h) = crop_packed(&rec_rgba, rec_w, 4, r.to_px(rec_w, rec_h));
+            (
+                det_gray,
+                det_w,
+                det_h,
+                rec_rgba,
+                rec_w,
+                rec_h,
+                crop.right - crop.left,
+                crop.bottom - crop.top,
+                crop,
+            )
+        }
+        None => (
+            det_gray,
+            det_w,
+            det_h,
+            rec_rgba,
+            rec_w,
+            rec_h,
+            canonical_w,
+            canonical_h,
+            Rect {
+                left: 0,
+                top: 0,
+                right: canonical_w,
+                bottom: canonical_h,
+            },
+        ),
     };
     let oriented = match OrientedImage::from_gpu_split(
-        det_gray,
-        det_w,
-        det_h,
-        &rec_rgba,
-        rec_w,
-        rec_h,
-        canonical_w,
-        canonical_h,
-        crop,
+        det_gray, det_w, det_h, &rec_rgba, rec_w, rec_h, canon_w, canon_h, crop,
     ) {
         Ok(o) => o,
         Err(e) => {
