@@ -16,7 +16,6 @@ use crate::language_detect::detect_language_robust_code;
 use crate::session::TranslatorSession;
 
 const ODT_MIMETYPE: &str = "application/vnd.oasis.opendocument.text";
-const ODT_TRANSLATION_BATCH_SIZE: usize = 32;
 
 pub enum OdtTranslateProgress {
     TranslatingBlock { current: usize, total: usize },
@@ -81,6 +80,18 @@ pub trait OdtTextTranslator {
         &mut self,
         texts: &[String],
     ) -> Result<Vec<TranslationWithAlignment>, OdtTranslateError>;
+
+    /// Cancellable, progress-reporting variant. `on_progress` is called from
+    /// slimt worker threads with `(sentences_done, sentences_total)`. The
+    /// default ignores progress and delegates to the plain method, which is
+    /// fine for non-session translators (e.g. tests).
+    fn translate_texts_with_alignment_ctx(
+        &mut self,
+        texts: &[String],
+        _on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Vec<TranslationWithAlignment>, OdtTranslateError> {
+        self.translate_texts_with_alignment(texts)
+    }
 }
 
 pub struct SessionOdtTranslator<'a> {
@@ -111,6 +122,14 @@ impl OdtTextTranslator for SessionOdtTranslator<'_> {
         &mut self,
         texts: &[String],
     ) -> Result<Vec<TranslationWithAlignment>, OdtTranslateError> {
+        self.translate_texts_with_alignment_ctx(texts, &|_, _| {})
+    }
+
+    fn translate_texts_with_alignment_ctx(
+        &mut self,
+        texts: &[String],
+        on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Vec<TranslationWithAlignment>, OdtTranslateError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -140,10 +159,18 @@ impl OdtTextTranslator for SessionOdtTranslator<'_> {
                 .collect());
         }
 
-        let Some(translations) =
-            self.session
-                .translate_texts_with_alignment(&source_code, &target_code, texts)?
-        else {
+        let translations = self
+            .session
+            .translate_texts_with_alignment_ctx(&source_code, &target_code, texts, on_progress)
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    OdtTranslateError::Cancelled
+                } else {
+                    OdtTranslateError::Translation(error.message)
+                }
+            })?;
+
+        let Some(translations) = translations else {
             return Err(OdtTranslateError::Translation(format!(
                 "Language pair {} -> {} not installed",
                 source_code.as_str(),
@@ -168,18 +195,23 @@ pub fn translate_odt(
         forced_source_code,
         target_code,
         available_language_codes,
-        |_| Ok(()),
+        |_| {},
     )
 }
 
+/// Progress is reported per sentence from slimt worker threads via
+/// `on_progress` (cheap, non-blocking, thread-safe). Cancellation is requested
+/// out-of-band via [`TranslatorSession::cancel_ongoing_work`] and surfaces as
+/// [`OdtTranslateError::Cancelled`].
 pub fn translate_odt_with_progress(
     session: &TranslatorSession,
     odt_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
-    on_progress: impl FnMut(OdtTranslateProgress) -> Result<(), OdtTranslateError>,
+    on_progress: impl Fn(OdtTranslateProgress) + Sync,
 ) -> Result<Vec<u8>, OdtTranslateError> {
+    session.begin_document_translation();
     let mut translator = SessionOdtTranslator::new(
         session,
         forced_source_code,
@@ -193,13 +225,13 @@ pub fn translate_odt_with_translator(
     odt_bytes: &[u8],
     translator: &mut dyn OdtTextTranslator,
 ) -> Result<Vec<u8>, OdtTranslateError> {
-    translate_odt_with_translator_and_progress(odt_bytes, translator, |_| Ok(()))
+    translate_odt_with_translator_and_progress(odt_bytes, translator, |_| {})
 }
 
 pub fn translate_odt_with_translator_and_progress(
     odt_bytes: &[u8],
     translator: &mut dyn OdtTextTranslator,
-    mut on_progress: impl FnMut(OdtTranslateProgress) -> Result<(), OdtTranslateError>,
+    on_progress: impl Fn(OdtTranslateProgress) + Sync,
 ) -> Result<Vec<u8>, OdtTranslateError> {
     let mut archive = ZipArchive::new(Cursor::new(odt_bytes))?;
     let mut entries = Vec::with_capacity(archive.len());
@@ -252,7 +284,7 @@ pub fn translate_odt_with_translator_and_progress(
     on_progress(OdtTranslateProgress::TranslatingBlock {
         current: translated_blocks,
         total: total_blocks,
-    })?;
+    });
 
     for entry in &mut entries {
         if is_translatable_xml_entry(&entry.name) && !entry.is_dir {
@@ -262,7 +294,7 @@ pub fn translate_odt_with_translator_and_progress(
                 translator,
                 total_blocks,
                 &mut translated_blocks,
-                &mut on_progress,
+                &on_progress,
             )?
             .into_bytes();
             entry.compression = CompressionMethod::Deflated;
@@ -346,7 +378,7 @@ fn rewrite_odt_xml(
         translator,
         total_blocks,
         &mut translated_blocks,
-        &mut |_| Ok(()),
+        &|_| {},
     )
 }
 
@@ -355,7 +387,7 @@ fn rewrite_odt_xml_with_progress(
     translator: &mut dyn OdtTextTranslator,
     total_blocks: usize,
     translated_blocks: &mut usize,
-    on_progress: &mut dyn FnMut(OdtTranslateProgress) -> Result<(), OdtTranslateError>,
+    on_progress: &(dyn Fn(OdtTranslateProgress) + Sync),
 ) -> Result<String, OdtTranslateError> {
     let tokens = tokenize_xml(xml);
     let mut replacements = Vec::<BlockReplacement>::new();
@@ -396,15 +428,29 @@ fn rewrite_odt_xml_with_progress(
         return Ok(xml.to_string());
     }
 
-    let mut translations = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(ODT_TRANSLATION_BATCH_SIZE) {
-        translations.extend(translator.translate_texts_with_alignment(chunk)?);
-        *translated_blocks += chunk.len();
+    // One slimt call for the whole entry. Map per-sentence worker progress
+    // onto the document-wide block bar: this entry spans `entry_blocks`
+    // blocks starting at `blocks_before`, so report it filling proportionally
+    // to the sentence fraction.
+    let entry_blocks = texts.len();
+    let blocks_before = *translated_blocks;
+    let report = |sentences_done: usize, sentences_total: usize| {
+        let filled = if sentences_total == 0 {
+            0
+        } else {
+            sentences_done * entry_blocks / sentences_total
+        };
         on_progress(OdtTranslateProgress::TranslatingBlock {
-            current: *translated_blocks,
+            current: blocks_before + filled,
             total: total_blocks,
-        })?;
-    }
+        });
+    };
+    let translations = translator.translate_texts_with_alignment_ctx(&texts, &report)?;
+    *translated_blocks += entry_blocks;
+    on_progress(OdtTranslateProgress::TranslatingBlock {
+        current: *translated_blocks,
+        total: total_blocks,
+    });
     let mut output = String::with_capacity(xml.len());
     let mut replacement_index = 0usize;
     let mut token_index = 0usize;

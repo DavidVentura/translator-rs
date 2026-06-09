@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use slimt_sys::{
     BlockingService, TranslationModel as SlimtModel,
@@ -9,6 +10,17 @@ use slimt_sys::{
 
 use crate::sentence_split::split_sentences;
 use crate::translate::{TokenAlignment, TranslationWithAlignment};
+
+/// Per-call cancellation + progress, plumbed from the document layer down to
+/// the single slimt call. `cancel` is polled by slimt worker threads, which
+/// abort within ~one batch once it is set. `on_progress` is invoked from those
+/// worker threads — once per sentence, with `(sentences_done, sentences_total)`
+/// — so it must be cheap and non-blocking (it bumps an atomic / posts to the
+/// UI; it must not take a contended lock).
+pub struct TranslateCtx<'a> {
+    pub cancel: &'a AtomicBool,
+    pub on_progress: &'a (dyn Fn(usize, usize) + Sync),
+}
 
 const DEFAULT_CACHE_SIZE: usize = 8192;
 const DEFAULT_WORKERS: usize = 4;
@@ -81,7 +93,31 @@ impl BergamotEngine {
 
     pub fn translate_multiple(&self, inputs: &[String], key: &str) -> Result<Vec<String>, String> {
         let model = self.model(key)?;
-        self.translate_split(inputs, |sentences| self.service.translate(model, sentences))
+        Ok(self
+            .translate_split(inputs, |sentences| {
+                Some(self.service.translate(model, sentences))
+            })?
+            .expect("uncancellable translate cannot return None"))
+    }
+
+    /// Cancellable, progress-reporting [`Self::translate_multiple`]. Returns
+    /// `Ok(None)` when the run was cancelled mid-flight.
+    pub fn translate_multiple_ctx(
+        &self,
+        inputs: &[String],
+        key: &str,
+        ctx: &TranslateCtx,
+    ) -> Result<Option<Vec<String>>, String> {
+        let model = self.model(key)?;
+        self.translate_split(inputs, |sentences| {
+            let total = sentences.len();
+            let done = AtomicUsize::new(0);
+            self.service
+                .translate_with_progress(model, sentences, ctx.cancel, |delta| {
+                    let n = done.fetch_add(delta, Ordering::Relaxed) + delta;
+                    (ctx.on_progress)(n, total);
+                })
+        })
     }
 
     pub fn translate_multiple_with_alignment(
@@ -90,8 +126,29 @@ impl BergamotEngine {
         key: &str,
     ) -> Result<Vec<TranslationWithAlignment>, String> {
         let model = self.model(key)?;
+        Ok(self
+            .translate_split_with_alignment(inputs, |sentences| {
+                Some(self.service.translate_with_alignment(model, sentences))
+            })?
+            .expect("uncancellable translate cannot return None"))
+    }
+
+    /// Cancellable, progress-reporting [`Self::translate_multiple_with_alignment`].
+    pub fn translate_multiple_with_alignment_ctx(
+        &self,
+        inputs: &[String],
+        key: &str,
+        ctx: &TranslateCtx,
+    ) -> Result<Option<Vec<TranslationWithAlignment>>, String> {
+        let model = self.model(key)?;
         self.translate_split_with_alignment(inputs, |sentences| {
-            self.service.translate_with_alignment(model, sentences)
+            let total = sentences.len();
+            let done = AtomicUsize::new(0);
+            self.service
+                .translate_with_alignment_progress(model, sentences, ctx.cancel, |delta| {
+                    let n = done.fetch_add(delta, Ordering::Relaxed) + delta;
+                    (ctx.on_progress)(n, total);
+                })
         })
     }
 
@@ -103,8 +160,37 @@ impl BergamotEngine {
     ) -> Result<Vec<String>, String> {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
+        Ok(self
+            .translate_split(inputs, |sentences| {
+                Some(self.service.pivot(first_model, second_model, sentences))
+            })?
+            .expect("uncancellable translate cannot return None"))
+    }
+
+    /// Cancellable, progress-reporting [`Self::pivot_multiple`]. Returns
+    /// `Ok(None)` when cancelled mid-flight.
+    pub fn pivot_multiple_ctx(
+        &self,
+        first_key: &str,
+        second_key: &str,
+        inputs: &[String],
+        ctx: &TranslateCtx,
+    ) -> Result<Option<Vec<String>>, String> {
+        let first_model = self.model(first_key)?;
+        let second_model = self.model(second_key)?;
         self.translate_split(inputs, |sentences| {
-            self.service.pivot(first_model, second_model, sentences)
+            let total = sentences.len();
+            let done = AtomicUsize::new(0);
+            self.service.pivot_with_progress(
+                first_model,
+                second_model,
+                sentences,
+                ctx.cancel,
+                |delta| {
+                    let n = done.fetch_add(delta, Ordering::Relaxed) + delta;
+                    (ctx.on_progress)(n, total);
+                },
+            )
         })
     }
 
@@ -116,9 +202,39 @@ impl BergamotEngine {
     ) -> Result<Vec<TranslationWithAlignment>, String> {
         let first_model = self.model(first_key)?;
         let second_model = self.model(second_key)?;
+        Ok(self
+            .translate_split_with_alignment(inputs, |sentences| {
+                Some(
+                    self.service
+                        .pivot_with_alignment(first_model, second_model, sentences),
+                )
+            })?
+            .expect("uncancellable translate cannot return None"))
+    }
+
+    /// Cancellable, progress-reporting [`Self::pivot_multiple_with_alignment`].
+    pub fn pivot_multiple_with_alignment_ctx(
+        &self,
+        first_key: &str,
+        second_key: &str,
+        inputs: &[String],
+        ctx: &TranslateCtx,
+    ) -> Result<Option<Vec<TranslationWithAlignment>>, String> {
+        let first_model = self.model(first_key)?;
+        let second_model = self.model(second_key)?;
         self.translate_split_with_alignment(inputs, |sentences| {
-            self.service
-                .pivot_with_alignment(first_model, second_model, sentences)
+            let total = sentences.len();
+            let done = AtomicUsize::new(0);
+            self.service.pivot_with_alignment_progress(
+                first_model,
+                second_model,
+                sentences,
+                ctx.cancel,
+                |delta| {
+                    let n = done.fetch_add(delta, Ordering::Relaxed) + delta;
+                    (ctx.on_progress)(n, total);
+                },
+            )
         })
     }
 
@@ -128,39 +244,44 @@ impl BergamotEngine {
     /// duplicate or drop spans (see the Pilgrima.ge regression). Splitting
     /// here also lets slimt's batcher pack sentences from different inputs
     /// together for better throughput.
+    ///
+    /// `translate` returns `None` when the underlying slimt call was cancelled,
+    /// which propagates out as `Ok(None)`.
     fn translate_split(
         &self,
         inputs: &[String],
-        translate: impl FnOnce(&[&str]) -> Vec<String>,
-    ) -> Result<Vec<String>, String> {
+        translate: impl FnOnce(&[&str]) -> Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, String> {
         let plan = SplitPlan::build(inputs);
         if plan.sentences.is_empty() {
-            return Ok(inputs.iter().map(|_| String::new()).collect());
+            return Ok(Some(inputs.iter().map(|_| String::new()).collect()));
         }
         let refs: Vec<&str> = plan.sentences.iter().map(String::as_str).collect();
         let translated = catch_slimt_panic(|| Ok(translate(&refs)))?;
-        Ok(plan.recombine_strings(&translated))
+        Ok(translated.map(|t| plan.recombine_strings(&t)))
     }
 
     fn translate_split_with_alignment(
         &self,
         inputs: &[String],
-        translate: impl FnOnce(&[&str]) -> Vec<SlimtTranslationWithAlignment>,
-    ) -> Result<Vec<TranslationWithAlignment>, String> {
+        translate: impl FnOnce(&[&str]) -> Option<Vec<SlimtTranslationWithAlignment>>,
+    ) -> Result<Option<Vec<TranslationWithAlignment>>, String> {
         let plan = SplitPlan::build(inputs);
         if plan.sentences.is_empty() {
-            return Ok(inputs
-                .iter()
-                .map(|s| TranslationWithAlignment {
-                    source_text: s.clone(),
-                    translated_text: String::new(),
-                    alignments: Vec::new(),
-                })
-                .collect());
+            return Ok(Some(
+                inputs
+                    .iter()
+                    .map(|s| TranslationWithAlignment {
+                        source_text: s.clone(),
+                        translated_text: String::new(),
+                        alignments: Vec::new(),
+                    })
+                    .collect(),
+            ));
         }
         let refs: Vec<&str> = plan.sentences.iter().map(String::as_str).collect();
         let raw = catch_slimt_panic(|| Ok(translate(&refs)))?;
-        Ok(plan.recombine_with_alignment(inputs, raw))
+        Ok(raw.map(|r| plan.recombine_with_alignment(inputs, r)))
     }
 
     pub fn clear(&mut self) {

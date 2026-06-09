@@ -171,6 +171,9 @@ pub enum TranslatorErrorKind {
     InvalidInput,
     Internal,
     MissingAsset,
+    /// User-initiated cancellation of an in-flight document translation.
+    /// Not a failure — callers should stop silently.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +212,16 @@ impl TranslatorError {
         Self::new(TranslatorErrorKind::MissingAsset, message)
     }
 
+    pub(crate) fn cancelled() -> Self {
+        Self::new(TranslatorErrorKind::Cancelled, "cancelled")
+    }
+
     pub fn is_missing_asset(&self) -> bool {
         self.kind == TranslatorErrorKind::MissingAsset
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.kind == TranslatorErrorKind::Cancelled
     }
 }
 

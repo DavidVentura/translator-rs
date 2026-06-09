@@ -7,8 +7,12 @@ use crate::language_detect::detect_language_robust_code;
 use crate::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use crate::routing::NothingReason;
 use crate::settings::BackgroundMode;
+use std::sync::atomic::AtomicBool;
+
+use crate::bergamot::TranslateCtx;
 use crate::translate::{
-    TokenAlignment, execute_translation_plan_with_alignment, resolve_translation_plan_in_snapshot,
+    TokenAlignment, execute_translation_plan_with_alignment,
+    execute_translation_plan_with_alignment_ctx, resolve_translation_plan_in_snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,6 +230,37 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
     available_language_codes: &[String],
     background_mode: BackgroundMode,
 ) -> Result<Vec<StructuredTranslationResult>, String> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let ctx = TranslateCtx {
+        cancel: &NEVER,
+        on_progress: &|_, _| {},
+    };
+    Ok(translate_structured_fragments_batch_ctx_in_snapshot(
+        engine,
+        snapshot,
+        pages,
+        forced_source_code,
+        target_code,
+        available_language_codes,
+        background_mode,
+        &ctx,
+    )?
+    .expect("uncancellable structured batch cannot return None"))
+}
+
+/// Cancellable, progress-reporting [`translate_structured_fragments_batch_in_snapshot`].
+/// `Ok(None)` means the run was cancelled. Progress accumulates across the
+/// per-source-language batches and is reported in sentence units.
+pub(crate) fn translate_structured_fragments_batch_ctx_in_snapshot(
+    engine: &mut BergamotEngine,
+    snapshot: &CatalogSnapshot,
+    pages: &[&[StyledFragment]],
+    forced_source_code: Option<&str>,
+    target_code: &str,
+    available_language_codes: &[String],
+    background_mode: BackgroundMode,
+    ctx: &TranslateCtx,
+) -> Result<Option<Vec<StructuredTranslationResult>>, String> {
     let available_codes = available_language_codes
         .iter()
         .map(|code| LanguageCode::from(code.as_str()))
@@ -277,6 +312,15 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
     let mut translations_by_page: HashMap<usize, Vec<BlockSegmentTranslation>> = HashMap::new();
     let mut missing_pair_pages: HashSet<usize> = HashSet::new();
 
+    // Report progress in block units across every source-language batch, so the
+    // bar reflects the whole document (not per-language) and never overshoots.
+    // The worker callback counts *sentences* (each block splits into one or
+    // more), so we scale each batch's sentence fraction by that batch's block
+    // count — keeping numerator and denominator both in blocks. The loop runs
+    // batches sequentially, so a plain accumulator is enough.
+    let total_blocks: usize = texts_by_source.values().map(Vec::len).sum();
+    let mut blocks_done = 0usize;
+
     for (source_code_str, texts) in texts_by_source {
         let refs = refs_by_source.remove(&source_code_str).unwrap_or_default();
         let Some(plan) =
@@ -287,7 +331,26 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
             }
             continue;
         };
-        let translated = execute_translation_plan_with_alignment(engine, &plan, &texts)?;
+        let batch_blocks = texts.len();
+        let base = blocks_done;
+        let batch_progress = |sentences_done: usize, sentences_total: usize| {
+            let filled = if sentences_total == 0 {
+                batch_blocks
+            } else {
+                sentences_done * batch_blocks / sentences_total
+            };
+            (ctx.on_progress)(base + filled, total_blocks);
+        };
+        let batch_ctx = TranslateCtx {
+            cancel: ctx.cancel,
+            on_progress: &batch_progress,
+        };
+        let Some(translated) =
+            execute_translation_plan_with_alignment_ctx(engine, &plan, &texts, &batch_ctx)?
+        else {
+            return Ok(None);
+        };
+        blocks_done += batch_blocks;
         for (r, t) in refs.into_iter().zip(translated) {
             translations_by_page
                 .entry(r.page_index)
@@ -346,7 +409,8 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
                 })
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
 }
 
 enum PageState {

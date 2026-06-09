@@ -76,61 +76,78 @@ pub fn translate_pdf(
         forced_source_code,
         target_code,
         available_language_codes,
-        |_| Ok(()),
+        |_| {},
     )
 }
 
-/// Number of pages bundled into a single bergamot call. With slimt's default
-/// 4-worker pool, batching ~8 pages per call keeps every worker fed even when
-/// individual pages are short — single-page calls couldn't fill the queue.
-/// The chunk boundary is also where progress ticks land, so it doubles as the
-/// granularity at which the caller's UI updates.
-const PAGE_BATCH_SIZE: usize = 8;
-
+/// Translate every page's text in a single bergamot call (slimt's batcher packs
+/// all pages' sentences across the worker pool). Progress is reported per
+/// sentence from worker threads via `on_progress` (cheap, non-blocking,
+/// thread-safe), mapped onto the page count. Cancellation is requested
+/// out-of-band via [`TranslatorSession::cancel_ongoing_work`] and surfaces as
+/// [`PdfTranslateError::Cancelled`].
 pub fn translate_pdf_with_progress(
     session: &TranslatorSession,
     pdf_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
-    mut on_progress: impl FnMut(PdfTranslateProgress) -> Result<(), PdfTranslateError>,
+    on_progress: impl Fn(PdfTranslateProgress) + Sync,
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
+    session.begin_document_translation();
     let extracted = extract_text(pdf_bytes)?;
     let total = extracted.len();
     if extracted.iter().all(|page| page.fragments.is_empty()) {
         return Err(PdfTranslateError::NoTextFound);
     }
 
-    let mut results = Vec::with_capacity(total);
-    on_progress(PdfTranslateProgress::TranslatingPage { current: 0, total })?;
+    on_progress(PdfTranslateProgress::TranslatingPage { current: 0, total });
 
-    for chunk in extracted.chunks(PAGE_BATCH_SIZE) {
-        let pages_fragments = chunk
-            .iter()
-            .map(|page| page.fragments.as_slice())
-            .collect::<Vec<_>>();
-        let translated = session.translate_structured_fragments_batch(
+    let pages_fragments = extracted
+        .iter()
+        .map(|page| page.fragments.as_slice())
+        .collect::<Vec<_>>();
+    let report = |sentences_done: usize, sentences_total: usize| {
+        let current = if sentences_total == 0 {
+            0
+        } else {
+            sentences_done * total / sentences_total
+        };
+        on_progress(PdfTranslateProgress::TranslatingPage { current, total });
+    };
+    let translated = session
+        .translate_structured_fragments_batch_ctx(
             &pages_fragments,
             forced_source_code,
             target_code,
             available_language_codes,
             BackgroundMode::BlackOnWhite,
-        )?;
-
-        for (page, result) in chunk.iter().zip(translated) {
-            results.push(PageTranslationResult {
-                page_index: page.page_index,
-                page: page.page,
-                blocks: result.blocks,
-                error: result.error_message,
-                target_language: target_code.to_string(),
-            });
-        }
-        on_progress(PdfTranslateProgress::TranslatingPage {
-            current: results.len(),
-            total,
+            &report,
+        )
+        .map_err(|error| {
+            if error.is_cancelled() {
+                PdfTranslateError::Cancelled
+            } else {
+                PdfTranslateError::Translator(error)
+            }
         })?;
-    }
+
+    let results = extracted
+        .into_iter()
+        .zip(translated)
+        .map(|(page, result)| PageTranslationResult {
+            page_index: page.page_index,
+            page: page.page,
+            blocks: result.blocks,
+            error: result.error_message,
+            target_language: target_code.to_string(),
+        })
+        .collect();
+
+    on_progress(PdfTranslateProgress::TranslatingPage {
+        current: total,
+        total,
+    });
 
     Ok(results)
 }

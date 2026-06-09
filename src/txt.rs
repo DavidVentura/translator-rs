@@ -18,13 +18,6 @@ use std::num::NonZeroU32;
 
 use crate::session::TranslatorSession;
 
-// Each batch is one blocking `translate_texts` call; the 4-worker pool
-// only goes idle on the final under-full wave of a call, so a larger
-// batch keeps more sentences in flight and shrinks the per-batch idle
-// tail. Sized for saturation over progress granularity — the bar still
-// ticks every 64 units, which is fine cadence for a long document.
-const TXT_TRANSLATION_BATCH_SIZE: usize = 64;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxtLayout {
     Preserve,
@@ -55,39 +48,42 @@ enum Plan {
     },
 }
 
+/// Translate a `.txt` document in a single slimt call. Progress is reported
+/// per sentence from slimt worker threads via `on_progress` (which must be
+/// cheap, non-blocking and thread-safe); `current`/`total` count sentences.
+/// Cancellation is requested out-of-band via
+/// [`TranslatorSession::cancel_ongoing_work`] and surfaces here as
+/// [`TxtTranslateError::Cancelled`].
 pub fn translate_txt_with_progress(
     session: &TranslatorSession,
     text: &str,
     source_code: &str,
     target_code: &str,
     layout: TxtLayout,
-    mut on_progress: impl FnMut(TxtTranslateProgress) -> Result<(), TxtTranslateError>,
+    on_progress: impl Fn(TxtTranslateProgress) + Sync,
 ) -> Result<String, TxtTranslateError> {
+    session.begin_document_translation();
     let (units, plan) = build_units(text, layout);
-    let total = units.len();
-    if total == 0 {
+    if units.is_empty() {
         return Ok(String::new());
     }
 
-    let mut translated = Vec::with_capacity(total);
-    for chunk in units.chunks(TXT_TRANSLATION_BATCH_SIZE) {
-        on_progress(TxtTranslateProgress::TranslatingParagraph {
-            current: translated.len(),
-            total,
-        })?;
-        if source_code == target_code {
-            translated.extend_from_slice(chunk);
-        } else {
-            let out = session
-                .translate_texts(source_code, target_code, chunk)
-                .map_err(|error| TxtTranslateError::Translation(error.message))?;
-            translated.extend(out);
-        }
-    }
-    on_progress(TxtTranslateProgress::TranslatingParagraph {
-        current: total,
-        total,
-    })?;
+    let translated = if source_code == target_code {
+        units.clone()
+    } else {
+        let report = |current, total| {
+            on_progress(TxtTranslateProgress::TranslatingParagraph { current, total });
+        };
+        session
+            .translate_texts_ctx(source_code, target_code, &units, &report)
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    TxtTranslateError::Cancelled
+                } else {
+                    TxtTranslateError::Translation(error.message)
+                }
+            })?
+    };
 
     Ok(reconstruct(plan, translated))
 }

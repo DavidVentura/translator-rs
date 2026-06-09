@@ -1,13 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::{LanguageCode, TranslatorError};
-use crate::bergamot::{BergamotEngine, ModelPaths};
+use crate::bergamot::{BergamotEngine, ModelPaths, TranslateCtx};
 use crate::catalog::CatalogSnapshot;
 #[cfg(feature = "html")]
 use crate::html_translate;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use crate::styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment,
+    translate_structured_fragments_batch_ctx_in_snapshot,
     translate_structured_fragments_batch_in_snapshot, translate_structured_fragments_in_snapshot,
 };
 
@@ -100,6 +101,32 @@ impl<'a> Translator<'a> {
             ))
         })?;
         execute_translation_plan(self.engine, &plan, texts).map_err(TranslatorError::translation)
+    }
+
+    /// Cancellable, progress-reporting [`Self::translate_texts`]. Errors with
+    /// `TranslatorErrorKind::Cancelled` if the run was cancelled mid-flight.
+    pub(crate) fn translate_texts_ctx(
+        &mut self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+        texts: &[String],
+        ctx: &TranslateCtx,
+    ) -> Result<Vec<String>, TranslatorError> {
+        let plan = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        )
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "translation pack not installed for {}->{}",
+                from_code.as_str(),
+                to_code.as_str()
+            ))
+        })?;
+        execute_translation_plan_ctx(self.engine, &plan, texts, ctx)
+            .map_err(TranslatorError::translation)?
+            .ok_or_else(TranslatorError::cancelled)
     }
 
     pub fn translate_html_fragments(
@@ -201,12 +228,45 @@ impl<'a> Translator<'a> {
         .map_err(TranslatorError::translation)
     }
 
+    /// Cancellable, progress-reporting [`Self::translate_structured_fragments_batch`].
+    /// Errors with `TranslatorErrorKind::Cancelled` if cancelled mid-flight.
+    pub fn translate_structured_fragments_batch_ctx(
+        &mut self,
+        pages: &[&[StyledFragment]],
+        forced_source_code: Option<&LanguageCode>,
+        target_code: &LanguageCode,
+        available_language_codes: &[LanguageCode],
+        background_mode: crate::BackgroundMode,
+        ctx: &TranslateCtx,
+    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
+        let available_language_codes = available_language_codes
+            .iter()
+            .map(|code| code.as_str().to_string())
+            .collect::<Vec<_>>();
+        translate_structured_fragments_batch_ctx_in_snapshot(
+            self.engine,
+            self.snapshot,
+            pages,
+            forced_source_code.map(LanguageCode::as_str),
+            target_code.as_str(),
+            &available_language_codes,
+            background_mode,
+            ctx,
+        )
+        .map_err(TranslatorError::translation)?
+        .ok_or_else(TranslatorError::cancelled)
+    }
+
+    /// Alignment translation for documents, with cancellation + per-sentence
+    /// progress. `Ok(None)` means no translation plan (passthrough); a
+    /// cancelled run errors with `TranslatorErrorKind::Cancelled`.
     #[cfg(any(feature = "odt", feature = "epub"))]
-    pub(crate) fn translate_texts_with_alignment(
+    pub(crate) fn translate_texts_with_alignment_ctx(
         &mut self,
         from_code: &LanguageCode,
         to_code: &LanguageCode,
         texts: &[String],
+        ctx: &TranslateCtx,
     ) -> Result<Option<Vec<TranslationWithAlignment>>, TranslatorError> {
         let Some(plan) = resolve_translation_plan_in_snapshot(
             self.snapshot,
@@ -215,9 +275,12 @@ impl<'a> Translator<'a> {
         ) else {
             return Ok(None);
         };
-        execute_translation_plan_with_alignment(self.engine, &plan, texts)
-            .map(Some)
-            .map_err(TranslatorError::translation)
+        match execute_translation_plan_with_alignment_ctx(self.engine, &plan, texts, ctx)
+            .map_err(TranslatorError::translation)?
+        {
+            Some(result) => Ok(Some(result)),
+            None => Err(TranslatorError::cancelled()),
+        }
     }
 }
 
@@ -342,6 +405,24 @@ pub(crate) fn execute_translation_plan(
     }
 }
 
+/// Cancellable, progress-reporting [`execute_translation_plan`]. `Ok(None)`
+/// means the run was cancelled.
+pub(crate) fn execute_translation_plan_ctx(
+    engine: &mut BergamotEngine,
+    plan: &TranslationPlan,
+    texts: &[String],
+    ctx: &TranslateCtx,
+) -> Result<Option<Vec<String>>, String> {
+    ensure_plan_loaded(engine, plan)?;
+    match plan.steps.as_slice() {
+        [step] => engine.translate_multiple_ctx(texts, &step.cache_key, ctx),
+        [first, second] => {
+            engine.pivot_multiple_ctx(&first.cache_key, &second.cache_key, texts, ctx)
+        }
+        _ => Ok(Some(Vec::new())),
+    }
+}
+
 pub(crate) fn execute_translation_plan_with_alignment(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
@@ -370,6 +451,27 @@ pub(crate) fn execute_translation_plan_with_alignment(
         }
     }
     Ok(result)
+}
+
+/// Cancellable, progress-reporting [`execute_translation_plan_with_alignment`].
+/// `Ok(None)` means cancelled.
+pub(crate) fn execute_translation_plan_with_alignment_ctx(
+    engine: &mut BergamotEngine,
+    plan: &TranslationPlan,
+    texts: &[String],
+    ctx: &TranslateCtx,
+) -> Result<Option<Vec<TranslationWithAlignment>>, String> {
+    ensure_plan_loaded(engine, plan)?;
+    match plan.steps.as_slice() {
+        [step] => engine.translate_multiple_with_alignment_ctx(texts, &step.cache_key, ctx),
+        [first, second] => engine.pivot_multiple_with_alignment_ctx(
+            &first.cache_key,
+            &second.cache_key,
+            texts,
+            ctx,
+        ),
+        _ => Ok(Some(Vec::new())),
+    }
 }
 
 /// HTML translation runs entirely Rust-side: html5ever parses each fragment,

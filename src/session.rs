@@ -1,7 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::api::{LanguageCode, TranslatorError};
-use crate::bergamot::BergamotEngine;
+use crate::bergamot::{BergamotEngine, TranslateCtx};
 #[cfg(feature = "ppocr")]
 use crate::catalog::PackKind;
 use crate::catalog::{
@@ -66,6 +67,12 @@ static BERGAMOT_ENGINE: OnceLock<Mutex<BergamotEngine>> = OnceLock::new();
 
 pub struct TranslatorSession {
     snapshot: RwLock<Arc<CatalogSnapshot>>,
+    /// Set true by `cancel_ongoing_work()` (from any thread) to abort the
+    /// in-flight document translation. slimt worker threads poll it and stop
+    /// within ~one batch. Document translations reset it to false at entry.
+    /// Translations are serialized through the global engine mutex, so a
+    /// single per-session flag unambiguously targets the active document.
+    document_cancel: AtomicBool,
     #[cfg(feature = "tts")]
     speech: Mutex<SpeechCache>,
     #[cfg(feature = "dictionary")]
@@ -127,6 +134,7 @@ impl TranslatorSession {
     pub fn from_snapshot(snapshot: CatalogSnapshot) -> Self {
         Self {
             snapshot: RwLock::new(Arc::new(snapshot)),
+            document_cancel: AtomicBool::new(false),
             #[cfg(feature = "tts")]
             speech: Mutex::new(SpeechCache::new()),
             #[cfg(feature = "dictionary")]
@@ -253,18 +261,40 @@ impl TranslatorSession {
         )
     }
 
-    pub(crate) fn translate_texts(
+    /// Request cancellation of the in-flight document translation. Safe to call
+    /// from any thread (e.g. a UI "cancel" tap) while a `*_ctx` translation is
+    /// running on another thread — slimt workers observe it within ~one batch.
+    pub fn cancel_ongoing_work(&self) {
+        self.document_cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the cancellation flag. Called once at the start of a document
+    /// translation so a previous cancel does not abort the next one.
+    pub fn begin_document_translation(&self) {
+        self.document_cancel.store(false, Ordering::Relaxed);
+    }
+
+    /// Cancellable, progress-reporting [`Self::translate_texts`]. `on_progress`
+    /// is invoked from slimt worker threads with `(sentences_done, total)`;
+    /// cancellation is driven by [`Self::cancel_ongoing_work`].
+    pub(crate) fn translate_texts_ctx(
         &self,
         from_code: &str,
         to_code: &str,
         texts: &[String],
+        on_progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Vec<String>, TranslatorError> {
+        let ctx = TranslateCtx {
+            cancel: &self.document_cancel,
+            on_progress,
+        };
         let snap = self.snapshot();
         let mut engine = self.engine().lock().expect("engine lock poisoned");
-        Translator::new(&mut engine, &snap).translate_texts(
+        Translator::new(&mut engine, &snap).translate_texts_ctx(
             &LanguageCode::from(from_code),
             &LanguageCode::from(to_code),
             texts,
+            &ctx,
         )
     }
 
@@ -340,17 +370,52 @@ impl TranslatorSession {
         )
     }
 
+    /// Cancellable, progress-reporting [`Self::translate_structured_fragments_batch`].
+    /// `on_progress` is invoked from slimt worker threads with
+    /// `(sentences_done, sentences_total)`; cancellation via
+    /// [`Self::cancel_ongoing_work`].
+    pub fn translate_structured_fragments_batch_ctx(
+        &self,
+        pages: &[&[StyledFragment]],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[LanguageCode],
+        background_mode: BackgroundMode,
+        on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
+        let ctx = TranslateCtx {
+            cancel: &self.document_cancel,
+            on_progress,
+        };
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap).translate_structured_fragments_batch_ctx(
+            pages,
+            forced_source_code.map(LanguageCode::from).as_ref(),
+            &LanguageCode::from(target_code),
+            available_language_codes,
+            background_mode,
+            &ctx,
+        )
+    }
+
+    /// Cancellable, progress-reporting alignment translation for documents.
     #[cfg(any(feature = "odt", feature = "epub"))]
-    pub(crate) fn translate_texts_with_alignment(
+    pub(crate) fn translate_texts_with_alignment_ctx(
         &self,
         from_code: &LanguageCode,
         to_code: &LanguageCode,
         texts: &[String],
+        on_progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Option<Vec<TranslationWithAlignment>>, TranslatorError> {
+        let ctx = TranslateCtx {
+            cancel: &self.document_cancel,
+            on_progress,
+        };
         let snap = self.snapshot();
         let mut engine = self.engine().lock().expect("engine lock poisoned");
         Translator::new(&mut engine, &snap)
-            .translate_texts_with_alignment(from_code, to_code, texts)
+            .translate_texts_with_alignment_ctx(from_code, to_code, texts, &ctx)
     }
 
     #[cfg(any(feature = "tesseract", feature = "ppocr"))]

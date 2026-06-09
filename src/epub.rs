@@ -35,7 +35,6 @@ use crate::session::TranslatorSession;
 use crate::translate::identity_char_alignments;
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
-const EPUB_TRANSLATION_BATCH_SIZE: usize = 32;
 
 pub enum EpubTranslateProgress {
     TranslatingBlock { current: usize, total: usize },
@@ -98,6 +97,17 @@ pub trait EpubTextTranslator {
         &mut self,
         texts: &[String],
     ) -> Result<Vec<TranslationWithAlignment>, EpubTranslateError>;
+
+    /// Cancellable, progress-reporting variant. `on_progress` is called from
+    /// slimt worker threads with `(sentences_done, sentences_total)`. The
+    /// default ignores progress and delegates to the plain method.
+    fn translate_texts_with_alignment_ctx(
+        &mut self,
+        texts: &[String],
+        _on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Vec<TranslationWithAlignment>, EpubTranslateError> {
+        self.translate_texts_with_alignment(texts)
+    }
 }
 
 pub struct SessionEpubTranslator<'a> {
@@ -128,6 +138,14 @@ impl EpubTextTranslator for SessionEpubTranslator<'_> {
         &mut self,
         texts: &[String],
     ) -> Result<Vec<TranslationWithAlignment>, EpubTranslateError> {
+        self.translate_texts_with_alignment_ctx(texts, &|_, _| {})
+    }
+
+    fn translate_texts_with_alignment_ctx(
+        &mut self,
+        texts: &[String],
+        on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Vec<TranslationWithAlignment>, EpubTranslateError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -157,10 +175,18 @@ impl EpubTextTranslator for SessionEpubTranslator<'_> {
                 .collect());
         }
 
-        let Some(translations) =
-            self.session
-                .translate_texts_with_alignment(&source_code, &target_code, texts)?
-        else {
+        let translations = self
+            .session
+            .translate_texts_with_alignment_ctx(&source_code, &target_code, texts, on_progress)
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    EpubTranslateError::Cancelled
+                } else {
+                    EpubTranslateError::Translation(error.message)
+                }
+            })?;
+
+        let Some(translations) = translations else {
             return Err(EpubTranslateError::Translation(format!(
                 "Language pair {} -> {} not installed",
                 source_code.as_str(),
@@ -185,18 +211,23 @@ pub fn translate_epub(
         forced_source_code,
         target_code,
         available_language_codes,
-        |_| Ok(()),
+        |_| {},
     )
 }
 
+/// Progress is reported per sentence from slimt worker threads via
+/// `on_progress` (cheap, non-blocking, thread-safe). Cancellation is requested
+/// out-of-band via [`TranslatorSession::cancel_ongoing_work`] and surfaces as
+/// [`EpubTranslateError::Cancelled`].
 pub fn translate_epub_with_progress(
     session: &TranslatorSession,
     epub_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
-    on_progress: impl FnMut(EpubTranslateProgress) -> Result<(), EpubTranslateError>,
+    on_progress: impl Fn(EpubTranslateProgress) + Sync,
 ) -> Result<Vec<u8>, EpubTranslateError> {
+    session.begin_document_translation();
     let mut translator = SessionEpubTranslator::new(
         session,
         forced_source_code,
@@ -210,13 +241,13 @@ pub fn translate_epub_with_translator(
     epub_bytes: &[u8],
     translator: &mut dyn EpubTextTranslator,
 ) -> Result<Vec<u8>, EpubTranslateError> {
-    translate_epub_with_translator_and_progress(epub_bytes, translator, |_| Ok(()))
+    translate_epub_with_translator_and_progress(epub_bytes, translator, |_| {})
 }
 
 pub fn translate_epub_with_translator_and_progress(
     epub_bytes: &[u8],
     translator: &mut dyn EpubTextTranslator,
-    mut on_progress: impl FnMut(EpubTranslateProgress) -> Result<(), EpubTranslateError>,
+    on_progress: impl Fn(EpubTranslateProgress) + Sync,
 ) -> Result<Vec<u8>, EpubTranslateError> {
     let mut archive = ZipArchive::new(Cursor::new(epub_bytes))?;
     let mut entries = Vec::with_capacity(archive.len());
@@ -285,22 +316,30 @@ pub fn translate_epub_with_translator_and_progress(
         });
     }
 
+    // The whole book's blocks are collected into `all_texts`, so translate
+    // them in one slimt call. Per-sentence worker progress maps onto the
+    // block bar by fraction.
     let total_blocks = all_texts.len();
     on_progress(EpubTranslateProgress::TranslatingBlock {
         current: 0,
         total: total_blocks,
-    })?;
-
-    let mut translations = Vec::with_capacity(total_blocks);
-    let mut translated_blocks = 0usize;
-    for chunk in all_texts.chunks(EPUB_TRANSLATION_BATCH_SIZE) {
-        translations.extend(translator.translate_texts_with_alignment(chunk)?);
-        translated_blocks += chunk.len();
+    });
+    let report = |sentences_done: usize, sentences_total: usize| {
+        let current = if sentences_total == 0 {
+            0
+        } else {
+            sentences_done * total_blocks / sentences_total
+        };
         on_progress(EpubTranslateProgress::TranslatingBlock {
-            current: translated_blocks,
+            current,
             total: total_blocks,
-        })?;
-    }
+        });
+    };
+    let translations = translator.translate_texts_with_alignment_ctx(&all_texts, &report)?;
+    on_progress(EpubTranslateProgress::TranslatingBlock {
+        current: total_blocks,
+        total: total_blocks,
+    });
 
     for doc in &prepared {
         apply_indexed(&doc.scopes, &doc.translation_idx, &translations);
