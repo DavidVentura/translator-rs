@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -359,6 +360,28 @@ impl PpocrEngine {
             &slot.spec.keys_path,
         )?);
         Ok(Arc::clone(slot.loaded.get_or_init(|| fresh)))
+    }
+
+    /// Recognize a single straightened strip and return its per-character CTC firings,
+    /// for debug visualization of where each glyph fires along the reading axis. The
+    /// returned [`StripChar::at`] fractions map directly onto the strip's width.
+    pub fn recognize_strip_firings(
+        &self,
+        strip: &DynamicImage,
+        script: PpocrScript,
+    ) -> Result<Vec<StripChar>, TranslatorError> {
+        let recognizer = self.recognizer(script)?;
+        let timings = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let result = recognizer.recognize_one(strip, 0, &timings)?;
+        Ok(result
+            .chars
+            .into_iter()
+            .map(|c| StripChar {
+                ch: c.ch,
+                score: c.score,
+                at: c.at.0,
+            })
+            .collect())
     }
 
     /// Run the detector on a pre-built `DynamicImage` and return geometry only,
@@ -1643,6 +1666,31 @@ fn extract_boxes(
 struct RecResult {
     text: String,
     confidence: f32,
+    chars: Vec<RecChar>,
+}
+
+/// One decoded character with the strip position where its CTC run fired, exposed for
+/// debug tooling. `at` is a fraction `0.0..=1.0` along the strip's reading axis — the
+/// leading edge of the glyph's CTC run.
+pub struct StripChar {
+    pub ch: char,
+    pub score: f32,
+    pub at: f32,
+}
+
+/// Position along the recognizer strip's reading axis, in `0.0..=1.0`. This is the only
+/// stable scalar for a CTC firing: the strip's pixel width is a resize artefact, and on a
+/// tilted line an image-space cut runs perpendicular to the reading axis (two points, not
+/// one x). Callers convert a fraction to an image-space quad once, through the line's
+/// dewarp transform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StripFraction(f32);
+
+/// One decoded character with the strip position where its CTC run fired.
+struct RecChar {
+    ch: char,
+    score: f32,
+    at: StripFraction,
 }
 
 struct RecChunk {
@@ -1735,7 +1783,17 @@ impl PpocrRecognizer {
         let t_post = Instant::now();
         let seq_len = out_shape[1];
         let num_classes = out_shape[2];
-        let result = decode_ctc(&out_data, seq_len, num_classes, &self.charset);
+        // The model ran on the bucket-padded width `w_us`, so `seq_len` spans that, but the
+        // strip content occupies only `w_exact`. `content_fraction` rescales firing positions
+        // off the padded axis onto the content reading axis.
+        let content_fraction = w_exact as f32 / w_us as f32;
+        let result = decode_ctc(
+            &out_data,
+            seq_len,
+            num_classes,
+            &self.charset,
+            content_fraction,
+        );
         timings_us
             .2
             .fetch_add(t_post.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1769,8 +1827,14 @@ fn load_charset(path: &Path) -> Result<Vec<char>, TranslatorError> {
     Ok(charset)
 }
 
-fn decode_ctc(logits: &[f32], seq_len: usize, num_classes: usize, charset: &[char]) -> RecResult {
-    let mut chars: Vec<(char, f32)> = Vec::new();
+fn decode_ctc(
+    logits: &[f32],
+    seq_len: usize,
+    num_classes: usize,
+    charset: &[char],
+    content_fraction: f32,
+) -> RecResult {
+    let mut chars: Vec<RecChar> = Vec::new();
     let mut prev_idx = 0usize;
     for t in 0..seq_len {
         let start = t * num_classes;
@@ -1792,7 +1856,17 @@ fn decode_ctc(logits: &[f32], seq_len: usize, num_classes: usize, charset: &[cha
                 REC_MIN_SCORE
             };
             if max_prob >= threshold {
-                chars.push((ch, max_prob));
+                // (t + 0.5)/seq_len is the leading edge of this glyph's CTC run as a
+                // fraction of the padded model input; dividing by content_fraction maps it
+                // onto the strip's content reading axis (peaky CTC biases it ~one stride
+                // forward). seq_len >= 1 inside this loop, so the division is safe.
+                let at =
+                    StripFraction(((t as f32 + 0.5) / seq_len as f32 / content_fraction).min(1.0));
+                chars.push(RecChar {
+                    ch,
+                    score: max_prob,
+                    at,
+                });
             }
         }
         prev_idx = max_idx;
@@ -1800,10 +1874,122 @@ fn decode_ctc(logits: &[f32], seq_len: usize, num_classes: usize, charset: &[cha
     let confidence = if chars.is_empty() {
         0.0
     } else {
-        chars.iter().map(|(_, s)| *s).sum::<f32>() / chars.len() as f32
+        chars.iter().map(|c| c.score).sum::<f32>() / chars.len() as f32
     };
-    let text: String = chars.iter().map(|(c, _)| *c).collect();
-    RecResult { text, confidence }
+    let text: String = chars.iter().map(|c| c.ch).collect();
+    RecResult {
+        text,
+        confidence,
+        chars,
+    }
+}
+
+/// A firing gap wider than this multiple of the line's median character advance starts a
+/// new word — the fallback for recognizer models/charsets that under-emit the space class.
+/// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
+const WORD_GAP_FACTOR: f32 = 1.8;
+
+/// Median strip-advance between consecutive decoded characters. Robust to the few large
+/// inter-word gaps, which are high outliers the median ignores. Returns 1.0 for fewer than
+/// two characters, which disables gap splitting (no firing fraction exceeds 1.0).
+#[allow(dead_code)]
+fn median_advance(chars: &[RecChar]) -> f32 {
+    if chars.len() < 2 {
+        return 1.0;
+    }
+    let mut advances: Vec<f32> = chars.windows(2).map(|w| w[1].at.0 - w[0].at.0).collect();
+    advances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    advances[advances.len() / 2]
+}
+
+/// Split a recognized line into word index-ranges over `chars`. A break falls on a
+/// whitespace character (the recognizer's own space class) or on a firing gap wider than
+/// [`WORD_GAP_FACTOR`] times the median advance. Whitespace belongs to no word, so the
+/// returned ranges cover only non-whitespace runs.
+#[allow(dead_code)]
+fn word_ranges(chars: &[RecChar]) -> Vec<Range<usize>> {
+    let gap_thresh = WORD_GAP_FACTOR * median_advance(chars);
+    let mut ranges = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+    for (i, c) in chars.iter().enumerate() {
+        if c.ch.is_whitespace() {
+            if let Some((start, last)) = cur.take() {
+                ranges.push(start..last + 1);
+            }
+            continue;
+        }
+        cur = match cur {
+            None => Some((i, i)),
+            Some((start, last)) => {
+                if chars[i].at.0 - chars[last].at.0 > gap_thresh {
+                    ranges.push(start..last + 1);
+                    Some((i, i))
+                } else {
+                    Some((start, i))
+                }
+            }
+        };
+    }
+    if let Some((start, last)) = cur {
+        ranges.push(start..last + 1);
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod word_segmentation_tests {
+    use super::{RecChar, StripFraction, word_ranges};
+
+    fn rc(ch: char, at: f32) -> RecChar {
+        RecChar {
+            ch,
+            score: 1.0,
+            at: StripFraction(at),
+        }
+    }
+
+    #[test]
+    fn empty_line_has_no_words() {
+        assert!(word_ranges(&[]).is_empty());
+    }
+
+    #[test]
+    fn single_char_is_one_word() {
+        assert_eq!(word_ranges(&[rc('a', 0.5)]), vec![0..1]);
+    }
+
+    #[test]
+    fn uniform_advance_stays_one_word() {
+        let chars = [rc('w', 0.1), rc('o', 0.2), rc('r', 0.3), rc('d', 0.4)];
+        assert_eq!(word_ranges(&chars), vec![0..4]);
+    }
+
+    #[test]
+    fn splits_on_whitespace_excluding_the_space() {
+        // "ab cd": the space at index 2 belongs to no word.
+        let chars = [
+            rc('a', 0.1),
+            rc('b', 0.2),
+            rc(' ', 0.3),
+            rc('c', 0.4),
+            rc('d', 0.5),
+        ];
+        assert_eq!(word_ranges(&chars), vec![0..2, 3..5]);
+    }
+
+    #[test]
+    fn splits_on_firing_gap_without_a_space_token() {
+        // No whitespace: a wide gap (0.15 -> 0.55) against a 0.05 median advance
+        // exceeds 1.8x and breaks the run; the small gaps do not.
+        let chars = [
+            rc('h', 0.05),
+            rc('i', 0.10),
+            rc('!', 0.15),
+            rc('y', 0.55),
+            rc('o', 0.60),
+        ];
+        assert_eq!(word_ranges(&chars), vec![0..3, 3..5]);
+    }
 }
 
 // ---------- Per-line contour-based dewarp (ported from OCR PoC) ----------
