@@ -813,10 +813,27 @@ impl TranslatorSession {
             let PackKind::Ocr(OcrPack::PpocrRecognizer { script }) = &pack.kind else {
                 continue;
             };
-            let Some(model_path) = best_present(pack, FileRole::RECOGNIZER) else {
-                continue;
-            };
-            let Some(keys_path) = best_present(pack, FileRole::KEYS) else {
+            // A recognizer's charset must match its model, so alternates are
+            // paired by priority: take the best recognizer whose same-priority
+            // keys file is also on disk. A half-downloaded upgrade then falls
+            // back to the older complete pair instead of mixing generations.
+            let pair = pack
+                .role_alternatives(FileRole::RECOGNIZER)
+                .into_iter()
+                .find_map(|rec| {
+                    let model_path = base.join(&rec.install_path);
+                    if !model_path.exists() {
+                        return None;
+                    }
+                    let keys_path = pack
+                        .role_alternatives(FileRole::KEYS)
+                        .into_iter()
+                        .find(|keys| keys.priority == rec.priority)
+                        .map(|keys| base.join(&keys.install_path))
+                        .filter(|path| path.exists())?;
+                    Some((model_path, keys_path))
+                });
+            let Some((model_path, keys_path)) = pair else {
                 continue;
             };
             specs.push(PpocrRecognizerSpec {
