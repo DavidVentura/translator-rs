@@ -115,12 +115,13 @@ pub mod txt;
 
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{
-    CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FsPackInstallChecker,
-    InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog, LanguageOverview, OcrEngine,
-    OcrPack, PpocrScript, TtsSpeakerEntry, TtsVoicePickerRegion,
+    CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FileRole,
+    FsPackInstallChecker, InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog,
+    LanguageOverview, OcrEngine, OcrPack, PpocrScript, TtsSpeakerEntry, TtsVoicePickerRegion,
     available_ocr_engines_for_language, installed_ocr_engines_for_language,
     installed_tts_voice_picker_regions, language_rows_in_snapshot, parse_and_validate_catalog,
-    plan_ocr_engine_download, plan_ocr_engine_downloads,
+    plan_delete_superseded_files, plan_ocr_engine_download, plan_ocr_engine_downloads,
+    plan_ocr_engine_upgrades,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{

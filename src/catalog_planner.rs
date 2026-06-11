@@ -4,9 +4,9 @@ use crate::api::LanguageCode;
 use crate::language::Language;
 
 use super::model::{
-    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, InstalledTtsPack, LangAvailability,
-    LanguageCatalog, PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry,
-    TtsVoicePackInfo, TtsVoicePickerRegion,
+    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRole, InstalledTtsPack,
+    LangAvailability, LanguageCatalog, PackKind, PackRecord, ResolvedTtsVoiceFiles,
+    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +15,12 @@ pub struct PackInstallStatus {
     pub installed: bool,
     pub missing_files: Vec<AssetFileV2>,
     pub missing_dependency_ids: Vec<String>,
+    /// Higher-priority role alternatives than the best file on disk. The pack
+    /// still counts as installed; these are optional improvements.
+    pub upgrade_files: Vec<AssetFileV2>,
+    /// Role alternatives on disk that are outranked by a better file also on
+    /// disk, safe to delete.
+    pub superseded_files: Vec<AssetFileV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,19 +148,47 @@ where
         }
 
         let pack = self.catalog.pack(pack_id)?;
-        let missing_files = pack
-            .files
-            .iter()
-            .filter(
-                |file| match (&file.install_marker_path, file.install_marker_version) {
-                    (Some(marker_path), Some(version)) => !self
-                        .install_checker
-                        .install_marker_exists(marker_path, version),
-                    _ => !self.install_checker.file_exists(&file.install_path),
-                },
-            )
-            .cloned()
-            .collect::<Vec<_>>();
+        let checker = self.install_checker;
+        let file_present =
+            |file: &AssetFileV2| match (&file.install_marker_path, file.install_marker_version) {
+                (Some(marker_path), Some(version)) => {
+                    checker.install_marker_exists(marker_path, version)
+                }
+                _ => checker.file_exists(&file.install_path),
+            };
+
+        let mut missing_files = Vec::new();
+        let mut upgrade_files = Vec::new();
+        let mut superseded_files = Vec::new();
+        let mut role_groups: Vec<(&FileRole, Vec<&AssetFileV2>)> = Vec::new();
+        for file in &pack.files {
+            let Some(role) = &file.role else {
+                if !file_present(file) {
+                    missing_files.push(file.clone());
+                }
+                continue;
+            };
+            match role_groups.iter_mut().find(|(r, _)| *r == role) {
+                Some((_, group)) => group.push(file),
+                None => role_groups.push((role, vec![file])),
+            }
+        }
+        for (_, mut group) in role_groups {
+            group.sort_by_key(|file| std::cmp::Reverse(file.priority));
+            let present = group
+                .iter()
+                .filter(|file| file_present(file))
+                .copied()
+                .collect::<Vec<_>>();
+            let Some(best_present) = present.first() else {
+                missing_files.push(group[0].clone());
+                continue;
+            };
+            if group[0].install_path != best_present.install_path {
+                upgrade_files.push(group[0].clone());
+            }
+            superseded_files.extend(present[1..].iter().map(|file| (*file).clone()));
+        }
 
         let missing_dependency_ids = pack
             .depends_on
@@ -168,6 +202,8 @@ where
             installed: missing_files.is_empty() && missing_dependency_ids.is_empty(),
             missing_files,
             missing_dependency_ids,
+            upgrade_files,
+            superseded_files,
         };
         self.status_cache
             .insert(pack_id.to_string(), status.clone());
@@ -378,7 +414,18 @@ fn missing_files_in_snapshot<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut missing = Vec::new();
+    status_files_in_snapshot(snapshot, pack_ids, |status| &status.missing_files)
+}
+
+fn status_files_in_snapshot<'a, I>(
+    snapshot: &'a CatalogSnapshot,
+    pack_ids: I,
+    select: impl Fn(&PackInstallStatus) -> &[AssetFileV2],
+) -> Vec<MissingPackFile>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut selected = Vec::new();
     let mut seen_install_paths = HashSet::new();
 
     for pack_id in snapshot.catalog.dependency_closure(pack_ids) {
@@ -388,9 +435,9 @@ where
         let Some(status) = snapshot.pack_statuses.get(&pack_id) else {
             continue;
         };
-        for file in &status.missing_files {
+        for file in select(status) {
             if seen_install_paths.insert(file.install_path.clone()) {
-                missing.push(MissingPackFile {
+                selected.push(MissingPackFile {
                     pack_id: pack.id.clone(),
                     file: file.clone(),
                 });
@@ -398,7 +445,50 @@ where
         }
     }
 
-    missing
+    selected
+}
+
+pub fn plan_ocr_engine_upgrades(
+    snapshot: &CatalogSnapshot,
+    language_codes: &[LanguageCode],
+    engine: &str,
+) -> DownloadPlan {
+    let pack_ids = language_codes
+        .iter()
+        .filter_map(|language_code| {
+            snapshot
+                .catalog
+                .ocr_pack_id_for_engine(language_code, engine)
+        })
+        .collect::<Vec<_>>();
+    let tasks = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
+        &status.upgrade_files
+    })
+    .into_iter()
+    .filter_map(|item| {
+        let pack = snapshot.catalog.pack(&item.pack_id)?;
+        Some(download_task_for(pack, &item.file))
+    })
+    .collect::<Vec<_>>();
+    DownloadPlan {
+        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
+        tasks,
+    }
+}
+
+pub fn plan_delete_superseded_files(snapshot: &CatalogSnapshot) -> DeletePlan {
+    let mut file_paths = snapshot
+        .pack_statuses
+        .values()
+        .flat_map(|status| &status.superseded_files)
+        .map(|file| file.install_path.clone())
+        .collect::<Vec<_>>();
+    file_paths.sort();
+    file_paths.dedup();
+    DeletePlan {
+        file_paths,
+        directory_paths: Vec::new(),
+    }
 }
 
 pub fn can_translate(

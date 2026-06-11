@@ -765,7 +765,7 @@ impl TranslatorSession {
     #[cfg(feature = "ppocr")]
     fn ppocr_engine(&self, snap: &CatalogSnapshot) -> Result<Arc<PpocrEngine>, TranslatorError> {
         use crate::api::TranslatorErrorKind;
-        use crate::catalog::OcrPack;
+        use crate::catalog::{FileRole, OcrPack, PackRecord};
 
         let catalog = &snap.catalog;
         let pack_installed = |pack_id: &str| {
@@ -793,22 +793,17 @@ impl TranslatorSession {
         }
 
         let base = std::path::Path::new(&snap.base_dir);
-        let det_path = det_pack
-            .files
-            .iter()
-            .find(|f| f.name.ends_with(".mnn") && f.name.contains("_det"))
-            .map(|f| base.join(&f.install_path))
-            .ok_or_else(|| TranslatorError::missing_asset("ppocr detector pack has no det .mnn"))?;
-        let classifier_path = det_pack
-            .files
-            .iter()
-            .find(|f| f.name.ends_with(".mnn") && f.name.contains("PULC"))
-            .map(|f| base.join(&f.install_path));
-        let textline_orientation_path = det_pack
-            .files
-            .iter()
-            .find(|f| f.name.ends_with(".mnn") && f.name.contains("textline_ori"))
-            .map(|f| base.join(&f.install_path));
+        let best_present = |pack: &PackRecord, role: &str| {
+            pack.role_alternatives(role)
+                .into_iter()
+                .map(|f| base.join(&f.install_path))
+                .find(|path| path.exists())
+        };
+        let det_path = best_present(det_pack, FileRole::DETECTOR).ok_or_else(|| {
+            TranslatorError::missing_asset("ppocr detector pack has no detector model on disk")
+        })?;
+        let classifier_path = best_present(det_pack, FileRole::SCRIPT_CLASSIFIER);
+        let textline_orientation_path = best_present(det_pack, FileRole::TEXTLINE_ORIENTATION);
 
         let mut specs = Vec::new();
         for (pack_id, pack) in &catalog.packs {
@@ -818,20 +813,10 @@ impl TranslatorSession {
             let PackKind::Ocr(OcrPack::PpocrRecognizer { script }) = &pack.kind else {
                 continue;
             };
-            let Some(model_path) = pack
-                .files
-                .iter()
-                .find(|f| f.name.ends_with(".mnn"))
-                .map(|f| base.join(&f.install_path))
-            else {
+            let Some(model_path) = best_present(pack, FileRole::RECOGNIZER) else {
                 continue;
             };
-            let Some(keys_path) = pack
-                .files
-                .iter()
-                .find(|f| f.name.ends_with("_keys.txt"))
-                .map(|f| base.join(&f.install_path))
-            else {
+            let Some(keys_path) = best_present(pack, FileRole::KEYS) else {
                 continue;
             };
             specs.push(PpocrRecognizerSpec {

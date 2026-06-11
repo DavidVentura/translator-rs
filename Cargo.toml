@@ -33,6 +33,11 @@ name = "viz_pipeline"
 path = "src/bin/viz_pipeline.rs"
 required-features = ["viz"]
 
+[[bin]]
+name = "ppocr_bench"
+path = "src/bin/ppocr_bench.rs"
+required-features = ["ppocr"]
+
 [features]
 default = []
 translate-cli = ["dep:toml"]

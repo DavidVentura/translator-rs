@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::language::Language;
 
 use super::model::{
-    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, LanguageCatalog,
+    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, FileRole, LanguageCatalog,
     LanguageFeature, LanguageInfo, LanguageResources, LanguageTtsRegionV2, LanguageTtsV2, OcrPack,
     PackKind, PackRecord, PpocrScript, SupportPack, TranslationPack, TtsPack,
     tts_pack_ids_from_config,
@@ -85,6 +85,10 @@ struct AssetFileWire {
     delete_after_extract: bool,
     install_marker_path: Option<String>,
     install_marker_version: Option<i32>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    priority: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -210,6 +214,11 @@ impl From<AssetFileWire> for AssetFileV2 {
             delete_after_extract: value.delete_after_extract,
             install_marker_path: value.install_marker_path.filter(|value| !value.is_empty()),
             install_marker_version: value.install_marker_version,
+            role: value
+                .role
+                .filter(|value| !value.is_empty())
+                .map(FileRole::new),
+            priority: value.priority,
         }
     }
 }

@@ -1632,7 +1632,7 @@ pub fn estimate_canonical_quadrant(
             Some(t) => t,
             None => continue,
         };
-        let deskewed_luma = match dewarp_contour_to_strip(gray, &contour, None) {
+        let deskewed_luma = match dewarp_contour_to_strip(gray, &contour, None, 0.0) {
             Some(s) => s,
             None => continue,
         };

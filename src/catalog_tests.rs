@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use crate::api::{DictionaryCode, LanguageCode};
-use crate::catalog::plan_ocr_engine_downloads;
 use crate::catalog::{
-    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, LangAvailability, LanguageCatalog,
-    LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker, PackRecord,
-    build_catalog_snapshot, plan_language_download,
+    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, FileRole, LangAvailability,
+    LanguageCatalog, LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker,
+    PackRecord, build_catalog_snapshot, plan_delete_superseded_files, plan_language_download,
 };
+use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades};
 use crate::language::Language;
 use crate::translate::resolve_translation_plan_in_snapshot;
 
@@ -52,6 +52,22 @@ fn asset_file(name: &str, install_path: &str, size_bytes: u64) -> AssetFileV2 {
         delete_after_extract: false,
         install_marker_path: None,
         install_marker_version: None,
+        role: None,
+        priority: 0,
+    }
+}
+
+fn role_file(
+    name: &str,
+    install_path: &str,
+    size_bytes: u64,
+    role: &str,
+    priority: i32,
+) -> AssetFileV2 {
+    AssetFileV2 {
+        role: Some(FileRole::new(role)),
+        priority,
+        ..asset_file(name, install_path, size_bytes)
     }
 }
 
@@ -560,6 +576,129 @@ fn batch_ocr_download_plan_dedupes_shared_dependencies() {
     );
 }
 
+fn catalog_with_detector_alternatives() -> LanguageCatalog {
+    let mut catalog = base_catalog();
+    catalog.packs.insert(
+        "ocr-ppocr-detector".to_string(),
+        pack_record(
+            "ocr-ppocr-detector",
+            PackKind::Ocr(OcrPack::PpocrDetector),
+            vec![
+                role_file(
+                    "det_old.mnn",
+                    "ppocr/det_old.mnn",
+                    100,
+                    FileRole::DETECTOR,
+                    0,
+                ),
+                role_file(
+                    "det_new.mnn",
+                    "ppocr/det_new.mnn",
+                    40,
+                    FileRole::DETECTOR,
+                    1,
+                ),
+                role_file(
+                    "pulc.mnn",
+                    "ppocr/pulc.mnn",
+                    10,
+                    FileRole::SCRIPT_CLASSIFIER,
+                    0,
+                ),
+            ],
+            vec![],
+        ),
+    );
+    catalog.packs.insert(
+        "ocr-ppocr-latin".to_string(),
+        ppocr_recognizer_pack(
+            "ocr-ppocr-latin",
+            PpocrScript::Latin,
+            role_file("latin.mnn", "ppocr/latin.mnn", 10, FileRole::RECOGNIZER, 0),
+            vec!["ocr-ppocr-detector"],
+        ),
+    );
+    catalog
+        .languages
+        .get_mut("en")
+        .unwrap()
+        .resources
+        .ocr_packs
+        .push(("ppocr".to_string(), "ocr-ppocr-latin".to_string()));
+    catalog
+}
+
+#[test]
+fn lower_priority_alternative_keeps_pack_installed_and_offers_upgrade() {
+    let catalog = catalog_with_detector_alternatives();
+    let checker =
+        FakeInstallChecker::with_files(&["ppocr/det_old.mnn", "ppocr/pulc.mnn", "ppocr/latin.mnn"]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    assert!(snapshot.pack_statuses["ocr-ppocr-detector"].installed);
+    assert!(snapshot.pack_statuses["ocr-ppocr-latin"].installed);
+
+    let en = [LanguageCode::from("en")];
+    let downloads = plan_ocr_engine_downloads(&snapshot, &en, "ppocr");
+    assert!(downloads.tasks.is_empty());
+
+    let upgrades = plan_ocr_engine_upgrades(&snapshot, &en, "ppocr");
+    let paths = upgrades
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["ppocr/det_new.mnn"]);
+    assert_eq!(upgrades.total_size, 40);
+}
+
+#[test]
+fn fresh_install_plan_downloads_only_best_alternative() {
+    let catalog = catalog_with_detector_alternatives();
+    let checker = FakeInstallChecker::with_files(&[]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    let en = [LanguageCode::from("en")];
+    let plan = plan_ocr_engine_downloads(&snapshot, &en, "ppocr");
+    let mut paths = plan
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+
+    assert_eq!(
+        paths,
+        vec!["ppocr/det_new.mnn", "ppocr/latin.mnn", "ppocr/pulc.mnn"]
+    );
+    assert!(
+        plan_ocr_engine_upgrades(&snapshot, &en, "ppocr")
+            .tasks
+            .is_empty()
+    );
+}
+
+#[test]
+fn outranked_alternative_on_disk_is_superseded() {
+    let catalog = catalog_with_detector_alternatives();
+    let checker = FakeInstallChecker::with_files(&[
+        "ppocr/det_old.mnn",
+        "ppocr/det_new.mnn",
+        "ppocr/pulc.mnn",
+        "ppocr/latin.mnn",
+    ]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    let en = [LanguageCode::from("en")];
+    assert!(
+        plan_ocr_engine_upgrades(&snapshot, &en, "ppocr")
+            .tasks
+            .is_empty()
+    );
+    let cleanup = plan_delete_superseded_files(&snapshot);
+    assert_eq!(cleanup.file_paths, vec!["ppocr/det_old.mnn".to_string()]);
+}
+
 #[test]
 fn computes_language_availability_from_pack_install_state() {
     let catalog = base_catalog();
@@ -689,7 +828,7 @@ fn parses_bundled_catalog_asset() {
         .parent()
         .and_then(|parent| parent.parent())
         .map(|parent| {
-            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v3.json")
+            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v4.json")
         })
         .expect("repo layout should have a parent");
     let Ok(json) = std::fs::read_to_string(asset_path) else {

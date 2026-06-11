@@ -40,6 +40,29 @@ pub(crate) struct LanguageInfo {
     pub tts: Option<LanguageTtsV2>,
 }
 
+/// Groups interchangeable files within a pack: files sharing a role are
+/// alternatives for the same slot, ranked by `AssetFileV2::priority`.
+/// Opaque to the planner (grouping is by equality), so catalogs can introduce
+/// new roles without breaking older clients' install/upgrade logic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileRole(String);
+
+impl FileRole {
+    pub const DETECTOR: &'static str = "detector";
+    pub const SCRIPT_CLASSIFIER: &'static str = "scriptClassifier";
+    pub const TEXTLINE_ORIENTATION: &'static str = "textlineOrientation";
+    pub const RECOGNIZER: &'static str = "recognizer";
+    pub const KEYS: &'static str = "keys";
+
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetFileV2 {
     pub name: String,
@@ -52,6 +75,8 @@ pub struct AssetFileV2 {
     pub delete_after_extract: bool,
     pub install_marker_path: Option<String>,
     pub install_marker_version: Option<i32>,
+    pub role: Option<FileRole>,
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -67,6 +92,20 @@ pub struct PackRecord {
     pub files: Vec<AssetFileV2>,
     pub depends_on: Vec<String>,
     pub kind: PackKind,
+}
+
+impl PackRecord {
+    /// Files filling the given role, best (highest priority) first.
+    /// Ties keep catalog order.
+    pub fn role_alternatives(&self, role: &str) -> Vec<&AssetFileV2> {
+        let mut files = self
+            .files
+            .iter()
+            .filter(|file| file.role.as_ref().is_some_and(|r| r.as_str() == role))
+            .collect::<Vec<_>>();
+        files.sort_by_key(|file| std::cmp::Reverse(file.priority));
+        files
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
