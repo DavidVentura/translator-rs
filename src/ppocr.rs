@@ -2434,11 +2434,15 @@ fn build_oriented_boxes(
         return None;
     }
 
+    // The tight box is the measured mask band; low-res heads underestimate
+    // it by ~(stride - 1) px total (pooling pulls the threshold crossing
+    // inward), which downstream consumers — live block merging, render
+    // geometry — read as genuinely thinner lines. Restore the deficit.
     let tight = crate::ocr::OrientedRect {
         cx,
         cy,
-        width: final_width,
-        height: final_height,
+        width: final_width + pool_comp_px,
+        height: final_height + pool_comp_px,
         angle_radians: final_angle,
     };
 

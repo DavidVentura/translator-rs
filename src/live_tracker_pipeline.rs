@@ -95,7 +95,7 @@ impl Default for PipelineConfig {
             to_lang: String::new(),
             is_auto_source: false,
             target_mode: TargetMode::Active,
-            det_max_pixels: 650_000,
+            det_max_pixels: 750_000,
             anchor_padding_px: 60,
             rec_batch_size: 4,
         }
