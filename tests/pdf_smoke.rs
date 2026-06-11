@@ -214,6 +214,19 @@ fn smoke_translate_and_write_pdf() {
                 chain.push(FontHandle::new(path, ttc_index));
             }
         }
+        if (req.language == "ar" || req.script == translator::script::Script::Arabic)
+            && !req.monospace
+        {
+            let leaf = if req.bold {
+                "NotoNaskhArabic-Bold.ttf"
+            } else {
+                "NotoNaskhArabic-Regular.ttf"
+            };
+            let path = noto_truetype_dir.join(leaf);
+            if path.is_file() {
+                chain.push(FontHandle::from(path));
+            }
+        }
         if (req.language == "bn" || req.script == translator::script::Script::Bengali)
             && !req.monospace
         {

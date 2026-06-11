@@ -391,6 +391,15 @@ fn emit_glyphs(
     embed: Option<&EmbeddedFont>,
 ) {
     if let Some(embedded) = embed {
+        // RTL scripts (Arabic, Hebrew, …) need BiDi reordering + cursive
+        // joining; the char-by-char cmap path below would emit isolated,
+        // left-to-right glyphs. Latin/CJK keep the original fast path.
+        if crate::pdf_overlay::line_contains_rtl(text)
+            && let Some(gids) = crate::pdf_overlay::shape_line_to_gids(text, metrics, embedded)
+        {
+            builder.show_hex_gids(gids);
+            return;
+        }
         builder.show_hex_gids(text.chars().map(|c| {
             let original = metrics.glyph_for(c).map(|g| g.gid).unwrap_or(0);
             embedded

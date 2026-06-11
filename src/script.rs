@@ -120,7 +120,7 @@ impl Script {
     }
 }
 
-#[cfg(any(feature = "image-render", feature = "transliterate"))]
+#[cfg(any(feature = "image-render", feature = "transliterate", feature = "pdf"))]
 impl From<unicode_script::Script> for Script {
     fn from(s: unicode_script::Script) -> Self {
         use unicode_script::Script as U;

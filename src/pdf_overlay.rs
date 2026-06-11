@@ -16,6 +16,7 @@ use crate::pdf_font_embed::EmbeddedFont;
 use crate::pdf_surgery::CapturedTextShow;
 use crate::pdf_write::{BlockGeometry, BlockTypography, SampledBlockStyle};
 use crate::styled::{StyleSpan, TranslatedStyledBlock};
+use crate::text_shape::{self, DirRun, segment_runs};
 
 /// Approximate average Helvetica glyph width as a fraction of font size.
 pub(crate) const HELVETICA_AVG_ADVANCE: f32 = 0.5;
@@ -386,6 +387,34 @@ fn emit_block(
         } else {
             FontMetrics::approx(HELVETICA_AVG_ADVANCE)
         };
+
+        // Lines containing a right-to-left script (Arabic, Hebrew, …) can't be
+        // emitted by the logical-order, left-to-right cursor below: BiDi
+        // reordering and cursive joining (shaping) are mandatory. Hand those to
+        // the shaped emitter, which lays runs in visual order and right-aligns.
+        // All-LTR lines keep the original cmap-direct path untouched.
+        let logical: String = segments.iter().map(|s| s.text.as_str()).collect();
+        if line_contains_rtl(&logical) {
+            last_line_end = Some(emit_line_shaped(
+                builder,
+                &segments,
+                resources,
+                line_x,
+                line_y,
+                advance_dx,
+                advance_dy,
+                line_dx,
+                line_dy,
+                font_size,
+                sampled_font_size,
+                line_width_at(&line_widths, i),
+                style.geometry.text_orientation,
+                inv_ctm,
+                style.typography.fill_rgb,
+            ));
+            continue;
+        }
+
         for seg in segments {
             if seg.text.is_empty() {
                 continue;
@@ -955,6 +984,263 @@ fn segment_font_runs<'a>(
     runs
 }
 
+/// One contiguous run of a line, already resolved to a font and laid out in
+/// visual order. `advance` is the run's width in text space at `font_size`.
+struct ShapedPiece {
+    content: PieceContent,
+    resource_name: Vec<u8>,
+    font_size: f32,
+    baseline_shift: f32,
+    fill_rgb: (f32, f32, f32),
+    advance: f32,
+}
+
+enum PieceContent {
+    /// Subset glyph IDs for an embedded Type-0 font, in visual order.
+    Gids(Vec<u16>),
+    /// WinAnsi text for a Standard-14 Latin fallback.
+    Winansi(String),
+}
+
+/// Emit one line that contains right-to-left text. Reorders the line's runs
+/// into visual order (BiDi), shapes each embedded-font run with rustybuzz so
+/// Arabic/Hebrew letters join, and right-aligns the line when its base
+/// direction is RTL. ASCII the target font can't cover still falls back to a
+/// Standard-14 Latin font. Returns the user-space `(x, y)` where the line ends.
+#[allow(clippy::too_many_arguments)]
+fn emit_line_shaped(
+    builder: &mut ContentStreamBuilder,
+    segments: &[LineSegment],
+    resources: &BlockResources,
+    line_x: f32,
+    line_y: f32,
+    advance_dx: f32,
+    advance_dy: f32,
+    line_dx: f32,
+    line_dy: f32,
+    font_size: f32,
+    sampled_font_size: f32,
+    avail_width: f32,
+    orientation: Matrix,
+    inv_ctm: &Matrix,
+    default_fill: (f32, f32, f32),
+) -> (f32, f32) {
+    // Logical line text plus, for each non-empty segment, its byte span within
+    // that text — so a BiDi run (expressed in logical bytes) maps back to the
+    // segment styles it overlaps.
+    let mut logical = String::new();
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    for (idx, seg) in segments.iter().enumerate() {
+        if seg.text.is_empty() {
+            continue;
+        }
+        let start = logical.len();
+        logical.push_str(&seg.text);
+        spans.push((start, logical.len(), idx));
+    }
+    if logical.is_empty() {
+        return (line_x, line_y);
+    }
+
+    let mut dir_runs = segment_runs(&logical);
+    let base_rtl = dir_runs
+        .iter()
+        .min_by_key(|r| r.start)
+        .map(|r| r.rtl)
+        .unwrap_or(false);
+    dir_runs.sort_by_key(|r| r.visual_index);
+
+    let latin_fallback = if resources.monospace {
+        FontMetrics::approx(COURIER_AVG_ADVANCE)
+    } else {
+        FontMetrics::approx(HELVETICA_AVG_ADVANCE)
+    };
+
+    let mut pieces: Vec<ShapedPiece> = Vec::new();
+    for dr in &dir_runs {
+        // Segments overlapping this run, in logical order; reversed for RTL so
+        // the cursor visits them right-to-left.
+        let mut overlap: Vec<(usize, usize, usize)> = spans
+            .iter()
+            .copied()
+            .filter(|(s, e, _)| *s < dr.end && *e > dr.start)
+            .collect();
+        if dr.rtl {
+            overlap.reverse();
+        }
+        for (sseg, eseg, seg_idx) in overlap {
+            let a = sseg.max(dr.start);
+            let b = eseg.min(dr.end);
+            if a >= b {
+                continue;
+            }
+            let seg = &segments[seg_idx];
+            let (metrics, embed) = resources.for_flags(seg.style.flags);
+            let seg_font_size = seg
+                .style
+                .text_size
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .map(|s| font_size * (s / sampled_font_size))
+                .unwrap_or(font_size);
+            let baseline_shift = seg
+                .style
+                .baseline_shift
+                .filter(|s| s.is_finite())
+                .map(|s| s * (font_size / sampled_font_size))
+                .unwrap_or(0.0);
+            let fill = seg.style.fill_rgb.unwrap_or(default_fill);
+
+            // Split the overlap into embedded vs Standard-14 font runs (ASCII the
+            // target font lacks), keeping byte spans so we can shape exact
+            // sub-slices of `logical`. Reversed for RTL.
+            let sub = &logical[a..b];
+            let mut frs: Vec<(usize, usize, bool)> = Vec::new();
+            let mut off = a;
+            for fr in segment_font_runs(sub, metrics, embed) {
+                frs.push((off, off + fr.text.len(), fr.use_standard14));
+                off += fr.text.len();
+            }
+            if dr.rtl {
+                frs.reverse();
+            }
+
+            for (fr_start, fr_end, use_standard14) in frs {
+                let fr_text = &logical[fr_start..fr_end];
+                if fr_text.is_empty() {
+                    continue;
+                }
+                if use_standard14 || embed.is_none() {
+                    let resource_name = BlockTypography::font_resource_for(FontStyleFlags {
+                        bold: seg.style.flags.bold,
+                        italic: seg.style.flags.italic,
+                        monospace: resources.monospace,
+                    })
+                    .to_vec();
+                    pieces.push(ShapedPiece {
+                        advance: latin_fallback.measure(fr_text, seg_font_size),
+                        content: PieceContent::Winansi(fr_text.to_string()),
+                        resource_name,
+                        font_size: seg_font_size,
+                        baseline_shift,
+                        fill_rgb: fill,
+                    });
+                    continue;
+                }
+
+                let embed = embed.unwrap();
+                let Some((bytes, ttc_index, _)) = metrics.embedding_source() else {
+                    continue;
+                };
+                let Some(face) = rustybuzz::Face::from_slice(&bytes, ttc_index) else {
+                    continue;
+                };
+                let run = DirRun {
+                    start: fr_start,
+                    end: fr_end,
+                    script: dr.script,
+                    rtl: dr.rtl,
+                    visual_index: 0,
+                };
+                let shaped = text_shape::shape_run(&logical, &run, &face);
+                if shaped.glyphs.is_empty() {
+                    continue;
+                }
+                let upem = metrics.units_per_em().unwrap_or(1000).max(1) as f32;
+                let advance_units: i64 = shaped.glyphs.iter().map(|g| g.advance_x as i64).sum();
+                let gids: Vec<u16> = shaped
+                    .glyphs
+                    .iter()
+                    .map(|g| embed.gid_remap.get(&g.gid).copied().unwrap_or(g.gid))
+                    .collect();
+                pieces.push(ShapedPiece {
+                    advance: advance_units as f32 / upem * seg_font_size,
+                    content: PieceContent::Gids(gids),
+                    resource_name: embed.resource_name.clone(),
+                    font_size: seg_font_size,
+                    baseline_shift,
+                    fill_rgb: fill,
+                });
+            }
+        }
+    }
+
+    let total: f32 = pieces.iter().map(|p| p.advance).sum();
+    let mut cursor = if base_rtl {
+        (avail_width - total).max(0.0)
+    } else {
+        0.0
+    };
+    for p in &pieces {
+        let run_x = line_x + cursor * advance_dx;
+        let run_y = line_y + cursor * advance_dy;
+        let combined = Matrix {
+            e: run_x + p.baseline_shift * line_dx,
+            f: run_y + p.baseline_shift * line_dy,
+            ..orientation
+        };
+        builder.set_fill_rgb(p.fill_rgb.0, p.fill_rgb.1, p.fill_rgb.2);
+        builder.set_font(&p.resource_name, p.font_size);
+        builder.set_text_matrix(combined.mul(*inv_ctm));
+        match &p.content {
+            PieceContent::Gids(gids) => builder.show_hex_gids(gids.iter().copied()),
+            PieceContent::Winansi(text) => builder.show_winansi(text),
+        }
+        cursor += p.advance;
+    }
+
+    (line_x + cursor * advance_dx, line_y + cursor * advance_dy)
+}
+
+/// Cheap codepoint test for the major RTL blocks, used to skip full BiDi
+/// analysis on the all-LTR lines that dominate most documents.
+pub(crate) fn has_rtl_char(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c as u32,
+            0x0590..=0x05FF // Hebrew
+            | 0x0600..=0x06FF // Arabic
+            | 0x0700..=0x074F // Syriac
+            | 0x0750..=0x077F // Arabic Supplement
+            | 0x0780..=0x07BF // Thaana
+            | 0x07C0..=0x07FF // NKo
+            | 0x0800..=0x083F // Samaritan
+            | 0x0840..=0x085F // Mandaic
+            | 0x08A0..=0x08FF // Arabic Extended-A
+            | 0xFB1D..=0xFB4F // Hebrew presentation forms
+            | 0xFB50..=0xFDFF // Arabic presentation forms-A
+            | 0xFE70..=0xFEFF // Arabic presentation forms-B
+        )
+    })
+}
+
+/// Does `text` contain any right-to-left script? Callers use this to decide
+/// whether the logical-order, char-by-char emit path is safe (it isn't for RTL).
+pub(crate) fn line_contains_rtl(text: &str) -> bool {
+    has_rtl_char(text) && segment_runs(text).iter().any(|r| r.rtl)
+}
+
+/// Shape `text` end-to-end with `embed`'s font and return the subset glyph IDs
+/// in visual order, concatenated across BiDi runs. For single-font lines (the
+/// OCR overlay path) this is the whole-line equivalent of [`emit_line_shaped`].
+/// Returns `None` if the font can't be parsed for shaping.
+#[cfg_attr(not(feature = "pdf-image-translate"), allow(dead_code))]
+pub(crate) fn shape_line_to_gids(
+    text: &str,
+    metrics: &FontMetrics,
+    embed: &EmbeddedFont,
+) -> Option<Vec<u16>> {
+    let (bytes, ttc_index, _) = metrics.embedding_source()?;
+    let face = rustybuzz::Face::from_slice(&bytes, ttc_index)?;
+    let mut runs = segment_runs(text);
+    runs.sort_by_key(|r| r.visual_index);
+    let mut gids = Vec::new();
+    for run in &runs {
+        for g in text_shape::shape_run(text, run, &face).glyphs {
+            gids.push(embed.gid_remap.get(&g.gid).copied().unwrap_or(g.gid));
+        }
+    }
+    Some(gids)
+}
+
 fn emit_tj_for_segment(
     builder: &mut ContentStreamBuilder,
     text: &str,
@@ -1178,6 +1464,7 @@ mod tests {
                 gid: 0,
                 advance: 500,
             },
+            used: Vec::new(),
             bytes: Arc::new(Vec::new()),
             ttc_index: 0,
             descriptor: FontDescriptorInfo {
@@ -1193,6 +1480,113 @@ mod tests {
                 kind: FontFileKind::TrueType,
             },
         }
+    }
+
+    fn arabic_font_path() -> Option<&'static str> {
+        [
+            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+            "/home/david/Android/Sdk/platforms/android-28/data/fonts/NotoNaskhArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansArabicUI-Regular.ttf",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    }
+
+    /// Parse the glyph ids out of the single `<HHHH...> Tj` the shaped emitter
+    /// writes for a one-run line.
+    fn parse_hex_tj_gids(stream: &str) -> Vec<u16> {
+        let open = stream.find('<').expect("hex Tj present");
+        let close = stream[open..].find("> Tj").expect("hex Tj terminator") + open;
+        stream[open + 1..close]
+            .as_bytes()
+            .chunks(4)
+            .map(|c| u16::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn arabic_line_emits_joined_visual_order_glyphs() {
+        let Some(path) = arabic_font_path() else {
+            eprintln!("no arabic font; skipping");
+            return;
+        };
+        let text = "مرحبا بالعالم";
+        let metrics = FontMetrics::from_file_for_text(path, 0, text).expect("parse arabic font");
+        // Identity remap: emitted gids == shaped gids, so we can compare directly.
+        let embed = EmbeddedFont {
+            resource_name: b"Tr0".to_vec(),
+            type0_id: (1, 0),
+            gid_remap: HashMap::new(),
+        };
+        let mut by_flags = HashMap::new();
+        by_flags.insert(BoldItalic::default(), (metrics.clone(), Some(embed)));
+        let resources = BlockResources {
+            by_flags,
+            default_flags: BoldItalic::default(),
+            monospace: false,
+        };
+        let segments = vec![LineSegment {
+            text: text.to_string(),
+            style: SegmentStyle {
+                flags: BoldItalic::default(),
+                fill_rgb: None,
+                text_size: None,
+                baseline_shift: None,
+            },
+        }];
+
+        let mut builder = ContentStreamBuilder::new();
+        builder.begin_text();
+        emit_line_shaped(
+            &mut builder,
+            &segments,
+            &resources,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            -1.0,
+            20.0,
+            20.0,
+            500.0,
+            Matrix::identity(),
+            &Matrix::identity(),
+            (0.0, 0.0, 0.0),
+        );
+        builder.end_text();
+        let stream = String::from_utf8(builder.finish()).unwrap();
+        let emitted = parse_hex_tj_gids(&stream);
+
+        // Expected: rustybuzz shaped gids in visual order across the whole line.
+        let font_bytes = std::fs::read(path).unwrap();
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+        let mut expected: Vec<u16> = Vec::new();
+        let mut runs = segment_runs(text);
+        runs.sort_by_key(|r| r.visual_index);
+        for run in &runs {
+            for g in text_shape::shape_run(text, run, &face).glyphs {
+                expected.push(g.gid);
+            }
+        }
+        assert_eq!(
+            emitted, expected,
+            "emitted gids must be shaped + visual order"
+        );
+
+        // The naive cmap-per-codepoint path (the old bug) would emit the
+        // isolated glyph of each char in logical order. The shaped output must
+        // differ — proving joining + reordering actually happened.
+        let naive: Vec<u16> = text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| face.glyph_index(c).map(|g| g.0).unwrap_or(0))
+            .collect();
+        let emitted_nonspace: Vec<u16> = emitted.iter().copied().filter(|g| *g != 0).collect();
+        assert_ne!(
+            emitted_nonspace, naive,
+            "shaped output must differ from naive isolated-glyph emission"
+        );
     }
 
     #[test]

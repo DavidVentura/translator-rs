@@ -103,8 +103,10 @@ pub mod surface_map;
 pub mod tarkka;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
-#[cfg(feature = "image-render")]
+#[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod text_runs;
+#[cfg(any(feature = "pdf", feature = "image-render"))]
+pub mod text_shape;
 mod translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;

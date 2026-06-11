@@ -19,11 +19,10 @@ use std::sync::Arc;
 use crate::font_provider::{FontHandle, FontProvider, FontRequest};
 use crate::ocr::{OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock};
 use crate::script::Script;
-use crate::text_runs::{ScriptRun, itemize};
+use crate::text_shape::{self, DirRun, ShapedGlyph, segment_runs};
 
+use rustybuzz::Face;
 use rustybuzz::ttf_parser;
-use rustybuzz::{Direction, Face, UnicodeBuffer};
-use unicode_bidi::{BidiInfo, Level};
 use zeno::{Command, Format, Mask, PathBuilder};
 
 /// Knobs for [`render_overlay`].
@@ -361,137 +360,12 @@ impl FontCache {
 }
 
 // ---------------------------------------------------------------------------
-// Script-run + run-direction segmentation
-
-#[derive(Debug, Clone)]
-struct DirRun {
-    /// Byte offsets into the source string.
-    start: usize,
-    end: usize,
-    script: Script,
-    rtl: bool,
-    /// Position in the laid-out (visual) sequence. For LTR-only text this is
-    /// the same as logical order.
-    visual_index: usize,
-}
-
-/// Itemize `text` into runs that share both script and BiDi direction. The
-/// returned vec is ordered logically; `visual_index` indicates the visual
-/// order if a BiDi shuffle is needed.
-fn segment_runs(text: &str) -> Vec<DirRun> {
-    let bidi = BidiInfo::new(text, None);
-    let script_runs = itemize(text);
-
-    if bidi.paragraphs.is_empty() {
-        return script_runs
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| DirRun {
-                start: r.start,
-                end: r.end,
-                script: r.script,
-                rtl: r.script.is_rtl(),
-                visual_index: i,
-            })
-            .collect();
-    }
-
-    let mut out: Vec<DirRun> = Vec::new();
-    for para in &bidi.paragraphs {
-        let para_range = para.range.clone();
-        let para_runs: Vec<&ScriptRun> = script_runs
-            .iter()
-            .filter(|r| r.start < para_range.end && r.end > para_range.start)
-            .collect();
-
-        let mut split: Vec<DirRun> = Vec::new();
-        for r in para_runs {
-            let from = r.start.max(para_range.start);
-            let to = r.end.min(para_range.end);
-            split.extend(split_by_bidi_level(text, &bidi.levels, from, to, r.script));
-        }
-
-        // Reorder by visual position — unicode_bidi gives us the visual order
-        // of the levels per paragraph.
-        let (levels, level_runs) = bidi.visual_runs(para, para_range.clone());
-        let mut visual_order: Vec<usize> = (0..split.len()).collect();
-        visual_order.sort_by_key(|&i| {
-            // find the visual index of this run's start byte.
-            level_runs
-                .iter()
-                .position(|lr| lr.start <= split[i].start && split[i].start < lr.end)
-                .unwrap_or(0)
-        });
-        let _ = levels;
-        for (visual_index, logical_index) in visual_order.iter().enumerate() {
-            let mut run = split[*logical_index].clone();
-            run.visual_index = out.len() + visual_index;
-            out.push(run);
-        }
-        // out's logical order is currently what we just appended; sort visual
-        // ordering preserved via visual_index.
-        // (We intentionally append in logical order for downstream cluster
-        // stability; visual_index is what the renderer uses to lay them out.)
-    }
-    // The previous block rebuilt entries; ensure logical order is by `start`.
-    out.sort_by_key(|r| r.start);
-    out
-}
-
-fn split_by_bidi_level(
-    _text: &str,
-    levels: &[Level],
-    from: usize,
-    to: usize,
-    script: Script,
-) -> Vec<DirRun> {
-    if from >= to {
-        return Vec::new();
-    }
-    let mut runs: Vec<DirRun> = Vec::new();
-    let mut cursor = from;
-    let mut current_level = levels.get(from).copied().unwrap_or_else(Level::ltr);
-    for i in (from + 1)..to {
-        let lvl = levels.get(i).copied().unwrap_or(current_level);
-        if lvl != current_level {
-            runs.push(DirRun {
-                start: cursor,
-                end: i,
-                script,
-                rtl: current_level.is_rtl(),
-                visual_index: 0,
-            });
-            cursor = i;
-            current_level = lvl;
-        }
-    }
-    runs.push(DirRun {
-        start: cursor,
-        end: to,
-        script,
-        rtl: current_level.is_rtl(),
-        visual_index: 0,
-    });
-    runs
-}
-
-// ---------------------------------------------------------------------------
 // Shaping
-
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-struct ShapedGlyph {
-    /// Glyph ID in the font.
-    gid: u16,
-    /// Horizontal advance in font units.
-    advance_x: i32,
-    /// X offset from cursor in font units.
-    offset_x: i32,
-    /// Y offset from baseline in font units.
-    offset_y: i32,
-    /// Original cluster (byte offset in the run text) — kept for line breaking.
-    cluster: u32,
-}
+//
+// BiDi segmentation + OpenType shaping live in [`crate::text_shape`], shared
+// with the PDF overlay. This path adds the per-render font bookkeeping: it
+// re-fetches the parsed `Face` from the `FontCache` and tags each shaped run
+// with the `FontHandle` the rasterizer needs.
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -519,76 +393,16 @@ fn shape_run(
     cache: &mut FontCache,
 ) -> Option<ShapedRun> {
     let face = cache.face(handle)?;
-    let units_per_em = face.units_per_em();
-    let ascent = face.ascender() as i32;
-    let descent = face.descender() as i32;
-
-    let mut buf = UnicodeBuffer::new();
-    buf.push_str(&text[run.start..run.end]);
-    buf.set_direction(if run.rtl {
-        Direction::RightToLeft
-    } else {
-        Direction::LeftToRight
-    });
-    buf.set_script(map_script(run.script));
-    let glyph_buffer = rustybuzz::shape(face, &[], buf);
-    let infos = glyph_buffer.glyph_infos();
-    let positions = glyph_buffer.glyph_positions();
-
-    let mut glyphs = Vec::with_capacity(infos.len());
-    for (info, pos) in infos.iter().zip(positions.iter()) {
-        glyphs.push(ShapedGlyph {
-            gid: info.glyph_id as u16,
-            advance_x: pos.x_advance,
-            offset_x: pos.x_offset,
-            offset_y: pos.y_offset,
-            cluster: info.cluster,
-        });
-    }
-
+    let shaped = text_shape::shape_run(text, run, face);
     Some(ShapedRun {
-        glyphs,
-        units_per_em,
-        ascent,
-        descent,
+        glyphs: shaped.glyphs,
+        units_per_em: shaped.units_per_em,
+        ascent: shaped.ascent,
+        descent: shaped.descent,
         handle: handle.clone(),
-        rtl: run.rtl,
-        byte_start_in_text: run.start,
+        rtl: shaped.rtl,
+        byte_start_in_text: shaped.byte_start_in_text,
     })
-}
-
-fn map_script(s: Script) -> rustybuzz::Script {
-    use rustybuzz::script;
-    match s {
-        Script::Latin => script::LATIN,
-        Script::Cyrillic => script::CYRILLIC,
-        Script::Greek => script::GREEK,
-        Script::Armenian => script::ARMENIAN,
-        Script::Hebrew => script::HEBREW,
-        Script::Arabic => script::ARABIC,
-        Script::Devanagari => script::DEVANAGARI,
-        Script::Bengali => script::BENGALI,
-        Script::Gurmukhi => script::GURMUKHI,
-        Script::Gujarati => script::GUJARATI,
-        Script::Oriya => script::ORIYA,
-        Script::Tamil => script::TAMIL,
-        Script::Telugu => script::TELUGU,
-        Script::Kannada => script::KANNADA,
-        Script::Malayalam => script::MALAYALAM,
-        Script::Sinhala => script::SINHALA,
-        Script::Thai => script::THAI,
-        Script::Lao => script::LAO,
-        Script::Tibetan => script::TIBETAN,
-        Script::Myanmar => script::MYANMAR,
-        Script::Georgian => script::GEORGIAN,
-        Script::Ethiopic => script::ETHIOPIC,
-        Script::Khmer => script::KHMER,
-        Script::Han => script::HAN,
-        Script::Hiragana => script::HIRAGANA,
-        Script::Katakana => script::KATAKANA,
-        Script::Hangul => script::HANGUL,
-        Script::Common | Script::Inherited | Script::Other => script::COMMON,
-    }
 }
 
 // ---------------------------------------------------------------------------

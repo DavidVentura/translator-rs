@@ -16,6 +16,19 @@ pub struct GlyphInfo {
     pub advance: u16,
 }
 
+/// A glyph the document actually emits, as determined by shaping the union
+/// text. Unlike the nominal `char -> GlyphInfo` cmap map, this captures the
+/// positional / ligature glyphs OpenType shaping produces (Arabic joining,
+/// Indic conjuncts), which is exactly the set the subsetter must keep.
+#[derive(Debug, Clone)]
+pub struct UsedGlyph {
+    pub gid: u16,
+    pub advance: u16,
+    /// Source characters this glyph stands for, for the ToUnicode CMap. A
+    /// ligature spans several; a decomposed mark may repeat its base's text.
+    pub unicode: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FontFileKind {
     TrueType,
@@ -56,6 +69,9 @@ pub enum FontMetrics {
         glyphs: HashMap<char, GlyphInfo>,
         /// Glyph 0 (`.notdef`), used for codepoints with no cmap entry.
         fallback: GlyphInfo,
+        /// Glyphs produced by shaping the union text — the set the embedder
+        /// subsets and the emitter references. Sorted unique by `gid`.
+        used: Vec<UsedGlyph>,
         /// Source font bytes — shared via `Arc` so cloning per-block doesn't
         /// duplicate large CJK files.
         bytes: Arc<Vec<u8>>,
@@ -148,11 +164,14 @@ impl FontMetrics {
         };
 
         let descriptor = build_descriptor(&face, bytes.as_slice());
+        let used =
+            collect_shaped_glyphs(&face, bytes.as_slice(), ttc_index, text, &glyphs, fallback);
 
         Ok(Self::Real {
             units_per_em,
             glyphs,
             fallback,
+            used,
             bytes,
             ttc_index,
             descriptor,
@@ -170,6 +189,14 @@ impl FontMetrics {
                 ..
             } => Some((bytes.clone(), *ttc_index, descriptor)),
             Self::Approx { .. } => None,
+        }
+    }
+
+    /// Glyphs the document emits (shaped), for subsetting + `/W` + ToUnicode.
+    pub fn used_glyphs(&self) -> &[UsedGlyph] {
+        match self {
+            Self::Real { used, .. } => used,
+            Self::Approx { .. } => &[],
         }
     }
 
@@ -228,6 +255,70 @@ impl FontMetrics {
 
 fn is_winansi_char(c: char) -> bool {
     c.is_ascii()
+}
+
+/// Shape `text` and collect every glyph it produces, so the subsetter keeps
+/// positional / ligature forms (Arabic joining, Indic conjuncts) rather than
+/// only the nominal cmap glyphs. Returns the union of shaped glyphs, the cmap
+/// glyphs, and `.notdef`, sorted unique by gid, each tagged with a source
+/// string for the ToUnicode CMap.
+fn collect_shaped_glyphs(
+    face: &ttf_parser::Face<'_>,
+    bytes: &[u8],
+    ttc_index: u32,
+    text: &str,
+    cmap_glyphs: &HashMap<char, GlyphInfo>,
+    fallback: GlyphInfo,
+) -> Vec<UsedGlyph> {
+    use std::collections::BTreeMap;
+
+    let advance_of = |gid: u16| -> u16 {
+        face.glyph_hor_advance(ttf_parser::GlyphId(gid))
+            .unwrap_or(0)
+    };
+
+    // gid -> (advance, unicode); first-seen unicode wins.
+    let mut map: BTreeMap<u16, (u16, String)> = BTreeMap::new();
+
+    if let Some(rb_face) = rustybuzz::Face::from_slice(bytes, ttc_index) {
+        for run in crate::text_shape::segment_runs(text) {
+            let run_slice = &text[run.start..run.end];
+            let shaped = crate::text_shape::shape_run(text, &run, &rb_face);
+            // Run-local cluster boundaries, ascending, to recover each glyph's
+            // source substring (a glyph's cluster spans up to the next one).
+            let mut clusters: Vec<usize> =
+                shaped.glyphs.iter().map(|g| g.cluster as usize).collect();
+            clusters.sort_unstable();
+            clusters.dedup();
+            for g in &shaped.glyphs {
+                map.entry(g.gid).or_insert_with(|| {
+                    let start = g.cluster as usize;
+                    let end = clusters
+                        .iter()
+                        .copied()
+                        .find(|&c| c > start)
+                        .unwrap_or(run_slice.len());
+                    let uni = run_slice.get(start..end).unwrap_or("").to_string();
+                    (advance_of(g.gid), uni)
+                });
+            }
+        }
+    }
+
+    for (ch, info) in cmap_glyphs {
+        map.entry(info.gid)
+            .or_insert_with(|| (info.advance, ch.to_string()));
+    }
+    map.entry(fallback.gid)
+        .or_insert_with(|| (fallback.advance, '\u{FFFD}'.to_string()));
+
+    map.into_iter()
+        .map(|(gid, (advance, unicode))| UsedGlyph {
+            gid,
+            advance,
+            unicode,
+        })
+        .collect()
 }
 
 fn build_descriptor(face: &ttf_parser::Face<'_>, raw: &[u8]) -> FontDescriptorInfo {

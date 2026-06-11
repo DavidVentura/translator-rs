@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-use crate::font_metrics::{FontFileKind, FontMetrics, GlyphInfo};
+use crate::font_metrics::{FontFileKind, FontMetrics, UsedGlyph};
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedFont {
@@ -41,15 +41,15 @@ pub struct EmbeddedFont {
 pub fn embed_font(doc: &mut Document, metrics: &FontMetrics, slot: usize) -> Option<EmbeddedFont> {
     let (bytes, ttc_index, descriptor) = metrics.embedding_source()?;
     let units_per_em = metrics.units_per_em()?;
-    let used = collect_used_glyphs(metrics);
+    let used = metrics.used_glyphs();
 
     // Subset the font to just the glyphs we actually use. The remapper
     // compacts the GID space (so 0,1,2,... in the subset). We have to
     // translate every GID we hand to the PDF — the Tj hex strings, the /W
     // array, and the ToUnicode CMap — through this map.
     let mut remapper = subsetter::GlyphRemapper::new();
-    for (gid, _, _) in &used {
-        remapper.remap(*gid);
+    for u in used {
+        remapper.remap(u.gid);
     }
     let (subset_bytes, remap_gids) = match subsetter::subset(bytes.as_ref(), ttc_index, &remapper) {
         Ok(b) => (b.to_vec(), true),
@@ -64,21 +64,19 @@ pub fn embed_font(doc: &mut Document, metrics: &FontMetrics, slot: usize) -> Opt
 
     let mut gid_remap: HashMap<u16, u16> = HashMap::with_capacity(used.len());
     if remap_gids {
-        for (gid, _, _) in &used {
-            if let Some(new_gid) = remapper.get(*gid) {
-                gid_remap.insert(*gid, new_gid);
+        for u in used {
+            if let Some(new_gid) = remapper.get(u.gid) {
+                gid_remap.insert(u.gid, new_gid);
             }
         }
     }
     // Re-key the used list by the *new* GIDs so /W and ToUnicode emit them.
-    let used_remapped: Vec<(u16, GlyphInfo, char)> = used
+    let used_remapped: Vec<UsedGlyph> = used
         .iter()
-        .map(|(old_gid, info, ch)| {
-            (
-                gid_remap.get(old_gid).copied().unwrap_or(*old_gid),
-                *info,
-                *ch,
-            )
+        .map(|u| UsedGlyph {
+            gid: gid_remap.get(&u.gid).copied().unwrap_or(u.gid),
+            advance: u.advance,
+            unicode: u.unicode.clone(),
         })
         .collect();
 
@@ -225,39 +223,22 @@ fn subset_tag(slot: usize) -> String {
     tag
 }
 
-/// Sorted unique `(gid, advance)` pairs the document actually uses, for the
-/// `/W` array and the ToUnicode CMap.
-fn collect_used_glyphs(metrics: &FontMetrics) -> Vec<(u16, GlyphInfo, char)> {
-    let FontMetrics::Real {
-        glyphs, fallback, ..
-    } = metrics
-    else {
-        return Vec::new();
-    };
-    let mut pairs: Vec<(u16, GlyphInfo, char)> =
-        glyphs.iter().map(|(c, g)| (g.gid, *g, *c)).collect();
-    pairs.push((fallback.gid, *fallback, '\u{FFFD}'));
-    pairs.sort_by_key(|p| p.0);
-    pairs.dedup_by_key(|p| p.0);
-    pairs
-}
-
 /// `/W` array using the per-CID form `cid [w]`. Compact run-encoding would
 /// save bytes but the saving is dwarfed by the embedded font program.
-fn build_w_array(glyphs: &[(u16, GlyphInfo, char)], units_per_em: u16) -> Vec<Object> {
+fn build_w_array(glyphs: &[UsedGlyph], units_per_em: u16) -> Vec<Object> {
     // PDF widths are in 1/1000 em.
     let to_pdf =
         |advance: u16| -> i64 { (advance as f32 * 1000.0 / units_per_em as f32).round() as i64 };
     let mut out = Vec::with_capacity(glyphs.len() * 2);
-    for (gid, info, _ch) in glyphs {
-        out.push(Object::Integer(*gid as i64));
-        out.push(Object::Array(vec![Object::Integer(to_pdf(info.advance))]));
+    for u in glyphs {
+        out.push(Object::Integer(u.gid as i64));
+        out.push(Object::Array(vec![Object::Integer(to_pdf(u.advance))]));
     }
     out
 }
 
 /// Build a minimal Adobe Identity-UCS ToUnicode CMap.
-fn build_to_unicode_cmap(glyphs: &[(u16, GlyphInfo, char)]) -> Vec<u8> {
+fn build_to_unicode_cmap(glyphs: &[UsedGlyph]) -> Vec<u8> {
     let header = b"/CIDInit /ProcSet findresource begin\n\
 12 dict begin\n\
 begincmap\n\
@@ -276,9 +257,9 @@ end\nend";
     out.extend_from_slice(header);
     for chunk in glyphs.chunks(100) {
         let _ = write_str(&mut out, &format!("{} beginbfchar\n", chunk.len()));
-        for (gid, _info, ch) in chunk {
-            let _ = write_str(&mut out, &format!("<{:04X}> ", gid));
-            append_utf16be(&mut out, *ch);
+        for u in chunk {
+            let _ = write_str(&mut out, &format!("<{:04X}> ", u.gid));
+            append_utf16be(&mut out, &u.unicode);
             out.push(b'\n');
         }
         out.extend_from_slice(b"endbfchar\n");
@@ -292,12 +273,10 @@ fn write_str(out: &mut Vec<u8>, s: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn append_utf16be(out: &mut Vec<u8>, ch: char) {
-    let mut buf = [0u16; 2];
-    let units = ch.encode_utf16(&mut buf);
+fn append_utf16be(out: &mut Vec<u8>, s: &str) {
     out.push(b'<');
-    for u in units.iter() {
-        let _ = write_str(out, &format!("{:04X}", u));
+    for unit in s.encode_utf16() {
+        let _ = write_str(out, &format!("{:04X}", unit));
     }
     out.push(b'>');
 }
