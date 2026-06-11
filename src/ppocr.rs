@@ -220,6 +220,9 @@ impl PpocrRect {
 
 pub struct PpocrDetector {
     session: MnnSession,
+    // Model-input px per probability-map px. 1.0 for heads that emit at
+    // full input resolution; 2/4 for the folded low-res heads.
+    output_stride: f32,
 }
 
 pub struct PpocrRecognizer {
@@ -415,6 +418,7 @@ impl PpocrEngine {
             tilt: TiltEstimate,
         }
 
+        let pool_comp = self.detector.pool_comp();
         let detected: Vec<Detected> = boxes
             .into_iter()
             .map(|tb| {
@@ -449,7 +453,7 @@ impl PpocrEngine {
                 let contour_boxes = d
                     .contour
                     .as_ref()
-                    .and_then(|c| build_oriented_boxes(c, angle));
+                    .and_then(|c| build_oriented_boxes(c, angle, pool_comp));
                 let (oriented, tight) = match contour_boxes {
                     Some(ContourBoxes { tight, inflated }) => (inflated, tight),
                     None => {
@@ -503,7 +507,14 @@ impl PpocrEngine {
                 "ppocr script classifier is not available",
             ));
         };
-        let crops = crop_text_strips(image, gray, boxes, canonical_quadrant).0;
+        let crops = crop_text_strips(
+            image,
+            gray,
+            boxes,
+            canonical_quadrant,
+            self.detector.pool_comp(),
+        )
+        .0;
         let image_area = (image.width() as f32) * (image.height() as f32);
         let mut predictions = vec![None; boxes.len()];
         let mut eligible_crops = Vec::new();
@@ -614,7 +625,13 @@ impl PpocrEngine {
         let height = image.height();
 
         let t_crops = Instant::now();
-        let (crops, dewarp_count) = crop_text_strips(image, gray, boxes, canonical_quadrant);
+        let (crops, dewarp_count) = crop_text_strips(
+            image,
+            gray,
+            boxes,
+            canonical_quadrant,
+            self.detector.pool_comp(),
+        );
         let mean_crop_w: f32 =
             crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32;
         let mean_crop_h: f32 =
@@ -854,6 +871,7 @@ pub(crate) fn crop_text_strips(
     gray: &GrayImage,
     boxes: &[crate::ocr::DetectedTextBox],
     canonical_quadrant: Option<crate::coords::Quadrant>,
+    thickness_pad: f32,
 ) -> (Vec<DynamicImage>, usize) {
     let mut dewarp_count = 0usize;
     let crops = boxes
@@ -867,7 +885,7 @@ pub(crate) fn crop_text_strips(
                 };
             let dewarped = contour_pairs
                 .as_deref()
-                .and_then(|c| dewarp_contour_to_strip(gray, c, canonical_quadrant))
+                .and_then(|c| dewarp_contour_to_strip(gray, c, canonical_quadrant, thickness_pad))
                 .map(DynamicImage::ImageLuma8);
             if let Some(dewarped) = dewarped {
                 dewarp_count += 1;
@@ -1149,7 +1167,27 @@ struct DetBox {
 impl PpocrDetector {
     fn load(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
         let session = MnnSession::load(model_path, intra_threads)?;
-        Ok(Self { session })
+        let probe = vec![0.0f32; 3 * 64 * 64];
+        let (_, out_shape) = session.run(&probe, &[1, 3, 64, 64])?;
+        if out_shape.len() < 4 {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                format!("ppocr det probe output shape unexpected: {:?}", out_shape),
+            ));
+        }
+        let output_stride = 64.0 / out_shape[out_shape.len() - 1] as f32;
+        Ok(Self {
+            session,
+            output_stride,
+        })
+    }
+
+    /// How far the binarised text band shrinks per side (in model-input px)
+    /// when the probability map is emitted below input resolution: the folded
+    /// low-res heads average-pool the logit map, which pulls the threshold
+    /// crossing inward by up to a mask pixel. Zero at native resolution.
+    fn pool_comp(&self) -> f32 {
+        (self.output_stride - 1.0).max(0.0)
     }
 
     fn detect_with_thresholds(
@@ -1210,8 +1248,30 @@ impl PpocrDetector {
                 }
             })
             .collect();
+        // The mask may come back at a lower resolution than the model input
+        // (heads that emit the prob map at 1/2 or 1/4 res). extract_boxes
+        // works in mask-grid units, so express the content region and the
+        // area gate on that grid.
+        let stride_x = scaled_w as f32 / out_w as f32;
+        let stride_y = scaled_h as f32 / out_h as f32;
+        let content_mask_w = (content_w as f32 / stride_x).round() as u32;
+        let content_mask_h = (content_h as f32 / stride_y).round() as u32;
+        let mask_thresholds = PpocrThresholds {
+            det_min_area: ((thresholds.det_min_area as f32 / (stride_x * stride_y)).round() as u32)
+                .max(1),
+            ..thresholds
+        };
         let boxes = extract_boxes(
-            &binary, &mask, out_w, out_h, content_w, content_h, orig_w, orig_h, thresholds,
+            &binary,
+            &mask,
+            out_w,
+            out_h,
+            content_mask_w,
+            content_mask_h,
+            orig_w,
+            orig_h,
+            (stride_x * stride_y).sqrt(),
+            mask_thresholds,
         );
         let post_ms = t_post.elapsed().as_secs_f32() * 1000.0;
         log::info!(
@@ -1531,6 +1591,7 @@ fn extract_boxes(
     content_h: u32,
     orig_w: u32,
     orig_h: u32,
+    mask_stride: f32,
     thresholds: PpocrThresholds,
 ) -> Vec<DetBox> {
     let Some(gray) = GrayImage::from_raw(mask_w, mask_h, mask.to_vec()) else {
@@ -1614,11 +1675,21 @@ fn extract_boxes(
         // DB unclip: distance = area * ratio / perimeter.
         let area = box_w as f32 * box_h as f32;
         let perimeter = 2.0 * (box_w + box_h) as f32;
-        let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0);
-        let ex_min_x = (min_x as f32 - expand_dist).max(0.0) as i32;
-        let ex_min_y = (min_y as f32 - expand_dist).max(0.0) as i32;
-        let ex_max_x = (max_x as f32 + expand_dist).min(content_w as f32) as i32;
-        let ex_max_y = (max_y as f32 + expand_dist).min(content_h as f32) as i32;
+        // Low-res heads average-pool the logit map, which smooths the steep
+        // logit edge at a line's boundary and pulls the threshold crossing
+        // inward by up to a mask pixel per side. Compensate by roughly
+        // (stride - 1) input px per side; zero at native resolution.
+        let pool_comp = 1.0 - 1.0 / mask_stride;
+        // A mask pixel covers a stride-wide input block; mapping its index to
+        // the block's top-left corner biases every coordinate toward the
+        // origin by ~(stride - 1) input px. Recenter; zero at stride 1, where
+        // the corner convention is what the thresholds were calibrated with.
+        let center_off = pool_comp;
+        let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0) + pool_comp;
+        let ex_min_x = (min_x as f32 + center_off - expand_dist).max(0.0) as i32;
+        let ex_min_y = (min_y as f32 + center_off - expand_dist).max(0.0) as i32;
+        let ex_max_x = (max_x as f32 + center_off + expand_dist).min(content_w as f32) as i32;
+        let ex_max_y = (max_y as f32 + center_off + expand_dist).min(content_h as f32) as i32;
         let ex_w = (ex_max_x - ex_min_x) as u32;
         let ex_h = (ex_max_y - ex_min_y) as u32;
 
@@ -1637,7 +1708,12 @@ fn extract_boxes(
         let scaled_contour: Vec<(f32, f32)> = contour
             .points
             .iter()
-            .map(|p: &Point<i32>| (p.x as f32 * scale_x, p.y as f32 * scale_y))
+            .map(|p: &Point<i32>| {
+                (
+                    (p.x as f32 + center_off) * scale_x,
+                    (p.y as f32 + center_off) * scale_y,
+                )
+            })
             .collect();
 
         boxes.push(DetBox {
@@ -2294,10 +2370,14 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     // enu, so the top edge slopes down while the baseline stays flat, and PCA's covariance
     // splits the difference into a phantom tilt. The bottom edge is the baseline (stable for
     // most words), and demanding agreement with the top filters out asymmetric shapes.
-    build_oriented_boxes(contour, estimate_horizontal_tilt(contour).angle)
+    build_oriented_boxes(contour, estimate_horizontal_tilt(contour).angle, 0.0)
 }
 
-fn build_oriented_boxes(contour: &[(f32, f32)], angle_radians: f32) -> Option<ContourBoxes> {
+fn build_oriented_boxes(
+    contour: &[(f32, f32)],
+    angle_radians: f32,
+    pool_comp_px: f32,
+) -> Option<ContourBoxes> {
     if contour.len() < 4 {
         return None;
     }
@@ -2370,7 +2450,7 @@ fn build_oriented_boxes(contour: &[(f32, f32)], angle_radians: f32) -> Option<Co
     let area = final_width * final_height;
     let perimeter = 2.0 * (final_width + final_height);
     let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0);
-    let pad = expand_dist + DET_BOX_BORDER as f32;
+    let pad = expand_dist + DET_BOX_BORDER as f32 + pool_comp_px;
     let inflated = crate::ocr::OrientedRect {
         cx,
         cy,
@@ -2459,6 +2539,7 @@ struct ContourStripWarp {
 fn contour_strip_warp(
     contour: &[(f32, f32)],
     canonical_quadrant: Option<crate::coords::Quadrant>,
+    thickness_pad: f32,
 ) -> Option<ContourStripWarp> {
     if contour.len() < 8 {
         return None;
@@ -2589,7 +2670,7 @@ fn contour_strip_warp(
         .collect();
     residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let percentile = |p: f32| residuals[(((residuals.len() - 1) as f32) * p).round() as usize];
-    let band_thickness = (percentile(0.95) - percentile(0.05)).max(1.0);
+    let band_thickness = (percentile(0.95) - percentile(0.05)).max(1.0) + thickness_pad;
     let global_thickness = band_thickness * 2.4;
     let u_pad = band_thickness;
     let padded_u_min = u_min - u_pad;
@@ -2634,8 +2715,9 @@ pub fn dewarp_contour_to_strip(
     gray: &GrayImage,
     contour: &[(f32, f32)],
     canonical_quadrant: Option<crate::coords::Quadrant>,
+    thickness_pad: f32,
 ) -> Option<GrayImage> {
-    let warp = contour_strip_warp(contour, canonical_quadrant)?;
+    let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;
     let gray_w = gray.width() as f32;
     let gray_h = gray.height() as f32;
     let gray_raw = gray.as_raw();
@@ -2658,8 +2740,9 @@ pub fn dewarp_contour_to_strip_rgb(
     rgb: &RgbImage,
     contour: &[(f32, f32)],
     canonical_quadrant: Option<crate::coords::Quadrant>,
+    thickness_pad: f32,
 ) -> Option<RgbImage> {
-    let warp = contour_strip_warp(contour, canonical_quadrant)?;
+    let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;
     let mut out = RgbImage::new(warp.width, warp.height);
     for x in 0..warp.width {
         for y in 0..warp.height {
@@ -2951,7 +3034,7 @@ mod tests {
         // must land on the true curvature.
         let (w, thickness, bow) = (200.0f32, 10.0f32, 40.0f32);
         let contour = curved_band(w, thickness, bow);
-        let warp = contour_strip_warp(&contour, None).expect("warp");
+        let warp = contour_strip_warp(&contour, None, 0.0).expect("warp");
 
         // The spine is v = a·un² + b·un + c over un ∈ [-1, 1]; `a` is the bow
         // amplitude in pixels. un maps linearly onto the band width, so it should
@@ -2967,7 +3050,7 @@ mod tests {
     fn dewarp_spine_stays_flat_for_straight_line() {
         // A straight band must not invent curvature.
         let contour = curved_band(200.0, 10.0, 0.0);
-        let warp = contour_strip_warp(&contour, None).expect("warp");
+        let warp = contour_strip_warp(&contour, None, 0.0).expect("warp");
         let bow = eval_quadratic(warp.spine_fit, 1.0) - eval_quadratic(warp.spine_fit, 0.0);
         assert!(bow.abs() < 1.0, "expected flat spine, got {bow:.2} px bow");
     }
