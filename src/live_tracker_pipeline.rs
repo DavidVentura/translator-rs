@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::live_worker::SlotWorker;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::LanguageCode;
 use crate::api::TranslatorError;
@@ -436,6 +436,105 @@ impl Default for LastVerdict {
     }
 }
 
+/// Backoff for acquire attempts after empty detections. Without it an empty
+/// scene (covered camera, blank wall) re-runs det back-to-back forever,
+/// pinning the MNN threads at full duty. Armed by an empty detect, doubled per
+/// consecutive empty, cleared by a non-empty detect, a user reset, or a scene
+/// change (the block-luma signature moving away from what the armed scene
+/// looked like).
+struct AcquireBackoff {
+    until: Option<Instant>,
+    delay: Duration,
+    scene_sig: Option<[u8; 64]>,
+}
+
+impl Default for AcquireBackoff {
+    fn default() -> Self {
+        Self {
+            until: None,
+            delay: Self::INITIAL_DELAY,
+            scene_sig: None,
+        }
+    }
+}
+
+impl AcquireBackoff {
+    const INITIAL_DELAY: Duration = Duration::from_millis(250);
+    const MAX_DELAY: Duration = Duration::from_secs(2);
+    /// Mean abs block-luma delta (0-255) above which the scene counts as
+    /// changed and a fresh detect is worth running immediately.
+    const SCENE_DELTA: f32 = 6.0;
+
+    fn active(&self) -> bool {
+        self.until.is_some_and(|t| Instant::now() < t)
+    }
+
+    fn arm(&mut self) {
+        self.delay = if self.until.is_some() {
+            (self.delay * 2).min(Self::MAX_DELAY)
+        } else {
+            Self::INITIAL_DELAY
+        };
+        self.until = Some(Instant::now() + self.delay);
+        // Re-sampled by the next `observe_scene`; the scene is static while
+        // the backoff holds, so the one-frame lag doesn't matter.
+        self.scene_sig = None;
+    }
+
+    fn clear(&mut self) {
+        self.until = None;
+        self.scene_sig = None;
+    }
+
+    /// Track the scene signature while armed; clears the backoff when the
+    /// view changes enough that the next acquire may find something new.
+    fn observe_scene(&mut self, gray: &image::GrayImage) {
+        if !self.active() {
+            return;
+        }
+        let sig = block_luma_signature(gray);
+        match self.scene_sig {
+            None => self.scene_sig = Some(sig),
+            Some(prev) => {
+                let delta = prev
+                    .iter()
+                    .zip(sig.iter())
+                    .map(|(a, b)| (*a as f32 - *b as f32).abs())
+                    .sum::<f32>()
+                    / 64.0;
+                if delta > Self::SCENE_DELTA {
+                    self.clear();
+                }
+            }
+        }
+    }
+}
+
+/// 8×8 grid of block-mean lumas, subsampled every 4th pixel in each axis.
+fn block_luma_signature(gray: &image::GrayImage) -> [u8; 64] {
+    let (w, h) = (gray.width().max(8), gray.height().max(8));
+    let mut sums = [0u32; 64];
+    let mut counts = [0u32; 64];
+    let mut y = 0;
+    while y < gray.height() {
+        let by = (y * 8 / h).min(7) as usize;
+        let mut x = 0;
+        while x < gray.width() {
+            let bx = (x * 8 / w).min(7) as usize;
+            let i = by * 8 + bx;
+            sums[i] += gray.get_pixel(x, y)[0] as u32;
+            counts[i] += 1;
+            x += 4;
+        }
+        y += 4;
+    }
+    let mut sig = [0u8; 64];
+    for (i, out) in sig.iter_mut().enumerate() {
+        *out = (sums[i] / counts[i].max(1)) as u8;
+    }
+    sig
+}
+
 pub struct LiveTrackerPipeline {
     /// Async-H fast half: per-frame KLT pose owner. The present thread runs
     /// `track` to produce the compose pose + the prior the engine relocalizes
@@ -459,6 +558,7 @@ pub struct LiveTrackerPipeline {
     catalog: Arc<TranslatorSession>,
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
+    acquire_backoff: Mutex<AcquireBackoff>,
     worker: Mutex<Option<SlotWorker<PendingJob>>>,
     /// Long-lived engine-step thread. `Option` because, like `worker`, it's
     /// spawned after the `Arc<Self>` exists. Driven only by `process_frame`,
@@ -493,6 +593,7 @@ impl LiveTrackerPipeline {
             catalog,
             font_provider,
             last_telemetry: Mutex::new(None),
+            acquire_backoff: Mutex::new(AcquireBackoff::default()),
             worker: Mutex::new(None),
             tracker_compute: Mutex::new(None),
             timing: Mutex::new(TimingStats::default()),
@@ -595,6 +696,9 @@ impl LiveTrackerPipeline {
         if let Ok(mut slot) = self.pending_compose.lock() {
             *slot = None;
         }
+        if let Ok(mut backoff) = self.acquire_backoff.lock() {
+            backoff.clear();
+        }
         self.session.clear();
     }
 
@@ -662,6 +766,12 @@ impl LiveTrackerPipeline {
         let t_gray = Instant::now();
         let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
         let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
+
+        // No-op unless an empty-detect backoff is armed; then it watches for
+        // the scene changing so the next acquire can fire immediately.
+        if let Ok(mut backoff) = self.acquire_backoff.lock() {
+            backoff.observe_scene(&tracker_gray);
+        }
 
         // Async-H step 3: the Relocalizer runs on the worker fire-and-forget.
         // Order matters at the async seam — **apply → track → dispatch**:
@@ -834,7 +944,18 @@ impl LiveTrackerPipeline {
                 None
             } else {
                 match lifecycle {
-                    Lifecycle::ReAcquire => Some(AsyncKind::Acquire),
+                    Lifecycle::ReAcquire => {
+                        let backed_off = self
+                            .acquire_backoff
+                            .lock()
+                            .map(|b| b.active())
+                            .unwrap_or(false);
+                        if backed_off {
+                            None
+                        } else {
+                            Some(AsyncKind::Acquire)
+                        }
+                    }
                     Lifecycle::Locked if should_refresh => Some(AsyncKind::Refresh),
                     _ => None,
                 }
@@ -1155,10 +1276,16 @@ impl LiveTrackerPipeline {
             return canceled_telemetry(0, elapsed_ms());
         }
         if detected.is_empty() {
+            if let Ok(mut backoff) = self.acquire_backoff.lock() {
+                backoff.arm();
+            }
             return AcquireTelemetry {
                 total_ms: elapsed_ms(),
                 ..Default::default()
             };
+        }
+        if let Ok(mut backoff) = self.acquire_backoff.lock() {
+            backoff.clear();
         }
 
         // 2. Register the anchor — engine flips Locked here. Doing
