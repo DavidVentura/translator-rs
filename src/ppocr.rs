@@ -52,7 +52,12 @@ const DET_BOX_MIN_SCORE: f32 = 0.6;
 /// recognizer. Real text glyphs at typical OCR scale fill many hundreds of mask pixels, so
 /// the floor is comfortably below legitimate text.
 const DET_MIN_AREA: u32 = 64;
-const DET_UNCLIP_RATIO: f32 = 1.6;
+/// Unlike upstream's 1.5–2.0, this is calibrated against measured ink extents (letter/book
+/// samples): the kernel band is ~0.55× the real ascender-to-descender ink height, so
+/// `tight·(1 + ratio) + 2·DET_BOX_BORDER` at 0.8 puts the inflated box at ~1.1–1.25× the ink —
+/// enough margin to erase the antialiasing fringe without swallowing neighboring lines the way
+/// upstream's ratio did (~1.75× the ink).
+const DET_UNCLIP_RATIO: f32 = 0.8;
 const DET_BOX_BORDER: u32 = 4;
 const LIVE_REC_DROP_SCORE: f32 = 0.65;
 const LIVE_DET_BOX_MIN_SCORE: f32 = 0.68;
@@ -405,11 +410,14 @@ impl PpocrEngine {
         let height = image.height();
         let boxes = self.detector.detect_with_thresholds(image, thresholds)?;
 
-        // Per-box tilt is measured first, then reconciled against a frame-level consensus reading
-        // direction. A single contour can't tell a genuine baseline lean from content asymmetry
+        // Per-box tilt is measured first, then reconciled against a frame-level consensus angle
+        // field. A single contour can't tell a genuine baseline lean from content asymmetry
         // or a deceptively-flat short word; the scene of agreeing boxes can. The consensus also
         // replaces the old hard "→ 0°" fallback, which only made sense for world-up pages: a box
-        // with no tilt of its own now adopts the scene angle instead of snapping to horizontal.
+        // with no tilt of its own now adopts the scene angle *at its own position* instead of
+        // snapping to horizontal — under perspective or page curl the reading direction varies
+        // smoothly across the frame, so a short continuation line inherits its neighborhood's
+        // lean rather than a global average dominated by far-away lines.
         struct Detected {
             aabb: crate::ocr::Rect,
             contour: Option<Vec<(f32, f32)>>,
@@ -442,12 +450,28 @@ impl PpocrEngine {
             })
             .collect();
 
-        let votes: Vec<f32> = detected.iter().filter_map(|d| d.tilt.vote).collect();
-        let consensus = frame_consensus_angle(&votes);
+        let votes: Vec<TiltVote> = detected
+            .iter()
+            .filter_map(|d| {
+                d.tilt.vote.map(|angle| TiltVote {
+                    x: (d.aabb.left + d.aabb.right) as f32 * 0.5,
+                    y: (d.aabb.top + d.aabb.bottom) as f32 * 0.5,
+                    weight: (d.aabb.right - d.aabb.left).max(1) as f32,
+                    angle,
+                })
+            })
+            .collect();
+        let field = fit_tilt_field(&votes);
 
         let out: Vec<crate::ocr::DetectedTextBox> = detected
             .into_iter()
             .map(|d| {
+                let consensus = field.as_ref().map(|f| {
+                    f.at(
+                        (d.aabb.left + d.aabb.right) as f32 * 0.5,
+                        (d.aabb.top + d.aabb.bottom) as f32 * 0.5,
+                    )
+                });
                 let angle = resolve_box_angle(&d.tilt, consensus);
                 let contour_boxes = d
                     .contour
@@ -1314,14 +1338,21 @@ impl PpocrDetector {
         }
         let out_h = out_shape[out_shape.len() - 2] as u32;
         let out_w = out_shape[out_shape.len() - 1] as u32;
-        let mut buf = vec![0u8; (out_w * out_h) as usize];
-        for y in 0..out_h {
-            for x in 0..out_w {
+        // The output map covers the zero-padded multiple-of-32 canvas; keep
+        // only the content region before resampling, otherwise the padding
+        // margin compresses the map and positions drift toward the origin.
+        let stride_x = scaled_w as f32 / out_w as f32;
+        let stride_y = scaled_h as f32 / out_h as f32;
+        let crop_w = ((content_w as f32 / stride_x).round() as u32).min(out_w);
+        let crop_h = ((content_h as f32 / stride_y).round() as u32).min(out_h);
+        let mut buf = vec![0u8; (crop_w * crop_h) as usize];
+        for y in 0..crop_h {
+            for x in 0..crop_w {
                 let v = mask[(y * out_w + x) as usize].clamp(0.0, 1.0);
-                buf[(y * out_w + x) as usize] = (v * 255.0).round() as u8;
+                buf[(y * crop_w + x) as usize] = (v * 255.0).round() as u8;
             }
         }
-        let content = GrayImage::from_raw(out_w, out_h, buf).ok_or_else(|| {
+        let content = GrayImage::from_raw(crop_w, crop_h, buf).ok_or_else(|| {
             TranslatorError::new(
                 TranslatorErrorKind::Internal,
                 "failed to build heatmap image",
@@ -1669,9 +1700,14 @@ fn extract_boxes(
             continue;
         }
 
-        // DB unclip: distance = area * ratio / perimeter.
-        let area = box_w as f32 * box_h as f32;
-        let perimeter = 2.0 * (box_w + box_h) as f32;
+        // DB unclip. Upstream uses `distance = area * ratio / perimeter`, which equals
+        // `ratio·t/2 · long/(long+t)` for a long×t box — the inflation a box gets relative
+        // to its stroke-band thickness `t` then depends on its aspect ratio (full lines get
+        // ~0.8·t per side, square single-word boxes only ~0.4·t), so the same font reports
+        // different heights depending on how much text sits on the line. Use the long-box
+        // limit `ratio·t/2` for every shape instead: identical for the calibrated common
+        // case, and short boxes now inflate by the same proportion as their neighbors.
+        let thickness = box_w.min(box_h) as f32;
         // Low-res heads average-pool the logit map, which smooths the steep
         // logit edge at a line's boundary and pulls the threshold crossing
         // inward by up to a mask pixel per side. Compensate by roughly
@@ -1682,7 +1718,7 @@ fn extract_boxes(
         // origin by ~(stride - 1) input px. Recenter; zero at stride 1, where
         // the corner convention is what the thresholds were calibrated with.
         let center_off = pool_comp;
-        let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0) + pool_comp;
+        let expand_dist = (DET_UNCLIP_RATIO * thickness / 2.0).max(1.0) + pool_comp;
         let ex_min_x = (min_x as f32 + center_off - expand_dist).max(0.0) as i32;
         let ex_min_y = (min_y as f32 + center_off - expand_dist).max(0.0) as i32;
         let ex_max_x = (max_x as f32 + center_off + expand_dist).min(content_w as f32) as i32;
@@ -2118,8 +2154,8 @@ struct TiltEstimate {
     angle: f32,
     vote: Option<f32>,
     /// True only when the contour measured a visible, self-consistent tilt (edges agree *and*
-    /// the lean clears the visibility floor). A committed box owns its angle: the consensus may
-    /// nudge it off a small phantom lean but must never override a large intentional rotation.
+    /// the lean clears the visibility floor). A committed box owns its angle outright; an
+    /// uncommitted box adopts the consensus field at its position (see `resolve_box_angle`).
     committed: bool,
 }
 
@@ -2299,13 +2335,6 @@ fn linear_regression_slope(pts: &[(f32, f32)]) -> f32 {
 /// box keeps its own measured tilt.
 const TILT_CONSENSUS_MIN_VOTERS: usize = 3;
 
-/// Deviation from the consensus beyond which a committed box is treated as intentionally rotated
-/// (a stamp, a vertical caption, a skewed callout) and keeps its own angle rather than snapping to
-/// the scene. Below it, a committed lean is treated as a measurement artefact — a tilted DB mask
-/// or an asymmetric short word picking up a few spurious degrees — and flattened to the consensus.
-/// ~15°, which cleanly separates spurious sub-10° leans from deliberate rotations.
-const TILT_BREAKAWAY: f32 = 0.26;
-
 /// A scene whose consensus reading-direction is within this of image-horizontal is snapped to
 /// exactly horizontal. The median of the per-box votes carries sub-degree noise even on a page
 /// that is visibly upright, and every committed box then snaps to that noisy value (see
@@ -2314,21 +2343,131 @@ const TILT_BREAKAWAY: f32 = 0.26;
 /// tilted scene (a held phone, a skewed scan) sits well beyond this and keeps its measured angle.
 const TILT_CONSENSUS_DEADZONE: f32 = 0.0175;
 
-/// Robust frame reading-direction from per-box votes: the median of the agreeing boxes' angles,
-/// snapped to exactly horizontal inside `TILT_CONSENSUS_DEADZONE`. `None` when too few boxes voted
-/// to trust a shared direction. Angles here are all near-horizontal (the ±90° reading-axis swap
-/// happens later in `build_oriented_boxes`), so a plain median needs no angular wrap handling.
-fn frame_consensus_angle(votes: &[f32]) -> Option<f32> {
+/// Shrinkage length scale for the tilt field's gradient terms. The ridge added to the
+/// normal equations equals the total vote weight times this length squared, so gradients only
+/// emerge once the votes' positional spread is comfortably past this scale — a frame whose
+/// text clusters in one corner can't hallucinate a perspective gradient from two noisy votes,
+/// it degrades to the constant (pure-rotation) fit instead.
+const TILT_FIELD_RIDGE_PX: f32 = 200.0;
+
+struct TiltVote {
+    x: f32,
+    y: f32,
+    /// Lever arm of the measurement: wide boxes regress their baseline angle over many more
+    /// x-bins, so their vote is proportionally more precise than a short word's.
+    weight: f32,
+    angle: f32,
+}
+
+/// Linear angle field over the frame: `angle(x, y) = a + gx·(x − x0) + gy·(y − y0)`.
+/// A flat scene (pure in-plane rotation) is the special case `gx = gy = 0`; perspective
+/// foreshortening and page curl show up as smooth spatial variation of the reading direction,
+/// which a first-order field captures well at the angle scales involved (a few degrees across
+/// the frame). Angles are all near-horizontal (the ±90° reading-axis swap happens later in
+/// `build_oriented_boxes`), so plain linear math needs no angular wrap handling.
+struct TiltField {
+    x0: f32,
+    y0: f32,
+    a: f32,
+    gx: f32,
+    gy: f32,
+}
+
+impl TiltField {
+    fn at(&self, x: f32, y: f32) -> f32 {
+        self.a + self.gx * (x - self.x0) + self.gy * (y - self.y0)
+    }
+}
+
+/// Robust weighted fit of the frame's reading-direction field from per-box votes. `None` when
+/// too few boxes voted to trust a shared direction. Outliers (a rotated label, a price sticker,
+/// a second surface at a different orientation) are shed by re-weighting: votes whose residual
+/// exceeds 3× the weighted-median residual get dropped and the field refit, so the majority
+/// surface defines the field and breakaway boxes keep their own angles via `resolve_box_angle`.
+/// A fitted field that stays within `TILT_CONSENSUS_DEADZONE` everywhere the votes live is
+/// collapsed to exactly 0° for render crispness, same as the old scalar consensus.
+fn fit_tilt_field(votes: &[TiltVote]) -> Option<TiltField> {
     if votes.len() < TILT_CONSENSUS_MIN_VOTERS {
         return None;
     }
-    let mut sorted = votes.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("tilt votes are finite"));
-    let median = sorted[sorted.len() / 2];
-    if median.abs() < TILT_CONSENSUS_DEADZONE {
-        return Some(0.0);
+    let mut weights: Vec<f32> = votes.iter().map(|v| v.weight).collect();
+    let mut field = TiltField {
+        x0: 0.0,
+        y0: 0.0,
+        a: 0.0,
+        gx: 0.0,
+        gy: 0.0,
+    };
+    for _ in 0..3 {
+        let sw: f32 = weights.iter().sum();
+        if sw <= 0.0 {
+            return None;
+        }
+        let x0 = votes
+            .iter()
+            .zip(&weights)
+            .map(|(v, w)| w * v.x)
+            .sum::<f32>()
+            / sw;
+        let y0 = votes
+            .iter()
+            .zip(&weights)
+            .map(|(v, w)| w * v.y)
+            .sum::<f32>()
+            / sw;
+        let a = votes
+            .iter()
+            .zip(&weights)
+            .map(|(v, w)| w * v.angle)
+            .sum::<f32>()
+            / sw;
+        let ridge = sw * TILT_FIELD_RIDGE_PX * TILT_FIELD_RIDGE_PX;
+        let (mut sxx, mut syy, mut sxy, mut sxa, mut sya) = (ridge, ridge, 0.0f32, 0.0f32, 0.0f32);
+        for (v, w) in votes.iter().zip(&weights) {
+            let dx = v.x - x0;
+            let dy = v.y - y0;
+            let da = v.angle - a;
+            sxx += w * dx * dx;
+            syy += w * dy * dy;
+            sxy += w * dx * dy;
+            sxa += w * dx * da;
+            sya += w * dy * da;
+        }
+        let det = sxx * syy - sxy * sxy;
+        field = TiltField {
+            x0,
+            y0,
+            a,
+            gx: (sxa * syy - sya * sxy) / det,
+            gy: (sya * sxx - sxa * sxy) / det,
+        };
+
+        let mut residuals: Vec<f32> = votes
+            .iter()
+            .map(|v| (v.angle - field.at(v.x, v.y)).abs())
+            .collect();
+        let mut sorted = residuals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("tilt residuals are finite"));
+        let mad = sorted[sorted.len() / 2];
+        let cut = (3.0 * mad).max(TILT_CONSENSUS_DEADZONE);
+        for ((w, v), r) in weights.iter_mut().zip(votes).zip(residuals.drain(..)) {
+            *w = if r <= cut { v.weight } else { 0.0 };
+        }
     }
-    Some(median)
+    let max_abs = votes
+        .iter()
+        .map(|v| field.at(v.x, v.y).abs())
+        .fold(0.0f32, f32::max);
+    if max_abs < TILT_CONSENSUS_DEADZONE {
+        return Some(TiltField {
+            x0: field.x0,
+            y0: field.y0,
+            a: 0.0,
+            gx: 0.0,
+            gy: 0.0,
+        });
+    }
+    Some(field)
 }
 
 /// Reconcile a box's own tilt with the frame consensus.
@@ -2336,27 +2475,18 @@ fn frame_consensus_angle(votes: &[f32]) -> Option<f32> {
 /// - No consensus → the box's own measured angle stands.
 /// - Box did not commit to a tilt (edges disagreed, or the lean was sub-visible) → it has no
 ///   opinion of its own, so it adopts the scene direction.
-/// - Committed box within `TILT_BREAKAWAY` of the scene → its lean is measurement error (a tilted
-///   DB mask or an asymmetric short word picking up a few spurious degrees against a co-aligned
-///   scene), so it snaps to the consensus. The scene's median over many boxes is a better estimate
-///   of the shared reading direction than any one box's noisy measurement, so there is nothing to
-///   gain by keeping a near-consensus box's own value.
-/// - Committed box past `TILT_BREAKAWAY` → too far to be measurement error; an intentionally
-///   rotated box, kept as measured. This is what stops a deliberately-skewed 35° label from
-///   being dragged flat by an otherwise horizontal page.
+/// - Committed box → keeps its own measured angle. The commitment gates (top/bottom edge
+///   agreement plus visible deviation) already filter content-asymmetric and sub-visible
+///   leans, and the oriented rect's height inflates by `width·tan(err)` for any angle error,
+///   so overriding a reliable per-box measurement with the field — fitted from those same
+///   votes, and only first-order — costs real geometry (5+ px of phantom height on a long
+///   line for a 0.2° nudge) to gain nothing. This is also what keeps a deliberately-skewed
+///   label and the per-line lean of a curved page (±5° across the frame) intact.
 fn resolve_box_angle(est: &TiltEstimate, consensus: Option<f32>) -> f32 {
-    let Some(c) = consensus else {
+    if est.committed {
         return est.angle;
-    };
-    if !est.committed {
-        return c;
     }
-    let delta = (est.angle - c).abs();
-    if delta >= TILT_BREAKAWAY {
-        est.angle
-    } else {
-        c
-    }
+    consensus.unwrap_or(est.angle)
 }
 
 #[cfg(test)]
@@ -2444,13 +2574,12 @@ fn build_oriented_boxes(
     };
 
     // DB segmentation produces a *shrunken* contour relative to the actual ink. The AABB path
-    // recovers the full text region by expanding by `expand_dist = area * UNCLIP / perimeter`
+    // recovers the full text region by expanding by `expand_dist = UNCLIP * thickness / 2`
     // plus a small border (see `extract_boxes` and `expand_box`). Apply the same inflation
     // here so the oriented rect covers ascenders/descenders for erase, and so its height
     // matches the AABB pipeline's height — what the renderer uses to size the font.
-    let area = final_width * final_height;
-    let perimeter = 2.0 * (final_width + final_height);
-    let expand_dist = (area * DET_UNCLIP_RATIO / perimeter).max(1.0);
+    let thickness = final_width.min(final_height);
+    let expand_dist = (DET_UNCLIP_RATIO * thickness / 2.0).max(1.0);
     let pad = expand_dist + DET_BOX_BORDER as f32 + pool_comp_px;
     let inflated = crate::ocr::OrientedRect {
         cx,
