@@ -6,11 +6,11 @@
 //! a new sentence that opens with quoted dialogue still splits (`bed. “In
 //! judging…”`). This matches ssplit-cpp's regex-fallback heuristic (the path it
 //! takes when no abbreviation prefix file is loaded), which works well on
-//! modern web / ebook prose. Edge cases like "Mr. Smith. He went..." will
-//! mis-split; we'd close those by adding a curated abbreviation list later if a
-//! real document hits regressions. The split layer used to live in slimt and
-//! pulled PCRE2 into the build (~1 MB binary, 13 MB source); moving it here
-//! removes both.
+//! modern web / ebook prose, plus a curated nonbreaking-prefix list so titles
+//! and initials ("Mr. Smith", "J. K. Rowling") don't split — a bare "Mr."
+//! fragment fed to the es model comes back as "¿Sr.", corrupting mundane
+//! sentences. The split layer used to live in slimt and pulled PCRE2 into the
+//! build (~1 MB binary, 13 MB source); moving it here removes both.
 //!
 //! The splitter returns `&str` slices borrowed from the input. Callers
 //! recover each sentence's byte offset via pointer arithmetic
@@ -46,6 +46,50 @@ fn boundary_regex() -> &'static Regex {
     })
 }
 
+/// Words that end with a period mid-sentence (titles, street/legal
+/// abbreviations), trimmed from the Moses/ssplit nonbreaking-prefix lists
+/// for the app's source languages to forms that realistically precede a
+/// capitalized word. Case-sensitive; matched against the word immediately
+/// before a lone `.` boundary. Single uppercase letters (initials,
+/// "J. K. Rowling") are handled in `is_nonbreaking_prefix` instead of
+/// being enumerated here.
+#[rustfmt::skip]
+static NONBREAKING_PREFIXES: &[&str] = &[
+    // en titles / ranks
+    "Mr", "Mrs", "Ms", "Dr", "Drs", "Prof", "Rev", "Hon", "St", "Ste", "Fr",
+    "Pres", "Gov", "Sen", "Rep", "Gen", "Col", "Maj", "Capt", "Cmdr", "Lt",
+    "Sgt", "Cpl", "Pvt", "Adm", "Messrs", "Jr", "Sr", "Bros",
+    // en misc
+    "vs", "v", "Mt", "Ft", "Ave", "Blvd", "Rd", "Dept", "Univ", "Inc", "Ltd",
+    "Corp", "Co", "Est", "Ph.D", "M.D", "B.A", "M.A", "D.C",
+    // es
+    "Sra", "Srta", "Ud", "Uds", "Vd", "Vds", "Dña", "Excmo", "Ilmo", "Avda",
+    // fr
+    "MM", "Mme", "Mmes", "Mlle", "Mlles", "Me", "Mgr",
+    // de
+    "Hr", "Frau", "Nr", "Str", "z.B", "bzw", "usw", "ca",
+    // pl (lowercase forms commonly precede capitalized names: "ul. Krakowska")
+    "ul", "al", "prof", "dr", "mgr", "inż", "hab", "im", "św", "ks", "płk",
+];
+
+fn is_nonbreaking_prefix(before_period: &str) -> bool {
+    let word = before_period
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or("")
+        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    if word.is_empty() {
+        return false;
+    }
+    let mut chars = word.chars();
+    if let (Some(first), None) = (chars.next(), chars.next()) {
+        if first.is_uppercase() {
+            return true;
+        }
+    }
+    NONBREAKING_PREFIXES.contains(&word)
+}
+
 /// Split `text` into sentence-sized substrings, each ending after its
 /// terminal punctuation. Inter-sentence whitespace is dropped from the
 /// output (the boundary point is where the next sentence's first
@@ -60,6 +104,12 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
     for caps in boundary_regex().captures_iter(text) {
         let punct = caps.get(1).expect("group 1 always present");
         let next = caps.get(2).expect("group 2 always present");
+        // Abbreviation guard: only a lone `.` can belong to a title or
+        // initial — `!`, `?`, ellipses, or punctuation followed by a closing
+        // quote always end a sentence.
+        if punct.as_str() == "." && is_nonbreaking_prefix(&text[..punct.start()]) {
+            continue;
+        }
         let piece = &text[last_end..punct.end()];
         if !piece.trim().is_empty() {
             out.push(piece);
@@ -169,16 +219,47 @@ mod tests {
     }
 
     #[test]
-    fn known_limitation_mister_splits_falsely() {
-        // Documents the regex-fallback limitation. If we ship an
-        // abbreviation list we'd merge these back into one sentence.
+    fn title_abbreviations_do_not_split() {
         let p = "Mr. Smith arrived.";
-        let parts = split_sentences(p);
+        assert_eq!(split_sentences(p), vec![p]);
+        let p = "Dr. Brzezinski prescribed amoxicillin for the laryngitis.";
+        assert_eq!(split_sentences(p), vec![p]);
+        let p = "El Sr. García llegó tarde.";
+        assert_eq!(split_sentences(p), vec![p]);
+        let p = "Mieszka przy ul. Krakowskiej.";
+        assert_eq!(split_sentences(p), vec![p]);
+    }
+
+    #[test]
+    fn initials_do_not_split() {
+        let p = "J. K. Rowling wrote it.";
+        assert_eq!(split_sentences(p), vec![p]);
+    }
+
+    #[test]
+    fn sentence_ending_before_abbreviation_still_splits() {
+        let p = "He met Mr. Smith. Then he left.";
         assert_eq!(
-            parts,
-            vec!["Mr.", "Smith arrived."],
-            "abbreviation handling not implemented; matches ssplit-cpp's regex fallback"
+            split_sentences(p),
+            vec!["He met Mr. Smith.", "Then he left."]
         );
+    }
+
+    #[test]
+    fn known_limitation_single_letter_sentence_end() {
+        // The initials rule absorbs a sentence genuinely ending in a single
+        // capital letter; "plan B. Next" reads as an initial. Accepted
+        // tradeoff, same as the Moses/ssplit prefix lists.
+        let p = "We go with plan B. Next question.";
+        assert_eq!(split_sentences(p), vec![p]);
+    }
+
+    #[test]
+    fn abbreviation_with_question_mark_still_splits() {
+        // Only a lone `.` is guarded; other terminals end the sentence even
+        // after a prefix-looking word.
+        let p = "Did you call Mr.? Yes.";
+        assert_eq!(split_sentences(p), vec!["Did you call Mr.?", "Yes."]);
     }
 
     #[test]
