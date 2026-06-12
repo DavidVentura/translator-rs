@@ -423,6 +423,11 @@ pub struct GlesRenderer {
     /// only the overlays over transparent. Set once for the renderer's
     /// lifetime via [`set_present_content`](Self::set_present_content).
     present_content: PresentContent,
+    /// Framebuffer the present functions draw into. 0 (the window surface) for
+    /// shells that own the EGL surface (Android); shells that composite under a
+    /// retained UI (QtQuick) point this at their own offscreen FBO via
+    /// [`set_present_fbo`](Self::set_present_fbo).
+    present_fbo: u32,
     /// Lazily-built rounded-rect pill program (the GPU overlay compositor).
     pill: Option<PillProgram>,
     /// Lazily-built glyph atlas program (R8 coverage × fg color → straight alpha).
@@ -561,6 +566,7 @@ impl GlesRenderer {
                 ext: None,
                 camera_external: None,
                 present_content: PresentContent::default(),
+                present_fbo: 0,
                 pill: None,
                 glyph_prog: None,
                 overlay_fbo: None,
@@ -596,6 +602,14 @@ impl GlesRenderer {
     /// final present composite, not the tracker readbacks.
     pub fn set_present_content(&mut self, content: PresentContent) {
         self.present_content = content;
+    }
+
+    /// Target framebuffer for the present functions. Defaults to 0 (the window
+    /// surface); shells whose UI toolkit owns the window (QtQuick) pass their
+    /// offscreen FBO so the present composes under the retained UI instead of
+    /// over it.
+    pub fn set_present_fbo(&mut self, fbo: u32) {
+        self.present_fbo = fbo;
     }
 
     /// Set the overlay opacity multiplier (0..1) applied to overlay draws.
@@ -1486,7 +1500,7 @@ impl GlesRenderer {
         let sy = surface_h as f32 / canonical_h.max(1) as f32;
         let ndc = ndc_from_viewport(surface_w as f32, surface_h as f32);
         let base = mat3_mul(&ndc, &scale(sx, sy));
-        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
+        self.bind_present_framebuffer(self.present_fbo, surface_w as i32, surface_h as i32);
         unsafe {
             let gl = &self.gl;
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
@@ -1518,7 +1532,7 @@ impl GlesRenderer {
         if self.camera_external.is_none() {
             return false;
         }
-        self.bind_present_framebuffer(0, surface_w as i32, surface_h as i32);
+        self.bind_present_framebuffer(self.present_fbo, surface_w as i32, surface_h as i32);
         unsafe {
             let gl = &self.gl;
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
