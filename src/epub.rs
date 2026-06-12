@@ -20,9 +20,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{Cursor, Read, Write};
 
-use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
+use markup5ever::{Namespace, Prefix, QualName};
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use xml5ever::driver::{XmlParseOpts, parse_document};
-use xml5ever::serialize::{SerializeOpts, TraversalScope, serialize};
 use xml5ever::tendril::TendrilSink;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -621,17 +621,198 @@ fn is_xml_declaration_pi(data: &NodeData) -> bool {
     matches!(data, NodeData::ProcessingInstruction { target, .. } if target.as_ref() == "xml")
 }
 
+/// Custom rcdom→XML writer. xml5ever's serializer reconstructs namespace
+/// declarations from a scope stack but gets it wrong twice: declarations
+/// needed by *attribute* prefixes (`epub:type`) are recorded after the xmlns
+/// emission loop already ran so they are never written, and the parser
+/// consumes the source `xmlns:*` attributes so they can't round-trip
+/// verbatim either. Strict readers then reject the output ("The prefix dc
+/// for element dc:title is not bound"). This writer re-derives each
+/// element's required declarations from its own and its attributes'
+/// QualName namespaces against the in-scope bindings.
 fn serialize_xml_document(dom: &RcDom) -> Result<String, EpubTranslateError> {
-    let serializable = SerializableHandle::from(dom.document.clone());
-    let mut buf: Vec<u8> = Vec::new();
-    serialize(
-        &mut buf,
-        &serializable,
-        SerializeOpts {
-            traversal_scope: TraversalScope::ChildrenOnly(None),
-        },
-    )?;
-    Ok(String::from_utf8(buf)?)
+    let mut out = String::new();
+    let mut scopes: Vec<NsFrame> = Vec::new();
+    // Declare every binding the document uses once, on the root element —
+    // matching how the sources are written — instead of redeclaring on each
+    // prefixed element. Shadowed prefixes still get local declarations via
+    // `collect_needed_binding`.
+    let mut root_decls = Some(collect_document_bindings(&dom.document));
+    for child in dom.document.children.borrow().iter() {
+        write_xml_node(child, &mut scopes, &mut root_decls, &mut out);
+    }
+    Ok(out)
+}
+
+type NsFrame = Vec<(Option<Prefix>, Namespace)>;
+
+fn collect_document_bindings(document: &Handle) -> NsFrame {
+    fn walk(node: &Handle, frame: &mut NsFrame) {
+        if let NodeData::Element { name, attrs, .. } = &node.data {
+            add_first_binding(name, false, frame);
+            for attr in attrs.borrow().iter() {
+                add_first_binding(&attr.name, true, frame);
+            }
+        }
+        for child in node.children.borrow().iter() {
+            walk(child, frame);
+        }
+    }
+    let mut frame = NsFrame::new();
+    walk(document, &mut frame);
+    frame
+}
+
+fn add_first_binding(name: &QualName, is_attr: bool, frame: &mut NsFrame) {
+    if is_xmlns_attr(name) || name.prefix.as_deref() == Some("xml") {
+        return;
+    }
+    if is_attr && name.prefix.is_none() {
+        return;
+    }
+    if name.prefix.is_none() && name.ns.is_empty() {
+        return;
+    }
+    if !frame.iter().any(|(p, _)| *p == name.prefix) {
+        frame.push((name.prefix.clone(), name.ns.clone()));
+    }
+}
+
+fn write_xml_node(
+    node: &Handle,
+    scopes: &mut Vec<NsFrame>,
+    root_decls: &mut Option<NsFrame>,
+    out: &mut String,
+) {
+    match &node.data {
+        NodeData::Document => {
+            for child in node.children.borrow().iter() {
+                write_xml_node(child, scopes, root_decls, out);
+            }
+        }
+        NodeData::Doctype { name, .. } => {
+            out.push_str("<!DOCTYPE ");
+            out.push_str(name);
+            out.push('>');
+        }
+        NodeData::Text { contents } => {
+            push_xml_escaped(&contents.borrow(), false, out);
+        }
+        NodeData::Comment { contents } => {
+            out.push_str("<!--");
+            out.push_str(contents);
+            out.push_str("-->");
+        }
+        NodeData::ProcessingInstruction { target, contents } => {
+            out.push_str("<?");
+            out.push_str(target);
+            out.push(' ');
+            out.push_str(contents);
+            out.push_str("?>");
+        }
+        NodeData::Element { name, attrs, .. } => {
+            let attrs = attrs.borrow();
+            let mut frame: NsFrame = root_decls.take().unwrap_or_default();
+            collect_needed_binding(name, false, scopes, &mut frame);
+            for attr in attrs.iter() {
+                collect_needed_binding(&attr.name, true, scopes, &mut frame);
+            }
+
+            out.push('<');
+            push_qual_name(name, out);
+            for (prefix, uri) in &frame {
+                out.push_str(" xmlns");
+                if let Some(prefix) = prefix {
+                    out.push(':');
+                    out.push_str(prefix);
+                }
+                out.push_str("=\"");
+                push_xml_escaped(uri, true, out);
+                out.push('"');
+            }
+            for attr in attrs.iter() {
+                if is_xmlns_attr(&attr.name) {
+                    continue;
+                }
+                out.push(' ');
+                push_qual_name(&attr.name, out);
+                out.push_str("=\"");
+                push_xml_escaped(&attr.value, true, out);
+                out.push('"');
+            }
+            out.push('>');
+
+            scopes.push(frame);
+            for child in node.children.borrow().iter() {
+                write_xml_node(child, scopes, root_decls, out);
+            }
+            scopes.pop();
+
+            out.push_str("</");
+            push_qual_name(name, out);
+            out.push('>');
+        }
+    }
+}
+
+fn collect_needed_binding(name: &QualName, is_attr: bool, scopes: &[NsFrame], frame: &mut NsFrame) {
+    if is_xmlns_attr(name) {
+        return;
+    }
+    // `xml:` is implicitly bound and must not be redeclared.
+    if name.prefix.as_deref() == Some("xml") {
+        return;
+    }
+    // Unprefixed attributes are never in a namespace.
+    if is_attr && name.prefix.is_none() {
+        return;
+    }
+    if frame.iter().any(|(p, _)| *p == name.prefix) {
+        return;
+    }
+    let bound = lookup_binding(scopes, &name.prefix);
+    let needs = match bound {
+        Some(uri) => uri != name.ns.as_ref(),
+        None => !(name.prefix.is_none() && name.ns.is_empty()),
+    };
+    if needs {
+        frame.push((name.prefix.clone(), name.ns.clone()));
+    }
+}
+
+fn lookup_binding<'a>(scopes: &'a [NsFrame], prefix: &Option<Prefix>) -> Option<&'a str> {
+    scopes
+        .iter()
+        .rev()
+        .flat_map(|frame| frame.iter().rev())
+        .find(|(p, _)| p == prefix)
+        .map(|(_, uri)| uri.as_ref())
+}
+
+fn is_xmlns_attr(name: &QualName) -> bool {
+    name.prefix.as_deref() == Some("xmlns")
+        || (name.prefix.is_none() && name.local.as_ref() == "xmlns")
+}
+
+fn push_qual_name(name: &QualName, out: &mut String) {
+    if let Some(prefix) = &name.prefix {
+        out.push_str(prefix);
+        out.push(':');
+    }
+    out.push_str(&name.local);
+}
+
+fn push_xml_escaped(text: &str, attr_mode: bool, out: &mut String) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' if !attr_mode => out.push_str("&gt;"),
+            '"' if attr_mode => out.push_str("&quot;"),
+            '\'' if attr_mode => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +882,48 @@ mod tests {
             .read_to_string(&mut out)
             .unwrap();
         out
+    }
+
+    /// epubcheck and strict phone readers reject output whose prefixed names
+    /// lost their `xmlns:*` declarations ("The prefix dc for element dc:title
+    /// is not bound") — xml5ever's serializer dropped declarations needed by
+    /// attribute prefixes entirely and leaked element-name declarations to the
+    /// first occurrence only.
+    #[test]
+    fn namespace_declarations_survive_round_trip() {
+        let chapter = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+            <html xmlns=\"http://www.w3.org/1999/xhtml\" \
+            xmlns:epub=\"http://www.idpf.org/2007/ops\" \
+            epub:prefix=\"z3998: http://www.daisy.org/z3998/2012/vocab/structure/#\">\
+            <head><title>chapter one</title></head>\
+            <body><nav epub:type=\"toc\"><p>hello</p></nav></body></html>";
+        let translated =
+            translate_epub_with_translator(&build_epub(chapter), &mut UppercaseTranslator)
+                .expect("translate epub");
+
+        let out = chapter_text(&translated, "OEBPS/chapter1.xhtml");
+        let epub_decl_pos = out
+            .find("xmlns:epub=\"http://www.idpf.org/2007/ops\"")
+            .expect("epub prefix declared");
+        let first_use = out.find("epub:prefix=").expect("attr kept");
+        assert!(
+            epub_decl_pos < first_use,
+            "declaration precedes first use: {out}"
+        );
+        assert!(out.contains("epub:type=\"toc\""), "{out}");
+        assert!(
+            out.contains("xmlns=\"http://www.w3.org/1999/xhtml\""),
+            "{out}"
+        );
+
+        let opf = chapter_text(&translated, "OEBPS/content.opf");
+        let decl_pos = opf
+            .find("xmlns:dc=\"http://purl.org/dc/elements/1.1/\"")
+            .expect("dc prefix declared");
+        for name in ["<dc:title>", "<dc:language>", "<dc:identifier"] {
+            let use_pos = opf.find(name).unwrap_or_else(|| panic!("{name} in {opf}"));
+            assert!(decl_pos < use_pos, "dc declared before {name}: {opf}");
+        }
     }
 
     #[test]

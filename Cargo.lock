@@ -3084,6 +3084,7 @@ dependencies = [
  "image",
  "imageproc",
  "khronos-egl",
+ "libc",
  "log",
  "lopdf",
  "markup5ever",
