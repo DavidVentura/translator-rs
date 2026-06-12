@@ -8,13 +8,41 @@ pub(crate) struct MnnSession {
     engine: InferenceEngine,
 }
 
+/// `MemoryMode::Low` selects MNN's dynamic int8 GEMM, which is only fast on
+/// cores with sdot (armv8.2 dotprod). Without it (e.g. SDM670) that path is
+/// ~3-4x slower, so gate on the hwcap. The fallback must be `High`, not
+/// `Normal`: with `MNN_CPU_WEIGHT_DEQUANT_GEMM` compiled in, MNN routes any
+/// mode below High into the per-tile weight-dequant GEMM executor, which
+/// skips the Strassen-1x1/Winograd conv paths and is ~2x slower again. High
+/// fully dequantizes weights at load, re-enabling those paths.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn default_memory_mode() -> MemoryMode {
+    const HWCAP_ASIMDDP: libc::c_ulong = 1 << 20;
+    if unsafe { libc::getauxval(libc::AT_HWCAP) } & HWCAP_ASIMDDP != 0 {
+        MemoryMode::Low
+    } else {
+        MemoryMode::High
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+)))]
+fn default_memory_mode() -> MemoryMode {
+    MemoryMode::Low
+}
+
 impl MnnSession {
     pub fn load(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
         Self::load_with_modes(
             model_path,
             intra_threads,
             PrecisionMode::Low,
-            MemoryMode::Low,
+            default_memory_mode(),
         )
     }
 

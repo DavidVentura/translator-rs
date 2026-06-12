@@ -14,7 +14,6 @@ use rayon::prelude::*;
 use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::catalog::PpocrScript;
 use crate::mnn_inference::MnnSession;
-use mnn_sys::{MemoryMode, PrecisionMode};
 
 const REC_TARGET_HEIGHT: u32 = 48;
 const REC_WIDTH_BUCKET: usize = 32;
@@ -1336,8 +1335,7 @@ impl PpocrDetector {
 
 impl PpocrScriptClassifier {
     fn load(model_path: &Path) -> Result<Self, TranslatorError> {
-        let session =
-            MnnSession::load_with_modes(model_path, 4, PrecisionMode::Low, MemoryMode::Low)?;
+        let session = MnnSession::load(model_path, 4)?;
         Ok(Self { session })
     }
 
@@ -1372,8 +1370,7 @@ impl PpocrScriptClassifier {
 
 impl PpocrTextlineOrientationClassifier {
     fn load(model_path: &Path) -> Result<Self, TranslatorError> {
-        let session =
-            MnnSession::load_with_modes(model_path, 4, PrecisionMode::Low, MemoryMode::Low)?;
+        let session = MnnSession::load(model_path, 4)?;
         Ok(Self { session })
     }
 
