@@ -14,27 +14,37 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 
-from gen_data import sample
+from gen_data import sample, stream
 from model import InkUNet, param_count
 
 
 class SyntheticStrips(IterableDataset):
-    """Infinite stream; fixed width per worker batch so default collation works."""
+    """Infinite stream of pre-stacked batches.
 
-    def __init__(self, width: int = 320, seed: int = 0):
+    Each worker stacks a whole batch and yields it as one tensor pair, so the
+    DataLoader ships one transfer per batch instead of `batch` small arrays. That
+    collapses the per-strip multiprocessing IPC that otherwise caps throughput well
+    below what the workers can generate. Use with `DataLoader(batch_size=None)`.
+    """
+
+    def __init__(self, batch: int, width: int = 320, seed: int = 0, reuse: int = 1):
+        self.batch = batch
         self.width = width
         self.seed = seed
+        self.reuse = reuse
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         worker = info.id if info else 0
         rng = random.Random(self.seed + worker * 7919 + os.getpid())
+        gen = stream(rng, self.width, self.reuse)
         while True:
-            img, cov = sample(rng, width=self.width)
-            yield (
-                torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))),
-                torch.from_numpy(cov[None]),
-            )
+            imgs, covs = [], []
+            for _ in range(self.batch):
+                img, cov = next(gen)
+                imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
+                covs.append(torch.from_numpy(cov[None]))
+            yield torch.stack(imgs), torch.stack(covs)
 
 
 def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
@@ -58,12 +68,17 @@ def main():
     ap.add_argument("--resume", default=None)
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--val-every", type=int, default=1000)
+    ap.add_argument("--no-compile", action="store_true", help="disable torch.compile (GPU)")
+    ap.add_argument("--base", type=int, default=16, help="base channel width (capacity)")
+    ap.add_argument("--levels", type=int, default=2, help="U-Net depth (3 = bigger RF)")
+    ap.add_argument("--reuse", type=int, default=1, help="composites per rasterized strip")
+    ap.add_argument("--val-batch", type=int, default=32, help="validation set size")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = InkUNet().to(device)
-    print(f"device={device} params={param_count(model):,}")
+    model = InkUNet(base=args.base, levels=args.levels).to(device)
+    print(f"device={device} base={args.base} levels={args.levels} params={param_count(model):,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     start_step = 0
     if args.resume:
@@ -73,14 +88,26 @@ def main():
         start_step = state["step"]
         print(f"resumed from {args.resume} at step {start_step}")
 
+    # AMP (fp16) and kernel fusion only pay off on the GPU, where this small model is
+    # launch-bound: fusing conv/BN/ReLU and halving memory traffic is the lever. `model`
+    # stays uncompiled so checkpoints save plain InkUNet weights (no `_orig_mod.` prefix)
+    # and stay loadable by eval_real.py / export_onnx.py.
+    use_amp = device == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    train_model = torch.compile(model) if use_amp and not args.no_compile else model
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.steps, last_epoch=start_step - 1
+    )
+
     loader = DataLoader(
-        SyntheticStrips(width=args.width),
-        batch_size=args.batch,
+        SyntheticStrips(batch=args.batch, width=args.width, reuse=args.reuse),
+        batch_size=None,  # the dataset yields whole batches (one IPC transfer each)
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
         prefetch_factor=4 if args.workers > 0 else None,
+        pin_memory=device == "cuda",
     )
-    val_img, val_cov = validation_batch(width=args.width)
+    val_img, val_cov = validation_batch(n=args.val_batch, width=args.width)
     val_img, val_cov = val_img.to(device), val_cov.to(device)
 
     os.makedirs(args.out, exist_ok=True)
@@ -90,12 +117,16 @@ def main():
     for step, (img, cov) in enumerate(loader, start=start_step + 1):
         if step > args.steps:
             break
-        img, cov = img.to(device), cov.to(device)
-        logits = model(img)
-        loss = F.binary_cross_entropy_with_logits(logits, cov)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        img = img.to(device, non_blocking=device == "cuda")
+        cov = cov.to(device, non_blocking=device == "cuda")
+        with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
+            logits = train_model(img)
+            loss = F.binary_cross_entropy_with_logits(logits, cov)
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        sched.step()
         running += loss.item()
 
         if step % args.log_every == 0:
@@ -107,11 +138,12 @@ def main():
             running, t0 = 0.0, time.time()
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
-            with torch.no_grad():
-                val_loss = F.binary_cross_entropy_with_logits(model(val_img), val_cov).item()
+            with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
+                val_loss = F.binary_cross_entropy_with_logits(train_model(val_img), val_cov).item()
             model.train()
             print(f"step {step:>6}  VAL loss {val_loss:.4f}", flush=True)
-            state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step}
+            state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
+                     "base": args.base, "levels": args.levels}
             torch.save(state, os.path.join(args.out, "ink-latest.pt"))
     print("done")
 

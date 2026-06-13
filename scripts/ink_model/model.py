@@ -1,7 +1,8 @@
 """Mini U-Net for per-strip ink coverage: RGB strip in, soft alpha matte out.
 
-Fully convolutional; height is 48 in training but any (H, W) divisible by 8 works.
-~100K parameters — small enough for CPU training and sub-ms mobile inference.
+Fully convolutional; height is 48 in training. `levels=2` needs (H, W) divisible by
+4, `levels=3` by 8. The 3rd level enlarges the receptive field so the interiors of
+thick/superbold strokes (edge-starved at 2 levels) get filled, not just outlined.
 """
 
 import torch
@@ -20,12 +21,17 @@ def conv_block(cin: int, cout: int) -> nn.Sequential:
 
 
 class InkUNet(nn.Module):
-    def __init__(self, base: int = 16):
+    def __init__(self, base: int = 16, levels: int = 2):
         super().__init__()
+        self.levels = levels
         self.enc1 = conv_block(3, base)
         self.enc2 = conv_block(base, base * 2)
         self.enc3 = conv_block(base * 2, base * 4)
         self.pool = nn.MaxPool2d(2)
+        if levels >= 3:
+            self.enc4 = conv_block(base * 4, base * 8)
+            self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
+            self.dec3 = conv_block(base * 8, base * 4)
         self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
         self.dec2 = conv_block(base * 4, base * 2)
         self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
@@ -36,6 +42,9 @@ class InkUNet(nn.Module):
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
+        if self.levels >= 3:
+            e4 = self.enc4(self.pool(e3))
+            e3 = self.dec3(torch.cat([self.up3(e4), e3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
         return self.head(d1)  # logits; sigmoid at the call site

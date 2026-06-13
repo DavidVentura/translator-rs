@@ -778,7 +778,86 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
 /// Right-justified and centered blocks aren't detected as multi-line paragraphs here; their
 /// lines will fall out as one-line paragraphs (same as the pre-change behaviour). That's a
 /// deliberate scope cut.
+///
+/// All gap/alignment math runs in the page's *reading frame*: tight-box centres are rotated
+/// by the lines' (width-weighted) median angle before grouping and rotated back after, the
+/// same move the vertical grouper makes with its transpose. In raw image space a tilted
+/// column's left edges drift by `leading·sin(θ)` per line (~3.6 px/line at 4.5°), which blows
+/// through `edge_alignment_tolerance` after a few lines and splits paragraphs spuriously —
+/// and a long tilted row's `cy` drifts by `width·sin(θ)`, defeating the same-row pre-merge.
 pub fn group_lines_into_paragraphs(
+    lines: Vec<TextLine>,
+    opts: ParagraphGroupingOptions,
+) -> Vec<TextBlock> {
+    let theta = frame_reading_angle(&lines);
+    if theta.abs() < FRAME_ROTATION_MIN_RAD || theta.abs() > FRAME_ROTATION_MAX_RAD {
+        return group_lines_in_reading_frame(lines, opts);
+    }
+    log::debug!(
+        "ppocr paragraph grouping: rotating reading frame by {:.2}°",
+        theta.to_degrees(),
+    );
+    let rotated = lines
+        .into_iter()
+        .map(|l| rotate_line_tight(l, -theta))
+        .collect();
+    group_lines_in_reading_frame(rotated, opts)
+        .into_iter()
+        .map(|block| TextBlock {
+            lines: block
+                .lines
+                .into_iter()
+                .map(|l| rotate_line_tight(l, theta))
+                .collect(),
+        })
+        .collect()
+}
+
+/// Skip the frame rotation below this angle: the per-line left-edge drift it would correct
+/// (`leading·sin(θ)`) is a fraction of a pixel, far inside every grouping tolerance.
+const FRAME_ROTATION_MIN_RAD: f32 = 0.005;
+/// Skip the frame rotation above this angle: past ~45° the reading axis is ambiguous (a
+/// sideways page belongs to the orientation-normalization path, not a grouping rotation),
+/// and a garbage median from a chaotic scene must not scramble the grouping coordinates.
+const FRAME_ROTATION_MAX_RAD: f32 = std::f32::consts::FRAC_PI_4;
+
+/// Width-weighted median of the lines' tight-box angles: long lines measure their angle far
+/// more precisely than short words, and a median ignores rotated outliers (a skewed label on
+/// an otherwise straight page).
+fn frame_reading_angle(lines: &[TextLine]) -> f32 {
+    let mut samples: Vec<(f32, f32)> = lines
+        .iter()
+        .map(|l| (l.tight_box.angle_radians, l.tight_box.width.max(1.0)))
+        .collect();
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total: f32 = samples.iter().map(|s| s.1).sum();
+    let mut acc = 0.0;
+    for (angle, weight) in &samples {
+        acc += weight;
+        if acc >= total * 0.5 {
+            return *angle;
+        }
+    }
+    samples.last().expect("samples is non-empty").0
+}
+
+/// Rigidly rotate a line's tight box about the image origin. Only the tight box moves: the
+/// grouper's decisions read nothing else, and `merge_two_lines` unions of `bounding_box` /
+/// `word_rects` stay in image space throughout, so they need no inverse transform.
+fn rotate_line_tight(mut line: TextLine, angle: f32) -> TextLine {
+    let (s, c) = angle.sin_cos();
+    let x = line.tight_box.cx;
+    let y = line.tight_box.cy;
+    line.tight_box.cx = c * x - s * y;
+    line.tight_box.cy = s * x + c * y;
+    line.tight_box.angle_radians += angle;
+    line
+}
+
+fn group_lines_in_reading_frame(
     lines: Vec<TextLine>,
     opts: ParagraphGroupingOptions,
 ) -> Vec<TextBlock> {
@@ -3055,6 +3134,53 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].lines.len(), 3);
         assert_eq!(blocks[1].lines.len(), 2);
+    }
+
+    fn tilted_line(i: usize, theta: f32) -> TextLine {
+        let (w, h, leading) = (1000.0f32, 20.0f32, 46.0f32);
+        let (s, c) = theta.sin_cos();
+        // Column origin, stepping along the column normal v = (−sinθ, cosθ); the line centre
+        // sits half a width along the reading direction u = (cosθ, sinθ).
+        let sx = 200.0 - (i as f32) * leading * s;
+        let sy = 300.0 + (i as f32) * leading * c;
+        let cx = sx + (w * 0.5) * c;
+        let cy = sy + (w * 0.5) * s;
+        let rect = Rect {
+            left: (cx - w * 0.5) as u32,
+            top: (cy - w * 0.5 * s.abs() - h * 0.5) as u32,
+            right: (cx + w * 0.5) as u32,
+            bottom: (cy + w * 0.5 * s.abs() + h * 0.5) as u32,
+        };
+        TextLine {
+            text: "lorem ipsum dolor sit amet consectetur adipiscing".to_string(),
+            bounding_box: rect,
+            oriented_box: OrientedRect::axis_aligned(rect),
+            tight_box: OrientedRect {
+                cx,
+                cy,
+                width: w,
+                height: h,
+                angle_radians: theta,
+            },
+            word_rects: vec![rect],
+        }
+    }
+
+    #[test]
+    fn tilted_column_groups_as_one_paragraph() {
+        // At −4° the left edges drift rightward ~3.2 px/line in image space, blowing through
+        // edge_alignment_tolerance (0.6 × 20 px) after four lines; the reading-frame rotation
+        // removes the drift. +4° drifts leftward (misread as indents without the rotation).
+        for theta in [-4.0f32.to_radians(), 4.0f32.to_radians()] {
+            let lines: Vec<TextLine> = (0..6).map(|i| tilted_line(i, theta)).collect();
+            let blocks = group_lines_into_paragraphs(lines, ParagraphGroupingOptions::default());
+            assert_eq!(blocks.len(), 1, "theta {:.1}°", theta.to_degrees());
+            assert_eq!(blocks[0].lines.len(), 6);
+            // Output geometry must be back in image space, not the rotated frame.
+            let first = &blocks[0].lines[0].tight_box;
+            assert!((first.cx - (200.0 + 500.0 * theta.cos())).abs() < 0.5);
+            assert!((first.angle_radians - theta).abs() < 1e-4);
+        }
     }
 
     #[test]

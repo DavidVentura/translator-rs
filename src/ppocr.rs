@@ -229,6 +229,49 @@ pub struct PpocrDetector {
     output_stride: f32,
 }
 
+/// Per-strip ink matte (soft alpha coverage). Optional — loaded only when the model is
+/// present in the bucket. Input is a dewarped RGB strip; output is a 0..255 mask at the
+/// model's 48px height (width padded to a multiple of 8 for the 3-level pooling).
+pub struct PpocrInkModel {
+    session: MnnSession,
+}
+
+impl PpocrInkModel {
+    const HEIGHT: u32 = 48;
+
+    fn load(model_path: &Path) -> Result<Self, TranslatorError> {
+        Ok(Self {
+            session: MnnSession::load(model_path, 1)?,
+        })
+    }
+
+    fn mask(&self, strip: &RgbImage) -> Result<GrayImage, TranslatorError> {
+        let h = Self::HEIGHT;
+        let aspect_w = (strip.width() * h).div_ceil(strip.height().max(1)).max(16);
+        let w = aspect_w.next_multiple_of(8);
+        let resized = image::imageops::resize(strip, w, h, FilterType::Triangle);
+        let plane = (h * w) as usize;
+        let mut input = vec![0f32; 3 * plane];
+        for (i, px) in resized.pixels().enumerate() {
+            input[i] = px[0] as f32 / 255.0;
+            input[plane + i] = px[1] as f32 / 255.0;
+            input[2 * plane + i] = px[2] as f32 / 255.0;
+        }
+        let (out, _shape) = self.session.run(&input, &[1, 3, h as usize, w as usize])?;
+        let mut buf = vec![0u8; plane];
+        for (b, &logit) in buf.iter_mut().zip(out.iter()) {
+            let s = 1.0 / (1.0 + (-logit).exp());
+            *b = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        GrayImage::from_raw(w, h, buf).ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                "ink mask buffer size mismatch",
+            )
+        })
+    }
+}
+
 pub struct PpocrRecognizer {
     /// One MnnSession per parallel worker. Each is wrapped in a Mutex but contention is zero —
     /// the rayon worker at index `i` only touches `sessions[i]`. The Mutex is just there to
@@ -279,6 +322,7 @@ pub struct PpocrEngine {
     classifier: Option<PpocrScriptClassifier>,
     textline_orientation: Option<PpocrTextlineOrientationClassifier>,
     recognizers: HashMap<PpocrScript, PpocrRecognizerSlot>,
+    ink: Option<PpocrInkModel>,
 }
 
 impl PpocrEngine {
@@ -288,6 +332,7 @@ impl PpocrEngine {
         textline_orientation_path: Option<&Path>,
         recognizer_specs: Vec<PpocrRecognizerSpec>,
         det_intra_threads: usize,
+        ink_path: Option<&Path>,
     ) -> Result<Self, TranslatorError> {
         // Det is one big graph and benefits from intra-session threading. Rec models are loaded
         // lazily per script so auto mode can route strips to multiple scripts without
@@ -311,16 +356,49 @@ impl PpocrEngine {
                 )
             })
             .collect();
+        let ink = ink_path.map(PpocrInkModel::load).transpose()?;
         Ok(Self {
             detector,
             classifier,
             textline_orientation,
             recognizers,
+            ink,
         })
     }
 
     pub fn has_classifier(&self) -> bool {
         self.classifier.is_some()
+    }
+
+    pub fn has_ink(&self) -> bool {
+        self.ink.is_some()
+    }
+
+    /// Per-box ink matte, 1:1 with `boxes`. `None` for a box when no ink model is loaded
+    /// or it has no usable contour. Run after detection — this is the same "keep it per
+    /// detection" pattern as the heatmap / contour / tight-box outputs. The mask is at the
+    /// model's 48px height (any width), in box-local dewarped space.
+    pub fn ink_masks(
+        &self,
+        image: &DynamicImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Vec<Option<GrayImage>> {
+        let Some(ink) = &self.ink else {
+            return boxes.iter().map(|_| None).collect();
+        };
+        let rgb = image.to_rgb8();
+        boxes
+            .iter()
+            .map(|b| {
+                if b.contour.len() < 6 || b.contour.len() % 2 != 0 {
+                    return None;
+                }
+                let contour: Vec<(f32, f32)> =
+                    b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+                dewarp_contour_to_strip_rgb(&rgb, &contour, None, 0.0)
+                    .and_then(|strip| ink.mask(&strip).ok())
+            })
+            .collect()
     }
 
     pub fn has_textline_orientation(&self) -> bool {
@@ -2881,6 +2959,28 @@ pub fn dewarp_contour_to_strip_rgb(
         }
     }
     Some(out)
+}
+
+/// Like [`dewarp_contour_to_strip_rgb`] but also returns, per strip pixel, the
+/// source-image coordinate it sampled (row-major `y * width + x`). Lets a caller
+/// splat a strip-space result — e.g. an ink erase — back onto the original image.
+pub fn dewarp_contour_to_strip_rgb_with_map(
+    rgb: &RgbImage,
+    contour: &[(f32, f32)],
+    canonical_quadrant: Option<crate::coords::Quadrant>,
+    thickness_pad: f32,
+) -> Option<(RgbImage, Vec<(f32, f32)>)> {
+    let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;
+    let mut out = RgbImage::new(warp.width, warp.height);
+    let mut map = Vec::with_capacity((warp.width * warp.height) as usize);
+    for y in 0..warp.height {
+        for x in 0..warp.width {
+            let (src_x, src_y) = strip_source_coord(&warp, x, y);
+            out.put_pixel(x, y, bilinear_rgb(rgb, src_x, src_y));
+            map.push((src_x, src_y));
+        }
+    }
+    Some((out, map))
 }
 
 fn fit_quadratic(points: &[(f32, f32)]) -> Option<(f32, f32, f32)> {

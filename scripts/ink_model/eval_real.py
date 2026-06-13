@@ -80,8 +80,8 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    model = InkUNet()
     state = torch.load(args.ckpt, map_location="cpu")
+    model = InkUNet(base=state.get("base", 16), levels=state.get("levels", 2))
     model.load_state_dict(state["model"])
     model.eval()
     print(f"loaded {args.ckpt} (step {state.get('step', '?')})")

@@ -870,12 +870,18 @@ impl TranslatorSession {
                 return Ok(Arc::clone(engine));
             }
         }
+        // Optional ink-matte model, shipped alongside det in the OCR model dir.
+        let ink_path = det_path
+            .parent()
+            .map(|d| d.join("ink.mnn"))
+            .filter(|p| p.exists());
         let engine = Arc::new(PpocrEngine::load(
             &det_path,
             classifier_path.as_deref(),
             textline_orientation_path.as_deref(),
             specs,
             4,
+            ink_path.as_deref(),
         )?);
         cache.state = Some((key, Arc::clone(&engine)));
         Ok(engine)
