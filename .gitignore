@@ -3,3 +3,6 @@ samples/*
 espeak-ng-data/*
 .test-assets/
 *.pdf
+*.log
+*.pt
+__pycache__
