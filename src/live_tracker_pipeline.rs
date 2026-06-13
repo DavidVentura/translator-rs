@@ -1513,10 +1513,13 @@ impl LiveTrackerPipeline {
             // Crop colours from the (possibly rec-res) rgb with rec-scaled boxes,
             // then lift the strips' canonical geometry back to canonical coords.
             let scaled = oriented.rec_scaled_boxes(detected);
-            let mut matted = crate::color_matting::mat_detections(
-                &oriented.rgb.as_ref().expect("with_rgb path").to_rgba8(),
-                &scaled,
-            );
+            let rgb = oriented.rgb.as_ref().expect("with_rgb path");
+            let ink_masks = self
+                .catalog
+                .ppocr_ink_masks(rgb, &scaled)
+                .unwrap_or_default();
+            let mut matted =
+                crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
             if rec_scale != 1.0 {
                 let inv = 1.0 / rec_scale;
                 for m in matted.iter_mut().flatten() {

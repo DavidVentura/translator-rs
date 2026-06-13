@@ -32,12 +32,16 @@ fn main() {
     let image = image::open(&args[3]).expect("open image");
     let runs: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5);
 
-    let engine = PpocrEngine::load(&det, None, None, Vec::new(), 4, Some(&ink))
-        .expect("load ppocr engine");
+    let engine =
+        PpocrEngine::load(&det, None, None, Vec::new(), 4, Some(&ink)).expect("load ppocr engine");
     let boxes = engine
         .detect_only_image(&image, PpocrProfile::Still)
         .expect("detect");
-    println!("detected {} boxes, has_ink={}", boxes.len(), engine.has_ink());
+    println!(
+        "detected {} boxes, has_ink={}",
+        boxes.len(),
+        engine.has_ink()
+    );
 
     for r in 0..runs {
         let t = Instant::now();

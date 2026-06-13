@@ -359,9 +359,11 @@ impl PpocrEngine {
     }
 
     /// Per-box ink matte, 1:1 with `boxes`. `None` for a box when no ink model is loaded
-    /// or it has no usable contour. Run after detection — this is the same "keep it per
-    /// detection" pattern as the heatmap / contour / tight-box outputs. The mask is at the
-    /// model's 48px height (any width), in box-local dewarped space.
+    /// or it has a degenerate oriented box. Run after detection — this is the same "keep it
+    /// per detection" pattern as the heatmap / contour / tight-box outputs. The mask is at
+    /// the model's 48px height (any width), in the box's *oriented-box* rectified space
+    /// (tight text band, no padding) so a caller — color matting — can register it 1:1
+    /// against a strip built from the same oriented box.
     pub fn ink_masks(
         &self,
         image: &DynamicImage,
@@ -374,21 +376,21 @@ impl PpocrEngine {
         let t_pre = Instant::now();
         let rgb = image.to_rgb8();
 
-        // Dewarp + resize each box to a 48px strip (width a multiple of 8), in parallel —
-        // the per-pixel warp dominates `pre` and the strips are independent.
+        // Dewarp each box's oriented text band straight to a 48px strip (width a multiple of
+        // 8), in parallel — the per-pixel warp dominates `pre` and the strips are
+        // independent. Using the oriented box (not the contour) keeps this rectification
+        // identical to the matting strip's, so the mask registers 1:1 there.
         let prepared: Vec<(usize, RgbImage)> = boxes
             .par_iter()
             .enumerate()
             .filter_map(|(i, b)| {
-                if b.contour.len() < 6 || b.contour.len() % 2 != 0 {
+                let o = &b.oriented_box;
+                if o.width <= 1.0 || o.height <= 1.0 {
                     return None;
                 }
-                let contour: Vec<(f32, f32)> =
-                    b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-                let strip = dewarp_contour_to_strip_rgb(&rgb, &contour, None, 0.0)?;
-                let aw = (strip.width() * h).div_ceil(strip.height().max(1)).max(16);
+                let aw = ((o.width * h as f32 / o.height).round() as u32).max(16);
                 let w = aw.next_multiple_of(8);
-                Some((i, image::imageops::resize(&strip, w, h, FilterType::Triangle)))
+                Some((i, dewarp_oriented_to_strip_rgb(&rgb, o, w, h)))
             })
             .collect();
         let pre_us = t_pre.elapsed().as_micros();
@@ -3012,6 +3014,35 @@ pub fn dewarp_contour_to_strip(
 /// Color counterpart of [`dewarp_contour_to_strip`]: identical geometry, but
 /// samples the RGB image so the strip keeps its original colors. Not used by the
 /// recognizer (which works on luma) — exposed for visualization/debugging.
+/// Rectify an oriented box's tight text band into an `out_w × out_h` strip via inverse
+/// warp. The strip's local axes map to the box's (cx, cy, angle); `out_w/out_h` set the
+/// sampling resolution. Uses the same `(u, v) -> (px, py)` convention as the matting strip
+/// in `color_matting`, so a mask produced here registers 1:1 against that strip.
+pub fn dewarp_oriented_to_strip_rgb(
+    rgb: &RgbImage,
+    oriented: &crate::ocr::OrientedRect,
+    out_w: u32,
+    out_h: u32,
+) -> RgbImage {
+    let cos_a = oriented.angle_radians.cos();
+    let sin_a = oriented.angle_radians.sin();
+    let sx_scale = oriented.width / out_w as f32;
+    let sy_scale = oriented.height / out_h as f32;
+    let half_w = oriented.width * 0.5;
+    let half_h = oriented.height * 0.5;
+    let mut out = RgbImage::new(out_w, out_h);
+    for sy in 0..out_h {
+        for sx in 0..out_w {
+            let u = (sx as f32 + 0.5) * sx_scale - half_w;
+            let v = (sy as f32 + 0.5) * sy_scale - half_h;
+            let px = u * cos_a - v * sin_a + oriented.cx;
+            let py = u * sin_a + v * cos_a + oriented.cy;
+            out.put_pixel(sx, sy, bilinear_rgb(rgb, px, py));
+        }
+    }
+    out
+}
+
 pub fn dewarp_contour_to_strip_rgb(
     rgb: &RgbImage,
     contour: &[(f32, f32)],

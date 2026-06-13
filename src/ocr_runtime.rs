@@ -179,13 +179,6 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
         .collect();
 
-    // Optional ink matte per detected strip, run right after detection. The model is
-    // loaded only if present in the bucket; masks aren't consumed yet (this measures and
-    // logs the per-frame cost). `ink_masks` is a no-op when no ink model is loaded.
-    if ppocr.has_ink() {
-        let _ = ppocr.ink_masks(rgb, &det_boxes);
-    }
-
     // Still images are display-oriented, so the canonical reading frame is R0.
     // Passing it explicitly (instead of None) pins the dewarp direction of
     // near-vertical strips — CJK vertical columns — to top-char-first; with

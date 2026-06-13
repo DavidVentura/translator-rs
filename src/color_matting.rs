@@ -1,18 +1,13 @@
-//! Per-detection color matting: classify ink/background pixels for each
-//! recognised text region and produce an inpainted rectified strip
-//! suitable for use as a live-overlay background. Replaces the
-//! hardcoded dark "pill" with a real per-pixel reconstruction of the
-//! camera background under the source text.
-//!
-//! The reference smoke-test for visual quality is
-//! `tests/ppocr_color_matting.rs`, which exercises the same algorithm
-//! and dumps PNG diagnostics. This module is the production extraction:
-//! same logic, no I/O, no test-only visualization helpers.
+//! Per-detection color matting: take the ink model's per-box matte for
+//! each recognised text region and produce an inpainted rectified strip
+//! suitable for use as a live-overlay background. Replaces the hardcoded
+//! dark "pill" with a real per-pixel reconstruction of the camera
+//! background under the source text.
 //!
 //! ## Why a rectified strip
 //!
-//! The algorithm operates in **rectified strip coordinates**, where
-//! the text runs strictly left-to-right inside an axis-aligned bitmap.
+//! The inpaint operates in **rectified strip coordinates**, where the
+//! text runs strictly left-to-right inside an axis-aligned bitmap.
 //! Column-wise inpaint assumes glyphs are bounded vertically per
 //! column with a contiguous masked region between non-ink pixels — an
 //! assumption that breaks on any tilted text. Dewarping into rectified
@@ -22,32 +17,28 @@
 //! compositor: its color drives the pill, and the GPU warps the baked overlay
 //! per-frame by the planar-tracker homography (canonical → viewport coords).
 //!
-//! See `FUTURE_SURFACE_MAP.md` ("Color matting") for the full design
-//! and how this slots into the surface-map roadmap.
-//!
 //! ## Pipeline per detection
 //!
-//! 1. Rasterize the detector's contour into a mask aligned to the
-//!    image (`ContourMask`).
-//! 2. Inflate the ROI for ascender/descender room. Sample a ring
-//!    annulus just outside the contour for a clean background median;
-//!    pixels claimed by other detections' contours are excluded so
-//!    adjacent lines don't bleed.
-//! 3. Otsu-split the polygon-internal luma; combine with `decide_ink_class`
-//!    to pick ink-on-light vs light-on-dark.
-//! 4. Hysteresis-flood ink mask from polygon seeds through a two-tier
-//!    candidate set (strict inside polygon, looser in the asc/desc band).
-//! 5. Dewarp camera + ink-mask into a rectified strip aligned to the
-//!    oriented box.
-//! 6. Inpaint masked pixels in the strip via 4-direction nearest-non-ink
+//! 1. Take the ink model's soft 0..255 matte for the box (from
+//!    `PpocrEngine::ink_masks`, rendered in the box's oriented-box frame).
+//! 2. Project every box's matte into one image-space *union* ink mask:
+//!    walk the box's source-space bounding box, map each pixel back to
+//!    the matte via the oriented frame, and set the union where the alpha
+//!    clears `INK_ALPHA_CUT`. The union lets a tall strip erase the
+//!    neighbouring lines that fall inside its padding.
+//! 3. Derive the box's ink class (dark/light) and a uniform-bg colour
+//!    from the pixels the matte partitions — the model says *what* is
+//!    ink, the pixels say what colour it and the background are.
+//! 4. Dewarp the camera + union ink mask into a rectified strip aligned
+//!    to the oriented box, growing the fill mask by a height-proportional
+//!    radius so the original ink's anti-aliased rim is erased too.
+//! 5. Inpaint masked pixels in the strip via 4-direction nearest-non-ink
 //!    blend with outlier rejection + smoothing passes.
 //!
 //! Output: rectified RGBA strip + the oriented-box parameters
 //! needed to re-warp it back to canonical-frame coords.
 
-use image::{GrayImage, Luma, Rgba, RgbaImage};
-use imageproc::drawing::draw_polygon_mut;
-use imageproc::point::Point;
+use image::{GrayImage, Rgba, RgbaImage};
 
 use crate::DetectedTextBox;
 use crate::ocr::Rect;
@@ -119,12 +110,49 @@ impl Default for MattingConfig {
     }
 }
 
-/// Compute matted strips for each detection. Returns one entry per
-/// input box; entries are `None` when the detection's contour was too
-/// small or under-resolved to recover a clean ink mask (caller should
-/// fall back to the default-pill rendering for those).
-pub fn mat_detections(rgba: &RgbaImage, boxes: &[DetectedTextBox]) -> Vec<Option<MattedStrip>> {
-    mat_detections_with_config(rgba, boxes, &MattingConfig::default())
+/// Confidence above which a model ink-mask pixel is treated as ink (to
+/// erase). The model emits a soft 0..255 alpha; the inpaint then dilates
+/// by `inpaint_sample_radius` to catch the anti-aliased rim, so a
+/// mid-grey cut is enough without bleeding into the background.
+const INK_ALPHA_CUT: u8 = 40;
+/// Minimum ink pixels in a strip to bother matting it. Below this the
+/// model found essentially no ink in the box — return `None` and let the
+/// caller fall back to default-pill rendering.
+const MIN_INK_PIXELS: usize = 6;
+/// Minimum background samples needed before judging the bg "uniform".
+const MIN_BG_SAMPLES: usize = 24;
+
+/// Per-box ink metadata the model mask can't give us directly: the ink
+/// class (for picking a readable translated-text colour) and a
+/// uniform-background colour (for the solid-pill fallback). Both are
+/// derived from the box pixels the mask partitions into ink/bg.
+#[derive(Clone, Copy)]
+struct BoxInk {
+    ink_is_dark: bool,
+    bg_uniform_argb: Option<u32>,
+}
+
+/// Compute matted strips for each detection from the ink model's per-box
+/// masks. `ink_masks` is 1:1 with `boxes` (the output of
+/// `PpocrEngine::ink_masks`); each mask is a soft 0..255 alpha in the
+/// box's oriented-box rectified space.
+///
+/// The masks are first projected into a single image-space *union* ink
+/// mask. A strip is padded ~75% of the line height beyond the text band,
+/// so a tall strip overlaps neighbouring lines; sampling the union (not
+/// just this box's mask) erases those neighbours' glyphs inside the strip
+/// too. Without it, a later strip would composite a neighbour's untouched
+/// original text back over a line an earlier strip had already erased.
+///
+/// Returns one entry per input box; entries are `None` when the box has
+/// no model mask, a degenerate oriented box, or the model found no ink —
+/// the caller falls back to default-pill rendering for those.
+pub fn mat_detections(
+    rgba: &RgbaImage,
+    boxes: &[DetectedTextBox],
+    ink_masks: &[Option<GrayImage>],
+) -> Vec<Option<MattedStrip>> {
+    mat_detections_with_config(rgba, boxes, ink_masks, &MattingConfig::default())
 }
 
 /// Like [`mat_detections`] but with explicit tuning. Mostly useful for
@@ -132,61 +160,138 @@ pub fn mat_detections(rgba: &RgbaImage, boxes: &[DetectedTextBox]) -> Vec<Option
 pub fn mat_detections_with_config(
     rgba: &RgbaImage,
     boxes: &[DetectedTextBox],
+    ink_masks: &[Option<GrayImage>],
     cfg: &MattingConfig,
 ) -> Vec<Option<MattedStrip>> {
     let (w, h) = rgba.dimensions();
-    let contour_masks: Vec<ContourMask> = boxes
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, b)| rasterize_contour_mask(w, h, b, idx))
-        .collect();
-    let contour_occupancy = build_contour_occupancy(w, h, &contour_masks);
-
-    // Build the global ink mask + per-detection metadata in one pass.
-    // We need the union mask so dewarp's sample-into-strip step can
-    // mark out-of-strip ink (e.g. neighbouring lines whose pixels would
-    // otherwise leak in via the rectification's padding).
-    let mut ink_mask = vec![false; (w as usize) * (h as usize)];
-    let mut detections: Vec<Option<Detection>> = Vec::with_capacity(boxes.len());
-    detections.resize_with(boxes.len(), || None);
-    for cmask in &contour_masks {
-        let Some(det) = build_detection(rgba, cmask, &contour_occupancy, w, h) else {
+    let mut union_ink = vec![false; (w as usize) * (h as usize)];
+    let mut meta: Vec<Option<BoxInk>> = Vec::with_capacity(boxes.len());
+    meta.resize_with(boxes.len(), || None);
+    for (idx, b) in boxes.iter().enumerate() {
+        let Some(Some(mask)) = ink_masks.get(idx) else {
             continue;
         };
-        for &(px, py) in &det.ink_pixels {
-            ink_mask[(py as usize) * (w as usize) + px as usize] = true;
-        }
-        detections[cmask.box_index] = Some(det);
+        meta[idx] = project_box_ink(rgba, b, mask, w, h, &mut union_ink);
     }
 
-    // Produce one MattedStrip per detection by dewarping + inpainting.
-    // `mat_strip_for_detection` returns None on bookkeeping failures
-    // (no oriented box, zero-area strip, etc.); those bubble up as
-    // `None` in the result so callers can substitute fallback rendering.
-    detections
-        .into_iter()
+    boxes
+        .iter()
         .enumerate()
-        .map(|(idx, det)| {
-            let det = det?;
-            mat_strip_for_detection(rgba, &ink_mask, w, h, &boxes[idx], &det, cfg)
+        .map(|(idx, b)| {
+            let ink = meta[idx]?;
+            mat_strip_for_detection(rgba, idx, b, &union_ink, w, h, ink, cfg)
         })
         .collect()
 }
 
-/// Dewarp a detection's region into a rectified RGBA strip, then
-/// inpaint the ink pixels. The strip is padded vertically by ~75% of
-/// the detected line height so we have clean background samples above
-/// and below the text band for the inpaint walk.
-fn mat_strip_for_detection(
+/// Project one box's model mask into the shared image-space `union_ink`
+/// (set a source pixel when its `(u, v)` in the box's oriented frame maps
+/// to a model-mask alpha above the cut), and derive the box's ink class
+/// and uniform-bg colour from the pixels the mask partitions. Iterates
+/// the box's source-space bounding box directly, so the union is dense at
+/// full resolution with no projection gaps. Returns `None` when the model
+/// found essentially no ink.
+fn project_box_ink(
     image: &RgbaImage,
-    mask: &[bool],
+    detected: &DetectedTextBox,
+    ink_mask: &GrayImage,
     w: u32,
     h: u32,
+    union_ink: &mut [bool],
+) -> Option<BoxInk> {
+    let o = detected.oriented_box;
+    if o.width <= 1.0 || o.height <= 1.0 {
+        return None;
+    }
+    let cos_a = o.angle_radians.cos();
+    let sin_a = o.angle_radians.sin();
+    let half_w = o.width * 0.5;
+    let half_h = o.height * 0.5;
+    let mw = ink_mask.width() as f32;
+    let mh = ink_mask.height() as f32;
+
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for (u, v) in [
+        (-half_w, -half_h),
+        (half_w, -half_h),
+        (half_w, half_h),
+        (-half_w, half_h),
+    ] {
+        let px = u * cos_a - v * sin_a + o.cx;
+        let py = u * sin_a + v * cos_a + o.cy;
+        min_x = min_x.min(px);
+        max_x = max_x.max(px);
+        min_y = min_y.min(py);
+        max_y = max_y.max(py);
+    }
+    let x0 = min_x.floor().max(0.0) as u32;
+    let y0 = min_y.floor().max(0.0) as u32;
+    let x1 = (max_x.ceil().max(0.0) as u32).min(w);
+    let y1 = (max_y.ceil().max(0.0) as u32).min(h);
+
+    let w_us = w as usize;
+    let mut ink_samples: Vec<Rgba<u8>> = Vec::new();
+    let mut bg_samples: Vec<Rgba<u8>> = Vec::new();
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let dx = px as f32 + 0.5 - o.cx;
+            let dy = py as f32 + 0.5 - o.cy;
+            let u = dx * cos_a + dy * sin_a;
+            let v = -dx * sin_a + dy * cos_a;
+            if u.abs() > half_w || v.abs() > half_h {
+                continue;
+            }
+            let mx = (((u + half_w) / o.width) * mw).floor().clamp(0.0, mw - 1.0) as u32;
+            let my = (((v + half_h) / o.height) * mh)
+                .floor()
+                .clamp(0.0, mh - 1.0) as u32;
+            let pixel = *image.get_pixel(px, py);
+            if ink_mask.get_pixel(mx, my)[0] >= INK_ALPHA_CUT {
+                union_ink[(py as usize) * w_us + px as usize] = true;
+                ink_samples.push(pixel);
+            } else {
+                bg_samples.push(pixel);
+            }
+        }
+    }
+
+    if ink_samples.len() < MIN_INK_PIXELS {
+        return None;
+    }
+    let ink_is_dark = if bg_samples.is_empty() {
+        true
+    } else {
+        luma(median_color(&ink_samples)) < luma(median_color(&bg_samples))
+    };
+    let bg_uniform_argb = if bg_samples.len() >= MIN_BG_SAMPLES {
+        uniform_bg_argb(&bg_samples, median_color(&bg_samples))
+    } else {
+        None
+    };
+    Some(BoxInk {
+        ink_is_dark,
+        bg_uniform_argb,
+    })
+}
+
+/// Dewarp a detection's oriented box into a rectified RGBA strip, sample
+/// the shared `union_ink` into strip coords, then inpaint the masked
+/// pixels. The strip is padded vertically by ~75% of the line height so
+/// the inpaint walk has clean background above and below the text band;
+/// horizontally by 15% for translated-text breathing room.
+fn mat_strip_for_detection(
+    image: &RgbaImage,
+    box_index: usize,
     detected: &DetectedTextBox,
-    det: &Detection,
+    union_ink: &[bool],
+    w: u32,
+    h: u32,
+    ink: BoxInk,
     cfg: &MattingConfig,
 ) -> Option<MattedStrip> {
-    let _ = det;
     let oriented = detected.oriented_box;
     if oriented.width <= 1.0 || oriented.height <= 1.0 {
         return None;
@@ -194,21 +299,18 @@ fn mat_strip_for_detection(
     let cos_a = oriented.angle_radians.cos();
     let sin_a = oriented.angle_radians.sin();
 
-    // 15% horizontal pad gives translated text breathing room without
-    // pulling in neighbouring detections; 75% vertical pad guarantees
-    // the inpaint walk finds clean bg above/below the text band.
     let pad_x = (oriented.width * 0.15).max(4.0);
     let pad_y = (oriented.height * 0.75).max(8.0);
     let strip_w = (oriented.width + 2.0 * pad_x).ceil().max(8.0) as u32;
     let strip_h = (oriented.height + 2.0 * pad_y).ceil().max(8.0) as u32;
     let sw_us = strip_w as usize;
+    let w_us = w as usize;
     let strip_cx = strip_w as f32 * 0.5;
     let strip_cy = strip_h as f32 * 0.5;
-    let w_us = w as usize;
 
-    // Sample the global image + ink mask into strip coords via inverse
-    // warp. Pixels that fall outside the image are flagged masked so
-    // the inpaint walk skips them.
+    // Sample the image + union ink mask into strip coords via inverse
+    // warp. Out-of-image pixels are flagged masked so the inpaint walk
+    // skips them.
     let mut strip_image = vec![Rgba([0u8; 4]); (strip_w * strip_h) as usize];
     let mut strip_mask = vec![false; (strip_w * strip_h) as usize];
     for sy in 0..strip_h {
@@ -225,10 +327,16 @@ fn mat_strip_for_detection(
                 continue;
             }
             strip_image[idx] = *image.get_pixel(pxi as u32, pyi as u32);
-            strip_mask[idx] = mask[(pyi as usize) * w_us + pxi as usize];
+            strip_mask[idx] = union_ink[(pyi as usize) * w_us + pxi as usize];
         }
     }
 
+    // The model mask is glyph-tight and sampled at 48px, so on large
+    // glyphs its upscaled edge sits inside the original ink's anti-aliased
+    // rim. Grow the *fill* region by a height-proportional radius so that
+    // rim is inpainted too, instead of surviving as a faint outline.
+    let fill_radius = ((oriented.height * 0.06).round() as u32).clamp(1, 6);
+    let strip_mask = dilate(&strip_mask, strip_w, strip_h, fill_radius);
     let strip_out = inpaint_native(
         &strip_image,
         &strip_mask,
@@ -249,7 +357,7 @@ fn mat_strip_for_detection(
     }
 
     Some(MattedStrip {
-        box_index: det.box_index,
+        box_index,
         strip_rgba: strip_bytes,
         strip_width: strip_w,
         strip_height: strip_h,
@@ -258,318 +366,8 @@ fn mat_strip_for_detection(
         canonical_angle_radians: oriented.angle_radians,
         canonical_width: strip_w as f32,
         canonical_height: strip_h as f32,
-        ink_is_dark: det.ink_is_dark,
-        bg_uniform_argb: det.bg_uniform_argb,
-    })
-}
-
-// --- internals shared with the smoke test --------------------------------
-//
-// Visibility is `pub(crate)` so the test (an integration test in the
-// `tests/` directory) can `use translator::color_matting::...` for its
-// visualization. Production callers use the `mat_detections` entry
-// point above.
-
-#[derive(Clone, Debug)]
-pub(crate) struct ContourMask {
-    pub box_index: usize,
-    pub rect: Rect,
-    pub width: u32,
-    pub height: u32,
-    pub bits: Vec<bool>,
-}
-
-impl ContourMask {
-    pub(crate) fn contains(&self, x: u32, y: u32) -> bool {
-        if x < self.rect.left || x >= self.rect.right || y < self.rect.top || y >= self.rect.bottom
-        {
-            return false;
-        }
-        let lx = x - self.rect.left;
-        let ly = y - self.rect.top;
-        self.bits[(ly as usize) * (self.width as usize) + lx as usize]
-    }
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct Detection {
-    pub box_index: usize,
-    pub contour_rect: Rect,
-    pub bg_ring_median: Rgba<u8>,
-    pub ink_pixels: Vec<(u32, u32)>,
-    pub fell_back: bool,
-    pub poly_coverage_pct: u32,
-    pub ink_is_dark: bool,
-    /// `Some(argb)` when the ring samples cluster around a single
-    /// peak — i.e. the background is one colour with sensor noise.
-    /// `None` when samples spread across multiple peaks (gradient,
-    /// shadow boundary, mixed bg). Computed via a 4-bit-per-channel
-    /// histogram with 3×3×3 neighbour-smoothing so noise straddling
-    /// a bucket boundary doesn't artificially split the cluster.
-    pub bg_uniform_argb: Option<u32>,
-}
-
-pub(crate) fn rasterize_contour_mask(
-    w: u32,
-    h: u32,
-    det: &DetectedTextBox,
-    box_index: usize,
-) -> Option<ContourMask> {
-    let rect = clamp_rect(det.rect, w, h)?;
-    let local_w = rect.width().max(1);
-    let local_h = rect.height().max(1);
-    let mut img = GrayImage::from_pixel(local_w, local_h, Luma([0u8]));
-    if det.contour.len() >= 6 {
-        let points: Vec<Point<i32>> = det
-            .contour
-            .chunks_exact(2)
-            .map(|p| {
-                Point::new(
-                    (p[0] - rect.left as f32).round() as i32,
-                    (p[1] - rect.top as f32).round() as i32,
-                )
-            })
-            .collect();
-        if points.len() >= 3 {
-            draw_polygon_mut(&mut img, &points, Luma([255u8]));
-        }
-    } else {
-        for p in img.pixels_mut() {
-            *p = Luma([255u8]);
-        }
-    }
-    let bits: Vec<bool> = img.pixels().map(|p| p[0] != 0).collect();
-    Some(ContourMask {
-        box_index,
-        rect,
-        width: local_w,
-        height: local_h,
-        bits,
-    })
-}
-
-pub(crate) fn build_contour_occupancy(w: u32, h: u32, masks: &[ContourMask]) -> Vec<bool> {
-    let mut occ = vec![false; (w as usize) * (h as usize)];
-    for m in masks {
-        for ly in 0..m.height {
-            for lx in 0..m.width {
-                if !m.bits[(ly as usize) * (m.width as usize) + lx as usize] {
-                    continue;
-                }
-                let x = m.rect.left + lx;
-                let y = m.rect.top + ly;
-                occ[(y as usize) * (w as usize) + x as usize] = true;
-            }
-        }
-    }
-    occ
-}
-
-pub(crate) fn build_detection(
-    image: &RgbaImage,
-    cmask: &ContourMask,
-    contour_occupancy: &[bool],
-    w: u32,
-    h: u32,
-) -> Option<Detection> {
-    let line_h = cmask.rect.height().max(1);
-    let pad_y = (line_h / 3).clamp(3, 14);
-    let ring_thickness = (line_h / 3).clamp(4, 14);
-
-    let pad_x = pad_y + ring_thickness;
-    let pad_y_total = pad_y + ring_thickness;
-    let roi = inflate_rect_xy(cmask.rect, pad_x, pad_y_total, w, h);
-    let roi_w = roi.width().max(1);
-    let roi_h = roi.height().max(1);
-    let roi_w_us = roi_w as usize;
-
-    let mut polygon_local = vec![false; (roi_w as usize) * (roi_h as usize)];
-    for cy in 0..cmask.height {
-        for cx in 0..cmask.width {
-            if !cmask.bits[(cy as usize) * (cmask.width as usize) + cx as usize] {
-                continue;
-            }
-            let gx = cmask.rect.left + cx;
-            let gy = cmask.rect.top + cy;
-            let lx = gx - roi.left;
-            let ly = gy - roi.top;
-            polygon_local[(ly as usize) * roi_w_us + lx as usize] = true;
-        }
-    }
-
-    let classify_region = dilate(&polygon_local, roi_w, roi_h, pad_y);
-    let ring_outer = dilate(&classify_region, roi_w, roi_h, ring_thickness);
-
-    let mut ring_samples = Vec::new();
-    for ly in 0..roi_h {
-        for lx in 0..roi_w {
-            let idx = (ly as usize) * roi_w_us + lx as usize;
-            if !ring_outer[idx] || classify_region[idx] {
-                continue;
-            }
-            let gx = roi.left + lx;
-            let gy = roi.top + ly;
-            if contour_occupancy[(gy as usize) * (w as usize) + gx as usize]
-                && !cmask.contains(gx, gy)
-            {
-                continue;
-            }
-            ring_samples.push(*image.get_pixel(gx, gy));
-        }
-    }
-    if ring_samples.len() < 24 {
-        return None;
-    }
-    let bg_median = median_color(&ring_samples);
-    let _bg_mad = mad_distance(&ring_samples, bg_median);
-    let bg_uniform_argb = uniform_bg_argb(&ring_samples, bg_median);
-
-    let mut luma_hist = [0u32; 256];
-    let mut poly_count = 0usize;
-    for idx in 0..polygon_local.len() {
-        if !polygon_local[idx] {
-            continue;
-        }
-        let lx = (idx % roi_w_us) as u32;
-        let ly = (idx / roi_w_us) as u32;
-        let gx = roi.left + lx;
-        let gy = roi.top + ly;
-        let p = image.get_pixel(gx, gy);
-        luma_hist[luma(*p) as usize] += 1;
-        poly_count += 1;
-    }
-    if poly_count < 16 {
-        return None;
-    }
-    let otsu_threshold = otsu_split(&luma_hist);
-    let ink_is_dark = decide_ink_class(
-        image,
-        roi,
-        polygon_local.as_slice(),
-        roi_w_us,
-        otsu_threshold,
-        bg_median,
-    )?;
-
-    let on_ink_side = |p: Rgba<u8>| -> bool {
-        if ink_is_dark {
-            luma(p) < otsu_threshold
-        } else {
-            luma(p) > otsu_threshold
-        }
-    };
-
-    let mut seed = vec![false; polygon_local.len()];
-    for idx in 0..polygon_local.len() {
-        if !polygon_local[idx] {
-            continue;
-        }
-        let lx = (idx % roi_w_us) as u32;
-        let ly = (idx / roi_w_us) as u32;
-        let p = *image.get_pixel(roi.left + lx, roi.top + ly);
-        if on_ink_side(p) {
-            seed[idx] = true;
-        }
-    }
-    let outside_bias = 18i32;
-    let outside_cut = if ink_is_dark {
-        (otsu_threshold as i32 + outside_bias).min(255) as u8
-    } else {
-        (otsu_threshold as i32 - outside_bias).max(0) as u8
-    };
-    let on_ink_side_at = |p: Rgba<u8>, cut: u8| -> bool {
-        if ink_is_dark {
-            luma(p) < cut
-        } else {
-            luma(p) > cut
-        }
-    };
-    let mut candidate = vec![false; polygon_local.len()];
-    for idx in 0..polygon_local.len() {
-        if !classify_region[idx] {
-            continue;
-        }
-        let lx = (idx % roi_w_us) as u32;
-        let ly = (idx / roi_w_us) as u32;
-        let gx = roi.left + lx;
-        let gy = roi.top + ly;
-        if !cmask.contains(gx, gy) && contour_occupancy[(gy as usize) * (w as usize) + gx as usize]
-        {
-            continue;
-        }
-        let p = *image.get_pixel(gx, gy);
-        let cut = if polygon_local[idx] {
-            otsu_threshold
-        } else {
-            outside_cut
-        };
-        if on_ink_side_at(p, cut) {
-            candidate[idx] = true;
-        }
-    }
-    let ink_core = hysteresis_flood_with_cca(&seed, &candidate, roi_w, roi_h, line_h);
-
-    let small_pad = ((line_h * 12 + 50) / 100).max(2);
-    let base_mask = dilate(&polygon_local, roi_w, roi_h, small_pad);
-
-    let extension_seed: Vec<bool> = ink_core
-        .iter()
-        .zip(polygon_local.iter())
-        .map(|(&core, &poly)| core && !poly)
-        .collect();
-    let extension_cap_radius = (line_h / 4).clamp(2, 8);
-    let extension_cap = dilate(&polygon_local, roi_w, roi_h, extension_cap_radius);
-    let extension_dilated = dilate(&extension_seed, roi_w, roi_h, 1);
-    let extension_capped: Vec<bool> = extension_dilated
-        .iter()
-        .zip(extension_cap.iter())
-        .map(|(&e, &c)| e && c)
-        .collect();
-
-    let ink: Vec<bool> = base_mask
-        .iter()
-        .zip(extension_capped.iter())
-        .map(|(&a, &b)| a || b)
-        .collect();
-
-    let mut poly_total = 0usize;
-    let mut core_in_poly = 0usize;
-    for idx in 0..polygon_local.len() {
-        if polygon_local[idx] {
-            poly_total += 1;
-            if ink_core[idx] {
-                core_in_poly += 1;
-            }
-        }
-    }
-
-    let mut ink_pixels = Vec::new();
-    for ly in 0..roi_h {
-        for lx in 0..roi_w {
-            if ink[(ly as usize) * roi_w_us + lx as usize] {
-                ink_pixels.push((roi.left + lx, roi.top + ly));
-            }
-        }
-    }
-    if ink_pixels.len() < 6 {
-        return None;
-    }
-
-    let poly_coverage_pct = if poly_total > 0 {
-        (core_in_poly * 100 / poly_total) as u32
-    } else {
-        0
-    };
-    Some(Detection {
-        box_index: cmask.box_index,
-        contour_rect: cmask.rect,
-        bg_ring_median: bg_median,
-        ink_pixels,
-        fell_back: false,
-        poly_coverage_pct,
-        ink_is_dark,
-        bg_uniform_argb,
+        ink_is_dark: ink.ink_is_dark,
+        bg_uniform_argb: ink.bg_uniform_argb,
     })
 }
 
@@ -649,35 +447,6 @@ fn rgba_to_argb(c: Rgba<u8>) -> u32 {
     let g = c[1] as u32;
     let b = c[2] as u32;
     (a << 24) | (r << 16) | (g << 8) | b
-}
-
-/// Estimate a per-detection ink colour by taking the median of ink
-/// pixels in the top quartile of bg-distance. Robust to anti-aliased
-/// rim pixels (which sit close to the bg in colour space). Currently
-/// unused by `mat_detections` itself — the smoke test still calls it
-/// for diagnostics, and future "tint the inpainted strip with original
-/// ink colour" experiments would reuse it.
-#[allow(dead_code)]
-pub(crate) fn estimate_fg(
-    image: &RgbaImage,
-    inpainted: &RgbaImage,
-    ink_pixels: &[(u32, u32)],
-) -> Rgba<u8> {
-    if ink_pixels.is_empty() {
-        return Rgba([0, 0, 0, 255]);
-    }
-    let mut scored: Vec<(f32, Rgba<u8>)> = ink_pixels
-        .iter()
-        .map(|&(px, py)| {
-            let original = *image.get_pixel(px, py);
-            let bg = *inpainted.get_pixel(px, py);
-            (rgb_dist2(original, bg), original)
-        })
-        .collect();
-    scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let take = (scored.len() / 4).max(1);
-    let top: Vec<Rgba<u8>> = scored.into_iter().take(take).map(|(_, c)| c).collect();
-    median_color(&top)
 }
 
 /// 4-direction nearest-non-ink inpaint with median outlier rejection
@@ -899,107 +668,6 @@ pub(crate) fn inpaint_native(
     out
 }
 
-pub(crate) fn hysteresis_flood_with_cca(
-    seed: &[bool],
-    candidate: &[bool],
-    w: u32,
-    h: u32,
-    line_h: u32,
-) -> Vec<bool> {
-    let w_us = w as usize;
-    let mut out = vec![false; seed.len()];
-    let mut stack: Vec<(u32, u32)> = Vec::new();
-
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y as usize) * w_us + x as usize;
-            if seed[idx] {
-                out[idx] = true;
-                stack.push((x, y));
-            }
-        }
-    }
-    while let Some((cx, cy)) = stack.pop() {
-        let x0 = cx.saturating_sub(1);
-        let y0 = cy.saturating_sub(1);
-        let x1 = (cx + 1).min(w - 1);
-        let y1 = (cy + 1).min(h - 1);
-        for ny in y0..=y1 {
-            for nx in x0..=x1 {
-                let nidx = (ny as usize) * w_us + nx as usize;
-                if out[nidx] || !candidate[nidx] {
-                    continue;
-                }
-                out[nidx] = true;
-                stack.push((nx, ny));
-            }
-        }
-    }
-
-    let max_dim = (line_h as f32 * 1.2) as u32 + 2;
-    let min_pixels = 3usize;
-    let max_pixels = (line_h * line_h) as usize;
-    let mut visited = out.clone();
-    for sy in 0..h {
-        for sx in 0..w {
-            let sidx = (sy as usize) * w_us + sx as usize;
-            if visited[sidx] || !candidate[sidx] {
-                continue;
-            }
-            let mut comp: Vec<usize> = Vec::new();
-            let mut min_x = sx;
-            let mut max_x = sx;
-            let mut min_y = sy;
-            let mut max_y = sy;
-            visited[sidx] = true;
-            stack.push((sx, sy));
-            while let Some((cx, cy)) = stack.pop() {
-                let cidx = (cy as usize) * w_us + cx as usize;
-                comp.push(cidx);
-                if cx < min_x {
-                    min_x = cx;
-                }
-                if cx > max_x {
-                    max_x = cx;
-                }
-                if cy < min_y {
-                    min_y = cy;
-                }
-                if cy > max_y {
-                    max_y = cy;
-                }
-                let x0 = cx.saturating_sub(1);
-                let y0 = cy.saturating_sub(1);
-                let x1 = (cx + 1).min(w - 1);
-                let y1 = (cy + 1).min(h - 1);
-                for ny in y0..=y1 {
-                    for nx in x0..=x1 {
-                        let nidx = (ny as usize) * w_us + nx as usize;
-                        if visited[nidx] || !candidate[nidx] {
-                            continue;
-                        }
-                        visited[nidx] = true;
-                        stack.push((nx, ny));
-                    }
-                }
-            }
-            let bbox_w = max_x - min_x + 1;
-            let bbox_h = max_y - min_y + 1;
-            if comp.len() < min_pixels
-                || comp.len() > max_pixels
-                || bbox_h > max_dim
-                || bbox_w > max_dim
-            {
-                continue;
-            }
-            for cidx in comp {
-                out[cidx] = true;
-            }
-        }
-    }
-    out
-}
-
 pub(crate) fn dilate(mask: &[bool], w: u32, h: u32, radius: u32) -> Vec<bool> {
     if radius == 0 {
         return mask.to_vec();
@@ -1064,89 +732,11 @@ pub(crate) fn median_color(colors: &[Rgba<u8>]) -> Rgba<u8> {
     Rgba([r[mid], g[mid], b[mid], 255])
 }
 
-pub(crate) fn mad_distance(samples: &[Rgba<u8>], median: Rgba<u8>) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut dists: Vec<f32> = samples
-        .iter()
-        .map(|c| rgb_dist2(*c, median).sqrt())
-        .collect();
-    dists.sort_unstable_by(f32::total_cmp);
-    dists[dists.len() / 2]
-}
-
-pub(crate) fn decide_ink_class(
-    image: &RgbaImage,
-    roi: Rect,
-    polygon_local: &[bool],
-    roi_w_us: usize,
-    otsu_threshold: u8,
-    bg_median: Rgba<u8>,
-) -> Option<bool> {
-    let mut dark_colors = Vec::new();
-    let mut light_colors = Vec::new();
-    for idx in 0..polygon_local.len() {
-        if !polygon_local[idx] {
-            continue;
-        }
-        let lx = (idx % roi_w_us) as u32;
-        let ly = (idx / roi_w_us) as u32;
-        let p = *image.get_pixel(roi.left + lx, roi.top + ly);
-        if luma(p) < otsu_threshold {
-            dark_colors.push(p);
-        } else {
-            light_colors.push(p);
-        }
-    }
-    if dark_colors.is_empty() || light_colors.is_empty() {
-        return None;
-    }
-    let dark_median = median_color(&dark_colors);
-    let light_median = median_color(&light_colors);
-    Some(rgb_dist2(dark_median, bg_median) >= rgb_dist2(light_median, bg_median))
-}
-
 pub(crate) fn luma(c: Rgba<u8>) -> u8 {
     let r = c[0] as u32;
     let g = c[1] as u32;
     let b = c[2] as u32;
     ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8
-}
-
-pub(crate) fn otsu_split(hist: &[u32; 256]) -> u8 {
-    let total: u64 = hist.iter().map(|&v| v as u64).sum();
-    if total == 0 {
-        return 128;
-    }
-    let mut sum_total: u64 = 0;
-    for i in 0..256 {
-        sum_total += (i as u64) * (hist[i] as u64);
-    }
-    let mut sum_bg: u64 = 0;
-    let mut w_bg: u64 = 0;
-    let mut best_var = -1.0f64;
-    let mut best_t: u8 = 128;
-    for t in 0..256 {
-        w_bg += hist[t] as u64;
-        if w_bg == 0 {
-            continue;
-        }
-        let w_fg = total - w_bg;
-        if w_fg == 0 {
-            break;
-        }
-        sum_bg += (t as u64) * (hist[t] as u64);
-        let mean_bg = sum_bg as f64 / w_bg as f64;
-        let mean_fg = (sum_total - sum_bg) as f64 / w_fg as f64;
-        let diff = mean_bg - mean_fg;
-        let var = w_bg as f64 * w_fg as f64 * diff * diff;
-        if var > best_var {
-            best_var = var;
-            best_t = t as u8;
-        }
-    }
-    best_t
 }
 
 pub(crate) fn rgb_dist2(a: Rgba<u8>, b: Rgba<u8>) -> f32 {
@@ -1167,14 +757,5 @@ pub(crate) fn clamp_rect(rect: Rect, w: u32, h: u32) -> Option<Rect> {
         Some(out)
     } else {
         None
-    }
-}
-
-pub(crate) fn inflate_rect_xy(rect: Rect, pad_x: u32, pad_y: u32, w: u32, h: u32) -> Rect {
-    Rect {
-        left: rect.left.saturating_sub(pad_x),
-        top: rect.top.saturating_sub(pad_y),
-        right: rect.right.saturating_add(pad_x).min(w),
-        bottom: rect.bottom.saturating_add(pad_y).min(h),
     }
 }

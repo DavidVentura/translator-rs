@@ -545,6 +545,22 @@ impl TranslatorSession {
         ppocr.detect_only_image(rgb_det, crate::ppocr::PpocrProfile::Live)
     }
 
+    /// Per-box ink mattes for `boxes` against the oriented image's colour `rgb`
+    /// (the same frame matting samples from). 1:1 with `boxes`; entries are
+    /// `None` for boxes the model couldn't matte, and every entry is `None` when
+    /// no ink model is installed. `boxes` must already be in `rgb`'s coord space
+    /// (rec-scaled) so the masks register against the matting strips.
+    #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+    pub(crate) fn ppocr_ink_masks(
+        &self,
+        rgb: &image::DynamicImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<Option<image::GrayImage>>, TranslatorError> {
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        Ok(ppocr.ink_masks(rgb, boxes))
+    }
+
     /// Estimate the scene's reading-direction quadrant from a set of
     /// detections against the supplied `OrientedImage`. Wraps
     /// [`crate::live_session::estimate_canonical_quadrant`] so callers

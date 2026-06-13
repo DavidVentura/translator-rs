@@ -51,7 +51,12 @@ impl MnnSession {
     /// (e.g. the ink matte) — `Low` would route them into the slow per-tile
     /// weight-dequant GEMM that skips those paths.
     pub fn load_conv(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
-        Self::load_with_modes(model_path, intra_threads, PrecisionMode::Low, MemoryMode::High)
+        Self::load_with_modes(
+            model_path,
+            intra_threads,
+            PrecisionMode::Low,
+            MemoryMode::High,
+        )
     }
 
     pub fn load_with_modes(

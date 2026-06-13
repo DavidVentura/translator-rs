@@ -716,6 +716,7 @@ fn main() {
             keys_path: rec_latin_keys,
         }],
         2,
+        None,
     ) {
         Ok(e) => e,
         Err(err) => {
