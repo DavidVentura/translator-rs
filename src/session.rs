@@ -114,6 +114,7 @@ struct PpocrEngineKey {
     detector_path: String,
     classifier_path: Option<String>,
     textline_orientation_path: Option<String>,
+    ink_path: Option<String>,
     recognizers: Vec<(crate::catalog::PpocrScript, String, String)>,
 }
 
@@ -844,6 +845,10 @@ impl TranslatorSession {
         }
         specs.sort_by_key(|s| s.script.as_slug());
 
+        // Optional ink-matte model. Resolved via the detector pack's declared install
+        // path (not det_path.parent() — det may be a different OCR version dir).
+        let ink_path = best_present(det_pack, FileRole::INK);
+
         let key = PpocrEngineKey {
             detector_path: det_path.to_string_lossy().into_owned(),
             classifier_path: classifier_path
@@ -852,6 +857,7 @@ impl TranslatorSession {
             textline_orientation_path: textline_orientation_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            ink_path: ink_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             recognizers: specs
                 .iter()
                 .map(|s| {
@@ -870,11 +876,6 @@ impl TranslatorSession {
                 return Ok(Arc::clone(engine));
             }
         }
-        // Optional ink-matte model, shipped alongside det in the OCR model dir.
-        let ink_path = det_path
-            .parent()
-            .map(|d| d.join("ink.mnn"))
-            .filter(|p| p.exists());
         let engine = Arc::new(PpocrEngine::load(
             &det_path,
             classifier_path.as_deref(),

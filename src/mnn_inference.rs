@@ -46,6 +46,14 @@ impl MnnSession {
         )
     }
 
+    /// Load with `MemoryMode::High`: fully dequantizes quantized weights at load,
+    /// re-enabling the Strassen-1x1 / Winograd conv paths. Right for conv-only models
+    /// (e.g. the ink matte) — `Low` would route them into the slow per-tile
+    /// weight-dequant GEMM that skips those paths.
+    pub fn load_conv(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
+        Self::load_with_modes(model_path, intra_threads, PrecisionMode::Low, MemoryMode::High)
+    }
+
     pub fn load_with_modes(
         model_path: &Path,
         intra_threads: usize,

@@ -53,6 +53,7 @@ impl FileRole {
     pub const TEXTLINE_ORIENTATION: &'static str = "textlineOrientation";
     pub const RECOGNIZER: &'static str = "recognizer";
     pub const KEYS: &'static str = "keys";
+    pub const INK: &'static str = "ink";
 
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())

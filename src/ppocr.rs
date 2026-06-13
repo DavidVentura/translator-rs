@@ -233,42 +233,26 @@ pub struct PpocrDetector {
 /// present in the bucket. Input is a dewarped RGB strip; output is a 0..255 mask at the
 /// model's 48px height (width padded to a multiple of 8 for the 3-level pooling).
 pub struct PpocrInkModel {
-    session: MnnSession,
+    // One session per rayon worker so buckets run in parallel without contention (each
+    // worker indexes its own session). High-memory load dequantizes int8 weights up front
+    // so the conv-only matte uses the fast Winograd/Strassen paths, not per-tile dequant.
+    sessions: Vec<Mutex<MnnSession>>,
 }
 
 impl PpocrInkModel {
     const HEIGHT: u32 = 48;
 
     fn load(model_path: &Path) -> Result<Self, TranslatorError> {
-        Ok(Self {
-            session: MnnSession::load(model_path, 1)?,
-        })
-    }
-
-    fn mask(&self, strip: &RgbImage) -> Result<GrayImage, TranslatorError> {
-        let h = Self::HEIGHT;
-        let aspect_w = (strip.width() * h).div_ceil(strip.height().max(1)).max(16);
-        let w = aspect_w.next_multiple_of(8);
-        let resized = image::imageops::resize(strip, w, h, FilterType::Triangle);
-        let plane = (h * w) as usize;
-        let mut input = vec![0f32; 3 * plane];
-        for (i, px) in resized.pixels().enumerate() {
-            input[i] = px[0] as f32 / 255.0;
-            input[plane + i] = px[1] as f32 / 255.0;
-            input[2 * plane + i] = px[2] as f32 / 255.0;
+        // `load_conv` (MemoryMode::High) dequantizes the weight-quant model at load and
+        // runs the all-3x3 UNet through MNN's Winograd path — measured ~2x faster on
+        // device than full-int8 + sdot GEMM (Winograd wins for these small 3x3 convs).
+        // One session per rayon worker, 1 intra-thread each (intra>1 hurts tiny convs).
+        let n = rayon::current_num_threads().clamp(1, 8);
+        let mut sessions = Vec::with_capacity(n);
+        for _ in 0..n {
+            sessions.push(Mutex::new(MnnSession::load_conv(model_path, 1)?));
         }
-        let (out, _shape) = self.session.run(&input, &[1, 3, h as usize, w as usize])?;
-        let mut buf = vec![0u8; plane];
-        for (b, &logit) in buf.iter_mut().zip(out.iter()) {
-            let s = 1.0 / (1.0 + (-logit).exp());
-            *b = (s * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        GrayImage::from_raw(w, h, buf).ok_or_else(|| {
-            TranslatorError::new(
-                TranslatorErrorKind::Internal,
-                "ink mask buffer size mismatch",
-            )
-        })
+        Ok(Self { sessions })
     }
 }
 
@@ -386,19 +370,103 @@ impl PpocrEngine {
         let Some(ink) = &self.ink else {
             return boxes.iter().map(|_| None).collect();
         };
+        let h = PpocrInkModel::HEIGHT;
+        let t_pre = Instant::now();
         let rgb = image.to_rgb8();
-        boxes
-            .iter()
-            .map(|b| {
+
+        // Dewarp + resize each box to a 48px strip (width a multiple of 8), in parallel —
+        // the per-pixel warp dominates `pre` and the strips are independent.
+        let prepared: Vec<(usize, RgbImage)> = boxes
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
                 if b.contour.len() < 6 || b.contour.len() % 2 != 0 {
                     return None;
                 }
                 let contour: Vec<(f32, f32)> =
                     b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-                dewarp_contour_to_strip_rgb(&rgb, &contour, None, 0.0)
-                    .and_then(|strip| ink.mask(&strip).ok())
+                let strip = dewarp_contour_to_strip_rgb(&rgb, &contour, None, 0.0)?;
+                let aw = (strip.width() * h).div_ceil(strip.height().max(1)).max(16);
+                let w = aw.next_multiple_of(8);
+                Some((i, image::imageops::resize(&strip, w, h, FilterType::Triangle)))
             })
-            .collect()
+            .collect();
+        let pre_us = t_pre.elapsed().as_micros();
+
+        // Bucket by *exact* width (same-width strips batch into one call, no padding), then
+        // run buckets in parallel — one MNN session per rayon worker, no lock contention.
+        let mut by_width: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+        for (j, (_, r)) in prepared.iter().enumerate() {
+            by_width.entry(r.width()).or_default().push(j);
+        }
+        let buckets: Vec<(u32, Vec<usize>)> = by_width.into_iter().collect();
+        let n_batches = buckets.len();
+
+        let t_inf = Instant::now();
+        let groups: Vec<Vec<(usize, GrayImage)>> = buckets
+            .par_iter()
+            .map(|(bw, idxs)| {
+                let bw = *bw;
+                let plane = (h * bw) as usize;
+                let nb = idxs.len();
+                let mut input = vec![0f32; nb * 3 * plane];
+                for (slot, &j) in idxs.iter().enumerate() {
+                    let base = slot * 3 * plane;
+                    for (x, y, px) in prepared[j].1.enumerate_pixels() {
+                        let idx = (y * bw + x) as usize;
+                        input[base + idx] = px[0] as f32 / 255.0;
+                        input[base + plane + idx] = px[1] as f32 / 255.0;
+                        input[base + 2 * plane + idx] = px[2] as f32 / 255.0;
+                    }
+                }
+                let slot = rayon::current_thread_index().unwrap_or(0) % ink.sessions.len();
+                let run = ink.sessions[slot]
+                    .lock()
+                    .expect("ink session poisoned")
+                    .run(&input, &[nb, 3, h as usize, bw as usize]);
+                let Ok((o, _)) = run else { return Vec::new() };
+                if o.len() < nb * plane {
+                    return Vec::new();
+                }
+                idxs.iter()
+                    .enumerate()
+                    .filter_map(|(slot, &j)| {
+                        let (box_idx, tw) = (prepared[j].0, prepared[j].1.width());
+                        let obase = slot * plane;
+                        let mut buf = vec![0u8; (h * tw) as usize];
+                        for y in 0..h {
+                            for x in 0..tw {
+                                let logit = o[obase + (y * bw + x) as usize];
+                                buf[(y * tw + x) as usize] = ((1.0 / (1.0 + (-logit).exp()))
+                                    * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0)
+                                    as u8;
+                            }
+                        }
+                        GrayImage::from_raw(tw, h, buf).map(|m| (box_idx, m))
+                    })
+                    .collect()
+            })
+            .collect();
+        let inf_us = t_inf.elapsed().as_micros();
+
+        let mut out: Vec<Option<GrayImage>> = boxes.iter().map(|_| None).collect();
+        for group in groups {
+            for (box_idx, mask) in group {
+                out[box_idx] = Some(mask);
+            }
+        }
+        if !prepared.is_empty() {
+            log::info!(
+                "ppocr ink: {} strips in {n_batches} batches, {} sessions — pre={:.1}ms infer={:.1}ms",
+                prepared.len(),
+                ink.sessions.len(),
+                pre_us as f32 / 1000.0,
+                inf_us as f32 / 1000.0,
+            );
+        }
+        out
     }
 
     pub fn has_textline_orientation(&self) -> bool {

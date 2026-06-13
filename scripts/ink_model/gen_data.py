@@ -98,6 +98,43 @@ def _heavy_fonts(cjk: bool) -> tuple[str, ...]:
     return heavy or tuple(base)
 
 
+# Connected/cursive scripts the Latin+CJK set misses: Arabic (cursive, RTL), the Indic
+# scripts (Devanagari's shirorekha roof bar + conjuncts, Tamil's thick curved loops) and
+# Thai. (fc-list lang, consonant codepoint range) — sampling consonants avoids stray
+# combining marks rendering as dotted-circle. Needs PIL+raqm to shape correctly.
+SHAPED = {
+    "arabic": ("ar", 0x0627, 0x064A),
+    "devanagari": ("hi", 0x0915, 0x0939),
+    "tamil": ("ta", 0x0B95, 0x0BB9),
+    "thai": ("th", 0x0E01, 0x0E2E),
+}
+SHAPED_NAMES = tuple(SHAPED)
+
+
+@lru_cache(maxsize=len(SHAPED))
+def shaped_fonts(script: str) -> tuple[str, ...]:
+    lang = SHAPED[script][0]
+    out = subprocess.run(["fc-list", f":lang={lang}", "file"], capture_output=True,
+                         text=True, check=True).stdout
+    paths = tuple(
+        ln.split(":")[0].strip()
+        for ln in out.splitlines()
+        if ln.split(":")[0].strip().lower().endswith((".ttf", ".otf"))
+    )
+    if not paths:
+        raise RuntimeError(f"no fonts for script {script}")
+    return paths
+
+
+def shaped_text(rng: random.Random, script: str) -> str:
+    _, lo, hi = SHAPED[script]
+    parts = []
+    for _ in range(rng.randint(1, 4)):
+        n = rng.randint(2, 6)
+        parts.append("".join(chr(rng.randint(lo, hi)) for _ in range(n)))
+    return " ".join(parts)
+
+
 def cjk_text(rng: random.Random) -> str:
     lo, hi = rng.choice(CJK_BLOCKS)
     chars = []
@@ -159,18 +196,31 @@ def render_coverage(
     outlined = stroke > 0
     fill_canvas = Image.new("L", canvas.size, 0) if outlined else None
     fill_draw = ImageDraw.Draw(fill_canvas) if outlined else None
-    # Dense-script (CJK) share: thick strokes with tiny enclosed counters are the one
-    # regime Latin-only training floods (it marks the counters as ink). Real CJK
-    # glyphs teach the model to keep them open.
-    use_cjk = rng.random() < 0.25
-    heavy = rng.random() < 0.4  # bias toward heavy/black weights for superbold strokes
-    fonts = _heavy_fonts(use_cjk) if heavy else (cjk_font_paths() if use_cjk else font_paths())
+    # Script mix. CJK (dense thick strokes, tiny counters) and the shaped scripts
+    # (Arabic cursive, Devanagari roof + conjuncts, Tamil thick curves, Thai) are stroke
+    # regimes Latin alone misses; teach them directly. Shaped scripts need raqm layout.
+    r = rng.random()
+    use_cjk = r < 0.22
+    shaped = SHAPED_NAMES[rng.randrange(len(SHAPED_NAMES))] if 0.22 <= r < 0.44 else None
+    heavy = not shaped and rng.random() < 0.4  # heavy/black weights for superbold strokes
+    if shaped:
+        fonts = shaped_fonts(shaped)
+    elif heavy:
+        fonts = _heavy_fonts(use_cjk)
+    else:
+        fonts = cjk_font_paths() if use_cjk else font_paths()
+    layout = ImageFont.Layout.RAQM if shaped else ImageFont.Layout.BASIC
     for attempt in range(8):
         path = rng.choice(fonts)
         size = rng.randint(max(7, int(height * 0.45)), max(8, int(height * 0.95)))
         try:
-            font = ImageFont.truetype(path, size=size)
-            text = cjk_text(rng) if use_cjk else random_text(rng)
+            font = ImageFont.truetype(path, size=size, layout_engine=layout)
+            if shaped:
+                text = shaped_text(rng, shaped)
+            elif use_cjk:
+                text = cjk_text(rng)
+            else:
+                text = random_text(rng)
             left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
             if right - left < 8 or bottom - top < 4:
                 continue
@@ -208,7 +258,8 @@ def render_coverage(
         else:
             fill = total
     if log is not None:
-        log.update(font=os.path.basename(path), size=size, cjk=use_cjk,
+        log.update(font=os.path.basename(path), size=size,
+                   script=shaped or ("cjk" if use_cjk else "latin"),
                    heavy=heavy, stroke=stroke, thick_k=thick_k)
     return (
         total[pad : pad + height, pad : pad + width],
@@ -528,7 +579,7 @@ def main():
             f"{kk}{log[kk]}" for kk in ("blur", "downsample", "jpeg", "noise", "squeeze",
                                         "motion", "shade", "hardshadow") if kk in log)
         head = (f"{i:03d} nh{log.get('native_h')} sz{log.get('size')} k{log.get('thick_k', 0)} "
-                f"{'CJK ' if log.get('cjk') else ''}{'HVY ' if log.get('heavy') else ''}"
+                f"{log.get('script', '')} {'HVY ' if log.get('heavy') else ''}"
                 f"{log.get('bg', '')} ct{log.get('contrast', '?')}")
         d = ImageDraw.Draw(pim)
         d.text((2, 1), head, fill=(220, 0, 0))
