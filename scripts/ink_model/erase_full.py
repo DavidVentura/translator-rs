@@ -33,8 +33,9 @@ def load_coordmap(path: str) -> np.ndarray:
 
 def matte_strip(model: InkUNet, strip: np.ndarray) -> np.ndarray:
     h, w = strip.shape[:2]
-    sw = max(16, round(w * HEIGHT / h))
-    sw += (-sw) % 8
+    mult = 2 ** model.levels  # H/W must divide by 2**levels for the U-Net pooling
+    sw = max(mult, round(w * HEIGHT / h))
+    sw += (-sw) % mult
     small = np.asarray(
         Image.fromarray((strip * 255).astype(np.uint8)).resize((sw, HEIGHT), Image.BILINEAR),
         dtype=np.float32,
