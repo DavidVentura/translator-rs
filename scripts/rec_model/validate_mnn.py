@@ -70,6 +70,10 @@ for ln in lines:
     arr = np.array(ot.getData()).reshape(shp)
     arr = arr[0] if arr.ndim == 3 else arr
     pred = decode(arr)
+    # NFC + strip ZW so composed/decomposed matras and chillu (atomic vs base+ZWJ)
+    # count as equal — they are the same glyph, not a recognition error.
+    norm = lambda s: __import__("unicodedata").normalize("NFC", s).replace("‌", "").replace("‍", "")
+    pred, lab = norm(pred), norm(lab)
     exact += pred == lab
     sm = difflib.SequenceMatcher(None, lab, pred)
     den += len(lab)

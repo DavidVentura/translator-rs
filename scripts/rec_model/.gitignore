@@ -3,3 +3,10 @@
 *.pdiparams
 *.pdparams
 .venv/**
+*jpg
+*jpeg
+*png
+fonts/*
+out/*
+data/indic_eval/*
+data/indic_corpus.txt
