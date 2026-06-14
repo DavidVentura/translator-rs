@@ -42,7 +42,6 @@ use image::imageops::FilterType;
 use image::{GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 
 use crate::DetectedTextBox;
-use crate::ocr::Rect;
 
 /// Per-detection matting result. The `strip_rgba` is a rectified RGBA
 /// image where the source text has been removed and replaced with the
@@ -101,7 +100,7 @@ const MIN_BG_SAMPLES: usize = 24;
 /// strip pixels. Each tile takes the median of its non-ink pixels; the
 /// grid is then bilinearly upsampled, so this trades smoothness (larger)
 /// against following tight background detail (smaller).
-const BG_BLOCK: u32 = 10;
+pub(crate) const BG_BLOCK: u32 = 10;
 
 /// Per-box ink metadata the model mask can't give us directly: the ink
 /// class (for picking a readable translated-text colour) and a
@@ -152,6 +151,26 @@ pub fn mat_detections(
             mat_strip_for_detection(rgba, idx, b, &union_ink, w, h, ink)
         })
         .collect()
+}
+
+/// Build the image-space union ink mask for `boxes` from their model mattes —
+/// the same projection [`mat_detections`] uses internally, exposed for callers
+/// that erase in place on the full image (the still-image overlay path) rather
+/// than producing rectified strips. Row-major `y * width + x`; a pixel is set
+/// where some box's matte clears the ink-alpha cut.
+pub fn union_ink_mask(
+    rgba: &RgbaImage,
+    boxes: &[DetectedTextBox],
+    ink_masks: &[Option<GrayImage>],
+) -> Vec<bool> {
+    let (w, h) = rgba.dimensions();
+    let mut union = vec![false; (w as usize) * (h as usize)];
+    for (idx, b) in boxes.iter().enumerate() {
+        if let Some(Some(mask)) = ink_masks.get(idx) {
+            let _ = project_box_ink(rgba, b, mask, w, h, &mut union);
+        }
+    }
+    union
 }
 
 /// Project one box's model mask into the shared image-space `union_ink`
@@ -426,7 +445,7 @@ fn rgba_to_argb(c: Rgba<u8>) -> u32 {
 /// sample in dense text (a neighbouring cell almost always has one) and
 /// follows gradients smoothly, so the replacement matches a varying
 /// background instead of smearing one edge colour across the glyph.
-fn background_field(
+pub(crate) fn background_field(
     strip: &[Rgba<u8>],
     exclude: &[bool],
     w: u32,
@@ -473,11 +492,11 @@ fn background_field(
         (0..gw * gh).filter(|&i| ok[i as usize]).collect();
     while let Some(i) = queue.pop_front() {
         let (gx, gy) = (i % gw, i / gw);
-        let mut visit = |nx: u32,
-                         ny: u32,
-                         grid: &mut [[u8; 3]],
-                         filled: &mut [bool],
-                         q: &mut std::collections::VecDeque<u32>| {
+        let visit = |nx: u32,
+                     ny: u32,
+                     grid: &mut [[u8; 3]],
+                     filled: &mut [bool],
+                     q: &mut std::collections::VecDeque<u32>| {
             let ni = (ny * gw + nx) as usize;
             if !filled[ni] {
                 filled[ni] = true;
@@ -575,18 +594,4 @@ pub(crate) fn luma(c: Rgba<u8>) -> u8 {
     let g = c[1] as u32;
     let b = c[2] as u32;
     ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8
-}
-
-pub(crate) fn clamp_rect(rect: Rect, w: u32, h: u32) -> Option<Rect> {
-    let out = Rect {
-        left: rect.left.min(w),
-        top: rect.top.min(h),
-        right: rect.right.min(w),
-        bottom: rect.bottom.min(h),
-    };
-    if out.right > out.left && out.bottom > out.top {
-        Some(out)
-    } else {
-        None
-    }
 }

@@ -2147,7 +2147,10 @@ fn erase_text_region(
     image: &mut RasterImageMut,
     oriented: OrientedRect,
     background_mode: crate::BackgroundMode,
+    ink_mask: Option<&[bool]>,
 ) -> OverlayColors {
+    #[cfg(not(any(feature = "ppocr", feature = "planar-tracker")))]
+    let _ = ink_mask;
     // The oriented rect carries the same DB-unclip + DET_BOX_BORDER inflation the AABB path
     // applies (see `oriented_rect_from_contour`), so it reliably covers ascenders/descenders
     // without spilling sideways the way an AABB does for tilted lines. AutoDetect samples
@@ -2172,9 +2175,70 @@ fn erase_text_region(
             colors
         }
         crate::BackgroundMode::AutoDetect => {
+            // Sample fg/bg colours from the still-intact region first.
             let paint = autodetect_paint(&image.as_image(), aabb);
+            // When the ink model gave us a matte, erase only its ink pixels and
+            // reconstruct the background under them, instead of flat-filling the
+            // whole rect — the page texture/gradient shows through untouched.
+            #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+            if let Some(mask) = ink_mask {
+                matte_erase_oriented(image, oriented, mask);
+                return paint.colors;
+            }
             image.apply_fill_plan_oriented(oriented, paint.fill);
             paint.colors
+        }
+    }
+}
+
+/// Erase the ink pixels the model matte marked inside `oriented`'s AABB and
+/// replace them with a reconstructed background field, leaving everything else
+/// untouched. `ink_mask` is the full-image union matte (`y * width + x`).
+#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+fn matte_erase_oriented(image: &mut RasterImageMut, oriented: OrientedRect, ink_mask: &[bool]) {
+    use crate::color_matting::{BG_BLOCK, background_field, dilate};
+    use image::{Rgb, Rgba};
+
+    let Some(aabb) = clamp_rect(oriented.to_aabb(), image.width, image.height) else {
+        return;
+    };
+    let aw = aabb.right - aabb.left;
+    let ah = aabb.bottom - aabb.top;
+    if aw == 0 || ah == 0 {
+        return;
+    }
+    let w = image.width;
+    let mut pixels = vec![Rgba([0u8; 4]); (aw * ah) as usize];
+    let mut sub = vec![false; (aw * ah) as usize];
+    {
+        let view = image.as_image();
+        for ly in 0..ah {
+            for lx in 0..aw {
+                let (gx, gy) = (aabb.left + lx, aabb.top + ly);
+                let c = view.pixel_argb(gx, gy);
+                let i = (ly * aw + lx) as usize;
+                pixels[i] = Rgba([channel_r(c), channel_g(c), channel_b(c), 255]);
+                sub[i] = ink_mask[(gy * w + gx) as usize];
+            }
+        }
+    }
+
+    // Grow the fill set by a height-proportional radius so the original ink's
+    // anti-aliased rim is replaced too (the matte edge sits just inside it).
+    let fill_radius = ((oriented.height * 0.06).round() as u32).clamp(1, 6);
+    let sub = dilate(&sub, aw, ah, fill_radius);
+    let bg: Vec<Rgb<u8>> = background_field(&pixels, &sub, aw, ah, BG_BLOCK);
+
+    for ly in 0..ah {
+        for lx in 0..aw {
+            let i = (ly * aw + lx) as usize;
+            if !sub[i] {
+                continue;
+            }
+            let b = bg[i];
+            let bytes = argb(b[0], b[1], b[2]).to_ne_bytes();
+            let idx = (((aabb.top + ly) * w + (aabb.left + lx)) * 4) as usize;
+            image.rgba[idx..idx + 4].copy_from_slice(&bytes);
         }
     }
 }
@@ -2187,6 +2251,7 @@ pub fn prepare_overlay_image(
     translated_blocks: &[String],
     background_mode: crate::BackgroundMode,
     reading_order: ReadingOrder,
+    ink_mask: Option<&[bool]>,
 ) -> Result<PreparedImageOverlay, String> {
     let mut image = RasterImageMut::new(rgba_bytes, width, height)?;
     let mut prepared_blocks = Vec::with_capacity(blocks.len());
@@ -2200,7 +2265,8 @@ pub fn prepare_overlay_image(
                 let mut block_background = argb(255, 255, 255);
                 let mut block_foreground = argb(0, 0, 0);
                 for (index, line) in block.lines.iter().enumerate() {
-                    let colors = erase_text_region(&mut image, line.oriented_box, background_mode);
+                    let colors =
+                        erase_text_region(&mut image, line.oriented_box, background_mode, ink_mask);
                     if index == 0 {
                         block_background = colors.background_argb;
                         block_foreground = colors.foreground_argb;
@@ -2232,6 +2298,7 @@ pub fn prepare_overlay_image(
                     &mut image,
                     OrientedRect::axis_aligned(block_bounds),
                     background_mode,
+                    ink_mask,
                 );
                 let prepared_lines = block
                     .lines
@@ -2665,6 +2732,7 @@ mod tests {
             &translated,
             BackgroundMode::BlackOnWhite,
             ReadingOrder::LeftToRight,
+            None,
         )
         .expect("overlay should prepare");
 

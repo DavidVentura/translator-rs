@@ -136,6 +136,7 @@ pub(crate) fn translate_image_rgba_in_snapshot(
         blocks,
         background_mode,
         reading_order,
+        None,
     )
 }
 
@@ -253,6 +254,26 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
             detected
         }
     };
+
+    // Per-box ink mattes → one full-image union mask. The overlay erase replaces
+    // just the inked pixels with a reconstructed background instead of flat-filling
+    // each line's rect. `None` when no ink model is installed → flat-fill fallback.
+    let ink_union = if ppocr.has_ink() {
+        match image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec()) {
+            Some(rgba) => {
+                let dynimg = image::DynamicImage::ImageRgba8(rgba);
+                let masks = ppocr.ink_masks(&dynimg, &det_boxes);
+                let rgba = dynimg.as_rgba8().expect("rgba8");
+                Some(crate::color_matting::union_ink_mask(
+                    rgba, &det_boxes, &masks,
+                ))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     finalize_image_overlay(
         engine,
         snapshot,
@@ -264,6 +285,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         blocks,
         background_mode,
         reading_order,
+        ink_union.as_deref(),
     )
 }
 
@@ -655,6 +677,7 @@ fn finalize_image_overlay(
     blocks: Vec<TextBlock>,
     background_mode: BackgroundMode,
     reading_order: ReadingOrder,
+    ink_mask: Option<&[bool]>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
     let t_translate = std::time::Instant::now();
     let translated_blocks = {
@@ -678,6 +701,7 @@ fn finalize_image_overlay(
         &translated_blocks,
         background_mode,
         reading_order,
+        ink_mask,
     )
     .map_err(TranslatorError::ocr);
     let overlay_ms = t_overlay.elapsed().as_secs_f32() * 1000.0;
