@@ -6,12 +6,11 @@
 //!
 //! ## Why a rectified strip
 //!
-//! The inpaint operates in **rectified strip coordinates**, where the
-//! text runs strictly left-to-right inside an axis-aligned bitmap.
-//! Column-wise inpaint assumes glyphs are bounded vertically per
-//! column with a contiguous masked region between non-ink pixels — an
-//! assumption that breaks on any tilted text. Dewarping into rectified
-//! coords first restores the assumption.
+//! The strip is built in **rectified coordinates**, axis-aligned to the
+//! detection's oriented box. That is the frame the GPU compositor warps
+//! back per-frame, and it matches the frame the ink model's matte was
+//! rendered in, so the matte registers onto the strip without a separate
+//! reprojection.
 //!
 //! At acquire time, the `MattedStrip` produced here feeds the GPU overlay
 //! compositor: its color drives the pill, and the GPU warps the baked overlay
@@ -32,13 +31,15 @@
 //! 4. Dewarp the camera + union ink mask into a rectified strip aligned
 //!    to the oriented box, growing the fill mask by a height-proportional
 //!    radius so the original ink's anti-aliased rim is erased too.
-//! 5. Inpaint masked pixels in the strip via 4-direction nearest-non-ink
-//!    blend with outlier rejection + smoothing passes.
+//! 5. Replace the masked pixels with a block-median background field
+//!    (`background_field`): smooth, gradient-following, and robust in
+//!    dense text where a directional inpaint can't find clean samples.
 //!
 //! Output: rectified RGBA strip + the oriented-box parameters
 //! needed to re-warp it back to canonical-frame coords.
 
-use image::{GrayImage, Rgba, RgbaImage};
+use image::imageops::FilterType;
+use image::{GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 
 use crate::DetectedTextBox;
 use crate::ocr::Rect;
@@ -85,35 +86,10 @@ pub struct MattedStrip {
     pub bg_uniform_argb: Option<u32>,
 }
 
-/// Tuning knobs for the matting algorithm. Defaults match the values
-/// the smoke test settled on.
-#[derive(Clone, Copy, Debug)]
-pub struct MattingConfig {
-    /// Maximum search distance for nearest-non-ink samples during
-    /// inpaint, in rectified-strip pixels.
-    pub inpaint_max_search: u32,
-    /// Number of post-pass smoothing iterations over masked pixels.
-    /// Kills 4-direction axis-aligned banding artefacts.
-    pub inpaint_smoothing_passes: u32,
-    /// Dilate the ink mask by this radius before inpainting. Catches
-    /// glyph anti-aliased rim pixels that the hysteresis flood missed.
-    pub inpaint_sample_radius: u32,
-}
-
-impl Default for MattingConfig {
-    fn default() -> Self {
-        Self {
-            inpaint_max_search: 40,
-            inpaint_smoothing_passes: 1,
-            inpaint_sample_radius: 2,
-        }
-    }
-}
-
 /// Confidence above which a model ink-mask pixel is treated as ink (to
-/// erase). The model emits a soft 0..255 alpha; the inpaint then dilates
-/// by `inpaint_sample_radius` to catch the anti-aliased rim, so a
-/// mid-grey cut is enough without bleeding into the background.
+/// erase). The model emits a soft 0..255 alpha; the fill mask is then
+/// grown by a height-proportional radius to catch the anti-aliased rim,
+/// so a low cut is enough without bleeding into the background.
 const INK_ALPHA_CUT: u8 = 40;
 /// Minimum ink pixels in a strip to bother matting it. Below this the
 /// model found essentially no ink in the box — return `None` and let the
@@ -121,6 +97,11 @@ const INK_ALPHA_CUT: u8 = 40;
 const MIN_INK_PIXELS: usize = 6;
 /// Minimum background samples needed before judging the bg "uniform".
 const MIN_BG_SAMPLES: usize = 24;
+/// Side of the square tiles the background field is reconstructed on, in
+/// strip pixels. Each tile takes the median of its non-ink pixels; the
+/// grid is then bilinearly upsampled, so this trades smoothness (larger)
+/// against following tight background detail (smaller).
+const BG_BLOCK: u32 = 10;
 
 /// Per-box ink metadata the model mask can't give us directly: the ink
 /// class (for picking a readable translated-text colour) and a
@@ -152,17 +133,6 @@ pub fn mat_detections(
     boxes: &[DetectedTextBox],
     ink_masks: &[Option<GrayImage>],
 ) -> Vec<Option<MattedStrip>> {
-    mat_detections_with_config(rgba, boxes, ink_masks, &MattingConfig::default())
-}
-
-/// Like [`mat_detections`] but with explicit tuning. Mostly useful for
-/// tests/benches.
-pub fn mat_detections_with_config(
-    rgba: &RgbaImage,
-    boxes: &[DetectedTextBox],
-    ink_masks: &[Option<GrayImage>],
-    cfg: &MattingConfig,
-) -> Vec<Option<MattedStrip>> {
     let (w, h) = rgba.dimensions();
     let mut union_ink = vec![false; (w as usize) * (h as usize)];
     let mut meta: Vec<Option<BoxInk>> = Vec::with_capacity(boxes.len());
@@ -179,7 +149,7 @@ pub fn mat_detections_with_config(
         .enumerate()
         .map(|(idx, b)| {
             let ink = meta[idx]?;
-            mat_strip_for_detection(rgba, idx, b, &union_ink, w, h, ink, cfg)
+            mat_strip_for_detection(rgba, idx, b, &union_ink, w, h, ink)
         })
         .collect()
 }
@@ -290,7 +260,6 @@ fn mat_strip_for_detection(
     w: u32,
     h: u32,
     ink: BoxInk,
-    cfg: &MattingConfig,
 ) -> Option<MattedStrip> {
     let oriented = detected.oriented_box;
     if oriented.width <= 1.0 || oriented.height <= 1.0 {
@@ -334,26 +303,23 @@ fn mat_strip_for_detection(
     // The model mask is glyph-tight and sampled at 48px, so on large
     // glyphs its upscaled edge sits inside the original ink's anti-aliased
     // rim. Grow the *fill* region by a height-proportional radius so that
-    // rim is inpainted too, instead of surviving as a faint outline.
+    // rim is replaced too, instead of surviving as a faint outline.
     let fill_radius = ((oriented.height * 0.06).round() as u32).clamp(1, 6);
     let strip_mask = dilate(&strip_mask, strip_w, strip_h, fill_radius);
-    let strip_out = inpaint_native(
-        &strip_image,
-        &strip_mask,
-        strip_w,
-        strip_h,
-        cfg.inpaint_max_search,
-        cfg.inpaint_sample_radius,
-        cfg.inpaint_smoothing_passes,
-    );
 
-    // Pack into a flat RGBA byte buffer for the bindings/compositor.
-    let mut strip_bytes = Vec::with_capacity(strip_out.len() * 4);
-    for px in &strip_out {
-        strip_bytes.push(px[0]);
-        strip_bytes.push(px[1]);
-        strip_bytes.push(px[2]);
-        strip_bytes.push(px[3]);
+    // Reconstruct the background as a smooth low-frequency field
+    // (block-median over non-ink pixels, nearest-fill, bilinear upsample),
+    // then replace the masked pixels with it. Robust where a directional
+    // inpaint walk fails: gradients (the field follows them) and dense
+    // text (a block almost always has some non-ink pixel nearby).
+    let bg = background_field(&strip_image, &strip_mask, strip_w, strip_h, BG_BLOCK);
+    let mut strip_bytes = Vec::with_capacity((strip_w * strip_h * 4) as usize);
+    for (px, (m, b)) in strip_image.iter().zip(strip_mask.iter().zip(bg.iter())) {
+        if *m {
+            strip_bytes.extend_from_slice(&[b[0], b[1], b[2], 255]);
+        } else {
+            strip_bytes.extend_from_slice(&[px[0], px[1], px[2], px[3]]);
+        }
     }
 
     Some(MattedStrip {
@@ -449,223 +415,95 @@ fn rgba_to_argb(c: Rgba<u8>) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
 }
 
-/// 4-direction nearest-non-ink inpaint with median outlier rejection
-/// and post-pass smoothing. Sees the same `(image, mask)` shape as the
-/// rest of the matting code so it can be reused on dewarped strips
-/// (the path `mat_strip_for_detection` takes) or, in principle, on
-/// canonical-frame coords directly (the legacy path the smoke test
-/// also tries).
+/// Reconstruct the background under the ink as a smooth low-frequency
+/// field. Tile the strip into `block`-px cells; each cell with enough
+/// non-`exclude` (background) pixels takes their per-channel median.
+/// Cells with too few background pixels (fully inside thick ink) are
+/// filled from the nearest populated cell via a multi-source BFS, then
+/// the coarse grid is bilinearly upsampled to full strip resolution.
 ///
-/// - `max_search`: cut sample propagation off after this many pixels
-///   along an axis. Beyond this, the direction reports "no sample"
-///   so the median is computed from the remaining directions only.
-/// - `sample_radius`: dilate the mask before walking so rim
-///   anti-aliased pixels don't get selected as bg samples.
-/// - `smoothing_passes`: N×3 box blur over masked pixels only. Kills
-///   axis-aligned banding from the 4-direction walk.
-pub(crate) fn inpaint_native(
-    image: &[Rgba<u8>],
-    mask: &[bool],
+/// Unlike a directional nearest-non-ink walk, this never fails to find a
+/// sample in dense text (a neighbouring cell almost always has one) and
+/// follows gradients smoothly, so the replacement matches a varying
+/// background instead of smearing one edge colour across the glyph.
+fn background_field(
+    strip: &[Rgba<u8>],
+    exclude: &[bool],
     w: u32,
     h: u32,
-    max_search: u32,
-    sample_radius: u32,
-    smoothing_passes: u32,
-) -> Vec<Rgba<u8>> {
+    block: u32,
+) -> Vec<Rgb<u8>> {
+    let gw = w.div_ceil(block);
+    let gh = h.div_ceil(block);
     let w_us = w as usize;
-    let h_us = h as usize;
-    let n = w_us * h_us;
-    let sample_mask = dilate(mask, w, h, sample_radius);
-    let mask_for_walk = sample_mask.as_slice();
+    let mut grid = vec![[0u8; 3]; (gw * gh) as usize];
+    let mut ok = vec![false; (gw * gh) as usize];
 
-    let mut up = vec![(u32::MAX, Rgba([0u8; 4])); n];
-    let mut down = vec![(u32::MAX, Rgba([0u8; 4])); n];
-    let mut left = vec![(u32::MAX, Rgba([0u8; 4])); n];
-    let mut right = vec![(u32::MAX, Rgba([0u8; 4])); n];
-
-    let mut row_has_mask = vec![false; h_us];
-    for y in 0..h_us {
-        let row = y * w_us;
-        for x in 0..w_us {
-            if mask_for_walk[row + x] {
-                row_has_mask[y] = true;
-                break;
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let mut cell: Vec<Rgba<u8>> = Vec::new();
+            for yy in (gy * block)..((gy + 1) * block).min(h) {
+                for xx in (gx * block)..((gx + 1) * block).min(w) {
+                    let i = (yy as usize) * w_us + xx as usize;
+                    if !exclude[i] {
+                        cell.push(strip[i]);
+                    }
+                }
+            }
+            if cell.len() >= 4 {
+                let m = median_color(&cell);
+                let gi = (gy * gw + gx) as usize;
+                grid[gi] = [m[0], m[1], m[2]];
+                ok[gi] = true;
             }
         }
     }
 
-    for x in 0..w {
-        let mut state: (u32, Rgba<u8>) = (u32::MAX, Rgba([0; 4]));
-        for y in 0..h {
-            let idx = (y as usize) * w_us + x as usize;
-            if mask_for_walk[idx] {
-                if state.0 != u32::MAX {
-                    state.0 = state.0.saturating_add(1);
-                    if state.0 > max_search {
-                        state.0 = u32::MAX;
-                    }
-                }
-            } else {
-                state = (0, image[idx]);
-            }
-            up[idx] = state;
-        }
-        state = (u32::MAX, Rgba([0; 4]));
-        for y in (0..h).rev() {
-            let idx = (y as usize) * w_us + x as usize;
-            if mask_for_walk[idx] {
-                if state.0 != u32::MAX {
-                    state.0 = state.0.saturating_add(1);
-                    if state.0 > max_search {
-                        state.0 = u32::MAX;
-                    }
-                }
-            } else {
-                state = (0, image[idx]);
-            }
-            down[idx] = state;
-        }
+    if !ok.iter().any(|&b| b) {
+        // Whole strip is ink: fall back to the median of every pixel.
+        let all: Vec<Rgba<u8>> = strip.to_vec();
+        let m = median_color(&all);
+        return vec![Rgb([m[0], m[1], m[2]]); (w * h) as usize];
     }
-    for y in 0..h_us {
-        if !row_has_mask[y] {
-            continue;
-        }
-        let mut state: (u32, Rgba<u8>) = (u32::MAX, Rgba([0; 4]));
-        for x in 0..w_us {
-            let idx = y * w_us + x;
-            if mask_for_walk[idx] {
-                if state.0 != u32::MAX {
-                    state.0 = state.0.saturating_add(1);
-                    if state.0 > max_search {
-                        state.0 = u32::MAX;
-                    }
-                }
-            } else {
-                state = (0, image[idx]);
+
+    // Multi-source BFS from populated cells: each empty cell inherits the
+    // colour of the nearest populated one.
+    let mut filled = ok.clone();
+    let mut queue: std::collections::VecDeque<u32> =
+        (0..gw * gh).filter(|&i| ok[i as usize]).collect();
+    while let Some(i) = queue.pop_front() {
+        let (gx, gy) = (i % gw, i / gw);
+        let mut visit = |nx: u32,
+                         ny: u32,
+                         grid: &mut [[u8; 3]],
+                         filled: &mut [bool],
+                         q: &mut std::collections::VecDeque<u32>| {
+            let ni = (ny * gw + nx) as usize;
+            if !filled[ni] {
+                filled[ni] = true;
+                grid[ni] = grid[i as usize];
+                q.push_back(ny * gw + nx);
             }
-            left[idx] = state;
+        };
+        if gx > 0 {
+            visit(gx - 1, gy, &mut grid, &mut filled, &mut queue);
         }
-        state = (u32::MAX, Rgba([0; 4]));
-        for x in (0..w_us).rev() {
-            let idx = y * w_us + x;
-            if mask_for_walk[idx] {
-                if state.0 != u32::MAX {
-                    state.0 = state.0.saturating_add(1);
-                    if state.0 > max_search {
-                        state.0 = u32::MAX;
-                    }
-                }
-            } else {
-                state = (0, image[idx]);
-            }
-            right[idx] = state;
+        if gx + 1 < gw {
+            visit(gx + 1, gy, &mut grid, &mut filled, &mut queue);
+        }
+        if gy > 0 {
+            visit(gx, gy - 1, &mut grid, &mut filled, &mut queue);
+        }
+        if gy + 1 < gh {
+            visit(gx, gy + 1, &mut grid, &mut filled, &mut queue);
         }
     }
 
-    let mut out = image.to_vec();
-    let outlier_thr = 35.0f32 * 35.0;
-    for y in 0..h_us {
-        if !row_has_mask[y] {
-            continue;
-        }
-        for x in 0..w_us {
-            let idx = y * w_us + x;
-            if !mask[idx] {
-                continue;
-            }
-            let raw = [up[idx], down[idx], left[idx], right[idx]];
-            let mut count = 0usize;
-            let mut rs = [0u8; 4];
-            let mut gs = [0u8; 4];
-            let mut bs = [0u8; 4];
-            for &(d, c) in &raw {
-                if d == u32::MAX {
-                    continue;
-                }
-                rs[count] = c[0];
-                gs[count] = c[1];
-                bs[count] = c[2];
-                count += 1;
-            }
-            if count == 0 {
-                continue;
-            }
-            rs[..count].sort_unstable();
-            gs[..count].sort_unstable();
-            bs[..count].sort_unstable();
-            let median = Rgba([rs[count / 2], gs[count / 2], bs[count / 2], 255]);
-
-            let mut wsum = 0.0f32;
-            let mut rsum = 0.0f32;
-            let mut gsum = 0.0f32;
-            let mut bsum = 0.0f32;
-            for &(d, c) in &raw {
-                if d == u32::MAX {
-                    continue;
-                }
-                if rgb_dist2(c, median) > outlier_thr {
-                    continue;
-                }
-                let weight = 1.0 / (d as f32 + 1.0);
-                wsum += weight;
-                rsum += weight * c[0] as f32;
-                gsum += weight * c[1] as f32;
-                bsum += weight * c[2] as f32;
-            }
-            out[idx] = if wsum == 0.0 {
-                median
-            } else {
-                Rgba([
-                    (rsum / wsum).round().clamp(0.0, 255.0) as u8,
-                    (gsum / wsum).round().clamp(0.0, 255.0) as u8,
-                    (bsum / wsum).round().clamp(0.0, 255.0) as u8,
-                    255,
-                ])
-            };
-        }
-    }
-
-    let mut updates: Vec<(usize, Rgba<u8>)> = Vec::new();
-    for _ in 0..smoothing_passes {
-        updates.clear();
-        for y in 0..h_us {
-            if !row_has_mask[y] {
-                continue;
-            }
-            for x in 0..w_us {
-                let idx = y * w_us + x;
-                if !mask[idx] {
-                    continue;
-                }
-                let x0 = x.saturating_sub(1);
-                let y0 = y.saturating_sub(1);
-                let x1 = (x + 1).min(w_us - 1);
-                let y1 = (y + 1).min(h_us - 1);
-                let mut r = 0u32;
-                let mut g = 0u32;
-                let mut b = 0u32;
-                let mut cnt = 0u32;
-                for yy in y0..=y1 {
-                    let row = yy * w_us;
-                    for xx in x0..=x1 {
-                        let p = out[row + xx];
-                        r += p[0] as u32;
-                        g += p[1] as u32;
-                        b += p[2] as u32;
-                        cnt += 1;
-                    }
-                }
-                updates.push((
-                    idx,
-                    Rgba([(r / cnt) as u8, (g / cnt) as u8, (b / cnt) as u8, 255]),
-                ));
-            }
-        }
-        for (idx, p) in updates.iter() {
-            out[*idx] = *p;
-        }
-    }
-    out
+    let small = RgbImage::from_fn(gw, gh, |x, y| Rgb(grid[(y * gw + x) as usize]));
+    image::imageops::resize(&small, w, h, FilterType::Triangle)
+        .pixels()
+        .copied()
+        .collect()
 }
 
 pub(crate) fn dilate(mask: &[bool], w: u32, h: u32, radius: u32) -> Vec<bool> {
@@ -737,13 +575,6 @@ pub(crate) fn luma(c: Rgba<u8>) -> u8 {
     let g = c[1] as u32;
     let b = c[2] as u32;
     ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8
-}
-
-pub(crate) fn rgb_dist2(a: Rgba<u8>, b: Rgba<u8>) -> f32 {
-    let dr = a[0] as f32 - b[0] as f32;
-    let dg = a[1] as f32 - b[1] as f32;
-    let db = a[2] as f32 - b[2] as f32;
-    dr * dr + dg * dg + db * db
 }
 
 pub(crate) fn clamp_rect(rect: Rect, w: u32, h: u32) -> Option<Rect> {
