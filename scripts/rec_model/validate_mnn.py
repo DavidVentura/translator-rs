@@ -71,8 +71,18 @@ for ln in lines:
     arr = arr[0] if arr.ndim == 3 else arr
     pred = decode(arr)
     # NFC + strip ZW so composed/decomposed matras and chillu (atomic vs base+ZWJ)
-    # count as equal — they are the same glyph, not a recognition error.
-    norm = lambda s: __import__("unicodedata").normalize("NFC", s).replace("‌", "").replace("‍", "")
+    # count as equal. NFC composes the Bengali two-part o/au matras, but Gujarati ો/ૌ
+    # (0ACB/0ACC) have NO canonical decomposition, so fold ે+ા->ો, ૈ+ા->ૌ by hand.
+    # Malayalam atomic chillu (0D7A-0D7F) == base consonant + virama (the model emits
+    # atomic, GT uses the sequence). Fold atomic -> sequence so they compare equal.
+    CHILLU = {"ൺ": "ണ്", "ൻ": "ന്", "ർ": "ര്", "ൽ": "ല്", "ൾ": "ള്", "ൿ": "ക്"}
+
+    def norm(s):
+        s = __import__("unicodedata").normalize("NFC", s).replace("‌", "").replace("‍", "")
+        s = s.replace("ેા", "ો").replace("ૈા", "ૌ")
+        for a, b in CHILLU.items():
+            s = s.replace(a, b)
+        return s
     pred, lab = norm(pred), norm(lab)
     exact += pred == lab
     sm = difflib.SequenceMatcher(None, lab, pred)

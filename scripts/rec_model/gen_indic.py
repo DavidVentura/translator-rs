@@ -18,6 +18,28 @@ import random
 
 import recgen
 
+# TODO (v3 — only if tightening Indic real-world accuracy further):
+# Real-data eval (data/indic_eval/* + data/{gujarati,malayalam}*sign*) was strong:
+# Kannada 0.21%, Bengali 1.1%, Malayalam 3.9% (crops) / perfect on signs, Gujarati
+# good on modern signs. Residual polish items seen on real photos:
+#  1. Gujarati rakar conjunct ્ર dropped (ત્ર -> તર, સ્ટ્રી -> સ્ટી). Likely under-
+#     represented in corpus spans / the conjunct renders subtly. Upweight rakar/
+#     conjunct-heavy words, or add fonts where rakar is more distinct.
+#  2. o/i and a/aa matra confusion (Gujarati આરોગ્ય -> આરીગ્ય; Malayalam dropped ൈ).
+#     Targeted matra-minimal-pair augmentation (cf. the Hebrew confusable approach).
+#  3. Old-letterpress Gujarati books (Mozhi) are OOD (20% CER) — out of the live/
+#     modern use case. Only chase if old-print Gujarati matters: needs letterpress-
+#     style fonts (scarce) or much heavier ink-spread degradation.
+#  4. Malayalam emits atomic chillu (ർ); GT sources vary (base+virama+ZWJ). Fine for
+#     us, but if a downstream consumer wants one form, normalize in ppocr.rs.
+#  5. BOLD/DISPLAY signage headers are the main real-world gap (all scripts): big
+#     stylized shop-sign titles garble (malayalam-sign-2 മലബാർ/അവിൽ മിൽക്ക്), while
+#     normal-weight text on the same sign reads perfectly. Same signature as Hebrew
+#     banners. Fix = add real heavy/display fonts (the harvested GF set is mostly
+#     text weights) — NOT stroke dilation (that regressed Hebrew round 3).
+# Perf: ext_data_num is 0 in the configs now (RecConAug was the CPU bottleneck on the
+# ~15-core vast container; our gen already supplies length/combination variety).
+
 LATIN = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DIGITS = "0123456789"
 PUNCT = " .,:;!?'\"()[]/%-+&@#।॥"  # incl. Indic danda + double danda (shared sentence terminators)

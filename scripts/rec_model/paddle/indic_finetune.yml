@@ -95,7 +95,7 @@ Train:
         channel_first: false
     - RecConAug:
         prob: 0.5
-        ext_data_num: 2
+        ext_data_num: 0
         image_shape: [48, 320, 3]
         max_text_length: *max_text_length
     - RecAug:

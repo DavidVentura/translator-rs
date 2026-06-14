@@ -4,7 +4,10 @@
 *.pdparams
 .venv/**
 *jpg
+*JPG
+*avif
 *jpeg
+*webp
 *png
 fonts/*
 out/*
