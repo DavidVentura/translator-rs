@@ -23,6 +23,9 @@ PRETRAINED_URL="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pret
 N_WORKERS=${N_WORKERS:-20}                   # parallel generator processes
 N_PER=${N_PER:-15000}                        # lines per worker (20*15000 = 300K)
 VAL_N=${VAL_N:-8000}
+# Non-text negatives default OFF: the confidence gate already cleanly separates
+# garbage (<=0.6) from real text (>=0.93). Set NEG_FRAC>0 only to A/B the gate.
+NEG_FRAC=${NEG_FRAC:-0}                        # fraction of non-text negatives in TRAIN (empty labels)
 EPOCHS=${EPOCHS:-20}
 BS=${BS:-256}
 
@@ -31,8 +34,11 @@ rm -rf /root/.cache/uv /root/.cache/pip /root/.cache/huggingface /root/.cache/to
 df -h / | tail -1
 
 echo "=== [2/6] paddlepaddle-gpu (cu129, runs on Blackwell) + GPU smoke test ==="
+if ! python3 -m pip --version >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y -qq python3-pip
+fi
 if ! python3 -c "import paddle" 2>/dev/null; then
-  pip3 install --no-cache-dir "paddlepaddle-gpu==3.2.0" -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+  python3 -m pip install --no-cache-dir "paddlepaddle-gpu==3.2.0" -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
 fi
 python3 - <<'PY'
 import paddle
@@ -41,10 +47,28 @@ z = paddle.matmul(paddle.randn([1024, 1024]), paddle.randn([1024, 1024]))
 print("paddle", paddle.__version__, "GPU matmul ok on", str(z.place))
 PY
 
-echo "=== [3/6] system libs for opencv + PaddleOCR repo + rec/gen python deps ==="
-apt-get update -qq && apt-get install -y -qq libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1
+echo "=== [3/6] system libs for opencv + Hebrew book/serif fonts + repo + python deps ==="
+apt-get update -qq
+# fontconfig is REQUIRED (gen_hebrew uses fc-list); bare images may lack it.
+apt-get install -y -qq fontconfig libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1
+# fonts-noto-core = reliable Hebrew baseline (Noto Sans/Serif Hebrew). fonts-culmus
+# = classic faces (David CLM, Frank Ruehl CLM, ...) + fonts-sil-ezra serif, the
+# round-2 fix for confusable letter pairs. Fonts live in 'universe'; enable it and
+# install best-effort so a missing package never halts the run.
+apt-get install -y -qq software-properties-common 2>/dev/null || true
+add-apt-repository -y universe 2>/dev/null || true
+apt-get update -qq || true
+apt-get install -y -qq fonts-noto-core fonts-culmus fonts-sil-ezra || echo "WARN: some Hebrew font packages unavailable"
+fc-cache -f >/dev/null 2>&1 || true
+nheb=$(fc-list :lang=he | wc -l)
+echo "hebrew fonts available: $nheb"
+[ "$nheb" -gt 0 ] || { echo "FATAL: no Hebrew fonts; generation would hang"; exit 1; }
 [ -d "$PADDLEOCR_DIR" ] || git clone --depth 1 -q https://github.com/PaddlePaddle/PaddleOCR.git "$PADDLEOCR_DIR"
-pip3 install --no-cache-dir -q -r "$PADDLEOCR_DIR/requirements.txt" uharfbuzz python-bidi freetype-py
+# Keep the empty-label negatives: BaseRecLabelEncode drops len-0 labels by default
+# (label_ops.py: "if len(text) == 0 or ..."). A len-0 CTC target (all blank) is valid.
+sed -i 's/if len(text) == 0 or len(text) > self.max_text_len:/if len(text) > self.max_text_len:/' \
+  "$PADDLEOCR_DIR/ppocr/data/imaug/label_ops.py"
+python3 -m pip install --no-cache-dir -q -r "$PADDLEOCR_DIR/requirements.txt" uharfbuzz python-bidi freetype-py
 
 echo "=== [4/6] pretrained v6 small weights ==="
 mkdir -p "$REC_DIR/pretrain"
@@ -56,8 +80,9 @@ cd "$REC_DIR"
 [ -f hebrew_corpus.txt ] || python3 prep_hebrew_corpus.py --download --out hebrew_corpus.txt
 rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR/images"
 for k in $(seq 0 $((N_WORKERS-1))); do
-  python3 gen_hebrew.py --out "$DATA_DIR" --n "$N_PER" --seed "$k" --prefix "w$k" --corpus hebrew_corpus.txt >/dev/null 2>&1 &
+  python3 gen_hebrew.py --out "$DATA_DIR" --n "$N_PER" --seed "$k" --prefix "w$k" --corpus hebrew_corpus.txt --neg-frac "$NEG_FRAC" >/dev/null 2>&1 &
 done
+# val stays text-only so the acc metric is meaningful (empty-label CTC eval is ill-defined).
 python3 gen_hebrew.py --out "$DATA_DIR" --n "$VAL_N" --seed 1000 --prefix val --corpus hebrew_corpus.txt >/dev/null 2>&1 &
 wait
 cat "$DATA_DIR"/labels_w*.txt > "$DATA_DIR/train_list.txt"
@@ -65,6 +90,10 @@ cat "$DATA_DIR"/labels_val*.txt > "$DATA_DIR/val_list.txt"
 echo "train=$(wc -l < "$DATA_DIR/train_list.txt") val=$(wc -l < "$DATA_DIR/val_list.txt")"
 
 echo "=== [6/6] fine-tune (detached; tail /root/rec/train.log) ==="
+# NOTE: PaddleOCR's BaseRecLabelEncode returns None for empty labels, so the
+# dataset SILENTLY DROPS the negative (empty-label) samples. Before trusting
+# NEG_FRAC, verify negatives survive — grep the loaded sample count, or patch
+# ppocr/data/imaug/label_ops.py to keep len-0 labels (CTC all-blank target is valid).
 cd "$PADDLEOCR_DIR"
 nohup python3 tools/train.py -c "$CONFIG" \
   -o Global.epoch_num="$EPOCHS" Global.save_epoch_step=5 \

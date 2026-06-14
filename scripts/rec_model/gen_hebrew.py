@@ -153,12 +153,14 @@ def _gen_number(rng: random.Random) -> str:
     return str(rng.randint(0, 999999))
 
 
-def shape_render(visual: str, font_path: str, px: int) -> np.ndarray | None:
+def shape_render(visual: str, font_path: str, px: int, rng: random.Random | None = None) -> np.ndarray | None:
     """Coverage (H x W float 0..1) for the already-visual-order string, or None on tofu.
 
     Shapes LTR with HarfBuzz (the string is pre-reordered) and rasterizes each
     glyph with FreeType at the shaped pen positions. Returns None if any glyph is
-    .notdef so the caller can retry with another font/text.
+    .notdef so the caller can retry with another font/text. When `rng` is given,
+    inter-word gaps are jittered (justified print has variable spacing) while the
+    label keeps single spaces, so the model learns "wide gap -> one space".
     """
     hbfont = _hb_font(font_path)
     hbfont.scale = (px * 64, px * 64)
@@ -170,17 +172,23 @@ def shape_render(visual: str, font_path: str, px: int) -> np.ndarray | None:
     infos, poss = buf.glyph_infos, buf.glyph_positions
     if any(i.codepoint == 0 for i in infos):
         return None
+    # Per-glyph advances, with space gaps widened/narrowed when rng is given.
+    advances = []
+    for info, pos in zip(infos, poss):
+        adv = pos.x_advance
+        if rng is not None and visual[info.cluster] == " ":
+            adv = int(adv * rng.uniform(0.7, 2.4))
+        advances.append(adv)
 
     ft = _ft_face(font_path)
     ft.set_pixel_sizes(0, px)
-    total_adv = sum(p.x_advance for p in poss) // 64
     pad = max(4, px // 6)
-    width = total_adv + 2 * pad
+    width = sum(advances) // 64 + 2 * pad
     height = int(px * 1.7)
     baseline = int(px * 1.3)
     canvas = np.zeros((height, width), np.float32)
     x = pad * 64
-    for info, pos in zip(infos, poss):
+    for info, pos, adv in zip(infos, poss, advances):
         ft.load_glyph(info.codepoint, freetype.FT_LOAD_RENDER)
         bm = ft.glyph.bitmap
         gw, gh = bm.width, bm.rows
@@ -193,7 +201,10 @@ def shape_render(visual: str, font_path: str, px: int) -> np.ndarray | None:
             if y1 > y0 and x1 > x0:
                 sub = glyph[y0 - gy : y1 - gy, x0 - gx : x1 - gx]
                 canvas[y0:y1, x0:x1] = np.maximum(canvas[y0:y1, x0:x1], sub)
-        x += pos.x_advance
+        x += adv
+    # NB: synthetic bold via MaxFilter dilation was tried (round 3) and REGRESSED the
+    # model — dilation distorts glyph geometry (מ -> read as ק/ז), unlike real bold
+    # fonts. For heavy-weight robustness use actual bold font files, not dilation.
     rows = np.where(canvas.max(axis=1) > 0.05)[0]
     cols = np.where(canvas.max(axis=0) > 0.05)[0]
     if rows.size < 4 or cols.size < 4:
@@ -205,6 +216,12 @@ def shape_render(visual: str, font_path: str, px: int) -> np.ndarray | None:
 
 
 def random_color(rng: random.Random) -> np.ndarray:
+    if rng.random() < 0.22:
+        # Saturated banner color (one channel high, others low) — news/sign banners
+        # are white-bold on saturated red/blue/green, a regime uniform color misses.
+        c = [rng.uniform(0.0, 0.22) for _ in range(3)]
+        c[rng.randrange(3)] = rng.uniform(0.55, 1.0)
+        return np.array(c, dtype=np.float32)
     return np.array([rng.random(), rng.random(), rng.random()], dtype=np.float32)
 
 
@@ -276,8 +293,62 @@ def compose(rng: random.Random, cov: np.ndarray, native_h: int) -> np.ndarray:
     return degrade(img, rng, native_h)
 
 
-def sample(rng: random.Random, corpus: list[str]) -> tuple[np.ndarray, str] | None:
-    """One (H=48 RGB uint8, visual-order label) pair, or None after retries."""
+def make_negative(rng: random.Random, corpus: list[str]) -> np.ndarray:
+    """A non-text strip with an EMPTY label: what the detector wrongly grabs.
+
+    Without these the recognizer hallucinates Hebrew on logos/icons/partial lines
+    at moderate confidence, defeating the score gate. Two regimes: background plus
+    random non-text marks (lines/rects/ellipses), and a clipped-glyph sliver (a
+    real line cropped to a thin band so glyphs are unreadable).
+    """
+    h, w = rng.randint(22, 60), rng.randint(48, 320)
+    if rng.random() < 0.5:
+        pim = Image.fromarray((background(rng, h, w) * 255).astype(np.uint8))
+        draw = ImageDraw.Draw(pim)
+        for _ in range(rng.randint(1, 7)):
+            c = tuple(int(v * 255) for v in random_color(rng))
+            shape, wd = rng.random(), rng.randint(1, 4)
+            if shape < 0.5:
+                draw.line([rng.randint(0, w), rng.randint(0, h), rng.randint(0, w), rng.randint(0, h)], fill=c, width=wd)
+            elif shape < 0.8:
+                xs, ys = sorted(rng.randint(0, w) for _ in range(2)), sorted(rng.randint(0, h) for _ in range(2))
+                draw.rectangle([xs[0], ys[0], xs[1], ys[1]], outline=c, width=wd)
+            else:
+                xs, ys = sorted(rng.randint(0, w) for _ in range(2)), sorted(rng.randint(0, h) for _ in range(2))
+                draw.ellipse([xs[0], ys[0], xs[1], ys[1]], outline=c, width=wd)
+        img = np.asarray(pim, np.float32) / 255.0
+    else:
+        cov = None
+        for _ in range(4):
+            visual = get_display(gen_logical(rng, corpus), base_dir="R")
+            fonts = fonts_for(visual)
+            if visual.strip() and fonts:
+                cov = shape_render(visual, rng.choice(fonts), rng.randint(16, 40), rng)
+                if cov is not None and cov.shape[1] >= 8:
+                    break
+                cov = None
+        if cov is None:
+            return make_negative(rng, [])  # fall back to the marks regime
+        # Keep only a thin horizontal band so the glyphs are cut and unreadable.
+        ch = cov.shape[0]
+        band = max(3, int(ch * rng.uniform(0.18, 0.32)))
+        off = rng.choice([0, ch - band])
+        sliver = np.zeros((h, cov.shape[1]), np.float32)
+        top = rng.randint(0, max(0, h - band))
+        sliver[top : top + band] = cov[off : off + band]
+        img = compose(rng, sliver, h)
+    img = degrade(img, rng, h)
+    out_w = max(16, round(img.shape[1] * STRIP_HEIGHT / img.shape[0]))
+    return np.asarray(
+        Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8)).resize((out_w, STRIP_HEIGHT), Image.BILINEAR),
+        np.uint8,
+    )
+
+
+def sample(rng: random.Random, corpus: list[str], neg_frac: float = 0.0) -> tuple[np.ndarray, str] | None:
+    """One (H=48 RGB uint8, label) pair, or None after retries. Label is "" for negatives."""
+    if neg_frac and rng.random() < neg_frac:
+        return make_negative(rng, corpus), ""
     for _ in range(8):
         logical = gen_logical(rng, corpus)
         visual = get_display(logical, base_dir="R")
@@ -288,7 +359,7 @@ def sample(rng: random.Random, corpus: list[str]) -> tuple[np.ndarray, str] | No
             continue
         native_h = rng.randint(22, 60)
         px = max(8, int(native_h * rng.uniform(0.62, 0.9)))
-        cov = shape_render(visual, rng.choice(fonts), px)
+        cov = shape_render(visual, rng.choice(fonts), px, rng)
         if cov is None or cov.shape[1] < 8:
             continue
         # Fit the rendered text into a native strip of height native_h.
@@ -333,6 +404,7 @@ def main() -> None:
     ap.add_argument("--corpus", help="UTF-8 file, one Hebrew line per row")
     ap.add_argument("--inspect", action="store_true", help="write an annotated QA sheet instead of a dataset")
     ap.add_argument("--prefix", default="", help="filename/label-file shard tag for parallel workers sharing one --out")
+    ap.add_argument("--neg-frac", type=float, default=0.0, help="fraction of non-text strips with empty labels (detector false-positive negatives)")
     args = ap.parse_args()
 
     corpus = []
@@ -346,7 +418,7 @@ def main() -> None:
     if args.inspect:
         got = []
         while len(got) < args.n:
-            s = sample(rng, corpus)
+            s = sample(rng, corpus, args.neg_frac)
             if s:
                 got.append(s)
         write_inspect_sheet(got, os.path.join(args.out, "inspect.png"))
@@ -359,7 +431,7 @@ def main() -> None:
     n = 0
     with open(labels_path, "w", encoding="utf-8") as labels:
         while n < args.n:
-            s = sample(rng, corpus)
+            s = sample(rng, corpus, args.neg_frac)
             if not s:
                 continue
             img, label = s
