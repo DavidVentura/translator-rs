@@ -52,7 +52,10 @@ def main():
     import onnxruntime as ort  # noqa: PLC0415
 
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    # Widths must divide by 2**levels for the pooling (e.g. 16 at levels=4); round up.
+    mult = 2**levels
     for n, width in ((1, 160), (1, 320), (8, 256), (4, 504)):
+        width += (-width) % mult
         x = torch.rand(n, 3, 48, width)
         with torch.no_grad():
             ref = model(x).numpy()

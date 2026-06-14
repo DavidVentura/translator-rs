@@ -241,6 +241,9 @@ pub struct PpocrInkModel {
 
 impl PpocrInkModel {
     const HEIGHT: u32 = 48;
+    /// Input H/W must divide by 2**levels for the U-Net pooling. The shipped model is
+    /// 4-level, so strips are padded to a multiple of 16 (48px height already divides).
+    const POOL_MULTIPLE: u32 = 16;
 
     fn load(model_path: &Path) -> Result<Self, TranslatorError> {
         // `load_conv` (MemoryMode::High) dequantizes the weight-quant model at load and
@@ -388,8 +391,9 @@ impl PpocrEngine {
                 if o.width <= 1.0 || o.height <= 1.0 {
                     return None;
                 }
-                let aw = ((o.width * h as f32 / o.height).round() as u32).max(16);
-                let w = aw.next_multiple_of(8);
+                let aw = ((o.width * h as f32 / o.height).round() as u32)
+                    .max(PpocrInkModel::POOL_MULTIPLE);
+                let w = aw.next_multiple_of(PpocrInkModel::POOL_MULTIPLE);
                 Some((i, dewarp_oriented_to_strip_rgb(&rgb, o, w, h)))
             })
             .collect();
