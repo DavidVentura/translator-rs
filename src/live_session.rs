@@ -2904,6 +2904,20 @@ pub struct OverlayPill {
     pub color: [u8; 4],
 }
 
+/// One matted strip the GPU draws as an oriented textured quad: the ink model's
+/// reconstructed background, composited through the per-pixel coverage alpha so
+/// only the erased source ink is painted and the live camera shows through
+/// elsewhere. Supersedes the solid pill for boxes that matted. `rect` is the
+/// strip's own canonical geometry (surface coords); `rgba` is the coverage-alpha
+/// bitmap (RGB = background field, A = coverage), `px_w × px_h`.
+#[derive(Clone, Debug)]
+pub struct OverlayStrip {
+    pub rect: OrientedRect,
+    pub rgba: Vec<u8>,
+    pub px_w: u32,
+    pub px_h: u32,
+}
+
 /// Backend-agnostic GPU draw list for one anchor's overlay: oriented pill quads
 /// (surface coords) + per-glyph instance data for the GPU atlas compositor, plus
 /// the canvas geometry the compositor renders into and the `painted_pills` the
@@ -2922,6 +2936,9 @@ pub struct OverlayDrawList {
     pub bitmap_w: u32,
     pub bitmap_h: u32,
     pub pills: Vec<OverlayPill>,
+    /// Matted background strips (textured quads) for boxes the ink model resolved;
+    /// drawn in place of a pill for those boxes.
+    pub strips: Vec<OverlayStrip>,
     pub glyphs: crate::image_render::GlyphCollector,
     /// Pill footprints (surface coords) for the movement monitor's mask.
     pub painted_pills: Vec<OrientedRect>,
@@ -2975,13 +2992,33 @@ pub(crate) fn build_overlay_draw_list(
 
     let (origin_x, origin_y, bitmap_w, bitmap_h) = canvas_geometry(&painted_pills, os)?;
 
-    // Pills: block strips (matted/default color per strip index) then provisional
-    // strips (default bg), in surface coords — drawn as oriented rounded quads.
+    // Per block strip index: if the ink model matted it, draw its reconstructed
+    // background as a textured quad (the strip carries its own canonical geometry,
+    // which spans the padded background patch rather than the inflated text
+    // footprint); otherwise fall back to a solid pill. Provisional strips have no
+    // matte and always pill. All in surface coords.
     let mut pills: Vec<OverlayPill> = Vec::with_capacity(painted_pills.len());
+    let mut strips: Vec<OverlayStrip> = Vec::new();
     for pb in &prepared {
         for (i, v) in pb.visuals.iter().enumerate() {
-            let color = block_pill_color(pb.spec, i, pb.block_id, bg_rgba);
-            pills.push(OverlayPill { rect: *v, color });
+            match pb.spec.matted_strips.get(i).and_then(|m| m.as_ref()) {
+                Some(ms) => strips.push(OverlayStrip {
+                    rect: OrientedRect {
+                        cx: ms.canonical_cx,
+                        cy: ms.canonical_cy,
+                        width: ms.canonical_width,
+                        height: ms.canonical_height,
+                        angle_radians: ms.canonical_angle_radians,
+                    },
+                    rgba: ms.strip_rgba.clone(),
+                    px_w: ms.strip_width,
+                    px_h: ms.strip_height,
+                }),
+                None => pills.push(OverlayPill {
+                    rect: *v,
+                    color: block_pill_color(pb.spec, i, pb.block_id, bg_rgba),
+                }),
+            }
         }
     }
     for v in &prepared_provisional {
@@ -3028,6 +3065,7 @@ pub(crate) fn build_overlay_draw_list(
         bitmap_w,
         bitmap_h,
         pills,
+        strips,
         glyphs,
         painted_pills,
     })
@@ -3066,36 +3104,16 @@ fn localize_visuals(
         .collect()
 }
 
-/// Background color for a block's i-th pill: the matted strip's reconstructed
-/// background (its mean RGB, opaque) when this strip matted, else the anchor
-/// default (or a debug palette entry keyed by block id when
-/// `DEBUG_PER_BLOCK_BG_COLOR`). The strip's RGB is the rim-free background
-/// field, so this is a faithful solid even where the old uniform-bg estimate
-/// would have come out too dark.
-fn block_pill_color(spec: &BlockSpec, i: usize, block_id: u64, bg_rgba: [u8; 4]) -> [u8; 4] {
-    let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
+/// Background color for a block's i-th pill — the fallback for boxes the ink
+/// model did not matte (matted boxes draw a textured strip instead). The anchor
+/// default, or a debug palette entry keyed by block id when
+/// `DEBUG_PER_BLOCK_BG_COLOR`.
+fn block_pill_color(_spec: &BlockSpec, _i: usize, block_id: u64, bg_rgba: [u8; 4]) -> [u8; 4] {
+    if DEBUG_PER_BLOCK_BG_COLOR {
         DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
     } else {
         bg_rgba
-    };
-    match spec.matted_strips.get(i).and_then(|m| m.as_ref()) {
-        Some(strip) => strip_bg_mean_rgba(strip),
-        None => default_bg,
     }
-}
-
-/// Mean RGB of a matted strip's reconstructed background field, as an opaque
-/// RGBA pill colour.
-fn strip_bg_mean_rgba(strip: &crate::color_matting::MattedStrip) -> [u8; 4] {
-    let px = strip.strip_rgba.chunks_exact(4);
-    let n = px.len().max(1) as u64;
-    let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
-    for c in px {
-        r += c[0] as u64;
-        g += c[1] as u64;
-        b += c[2] as u64;
-    }
-    [(r / n) as u8, (g / n) as u8, (b / n) as u8, 255]
 }
 
 /// Build one block's `PreparedTextBlock` (per-line oriented text boxes + layout

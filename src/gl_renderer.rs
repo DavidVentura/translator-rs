@@ -439,6 +439,9 @@ pub struct GlesRenderer {
     /// Pill-layer FBO: opaque rounded pills are unioned here, then composited
     /// into `overlay_fbo` at the pill opacity. `(fbo, tex, w, h)`.
     pill_fbo: Option<(glow::Framebuffer, glow::Texture, u32, u32)>,
+    /// Scratch RGBA texture the matted-strip pass re-uploads per strip (sizes
+    /// vary); reused across strips and overlay bakes. Lazily created.
+    strip_tex: Option<glow::Texture>,
     /// R8 glyph coverage atlas with shelf packing. Grows until overflow, then
     /// clears and re-packs the current frame's masks.
     glyph_atlas: Option<GlyphAtlas>,
@@ -571,6 +574,7 @@ impl GlesRenderer {
                 glyph_prog: None,
                 overlay_fbo: None,
                 pill_fbo: None,
+                strip_tex: None,
                 glyph_atlas: None,
                 baked_overlay: None,
                 overlay_baked_version: None,
@@ -1261,6 +1265,79 @@ impl GlesRenderer {
             }
             gl.bind_texture(glow::TEXTURE_2D, Some(pill_tex));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+            // B1.5: matted strips — the ink model's reconstructed background, each
+            // an oriented textured quad composited at full opacity through its
+            // per-pixel coverage alpha (only the erased ink pixels paint; the live
+            // camera shows through elsewhere). Reuses the 2D program with an
+            // identity uv so the quad samples the whole strip; the strip's own
+            // canonical geometry gives the quad, so texture and footprint register
+            // 1:1. Drawn after the pill layer (matted boxes emit no pill) and under
+            // the glyphs.
+            if !dl.strips.is_empty() {
+                if self.strip_tex.is_none() {
+                    self.strip_tex = new_texture(gl).ok();
+                }
+                if let Some(stex) = self.strip_tex {
+                    let ident = to_column_major(&scale(1.0, 1.0));
+                    gl.use_program(Some(self.program));
+                    gl.enable_vertex_attrib_array(self.a_pos);
+                    gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 0, 0);
+                    gl.uniform_1_i32(Some(&self.u_tex), 0);
+                    gl.uniform_1_f32(Some(&self.u_overlay_alpha), 1.0);
+                    gl.uniform_matrix_3_f32_slice(Some(&self.u_uv_xform), false, &ident);
+                    if let Some(l) = &self.u_hole_spacing {
+                        gl.uniform_1_f32(Some(l), 0.0);
+                    }
+                    gl.bind_texture(glow::TEXTURE_2D, Some(stex));
+                    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                    for s in &dl.strips {
+                        let r = &s.rect;
+                        let cos = r.angle_radians.cos();
+                        let sin = r.angle_radians.sin();
+                        let cx = (r.cx - dl.origin_x) * os;
+                        let cy = (r.cy - dl.origin_y) * os;
+                        let hw = r.width * os * 0.5;
+                        let hh = r.height * os * 0.5;
+                        if hw <= 0.0 || hh <= 0.0 || s.px_w == 0 || s.px_h == 0 {
+                            continue;
+                        }
+                        let (tx, ty) = (cos, sin);
+                        let (px, py) = (-sin, cos);
+                        let c0x = cx - hw * tx - hh * px;
+                        let c0y = cy - hw * ty - hh * py;
+                        let quad_to_texel = [
+                            2.0 * hw * tx,
+                            2.0 * hh * px,
+                            c0x,
+                            2.0 * hw * ty,
+                            2.0 * hh * py,
+                            c0y,
+                            0.0,
+                            0.0,
+                            1.0,
+                        ];
+                        let transform = mat3_mul(&ndc, &quad_to_texel);
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA as i32,
+                            s.px_w as i32,
+                            s.px_h as i32,
+                            0,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(&s.rgba)),
+                        );
+                        gl.uniform_matrix_3_f32_slice(
+                            Some(&self.u_transform),
+                            false,
+                            &to_column_major(&transform),
+                        );
+                        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    }
+                }
+            }
 
             // B2: glyph quads from the R8 atlas, one draw call per instance.
             // Each quad is rotated in overlay-texel space by the glyph's line angle,
