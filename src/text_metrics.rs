@@ -54,13 +54,17 @@ const MIN_TILT_COLUMNS: usize = 8;
 /// with the rough angle, so a real residual is small; a larger fit is a
 /// degenerate matte, not a steeper line.
 const MAX_TILT_RADIANS: f32 = 0.26; // ~15°
-/// Alpha at or above which a texel is a confident *stroke core*, used for stroke
-/// width. Higher than `INK_CUT` so the soft matte's anti-aliased halo doesn't
-/// fatten the measurement; the core is what carries the real weight signal.
-const STROKE_CUT: u8 = 128;
+/// Stroke width is measured on the confident *core* of the ink — texels at or
+/// above this fraction of the line's own peak alpha. Relative (not a fixed cut)
+/// so a faint/low-confidence bold matte isn't penalised the way a fixed high
+/// threshold would; feathered edges, which matter proportionally less on a bold
+/// stroke, drop out either way. Floored at `INK_CUT` so a weak matte still has a
+/// core.
+const STROKE_CORE_FRAC: f32 = 0.6;
 /// Stroke-core-width-to-x-height ratio at or above which a line reads as bold.
-/// Calibrated on real e-ink/print pages: regular body runs ~0.17–0.22, bold
-/// headings ~0.30+.
+/// Calibrated on real photographed print pages: regular body runs ~0.15–0.20,
+/// bold headings ~0.27+. Note all-caps lines read low (their band is cap-height,
+/// not x-height), so a large all-caps title can slip under this.
 pub const BOLD_WEIGHT_RATIO: f32 = 0.26;
 
 /// Typography recovered from one line's ink matte, in the source image's pixel
@@ -223,7 +227,14 @@ fn stroke_width_px(
     rows_to_px: f32,
     cols_to_px: f32,
 ) -> f32 {
-    let ink = |x: usize, y: usize| data[y * mw + x] >= STROKE_CUT;
+    // Core threshold relative to this line's own peak alpha, so a faint bold
+    // matte keeps its core instead of being thinned by a fixed high cut.
+    let peak = (sup_top..=sup_bottom)
+        .flat_map(|y| (0..mw).map(move |x| data[y * mw + x]))
+        .max()
+        .unwrap_or(0);
+    let core = ((peak as f32 * STROKE_CORE_FRAC) as u8).max(INK_CUT as u8);
+    let ink = |x: usize, y: usize| data[y * mw + x] >= core;
     let mut area: u32 = 0;
     let mut perimeter: u32 = 0;
     for y in sup_top..=sup_bottom {
