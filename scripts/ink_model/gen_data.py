@@ -98,6 +98,16 @@ def _heavy_fonts(cjk: bool) -> tuple[str, ...]:
     return heavy or tuple(base)
 
 
+@lru_cache(maxsize=2)
+def _regular_fonts(cjk: bool) -> tuple[str, ...]:
+    """Regular weights only — the full pool *minus* heavy fonts. A non-bold run must
+    not draw a bold/black face, or its pixels become bold ink with a regular label
+    and the bold head trains on contradictory targets."""
+    base = cjk_font_paths() if cjk else font_paths()
+    reg = tuple(p for p in base if not any(t in p.lower() for t in HEAVY_TOKENS))
+    return reg or tuple(base)
+
+
 # Connected/cursive scripts the Latin+CJK set misses: Arabic (cursive, RTL), the Indic
 # scripts (Devanagari's shirorekha roof bar + conjuncts, Tamil's thick curved loops) and
 # Thai. (fc-list lang, consonant codepoint range) — sampling consonants avoids stray
@@ -183,11 +193,7 @@ def _latin_chunk(rng: random.Random) -> str:
 def _pick_font(rng: random.Random, script: str, bold: bool) -> tuple[str, object]:
     if script in SHAPED:
         return rng.choice(shaped_fonts(script)), ImageFont.Layout.RAQM
-    pool = (
-        _heavy_fonts(script == "cjk")
-        if bold
-        else (cjk_font_paths() if script == "cjk" else font_paths())
-    )
+    pool = _heavy_fonts(script == "cjk") if bold else _regular_fonts(script == "cjk")
     return rng.choice(pool), ImageFont.Layout.BASIC
 
 
