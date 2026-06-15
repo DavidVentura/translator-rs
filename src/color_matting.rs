@@ -250,35 +250,39 @@ fn project_box_ink(
     if ink.len() < MIN_INK_PIXELS {
         return None;
     }
-    // Foreground colour = the ink's *core*, not the median of all ink pixels.
-    // The 48px matte is coarser than the source, so a high-alpha matte texel maps
-    // to a cluster of source pixels — the dark stroke centre plus its lighter
-    // anti-aliased edges — and the median lands between them, washing the colour
-    // toward the page (low-contrast lines render near-invisible). Instead take the
-    // pixels farthest from the background: sort the matte-gated pixels by luma and
-    // keep the extreme fraction on the ink side (darkest for dark-on-light text,
-    // lightest for light-on-dark), then median those. Direction comes from the
-    // background luma so it works either way.
     let bg_luma = if bg_count > 0 {
         (bg_luma_sum / bg_count) as u8
     } else {
         255
     };
-    let mut by_luma: Vec<Rgba<u8>> = ink;
-    by_luma.sort_by_key(|&p| luma(p));
-    let ink_is_dark = luma(by_luma[by_luma.len() / 2]) < bg_luma;
-    let k = ((by_luma.len() as f32 * FG_INK_FRACTION).ceil() as usize)
-        .clamp(MIN_INK_PIXELS, by_luma.len());
+    Some(ink_core_argb(ink, bg_luma))
+}
+
+/// Foreground ink colour from a line's matte-gated source pixels: the ink-side
+/// luma *extreme* (the stroke cores), not the median of the whole stroke. The
+/// 48px matte is coarser than the source, so a high-alpha matte texel maps to a
+/// cluster of source pixels — the dark stroke centre plus its lighter
+/// anti-aliased edges — and the median lands between them, washing the colour
+/// toward the page (low-contrast lines render near-invisible). Sorting by luma
+/// and keeping the extreme fraction on the ink side recovers the true ink. The
+/// direction comes from `bg_luma` so it works for dark-on-light and light-on-dark
+/// alike. Shared by the live (`project_box_ink`) and still
+/// (`ocr::matte_erase_oriented`) paths so both colour text identically.
+/// `ink` must be non-empty.
+pub(crate) fn ink_core_argb(mut ink: Vec<Rgba<u8>>, bg_luma: u8) -> u32 {
+    ink.sort_by_key(|&p| luma(p));
+    let ink_is_dark = luma(ink[ink.len() / 2]) < bg_luma;
+    let k = ((ink.len() as f32 * FG_INK_FRACTION).ceil() as usize).clamp(1, ink.len());
     let core = if ink_is_dark {
-        &by_luma[..k]
+        &ink[..k]
     } else {
-        &by_luma[by_luma.len() - k..]
+        &ink[ink.len() - k..]
     };
-    Some(rgba_to_argb(median_color(core)))
+    rgba_to_argb(median_color(core))
 }
 
 /// BT.601 luma of an RGBA pixel (alpha ignored).
-fn luma(c: Rgba<u8>) -> u8 {
+pub(crate) fn luma(c: Rgba<u8>) -> u8 {
     ((c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114) / 1000).min(255) as u8
 }
 

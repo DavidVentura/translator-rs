@@ -2212,7 +2212,7 @@ fn matte_erase_oriented(
     oriented: OrientedRect,
     ink_mask: &[bool],
 ) -> Option<u32> {
-    use crate::color_matting::{BG_BLOCK, background_field, dilate, median_color};
+    use crate::color_matting::{BG_BLOCK, background_field, dilate, ink_core_argb, luma};
     use image::{Rgb, Rgba};
 
     let aabb = clamp_rect(oriented.to_aabb(), image.width, image.height)?;
@@ -2237,16 +2237,26 @@ fn matte_erase_oriented(
         }
     }
 
-    // Foreground = median of the matte's ink pixels (before dilation, so the
-    // anti-aliased rim doesn't pull it toward the background).
-    let ink: Vec<Rgba<u8>> = pixels
-        .iter()
-        .zip(sub.iter())
-        .filter_map(|(p, &m)| m.then_some(*p))
-        .collect();
+    // Foreground colour: the ink-side luma extreme of the matte's ink pixels (the
+    // stroke cores), via the shared derivation so still and live colour text
+    // identically. The background luma (the non-ink pixels) orients it.
+    let mut ink: Vec<Rgba<u8>> = Vec::new();
+    let (mut bg_luma_sum, mut bg_count) = (0u64, 0u64);
+    for (p, &m) in pixels.iter().zip(sub.iter()) {
+        if m {
+            ink.push(*p);
+        } else {
+            bg_luma_sum += luma(*p) as u64;
+            bg_count += 1;
+        }
+    }
     let fg = (ink.len() >= 6).then(|| {
-        let m = median_color(&ink);
-        argb(m[0], m[1], m[2])
+        let bg_luma = if bg_count > 0 {
+            (bg_luma_sum / bg_count) as u8
+        } else {
+            255
+        };
+        ink_core_argb(ink, bg_luma)
     });
 
     // Grow the fill set by a height-proportional radius so the original ink's
