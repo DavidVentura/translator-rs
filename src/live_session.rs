@@ -2170,21 +2170,16 @@ impl LiveSession {
                 .collect();
         }
 
-        // Per-block bold: majority of the block's source lines that read bold
-        // (from the ink text-metrics, indexed parallel to `detections`/`entries`).
+        // Per-block bold: majority of the block's source lines that read bold.
+        // Boldness is decided relative to this frame's median weight (indexed
+        // parallel to `detections`/`entries`).
+        let line_bold = crate::text_metrics::bold_flags(input.line_metrics);
         let block_bold: Vec<bool> = block_strip_indices
             .iter()
             .map(|idxs| {
                 let bold = idxs
                     .iter()
-                    .filter(|&&j| {
-                        input
-                            .line_metrics
-                            .get(j)
-                            .copied()
-                            .flatten()
-                            .is_some_and(|m| m.is_bold())
-                    })
+                    .filter(|&&j| line_bold.get(j).copied().unwrap_or(false))
                     .count();
                 bold * 2 >= idxs.len().max(1)
             })

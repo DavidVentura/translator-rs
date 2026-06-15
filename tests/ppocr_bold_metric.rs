@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use translator::PpocrScript;
 use translator::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
-use translator::text_metrics::measure_line;
+use translator::text_metrics::{bold_flags, measure_line};
 
 const MODEL_DIR: &str = "/home/david/AndroidStudioProjects/bucket/ocr/1/PP-OCRv5";
 const IMAGE_PATH: &str = "files/letter.jpg";
@@ -61,16 +61,22 @@ fn bold_headings_detected_body_stays_regular() {
         .expect("recognize");
     let masks = engine.ink_masks(&image, &boxes);
 
-    // (lowercased text, is_bold) per recognised line that produced a matte band.
-    let labelled: Vec<(String, bool)> = boxes
+    // Frame-relative bold over all the page's lines.
+    let metrics: Vec<Option<_>> = boxes
         .iter()
-        .zip(lines)
         .enumerate()
-        .filter_map(|(i, (b, line))| {
+        .map(|(i, b)| {
             let mask = masks.get(i)?.as_ref()?;
-            let m = measure_line(mask, b.oriented_box.width, b.oriented_box.height)?;
-            Some((line.text.to_lowercase(), m.is_bold()))
+            measure_line(mask, b.oriented_box.width, b.oriented_box.height)
         })
+        .collect();
+    let bold = bold_flags(&metrics);
+
+    // (lowercased text, is_bold) per recognised line.
+    let labelled: Vec<(String, bool)> = lines
+        .iter()
+        .zip(bold.iter())
+        .map(|(line, &is_bold)| (line.text.to_lowercase(), is_bold))
         .collect();
 
     let bold_of = |needle: &str| -> bool {

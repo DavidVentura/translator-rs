@@ -244,12 +244,15 @@ fn still_ppocr_lines_to_blocks(
     // recognizer's built-in `rec_drop_score`: lines the model accepted but whose mean
     // CTC score sits below the user's bar are dropped before paragraph grouping.
     let min_score = min_confidence as f32 / 100.0;
+    // Bold is decided relative to this page's median weight.
+    let bold = crate::text_metrics::bold_flags(text_metrics);
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())
         .zip(text_metrics.iter())
-        .filter(|((_, line), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
-        .map(|((b, line), metrics)| {
+        .zip(bold.iter())
+        .filter(|(((_, line), _), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
+        .map(|(((b, line), metrics), &is_bold)| {
             let delta = metrics.map_or(0.0, |m| m.baseline_angle_delta);
             let mut oriented_box = line.oriented_box;
             oriented_box.angle_radians += delta;
@@ -265,7 +268,7 @@ fn still_ppocr_lines_to_blocks(
                 oriented_box,
                 tight_box,
                 word_rects: vec![line.rect],
-                is_bold: metrics.map_or(false, |m| m.is_bold()),
+                is_bold,
             }
         })
         .collect();

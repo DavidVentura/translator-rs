@@ -913,9 +913,23 @@ fn run(cli: Cli) -> Result<(), String> {
                     let mut csv = String::from(
                         "cx,cy,width,tight_h,x_height,centerline,tilt_deg,stroke,weight,bold,text\n",
                     );
+                    // Per-box metrics, then frame-relative bold over the whole page.
+                    let metrics: Vec<Option<translator::text_metrics::LineMetrics>> = boxes
+                        .iter()
+                        .zip(masks.iter())
+                        .map(|(b, mask)| {
+                            let mask = mask.as_ref()?;
+                            translator::text_metrics::measure_line(
+                                mask,
+                                b.oriented_box.width,
+                                b.oriented_box.height,
+                            )
+                        })
+                        .collect();
+                    let bold = translator::text_metrics::bold_flags(&metrics);
                     // Thin lines so adjacent lines' boxes stay distinguishable.
                     let thin = 1;
-                    for ((b, mask), line) in boxes.iter().zip(masks.iter()).zip(lines.iter()) {
+                    for (i, (b, line)) in boxes.iter().zip(lines.iter()).enumerate() {
                         // Inflated oriented box (magenta) — the region the ink model
                         // actually searches — and the tight detection core (green).
                         draw_closed_polyline(
@@ -930,14 +944,8 @@ fn run(cli: Cli) -> Result<(), String> {
                             Rgba([30, 220, 30, 255]),
                             thin,
                         );
-                        let Some(mask) = mask else { continue };
-                        let Some(m) = translator::text_metrics::measure_line(
-                            mask,
-                            b.oriented_box.width,
-                            b.oriented_box.height,
-                        ) else {
-                            continue;
-                        };
+                        let Some(m) = metrics[i] else { continue };
+                        let is_bold = bold[i];
                         // Matte band in cyan: box re-fit to actual ink on both axes.
                         let band = m.refit(b.tight_box);
                         draw_closed_polyline(
@@ -961,7 +969,7 @@ fn run(cli: Cli) -> Result<(), String> {
                                 "xh{:.0} w{:.2}{}",
                                 m.x_height,
                                 m.weight_ratio(),
-                                if m.is_bold() { " BOLD" } else { "" },
+                                if is_bold { " BOLD" } else { "" },
                             ),
                         );
                         csv.push_str(&format!(
@@ -975,7 +983,7 @@ fn run(cli: Cli) -> Result<(), String> {
                             m.baseline_angle_delta.to_degrees(),
                             m.stroke_width,
                             m.weight_ratio(),
-                            m.is_bold(),
+                            is_bold,
                             line.text.replace(',', " "),
                         ));
                     }
