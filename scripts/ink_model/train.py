@@ -59,7 +59,7 @@ def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     return torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
 
 
-def ink_losses(logits, cov, bold):
+def ink_losses(logits, cov, bold, bold_weight=0.5):
     """Matte BCE over the whole strip + bold BCE *masked to ink*. Bold is only
     defined where there's ink, so masking keeps the empty background from drowning
     the bold signal. Returns (total, matte, bold) for logging."""
@@ -68,7 +68,7 @@ def ink_losses(logits, cov, bold):
     ink = (cov > 0.5).float()
     bce = F.binary_cross_entropy_with_logits(bold_logit, (bold > 0.5).float(), reduction="none")
     loss_bold = (bce * ink).sum() / ink.sum().clamp_min(1.0)
-    return loss_matte + 0.5 * loss_bold, loss_matte, loss_bold
+    return loss_matte + bold_weight * loss_bold, loss_matte, loss_bold
 
 
 def main():
@@ -87,6 +87,7 @@ def main():
     ap.add_argument("--levels", type=int, default=2, help="U-Net depth (3 = bigger RF)")
     ap.add_argument("--reuse", type=int, default=1, help="composites per rasterized strip")
     ap.add_argument("--val-batch", type=int, default=32, help="validation set size")
+    ap.add_argument("--bold-weight", type=float, default=0.5, help="weight on the bold BCE term")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -136,7 +137,7 @@ def main():
         bold = bold.to(device, non_blocking=device == "cuda")
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss, _, _ = ink_losses(logits, cov, bold)
+            loss, _, _ = ink_losses(logits, cov, bold, args.bold_weight)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -154,7 +155,7 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
-                vl, vm, vb = ink_losses(train_model(val_img), val_cov, val_bold)
+                vl, vm, vb = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight)
             model.train()
             print(
                 f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f})",
