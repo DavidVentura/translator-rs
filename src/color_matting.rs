@@ -102,6 +102,11 @@ const INK_ALPHA_CUT: u8 = 40;
 /// stroke cores (farthest from the page), not the washed median of the whole
 /// stroke.
 const FG_INK_FRACTION: f32 = 0.15;
+/// Minimum WCAG contrast ratio the translated ink is guaranteed against its
+/// reconstructed background. A floor, not a stretch: faithful colours above this
+/// pass through untouched; only genuinely low-contrast lines (device chrome,
+/// shadowed page edges) get pushed darker/lighter to stay readable.
+const FG_MIN_CONTRAST: f32 = 2.5;
 /// Minimum ink pixels in a strip to bother matting it. Below this the
 /// model found essentially no ink in the box — return `None` and let the
 /// caller fall back to default-pill rendering.
@@ -278,7 +283,81 @@ pub(crate) fn ink_core_argb(mut ink: Vec<Rgba<u8>>, bg_luma: u8) -> u32 {
     } else {
         &ink[ink.len() - k..]
     };
-    rgba_to_argb(median_color(core))
+    enforce_contrast(rgba_to_argb(median_color(core)), bg_luma, FG_MIN_CONTRAST)
+}
+
+/// sRGB channel (0..1) → linear light.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light → sRGB channel (0..1).
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Push the foreground colour away from the background until their WCAG contrast
+/// ratio reaches `min_ratio`, preserving hue. The faithful ink colour is great
+/// when the source has contrast, but genuinely low-contrast lines (device chrome,
+/// shadowed page edges, faded print) reproduce as unreadable; this is a floor,
+/// not a stretch — anything already above `min_ratio` is returned unchanged.
+/// Darkening (the common dark-on-light case) scales the colour toward black in
+/// linear light, which keeps chromaticity exactly; lightening blends toward white.
+/// The background is approximated as a neutral gray of `bg_luma` (paper/screen is
+/// near-neutral), which is all the WCAG luminance needs.
+fn enforce_contrast(argb: u32, bg_luma: u8, min_ratio: f32) -> u32 {
+    let (r, g, b) = (
+        ((argb >> 16) & 0xff) as f32 / 255.0,
+        ((argb >> 8) & 0xff) as f32 / 255.0,
+        (argb & 0xff) as f32 / 255.0,
+    );
+    let (lr, lg, lb) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+    let l_fg = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+    let l_bg = srgb_to_linear(bg_luma as f32 / 255.0);
+    let ratio = if l_fg > l_bg {
+        (l_fg + 0.05) / (l_bg + 0.05)
+    } else {
+        (l_bg + 0.05) / (l_fg + 0.05)
+    };
+    if ratio >= min_ratio {
+        return argb;
+    }
+    let dark = l_fg < l_bg;
+    let out = if dark {
+        // Target luminance so (l_bg+0.05)/(target+0.05) == min_ratio, then scale
+        // toward black in linear light (uniform scale ⇒ hue preserved exactly).
+        let target = ((l_bg + 0.05) / min_ratio - 0.05).max(0.0);
+        let t = if l_fg > 1e-6 {
+            (target / l_fg).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        [lr * t, lg * t, lb * t]
+    } else {
+        // Lighten toward white.
+        let target = (min_ratio * (l_bg + 0.05) - 0.05).min(1.0);
+        let (df, dt) = (1.0 - l_fg, 1.0 - target);
+        let t = if df > 1e-6 {
+            (dt / df).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        [
+            1.0 - (1.0 - lr) * t,
+            1.0 - (1.0 - lg) * t,
+            1.0 - (1.0 - lb) * t,
+        ]
+    };
+    let to8 = |c: f32| (linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u32;
+    0xFF00_0000 | (to8(out[0]) << 16) | (to8(out[1]) << 8) | to8(out[2])
 }
 
 /// BT.601 luma of an RGBA pixel (alpha ignored).
