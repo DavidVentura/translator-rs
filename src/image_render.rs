@@ -1275,11 +1275,11 @@ fn blit_mask(
     if mask_w == 0 || mask_h == 0 {
         return;
     }
-    // `fg_argb` is ARGB; the canvas is R,G,B,A. Decompose big-endian so R/B
-    // aren't swapped (`to_ne_bytes` emits B,G,R,A on little-endian — invisible
-    // for black/white text, but it turns coloured ink the wrong colour).
-    let [_, r, g, b] = fg_argb.to_be_bytes();
-    let fg_bytes = [r, g, b];
+    // Match the rest of this canvas, which `crate::ocr` writes (erase, fill,
+    // sample) with `argb.to_ne_bytes()`. The glyph colour must use the same
+    // little-endian byte order so it isn't R/B-swapped relative to the
+    // background it's drawn over.
+    let fg_bytes = fg_argb.to_ne_bytes();
     for my in 0..mask_h {
         let py = placement_top + my as i32;
         if py < 0 || py >= height as i32 {
