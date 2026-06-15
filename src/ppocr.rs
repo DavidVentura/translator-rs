@@ -921,6 +921,14 @@ impl PpocrEngine {
                 confidence_sum += r.confidence;
                 confidence_count += 1;
             }
+            // RTL recognizers emit the whole strip in visual (left-to-right) order, so
+            // the assembled line — characters and word order both — is the reversal of
+            // logical order. Recover logical order once the full line is joined.
+            let text = if scripts[idx].is_rtl() {
+                reverse_visual_to_logical(&text)
+            } else {
+                text
+            };
             let raw_confidence = if confidence_count > 0 {
                 confidence_sum / confidence_count as f32
             } else {
@@ -1006,6 +1014,57 @@ fn normalize_rec_text_for_script(script: PpocrScript, text: String) -> String {
             crate::script_normalize::repair_cyrillic_word_mixing(&text)
         }
         _ => text,
+    }
+}
+
+/// Convert an RTL recognizer's visual-order line back to logical order (PaddleOCR's
+/// `pred_reverse`). Runs of LTR characters — Latin letters, digits, spaces and the
+/// common shared punctuation — stay forward; every other character is its own unit.
+/// Reversing the sequence of units flips the RTL script (and overall word order) while
+/// keeping embedded Latin words and numbers readable.
+fn reverse_visual_to_logical(text: &str) -> String {
+    fn is_ltr_run_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, ' ' | ':' | '*' | '.' | '/' | '%' | '+' | '-')
+    }
+    let mut units: Vec<String> = Vec::new();
+    let mut ltr_run = String::new();
+    for c in text.chars() {
+        if is_ltr_run_char(c) {
+            ltr_run.push(c);
+            continue;
+        }
+        if !ltr_run.is_empty() {
+            units.push(std::mem::take(&mut ltr_run));
+        }
+        units.push(c.to_string());
+    }
+    if !ltr_run.is_empty() {
+        units.push(ltr_run);
+    }
+    units.into_iter().rev().collect()
+}
+
+#[cfg(test)]
+mod rtl_reverse_tests {
+    use super::reverse_visual_to_logical;
+
+    #[test]
+    fn pure_hebrew_word_reverses() {
+        // Camera-validated case: the model emits the visual order "למשח"; the logical
+        // (correct) spelling is "חשמל".
+        assert_eq!(reverse_visual_to_logical("למשח"), "חשמל");
+    }
+
+    #[test]
+    fn multi_word_reverses_word_order_and_keeps_maqaf() {
+        assert_eq!(reverse_visual_to_logical("הל־תיב"), "בית־לה");
+        assert_eq!(reverse_visual_to_logical("דג בא"), "אב גד");
+    }
+
+    #[test]
+    fn embedded_latin_and_digits_stay_forward() {
+        // "USB2" sits inside a Hebrew line; the Latin/number run must not be flipped.
+        assert_eq!(reverse_visual_to_logical("בא USB2 גד"), "דג USB2 אב");
     }
 }
 

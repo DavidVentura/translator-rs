@@ -221,6 +221,13 @@ impl PpocrScript {
             _ => None,
         }
     }
+
+    /// True for scripts whose recognizer emits glyphs in visual (left-to-right strip)
+    /// order, so the decoded line needs a visual→logical bidi pass. PaddleOCR's Arabic
+    /// model and our fine-tuned Hebrew model are both trained this way.
+    pub fn is_rtl(&self) -> bool {
+        matches!(self, PpocrScript::Arabic | PpocrScript::Hebrew)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
