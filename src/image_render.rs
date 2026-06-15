@@ -1055,13 +1055,17 @@ fn draw_shaped_line(
                                 left,
                                 top,
                             });
+                            // ARGB → RGBA bytes (see the rotated branch below): the GPU
+                            // glyph shader reads the colour as R,G,B,A, so `to_ne_bytes`
+                            // would swap R/B for coloured ink.
+                            let [a, r, g, b] = fg_argb.to_be_bytes();
                             col.instances.push(GlyphInstanceData {
                                 key,
                                 pen_x: glyph_x,
                                 pen_y: glyph_y,
                                 cos: cos_angle,
                                 sin: sin_angle,
-                                color: fg_argb.to_ne_bytes(),
+                                color: [r, g, b, a],
                             });
                         }
                     }
