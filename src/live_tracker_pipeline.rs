@@ -174,6 +174,11 @@ pub struct AcquireRequest {
     config: PipelineConfig,
     timestamp_ns: u64,
     generation: u64,
+    /// `(anchor_id, H_root→view)` of the frame this request was emitted on, so a
+    /// recolor warps cached boxes with the pose matching the frame it reads back
+    /// — not a later, drifted one (which would offset the strips). `None` when not
+    /// locked.
+    recolor_pose: Option<(u64, [f32; 9])>,
 }
 
 impl AcquireRequest {
@@ -272,6 +277,7 @@ enum PendingJob {
         frame: Arc<LiveFrame>,
         display_crop: Rect,
         config: PipelineConfig,
+        pose: (u64, [f32; 9]),
         generation: u64,
     },
 }
@@ -661,8 +667,11 @@ impl LiveTrackerPipeline {
                         frame,
                         display_crop,
                         config,
+                        pose,
                         generation,
-                    } => pipeline.run_recolor_inner(&frame, display_crop, &config, generation),
+                    } => {
+                        pipeline.run_recolor_inner(&frame, display_crop, &config, pose, generation)
+                    }
                 };
                 if let Ok(mut slot) = pipeline.last_telemetry.lock() {
                     *slot = Some(telemetry);
@@ -1013,6 +1022,9 @@ impl LiveTrackerPipeline {
         // `rgb_request`; it reads back a full-res RGBA frame and feeds it to
         // `provide_acquire_rgb`. Frames that carry RGBA (Android) dispatch
         // inline as before. Both gated by worker backpressure.
+        // Pose of THIS frame (matches the camera the caller reads back), stamped
+        // onto the request so an async recolor warps boxes with the right H.
+        let recolor_pose = h_for_compose.map(|h| (tracker_anchor, h));
         let (started_acquire, started_refresh, rgb_request) = match async_kind {
             None => (false, false, None),
             Some(kind) if frame.is_gray_only() => (
@@ -1024,6 +1036,7 @@ impl LiveTrackerPipeline {
                     config: cfg.clone(),
                     timestamp_ns,
                     generation: self.generation.load(Ordering::SeqCst),
+                    recolor_pose,
                 }),
             ),
             Some(kind) => {
@@ -1034,17 +1047,20 @@ impl LiveTrackerPipeline {
                     &cfg,
                     timestamp_ns,
                     self.generation.load(Ordering::SeqCst),
+                    recolor_pose,
                 );
                 (a, r, None)
             }
         };
 
-        // Materialize bytes if any async work was dispatched, else
-        // drop the borrow. Cheap (~3 ms memcpy at 1.2 MP) and avoided
-        // entirely on the common pure-tracking frame.
+        // Materialize bytes if any async work was dispatched inline (acquire,
+        // refresh, or recolor), else drop the borrow. Cheap (~3 ms memcpy at
+        // 1.2 MP) and avoided entirely on the common pure-tracking frame.
+        let inline_recolor =
+            matches!(async_kind, Some(AsyncKind::Recolor)) && !frame.is_gray_only();
         {
             let mut state = frame.state().lock().map_err(|_| poisoned())?;
-            if started_acquire || started_refresh {
+            if started_acquire || started_refresh || inline_recolor {
                 state.materialize_owned();
             } else {
                 state.clear_external();
@@ -1243,6 +1259,7 @@ impl LiveTrackerPipeline {
         cfg: &PipelineConfig,
         timestamp_ns: u64,
         generation: u64,
+        recolor_pose: Option<(u64, [f32; 9])>,
     ) -> (bool, bool) {
         let worker_guard = self.worker.lock().ok();
         let Some(worker) = worker_guard.as_ref().and_then(|w| w.as_ref()) else {
@@ -1269,12 +1286,16 @@ impl LiveTrackerPipeline {
                 (false, started)
             }
             AsyncKind::Recolor => {
-                worker.try_dispatch(PendingJob::Recolor {
-                    frame: Arc::clone(frame),
-                    display_crop,
-                    config: cfg.clone(),
-                    generation,
-                });
+                // Need the pose of the read-back frame; skip if it's gone.
+                if let Some(pose) = recolor_pose {
+                    worker.try_dispatch(PendingJob::Recolor {
+                        frame: Arc::clone(frame),
+                        display_crop,
+                        config: cfg.clone(),
+                        pose,
+                        generation,
+                    });
+                }
                 (false, false)
             }
         }
@@ -1291,6 +1312,7 @@ impl LiveTrackerPipeline {
             &req.config,
             req.timestamp_ns,
             req.generation,
+            req.recolor_pose,
         );
         a || r
     }
@@ -1652,6 +1674,7 @@ impl LiveTrackerPipeline {
         frame: &Arc<LiveFrame>,
         display_crop: Rect,
         cfg: &PipelineConfig,
+        pose: (u64, [f32; 9]),
         generation: u64,
     ) -> AcquireTelemetry {
         let t = Instant::now();
@@ -1659,13 +1682,9 @@ impl LiveTrackerPipeline {
         if self.generation.load(Ordering::SeqCst) != generation {
             return canceled_telemetry(0, 0.0);
         }
-        let (anchor_id, h_root_to_view) = match self.last_root_to_view.lock() {
-            Ok(g) => match *g {
-                Some((a, h)) => (a, h),
-                None => return error_telemetry("recolor: nothing locked"),
-            },
-            Err(_) => return error_telemetry("recolor: last_root_to_view poisoned"),
-        };
+        // Pose captured when the request was emitted (matches the read-back frame),
+        // not the latest — the camera may have moved before this worker ran.
+        let (anchor_id, h_root_to_view) = pose;
         let (scaled_boxes, ink_masks) = match self.recolor_cache.lock() {
             Ok(c) => match c.get(&anchor_id) {
                 Some(rc) => (rc.scaled_boxes.clone(), rc.ink_masks.clone()),
