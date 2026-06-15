@@ -28,7 +28,6 @@ pub struct LanguageTtsV2 {
 pub(crate) struct LanguageResources {
     pub translation_root_packs: Vec<String>,
     pub ocr_packs: Vec<(String, String)>,
-    pub preferred_ocr_engine: String,
     pub dictionary_pack_id: Option<String>,
     pub support_root_packs: Vec<String>,
 }
@@ -126,7 +125,6 @@ pub struct TranslationPack {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OcrPack {
-    Tesseract { language: String },
     PpocrDetector,
     PpocrRecognizer { script: PpocrScript },
 }
@@ -134,7 +132,6 @@ pub enum OcrPack {
 impl OcrPack {
     pub fn engine(&self) -> OcrEngine {
         match self {
-            OcrPack::Tesseract { .. } => OcrEngine::Tesseract,
             OcrPack::PpocrDetector | OcrPack::PpocrRecognizer { .. } => OcrEngine::Ppocr,
         }
     }
@@ -142,21 +139,18 @@ impl OcrPack {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OcrEngine {
-    Tesseract,
     Ppocr,
 }
 
 impl OcrEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
-            OcrEngine::Tesseract => "tesseract",
             OcrEngine::Ppocr => "ppocr",
         }
     }
 
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
-            "tesseract" => Some(OcrEngine::Tesseract),
             "ppocr" => Some(OcrEngine::Ppocr),
             _ => None,
         }
@@ -177,6 +171,12 @@ pub enum PpocrScript {
     Devanagari,
     El,
     Eslav,
+    /// Hebrew. The fine-tuned rec model emits glyphs in visual (RTL) order; logical
+    /// order is recovered downstream by the bidi pass, same as Arabic.
+    Hebrew,
+    /// Merged Bengali + Gujarati + Kannada + Malayalam recognizer (one model over the
+    /// four non-Devanagari Indic scripts; Devanagari/hi keeps its own recognizer).
+    Indic,
     Korean,
     Latin,
     Ta,
@@ -193,6 +193,8 @@ impl PpocrScript {
             PpocrScript::Devanagari => "devanagari",
             PpocrScript::El => "el",
             PpocrScript::Eslav => "eslav",
+            PpocrScript::Hebrew => "hebrew",
+            PpocrScript::Indic => "indic",
             PpocrScript::Korean => "korean",
             PpocrScript::Latin => "latin",
             PpocrScript::Ta => "ta",
@@ -209,6 +211,8 @@ impl PpocrScript {
             "devanagari" => Some(PpocrScript::Devanagari),
             "el" => Some(PpocrScript::El),
             "eslav" => Some(PpocrScript::Eslav),
+            "hebrew" => Some(PpocrScript::Hebrew),
+            "indic" => Some(PpocrScript::Indic),
             "korean" => Some(PpocrScript::Korean),
             "latin" => Some(PpocrScript::Latin),
             "ta" => Some(PpocrScript::Ta),
@@ -738,13 +742,6 @@ impl LanguageCatalog {
         self.languages
             .get(language_code.as_str())
             .map(|info| info.resources.ocr_packs.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn preferred_ocr_engine_for_language(&self, language_code: &LanguageCode) -> String {
-        self.languages
-            .get(language_code.as_str())
-            .map(|info| info.resources.preferred_ocr_engine.clone())
             .unwrap_or_default()
     }
 

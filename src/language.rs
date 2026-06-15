@@ -40,10 +40,8 @@ pub struct Language {
     pub code: String,
     pub display_name: String,
     pub short_display_name: String,
-    pub tess_name: String,
     pub script: String,
     pub dictionary_code: String,
-    pub tessdata_size_bytes: u64,
 }
 
 impl PartialEq for Language {
@@ -61,10 +59,6 @@ impl Hash for Language {
 }
 
 impl Language {
-    pub fn tess_filename(&self) -> String {
-        format!("{}.traineddata", self.tess_name)
-    }
-
     pub fn is_english(&self) -> bool {
         self.code == "en"
     }
@@ -101,13 +95,10 @@ mod tests {
             code: "en".to_string(),
             display_name: "English".to_string(),
             short_display_name: "English".to_string(),
-            tess_name: "eng".to_string(),
             script: "Latn".to_string(),
             dictionary_code: "en".to_string(),
-            tessdata_size_bytes: 42,
         };
 
-        assert_eq!(language.tess_filename(), "eng.traineddata");
         assert!(language.is_english());
     }
 }

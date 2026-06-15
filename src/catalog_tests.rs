@@ -103,11 +103,11 @@ fn translation_pack(
     )
 }
 
-fn ocr_pack(id: &str, language: &str, file: AssetFileV2) -> PackRecord {
+fn ocr_pack(id: &str, file: AssetFileV2) -> PackRecord {
     pack_record(
         id,
-        PackKind::Ocr(OcrPack::Tesseract {
-            language: language.to_string(),
+        PackKind::Ocr(OcrPack::PpocrRecognizer {
+            script: PpocrScript::Latin,
         }),
         vec![file],
         vec![],
@@ -203,8 +203,7 @@ fn language_info(
                 .into_iter()
                 .map(ToString::to_string)
                 .collect(),
-            ocr_packs: vec![("tesseract".to_string(), ocr_pack_id.to_string())],
-            preferred_ocr_engine: "tesseract".to_string(),
+            ocr_packs: vec![("ppocr".to_string(), ocr_pack_id.to_string())],
             dictionary_pack_id: dictionary_pack_id.map(ToString::to_string),
             support_root_packs: support_root_packs
                 .into_iter()
@@ -235,19 +234,15 @@ fn base_catalog() -> LanguageCatalog {
         code: "en".to_string(),
         display_name: "English".to_string(),
         short_display_name: "English".to_string(),
-        tess_name: "eng".to_string(),
         script: "Latn".to_string(),
         dictionary_code: "en".to_string(),
-        tessdata_size_bytes: 10,
     };
     let spanish = Language {
         code: "es".to_string(),
         display_name: "Spanish".to_string(),
         short_display_name: "Spanish".to_string(),
-        tess_name: "spa".to_string(),
         script: "Latn".to_string(),
         dictionary_code: "es".to_string(),
-        tessdata_size_bytes: 11,
     };
 
     let languages = HashMap::from([
@@ -282,16 +277,14 @@ fn base_catalog() -> LanguageCatalog {
             "ocr-en".to_string(),
             ocr_pack(
                 "ocr-en",
-                "en",
-                asset_file("eng.traineddata", "tesseract/tessdata/eng.traineddata", 10),
+                asset_file("rec_latin_en.mnn", "ppocr/rec_latin_en.mnn", 10),
             ),
         ),
         (
             "ocr-es".to_string(),
             ocr_pack(
                 "ocr-es",
-                "es",
-                asset_file("spa.traineddata", "tesseract/tessdata/spa.traineddata", 11),
+                asset_file("rec_latin_es.mnn", "ppocr/rec_latin_es.mnn", 11),
             ),
         ),
         (
@@ -536,20 +529,10 @@ fn batch_ocr_download_plan_dedupes_shared_dependencies() {
             vec!["ocr-ppocr-detector"],
         ),
     );
-    catalog
-        .languages
-        .get_mut("en")
-        .unwrap()
-        .resources
-        .ocr_packs
-        .push(("ppocr".to_string(), "ocr-ppocr-latin".to_string()));
-    catalog
-        .languages
-        .get_mut("es")
-        .unwrap()
-        .resources
-        .ocr_packs
-        .push(("ppocr".to_string(), "ocr-ppocr-cj".to_string()));
+    catalog.languages.get_mut("en").unwrap().resources.ocr_packs =
+        vec![("ppocr".to_string(), "ocr-ppocr-latin".to_string())];
+    catalog.languages.get_mut("es").unwrap().resources.ocr_packs =
+        vec![("ppocr".to_string(), "ocr-ppocr-cj".to_string())];
 
     let checker = FakeInstallChecker::with_files(&[]);
     let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
@@ -618,13 +601,8 @@ fn catalog_with_detector_alternatives() -> LanguageCatalog {
             vec!["ocr-ppocr-detector"],
         ),
     );
-    catalog
-        .languages
-        .get_mut("en")
-        .unwrap()
-        .resources
-        .ocr_packs
-        .push(("ppocr".to_string(), "ocr-ppocr-latin".to_string()));
+    catalog.languages.get_mut("en").unwrap().resources.ocr_packs =
+        vec![("ppocr".to_string(), "ocr-ppocr-latin".to_string())];
     catalog
 }
 
@@ -703,7 +681,7 @@ fn outranked_alternative_on_disk_is_superseded() {
 fn computes_language_availability_from_pack_install_state() {
     let catalog = base_catalog();
     let checker = FakeInstallChecker::with_files(&[
-        "tesseract/tessdata/eng.traineddata",
+        "ppocr/rec_latin_en.mnn",
         "dictionaries/en.dict",
         "tts/voice.onnx",
         "tts/voice.onnx.json",
@@ -716,7 +694,7 @@ fn computes_language_availability_from_pack_install_state() {
         "bin/vocab.bb.spm",
         "bin/vocab.yy.spm",
         "bin/shared.bin",
-        "tesseract/tessdata/spa.traineddata",
+        "ppocr/rec_latin_es.mnn",
         "dictionaries/es.dict",
         "bin/mucab.bin",
         "tts/voice-es.onnx",
@@ -754,7 +732,7 @@ fn builds_languages_and_dictionary_info_from_catalog() {
         .dictionary_info(&DictionaryCode::from("en"))
         .unwrap();
 
-    assert_eq!(spanish.tess_name, "spa");
+    assert_eq!(spanish.display_name, "Spanish");
     assert_eq!(dictionary_info.filename, "en.dict");
     assert_eq!(dictionary_info.type_name, "wiktionary");
     assert_eq!(dictionary_info.word_count, 456);
@@ -894,10 +872,8 @@ fn resolves_pivot_translation_plan_from_installed_catalog() {
         code: "fr".to_string(),
         display_name: "French".to_string(),
         short_display_name: "French".to_string(),
-        tess_name: "fra".to_string(),
         script: "Latn".to_string(),
         dictionary_code: "fr".to_string(),
-        tessdata_size_bytes: 0,
     };
     catalog.languages.insert(
         "fr".to_string(),

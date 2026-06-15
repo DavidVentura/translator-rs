@@ -1,146 +1,17 @@
-#[cfg(feature = "tesseract")]
-use std::path::Path;
-#[cfg(not(feature = "tesseract"))]
 use std::sync::Mutex;
-#[cfg(feature = "tesseract")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "tesseract")]
-use std::sync::{Mutex, MutexGuard};
 
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
-#[cfg(feature = "ppocr")]
 use crate::catalog::{OcrPack, PackKind, PpocrScript};
-#[cfg(feature = "ppocr")]
 use crate::language_detect::detect_language_robust_code;
-#[cfg(feature = "ppocr")]
 use crate::live_frame::OrientedImage;
-#[cfg(feature = "ppocr")]
 use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine};
-#[cfg(feature = "tesseract")]
-use crate::ocr::{DetectedWord, build_text_blocks};
 use crate::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock, prepare_overlay_image};
-#[cfg(feature = "ppocr")]
 use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
 use crate::settings::BackgroundMode;
-#[cfg(feature = "tesseract")]
-use crate::tesseract::DetectedWord as TesseractDetectedWord;
-#[cfg(feature = "tesseract")]
-use crate::tesseract::{PageSegMode, TesseractWrapper};
 use crate::translate::Translator;
 
-#[cfg(feature = "tesseract")]
-struct OcrEngineState {
-    engine: TesseractWrapper,
-    language_spec: String,
-    reading_order: ReadingOrder,
-    tessdata_path: String,
-}
-
-#[cfg(feature = "tesseract")]
-pub struct OcrCache {
-    state: Option<OcrEngineState>,
-}
-
-#[cfg(feature = "tesseract")]
-impl OcrCache {
-    pub fn new() -> Self {
-        Self { state: None }
-    }
-}
-
-#[cfg(feature = "tesseract")]
-impl Default for OcrCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Pool of [`OcrCache`] instances, one [`Mutex`] per slot, so concurrent
-/// callers can run Tesseract in parallel. Single-language workloads keep
-/// each slot's tessdata loaded on first use; the cost is roughly N copies
-/// of the language model in RAM (50–80 MB each for `eng`).
-#[cfg(feature = "tesseract")]
-pub struct OcrPool {
-    workers: Vec<Mutex<OcrCache>>,
-    /// Round-robin pointer used as a tiebreaker when every worker is busy
-    /// — distributes the blocking-wait load instead of always queueing
-    /// behind worker[0].
-    next: AtomicUsize,
-}
-
-#[cfg(feature = "tesseract")]
-impl OcrPool {
-    pub fn new(n_workers: usize) -> Self {
-        let n = n_workers.max(1);
-        Self {
-            workers: (0..n).map(|_| Mutex::new(OcrCache::new())).collect(),
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    /// Lease an idle worker. Walks `try_lock` over every slot first
-    /// (lock-free fast path); if all are busy, blocks on a round-robin
-    /// pick so concurrent callers don't all queue behind the same slot.
-    pub fn lease(&self) -> MutexGuard<'_, OcrCache> {
-        for w in &self.workers {
-            if let Ok(g) = w.try_lock() {
-                return g;
-            }
-        }
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        self.workers[idx].lock().expect("ocr cache poisoned")
-    }
-}
-
-#[cfg(feature = "tesseract")]
-impl Default for OcrPool {
-    fn default() -> Self {
-        Self::new(1)
-    }
-}
-
-#[cfg(feature = "tesseract")]
-pub(crate) fn translate_image_rgba_in_snapshot(
-    engine: &Mutex<BergamotEngine>,
-    ocr_pool: &OcrPool,
-    snapshot: &CatalogSnapshot,
-    rgba_bytes: &[u8],
-    width: u32,
-    height: u32,
-    source_code: &LanguageCode,
-    target_code: &LanguageCode,
-    min_confidence: u32,
-    reading_order: ReadingOrder,
-    background_mode: BackgroundMode,
-) -> Result<PreparedImageOverlay, TranslatorError> {
-    let blocks = build_tesseract_blocks(
-        ocr_pool,
-        snapshot,
-        rgba_bytes,
-        width,
-        height,
-        source_code,
-        min_confidence,
-        reading_order,
-    )?;
-    finalize_image_overlay(
-        engine,
-        snapshot,
-        rgba_bytes,
-        width,
-        height,
-        source_code,
-        target_code,
-        blocks,
-        background_mode,
-        reading_order,
-        None,
-    )
-}
-
-#[cfg(feature = "ppocr")]
 pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     engine: &Mutex<BergamotEngine>,
     ppocr: &PpocrEngine,
@@ -151,6 +22,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     max_image_size: u32,
     source_selection: &OcrSourceSelection,
     target_code: &LanguageCode,
+    min_confidence: u32,
     background_mode: BackgroundMode,
     reading_order: Option<ReadingOrder>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
@@ -236,7 +108,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
-    let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines, reading_order);
+    let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines, min_confidence, reading_order);
     let source_code = match source_selection {
         OcrSourceSelection::Specific { language_code } => language_code.clone(),
         OcrSourceSelection::Auto => {
@@ -324,66 +196,6 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
     }
 }
 
-#[cfg(feature = "tesseract")]
-fn build_tesseract_blocks(
-    ocr_pool: &OcrPool,
-    snapshot: &CatalogSnapshot,
-    rgba_bytes: &[u8],
-    width: u32,
-    height: u32,
-    source_code: &LanguageCode,
-    min_confidence: u32,
-    reading_order: ReadingOrder,
-) -> Result<Vec<TextBlock>, TranslatorError> {
-    let bytes_per_pixel = 4i32;
-    let i_width = width as i32;
-    let i_height = height as i32;
-    let bytes_per_line = i_width
-        .checked_mul(bytes_per_pixel)
-        .ok_or_else(|| TranslatorError::ocr("image width overflow"))?;
-
-    let page_seg_mode = match reading_order {
-        ReadingOrder::LeftToRight => PageSegMode::PsmAutoOsd,
-        ReadingOrder::TopToBottomRightToLeft => PageSegMode::PsmSingleBlockVertText,
-    };
-
-    let join_without_spaces = source_code.as_str() == "ja";
-    let relax_single_char_confidence = reading_order == ReadingOrder::TopToBottomRightToLeft;
-
-    let mut cache_guard = ocr_pool.lease();
-    with_ocr_engine(
-        &mut cache_guard,
-        snapshot,
-        source_code.as_str(),
-        reading_order,
-        |ocr| {
-            ocr.set_page_seg_mode(page_seg_mode);
-            ocr.set_frame(
-                rgba_bytes,
-                i_width,
-                i_height,
-                bytes_per_pixel,
-                bytes_per_line,
-            )
-            .map_err(|err| format!("failed to set OCR frame: {err}"))?;
-            let words = ocr
-                .get_word_boxes()
-                .map_err(|err| format!("failed to read OCR words: {err}"))?;
-            let detected_words = words
-                .into_iter()
-                .map(map_tesseract_word)
-                .collect::<Vec<_>>();
-            Ok(build_text_blocks(
-                &detected_words,
-                min_confidence,
-                join_without_spaces,
-                relax_single_char_confidence,
-            ))
-        },
-    )
-    .map_err(TranslatorError::ocr)
-}
-
 /// Pair the still-path detector boxes with their recognised lines, carrying the
 /// tight oriented rect forward into [`TextLine`] so paragraph grouping has the
 /// glyph-tight metric (the `RecognizedTextLine` shape doesn't carry it on its
@@ -392,12 +204,17 @@ fn build_tesseract_blocks(
 fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
+    min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
+    // The user's confidence setting (0–100) is a stricter line gate on top of the
+    // recognizer's built-in `rec_drop_score`: lines the model accepted but whose mean
+    // CTC score sits below the user's bar are dropped before paragraph grouping.
+    let min_score = min_confidence as f32 / 100.0;
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())
-        .filter(|(_, line)| !line.text.trim().is_empty())
+        .filter(|(_, line)| !line.text.trim().is_empty() && line.confidence >= min_score)
         .map(|(b, line)| TextLine {
             text: line.text,
             bounding_box: line.rect,
@@ -426,9 +243,10 @@ fn ppocr_script_for_class(ppocr: &PpocrEngine, class: PpocrScriptClass) -> Optio
         PpocrScriptClass::Chinese | PpocrScriptClass::Japanese => &[PpocrScript::Cj],
         PpocrScriptClass::Cyrillic => &[PpocrScript::Eslav, PpocrScript::Cyrillic],
         PpocrScriptClass::Devanagari => &[PpocrScript::Devanagari],
-        // PULC has a Kannada class but PPOCR has no Kannada recognizer; falls through to
-        // the dominant-pack fallback in `route_ppocr_predictions`.
-        PpocrScriptClass::Kannada => &[],
+        // PULC's Kannada class is the only one of the merged Indic scripts (bn/gu/kn/ml)
+        // it can name; the other three have no PULC class and reach the Indic recognizer
+        // only via forced-source or the dominant-pack fallback.
+        PpocrScriptClass::Kannada => &[PpocrScript::Indic],
         PpocrScriptClass::Korean => &[PpocrScript::Korean],
         PpocrScriptClass::Tamil => &[PpocrScript::Ta],
         PpocrScriptClass::Telugu => &[PpocrScript::Te],
@@ -714,23 +532,6 @@ fn finalize_image_overlay(
     result
 }
 
-#[cfg(feature = "tesseract")]
-fn map_tesseract_word(word: TesseractDetectedWord) -> DetectedWord {
-    DetectedWord {
-        text: word.text,
-        confidence: word.confidence,
-        bounding_box: Rect {
-            left: word.bounding_rect.left as u32,
-            top: word.bounding_rect.top as u32,
-            right: word.bounding_rect.right as u32,
-            bottom: word.bounding_rect.bottom as u32,
-        },
-        is_at_beginning_of_para: word.is_at_beginning_of_para,
-        end_para: word.end_para,
-        end_line: word.end_line,
-    }
-}
-
 fn translate_block_texts(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
@@ -787,63 +588,6 @@ fn merge_translated_block_texts(
         translated_blocks[index] = translated_text;
     }
     translated_blocks
-}
-
-#[cfg(feature = "tesseract")]
-fn with_ocr_engine<T, F>(
-    cache: &mut OcrCache,
-    snapshot: &CatalogSnapshot,
-    source_code: &str,
-    reading_order: ReadingOrder,
-    f: F,
-) -> Result<T, String>
-where
-    F: FnOnce(&mut TesseractWrapper) -> Result<T, String>,
-{
-    let language = snapshot
-        .catalog
-        .language_by_code(&LanguageCode::from(source_code))
-        .ok_or_else(|| format!("unknown source language: {source_code}"))?;
-    let tessdata_path = Path::new(&snapshot.base_dir)
-        .join("tesseract")
-        .join("tessdata");
-    let has_japanese_vertical_model =
-        source_code == "ja" && tessdata_path.join("jpn_vert.traineddata").exists();
-    let language_spec = match (source_code, reading_order, has_japanese_vertical_model) {
-        ("ja", ReadingOrder::TopToBottomRightToLeft, true) => "jpn_vert".to_string(),
-        _ => format!("{}+eng", language.tess_name),
-    };
-
-    let tessdata_path_string = tessdata_path.to_string_lossy().into_owned();
-    let needs_reinit = cache.state.as_ref().is_none_or(|state| {
-        state.language_spec != language_spec
-            || state.reading_order != reading_order
-            || state.tessdata_path != tessdata_path_string
-    });
-
-    if needs_reinit {
-        let engine = TesseractWrapper::new(
-            Some(
-                tessdata_path
-                    .to_str()
-                    .ok_or_else(|| "invalid tessdata path".to_string())?,
-            ),
-            Some(&language_spec),
-        )
-        .map_err(|err| format!("failed to initialize tesseract: {err}"))?;
-        cache.state = Some(OcrEngineState {
-            engine,
-            language_spec,
-            reading_order,
-            tessdata_path: tessdata_path_string,
-        });
-    }
-
-    let state = cache
-        .state
-        .as_mut()
-        .ok_or_else(|| "OCR engine unavailable".to_string())?;
-    f(&mut state.engine)
 }
 
 #[cfg(test)]

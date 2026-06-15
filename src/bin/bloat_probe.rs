@@ -44,7 +44,6 @@ fn main() {
                 75,
                 Some(ReadingOrder::LeftToRight),
                 BackgroundMode::AutoDetect,
-                translator::PreferredOcrEngine::default(),
             );
             let _ = session.plan_download("en", Feature::Core, None);
             let _ = session.plan_download("en", Feature::Dictionary, None);

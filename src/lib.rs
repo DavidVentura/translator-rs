@@ -54,7 +54,7 @@ mod mnn_inference;
 #[cfg(feature = "mucab")]
 pub mod mucab;
 pub mod ocr;
-#[cfg(any(feature = "tesseract", feature = "ppocr"))]
+#[cfg(feature = "ppocr")]
 mod ocr_runtime;
 #[cfg(feature = "odt")]
 pub mod odt;
@@ -101,8 +101,6 @@ mod styled;
 pub mod surface_map;
 #[cfg(feature = "dictionary")]
 pub mod tarkka;
-#[cfg(feature = "tesseract")]
-pub mod tesseract;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod text_runs;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
@@ -130,7 +128,7 @@ pub use ocr::{
 };
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
-pub use settings::{BackgroundMode, PreferredOcrEngine};
+pub use settings::BackgroundMode;
 pub use styled::{
     OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
 };

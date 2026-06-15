@@ -36,8 +36,6 @@ struct LanguageAssetsWire {
     translate: Vec<String>,
     #[serde(default)]
     ocr: HashMap<String, String>,
-    #[serde(default)]
-    preferred_ocr_engine: String,
     dictionary: Option<String>,
     #[serde(default)]
     support: Vec<String>,
@@ -237,17 +235,8 @@ fn normalized(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
-fn parse_ocr_pack(
-    engine: &str,
-    role: Option<&str>,
-    script: Option<&str>,
-    language: Option<String>,
-) -> Option<OcrPack> {
+fn parse_ocr_pack(engine: &str, role: Option<&str>, script: Option<&str>) -> Option<OcrPack> {
     match engine {
-        "tesseract" => {
-            let language = normalized(language)?;
-            Some(OcrPack::Tesseract { language })
-        }
         "ppocr" => match role? {
             "detector" => Some(OcrPack::PpocrDetector),
             "recognizer" => {
@@ -273,11 +262,10 @@ impl AssetPackWire {
                 engine,
                 role,
                 script,
-                language,
+                language: _,
                 common,
             } => {
-                let ocr_pack =
-                    parse_ocr_pack(&engine, role.as_deref(), script.as_deref(), language)?;
+                let ocr_pack = parse_ocr_pack(&engine, role.as_deref(), script.as_deref())?;
                 PackRecord {
                     id,
                     files: common.files.into_iter().map(Into::into).collect(),
@@ -388,24 +376,10 @@ fn compile_language_info(
     let resources = LanguageResources {
         translation_root_packs: entry.assets.translate,
         ocr_packs,
-        preferred_ocr_engine: entry.assets.preferred_ocr_engine,
         dictionary_pack_id: entry.assets.dictionary.filter(|value| !value.is_empty()),
         support_root_packs: entry.assets.support,
     };
 
-    let tesseract_pack_id = resources
-        .ocr_packs
-        .iter()
-        .find(|(engine, _)| engine == "tesseract")
-        .map(|(_, pack_id)| pack_id)?;
-    let tesseract_pack = packs.get(tesseract_pack_id)?;
-    let tess_file = tesseract_pack.files.first()?;
-    let tess_name = tess_file.name.strip_suffix(".traineddata")?.to_string();
-    let tessdata_size_bytes = tesseract_pack
-        .files
-        .iter()
-        .map(|file| file.size_bytes)
-        .sum();
     let dictionary_code = resources
         .dictionary_pack_id
         .as_ref()
@@ -422,10 +396,8 @@ fn compile_language_info(
             code: code.clone(),
             display_name: entry.meta.name,
             short_display_name: entry.meta.short_name,
-            tess_name,
             script: entry.meta.script,
             dictionary_code,
-            tessdata_size_bytes,
         },
         resources,
         tts: compile_tts_config(entry.tts),

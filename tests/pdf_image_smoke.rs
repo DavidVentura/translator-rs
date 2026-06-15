@@ -3,7 +3,7 @@
 //!
 //! Skipped unless every required asset is provided via env vars:
 //!   PDF_IMAGE_TEST_FILE       path to a PDF with raster image XObjects
-//!   PDF_IMAGE_BUCKET_DIR      bucket dir with index.json + bin/ + tesseract/
+//!   PDF_IMAGE_BUCKET_DIR      bucket dir with index.json + bin/ + ppocr/
 //!   PDF_IMAGE_TARGET_LANG     target BCP-47, e.g. "es"
 //!   PDF_IMAGE_SOURCE_LANG     source BCP-47, e.g. "en"
 //! Optional:

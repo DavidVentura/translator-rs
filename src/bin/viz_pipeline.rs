@@ -177,6 +177,8 @@ fn script_from_slug(slug: &str) -> Option<PpocrScript> {
         "devanagari" => PpocrScript::Devanagari,
         "el" => PpocrScript::El,
         "eslav" => PpocrScript::Eslav,
+        "hebrew" => PpocrScript::Hebrew,
+        "indic" => PpocrScript::Indic,
         "korean" => PpocrScript::Korean,
         "latin" => PpocrScript::Latin,
         "ta" => PpocrScript::Ta,

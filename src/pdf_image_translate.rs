@@ -94,9 +94,8 @@ pub struct ImageTranslateOutput {
 }
 
 /// Number of worker threads that decode + OCR + render image XObjects
-/// in parallel. Sized to match the OcrPool so workers don't queue on
-/// the OCR mutexes; encoding (G4 / JPEG) and translation (bergamot
-/// mutex) overlap with pending OCR on other workers.
+/// in parallel. Encoding (G4 / JPEG) and translation (bergamot mutex)
+/// overlap with pending OCR on other workers.
 const XOBJECT_WORKERS: usize = 4;
 
 pub fn translate_pdf_images_in_place(
@@ -818,7 +817,6 @@ fn translate_one_xobject(
             DEFAULT_MIN_CONFIDENCE,
             Some(ReadingOrder::LeftToRight),
             BackgroundMode::AutoDetect,
-            crate::settings::PreferredOcrEngine::default(),
         )
         .map_err(|e: TranslatorError| {
             // The OCR layer returns "No text found in image" as a normal
@@ -1487,13 +1485,12 @@ fn jpeg_encode_rgb(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image
 // the page, OCR it, and replace the page's content stream.
 
 /// DPI to render PDF pages at when running them through the OCR pipeline.
-/// 200 is a balance between OCR accuracy (Tesseract likes ~300) and PDF
+/// 200 is a balance between OCR accuracy (~300 is ideal) and PDF
 /// payload size (200 DPI A4 ≈ 1700×2200 = 3.7M pixels).
 const RASTER_PAGE_DPI: f32 = 200.0;
 
 /// Number of worker threads that run mupdf render + OCR + image_render +
-/// flate compress in parallel. Tied to the size of `OcrPool` in the
-/// session — extra workers would just queue on the OCR mutexes.
+/// flate compress in parallel.
 const RASTER_WORKERS: usize = 4;
 
 /// Run a PDF-text overlay pass on every page that has no extractable
@@ -1768,7 +1765,6 @@ fn ocr_page(
             DEFAULT_MIN_CONFIDENCE,
             Some(ReadingOrder::LeftToRight),
             BackgroundMode::AutoDetect,
-            crate::settings::PreferredOcrEngine::default(),
         )
         .map_err(|e: TranslatorError| {
             if e.message.to_lowercase().contains("no text") {
