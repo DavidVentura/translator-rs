@@ -2179,11 +2179,18 @@ fn erase_text_region(
             let paint = autodetect_paint(&image.as_image(), aabb);
             // When the ink model gave us a matte, erase only its ink pixels and
             // reconstruct the background under them, instead of flat-filling the
-            // whole rect — the page texture/gradient shows through untouched.
+            // whole rect — the page texture/gradient shows through untouched. The
+            // erase also returns the ink-median foreground colour (the real ink
+            // colour), the same derivation the live overlay uses for its text, so
+            // the translated text matches the source ink instead of an autodetect
+            // luma guess. Background still comes from the autodetect sample.
             #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
             if let Some(mask) = ink_mask {
-                matte_erase_oriented(image, oriented, mask);
-                return paint.colors;
+                let fg = matte_erase_oriented(image, oriented, mask);
+                return OverlayColors {
+                    background_argb: paint.colors.background_argb,
+                    foreground_argb: fg.unwrap_or(paint.colors.foreground_argb),
+                };
             }
             image.apply_fill_plan_oriented(oriented, paint.fill);
             paint.colors
@@ -2194,18 +2201,25 @@ fn erase_text_region(
 /// Erase the ink pixels the model matte marked inside `oriented`'s AABB and
 /// replace them with a reconstructed background field, leaving everything else
 /// untouched. `ink_mask` is the full-image union matte (`y * width + x`).
+/// Returns the median colour of the erased ink pixels as an opaque ARGB — the
+/// real ink colour, for the translated text's foreground (`None` when too few
+/// ink pixels to estimate). This is the same derivation
+/// [`crate::color_matting::mat_detections`] uses for the live overlay's
+/// `fg_argb`, so still and live colour text identically.
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
-fn matte_erase_oriented(image: &mut RasterImageMut, oriented: OrientedRect, ink_mask: &[bool]) {
-    use crate::color_matting::{BG_BLOCK, background_field, dilate};
+fn matte_erase_oriented(
+    image: &mut RasterImageMut,
+    oriented: OrientedRect,
+    ink_mask: &[bool],
+) -> Option<u32> {
+    use crate::color_matting::{BG_BLOCK, background_field, dilate, median_color};
     use image::{Rgb, Rgba};
 
-    let Some(aabb) = clamp_rect(oriented.to_aabb(), image.width, image.height) else {
-        return;
-    };
+    let aabb = clamp_rect(oriented.to_aabb(), image.width, image.height)?;
     let aw = aabb.right - aabb.left;
     let ah = aabb.bottom - aabb.top;
     if aw == 0 || ah == 0 {
-        return;
+        return None;
     }
     let w = image.width;
     let mut pixels = vec![Rgba([0u8; 4]); (aw * ah) as usize];
@@ -2222,6 +2236,18 @@ fn matte_erase_oriented(image: &mut RasterImageMut, oriented: OrientedRect, ink_
             }
         }
     }
+
+    // Foreground = median of the matte's ink pixels (before dilation, so the
+    // anti-aliased rim doesn't pull it toward the background).
+    let ink: Vec<Rgba<u8>> = pixels
+        .iter()
+        .zip(sub.iter())
+        .filter_map(|(p, &m)| m.then_some(*p))
+        .collect();
+    let fg = (ink.len() >= 6).then(|| {
+        let m = median_color(&ink);
+        argb(m[0], m[1], m[2])
+    });
 
     // Grow the fill set by a height-proportional radius so the original ink's
     // anti-aliased rim is replaced too (the matte edge sits just inside it).
@@ -2241,6 +2267,7 @@ fn matte_erase_oriented(image: &mut RasterImageMut, oriented: OrientedRect, ink_
             image.rgba[idx..idx + 4].copy_from_slice(&bytes);
         }
     }
+    fg
 }
 
 pub fn prepare_overlay_image(
