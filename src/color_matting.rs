@@ -311,14 +311,11 @@ fn mat_strip_for_detection(
         }
     }
 
-    // The model mask is glyph-tight and sampled at 48px, so its upscaled edge
-    // sits inside the original ink's anti-aliased rim. Grow the *fill* region so
-    // that rim is replaced too, instead of surviving as a faint outline that the
-    // live camera shows through the strip's transparent pixels. The rim is ~1-2px
-    // of camera/screen anti-aliasing regardless of text size, so the radius needs
-    // an absolute floor: a purely height-proportional one collapses to 1px on the
-    // small canonical-resolution lines of the live path and leaves the rim.
-    let fill_radius = ((oriented.height * 0.10).round() as u32).clamp(3, 8);
+    // The model mask is glyph-tight and sampled at 48px, so on large
+    // glyphs its upscaled edge sits inside the original ink's anti-aliased
+    // rim. Grow the *fill* region by a height-proportional radius so that
+    // rim is replaced too, instead of surviving as a faint outline.
+    let fill_radius = ((oriented.height * 0.06).round() as u32).clamp(1, 6);
     let strip_mask = dilate(&strip_mask, strip_w, strip_h, fill_radius);
 
     // Reconstruct the background as a smooth low-frequency field

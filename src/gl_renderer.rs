@@ -1687,8 +1687,14 @@ impl GlesRenderer {
                     glow::ONE_MINUS_SRC_ALPHA,
                 );
             } else {
-                // Overlay composites onto the opaque camera; plain source-over.
-                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                // Overlay composites onto the opaque camera. The baked overlay
+                // texture is PREMULTIPLIED (the bake source-over'd into a cleared
+                // FBO, so rgb already carries × coverage), so source-over with
+                // `ONE` for the source factor — not `SRC_ALPHA`, which would apply
+                // coverage a second time and darken every soft edge toward black
+                // (a dark rim around strips, a dark halo around glyph anti-aliasing
+                // that reads as outlined text).
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
             }
             gl.uniform_matrix_3_f32_slice(
                 Some(&self.u_transform),
