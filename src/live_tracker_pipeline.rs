@@ -210,10 +210,9 @@ const RECOLOR_LUMA_DELTA: f32 = 0.06;
 /// masks are the model's geometry (stroke positions); only the colours sampled
 /// through them drift as the camera changes.
 struct RecolorCache {
-    /// Detection boxes in recognition-resolution coords (as passed to the model).
+    /// Detection boxes in the anchor root frame (as passed to the model at acquire).
+    /// A recolor warps these into the current view before re-sampling.
     scaled_boxes: Vec<DetectedTextBox>,
-    /// Recognition→canonical scale, to lift the fresh strips back to canonical.
-    rec_scale: f32,
     /// The ink model's per-box mattes from acquire (1:1 with `scaled_boxes`).
     ink_masks: Vec<Option<image::GrayImage>>,
 }
@@ -1585,7 +1584,6 @@ impl LiveTrackerPipeline {
                     anchor_id,
                     RecolorCache {
                         scaled_boxes: scaled,
-                        rec_scale,
                         ink_masks,
                     },
                 );
@@ -1661,21 +1659,21 @@ impl LiveTrackerPipeline {
         if self.generation.load(Ordering::SeqCst) != generation {
             return canceled_telemetry(0, 0.0);
         }
-        let anchor_id = match self.last_root_to_view.lock() {
+        let (anchor_id, h_root_to_view) = match self.last_root_to_view.lock() {
             Ok(g) => match *g {
-                Some((a, _)) => a,
+                Some((a, h)) => (a, h),
                 None => return error_telemetry("recolor: nothing locked"),
             },
             Err(_) => return error_telemetry("recolor: last_root_to_view poisoned"),
         };
-        let (scaled_boxes, rec_scale, ink_masks) = match self.recolor_cache.lock() {
+        let (scaled_boxes, ink_masks) = match self.recolor_cache.lock() {
             Ok(c) => match c.get(&anchor_id) {
-                Some(rc) => (rc.scaled_boxes.clone(), rc.rec_scale, rc.ink_masks.clone()),
+                Some(rc) => (rc.scaled_boxes.clone(), rc.ink_masks.clone()),
                 None => return error_telemetry("recolor: no cache for anchor"),
             },
             Err(_) => return error_telemetry("recolor: cache poisoned"),
         };
-        let mut strips = {
+        let strips = {
             let mut state = match frame.state().lock() {
                 Ok(s) => s,
                 Err(_) => return error_telemetry("recolor: frame.state poisoned"),
@@ -1695,9 +1693,27 @@ impl LiveTrackerPipeline {
             let Some(rgb) = oriented.rgb.as_ref() else {
                 return error_telemetry("recolor: oriented has no rgb");
             };
-            crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled_boxes, &ink_masks)
+            // The fresh readback is the *current* camera view; the cached boxes are
+            // in the anchor's root frame. The camera has moved since acquire (that's
+            // when exposure shifts), so the cached boxes don't line up with the view.
+            // Warp each box into the current view via `H_root→view`, sample there, and
+            // hand the strips to `recolor_anchor`, which keeps the original root
+            // geometry and swaps only the texture + colour — the view-rectified strip
+            // maps onto the root quad once the overlay warps it back by the same H.
+            let view_boxes: Vec<DetectedTextBox> = scaled_boxes
+                .iter()
+                .map(|b| {
+                    crate::live_session::warp_oriented_box(&b.oriented_box, &h_root_to_view)
+                        .map(|ob| {
+                            let mut nb = b.clone();
+                            nb.oriented_box = ob;
+                            nb
+                        })
+                        .unwrap_or_else(|| b.clone())
+                })
+                .collect();
+            crate::color_matting::mat_detections(&rgb.to_rgba8(), &view_boxes, &ink_masks)
         };
-        lift_strips_to_canonical(&mut strips, rec_scale);
         if self.generation.load(Ordering::SeqCst) != generation {
             return canceled_telemetry(anchor_id, ms());
         }

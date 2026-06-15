@@ -1017,11 +1017,18 @@ impl LiveSession {
         for spec in anchor.blocks.values_mut() {
             let mut block_changed = false;
             for slot in spec.matted_strips.iter_mut() {
-                let Some(old) = slot.as_ref() else { continue };
+                let Some(old) = slot.as_mut() else { continue };
                 let Some(new) = by_idx.get(&old.box_index) else {
                     continue;
                 };
-                *slot = Some((*new).clone());
+                // Keep the original (correct) root geometry; swap only the
+                // re-sampled background texture + ink colour. The fresh strip was
+                // sampled in the current view, but the overlay warps the root quad
+                // by the same homography, so the view-rectified texture registers.
+                old.strip_rgba = new.strip_rgba.clone();
+                old.strip_width = new.strip_width;
+                old.strip_height = new.strip_height;
+                old.fg_argb = new.fg_argb;
                 block_changed = true;
             }
             if block_changed {
