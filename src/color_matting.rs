@@ -92,11 +92,12 @@ pub struct MattedStrip {
 /// grown by a height-proportional radius to catch the anti-aliased rim,
 /// so a low cut is enough without bleeding into the background.
 const INK_ALPHA_CUT: u8 = 40;
-/// Matte alpha above which a pixel is a confident stroke *core* (not the
-/// anti-aliased rim), used to sample the foreground ink colour. Higher than
-/// [`INK_ALPHA_CUT`] (which governs the erase) so faint rim pixels don't wash
-/// the colour toward the background.
-const FG_INK_CORE_CUT: u8 = 160;
+/// Fraction of a line's *peak* matte alpha above which a pixel counts as a
+/// confident stroke core for sampling the foreground ink colour. Relative (not
+/// an absolute cut) so it adapts to the matte strength: a faint line still keeps
+/// its strongest pixels instead of falling back to the rim, which blends toward
+/// the page and washes the colour out.
+const FG_CORE_FRACTION: f32 = 0.6;
 /// Minimum ink pixels in a strip to bother matting it. Below this the
 /// model found essentially no ink in the box — return `None` and let the
 /// caller fall back to default-pill rendering.
@@ -215,8 +216,7 @@ fn project_box_ink(
     let y1 = (max_y.ceil().max(0.0) as u32).min(h);
 
     let w_us = w as usize;
-    let mut ink_samples: Vec<Rgba<u8>> = Vec::new();
-    let mut ink_core: Vec<Rgba<u8>> = Vec::new();
+    let mut ink: Vec<(Rgba<u8>, u8)> = Vec::new();
     for py in y0..y1 {
         for px in x0..x1 {
             let dx = px as f32 + 0.5 - o.cx;
@@ -233,29 +233,28 @@ fn project_box_ink(
             let alpha = ink_mask.get_pixel(mx, my)[0];
             if alpha >= INK_ALPHA_CUT {
                 union_ink[(py as usize) * w_us + px as usize] = true;
-                let pixel = *image.get_pixel(px, py);
-                ink_samples.push(pixel);
-                if alpha >= FG_INK_CORE_CUT {
-                    ink_core.push(pixel);
-                }
+                ink.push((*image.get_pixel(px, py), alpha));
             }
         }
     }
 
-    if ink_samples.len() < MIN_INK_PIXELS {
+    if ink.len() < MIN_INK_PIXELS {
         return None;
     }
-    // Foreground from the confident stroke cores (high matte alpha). At the 48px
-    // matte resolution the anti-aliased rim is a large fraction of these thin
-    // strokes, and including it (the `INK_ALPHA_CUT` set) pulls the median toward
-    // the background, washing the text out. Fall back to the full ink set only
-    // when the cores are too sparse to estimate.
-    let fg_pool = if ink_core.len() >= MIN_INK_PIXELS {
-        &ink_core
-    } else {
-        &ink_samples
-    };
-    Some(rgba_to_argb(median_color(fg_pool)))
+    // Foreground colour from the strongest-alpha pixels *relative to this line's
+    // own matte*. The anti-aliased rim blends toward the page, so on thin/faint
+    // text it outnumbers the stroke cores and a plain median washes the colour to
+    // the background (a black URL line rendering white-on-white). A fixed alpha cut
+    // can leave a faint line with no cores at all; a relative cut keeps the most
+    // ink-like pixels whatever the matte strength, then medians their colour.
+    let max_alpha = ink.iter().map(|(_, a)| *a).max().unwrap_or(0);
+    let cut = (max_alpha as f32 * FG_CORE_FRACTION) as u8;
+    let core: Vec<Rgba<u8>> = ink
+        .iter()
+        .filter(|(_, a)| *a >= cut)
+        .map(|(p, _)| *p)
+        .collect();
+    Some(rgba_to_argb(median_color(&core)))
 }
 
 /// Dewarp a detection's oriented box into a rectified RGBA strip, sample
