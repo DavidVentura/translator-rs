@@ -54,6 +54,14 @@ const MIN_TILT_COLUMNS: usize = 8;
 /// with the rough angle, so a real residual is small; a larger fit is a
 /// degenerate matte, not a steeper line.
 const MAX_TILT_RADIANS: f32 = 0.26; // ~15°
+/// Alpha at or above which a texel is a confident *stroke core*, used for stroke
+/// width. Higher than `INK_CUT` so the soft matte's anti-aliased halo doesn't
+/// fatten the measurement; the core is what carries the real weight signal.
+const STROKE_CUT: u8 = 128;
+/// Stroke-core-width-to-x-height ratio at or above which a line reads as bold.
+/// Calibrated on real e-ink/print pages: regular body runs ~0.17–0.22, bold
+/// headings ~0.30+.
+pub const BOLD_WEIGHT_RATIO: f32 = 0.26;
 
 /// Typography recovered from one line's ink matte, in the source image's pixel
 /// space (converted out of strip space via the box dimensions).
@@ -79,9 +87,25 @@ pub struct LineMetrics {
     /// Residual baseline tilt to add to the oriented box's angle (radians).
     /// Positive rotates the reading axis toward +v (downward in strip space).
     pub baseline_angle_delta: f32,
+    /// Mean ink stroke width (image-space pixels), estimated as `2·area/perimeter`
+    /// over the line's ink. On its own it scales with font size; divide by
+    /// `x_height` ([`weight_ratio`]) for a size-invariant weight that separates
+    /// bold from regular.
+    pub stroke_width: f32,
 }
 
 impl LineMetrics {
+    /// Stroke width relative to x-height — a size-invariant font-weight proxy.
+    /// Regular body text sits well below [`BOLD_WEIGHT_RATIO`]; bold above it.
+    pub fn weight_ratio(&self) -> f32 {
+        self.stroke_width / self.x_height.max(1e-3)
+    }
+
+    /// Whether this line reads as bold, by its stroke-to-x-height ratio.
+    pub fn is_bold(&self) -> bool {
+        self.weight_ratio() >= BOLD_WEIGHT_RATIO
+    }
+
     /// Re-fit a detection box to the measured ink: x-height as the height, the
     /// ink column span as the width, the centre snapped to the ink along both the
     /// reading (`u`) and cross-reading (`v`) axes, and the baseline tilt folded
@@ -162,13 +186,66 @@ pub fn measure_line(matte: &GrayImage, box_width: f32, box_height: f32) -> Optio
     let dv = slope_rows_per_col * box_height / mh as f32;
     let baseline_angle_delta = dv.atan2(du).clamp(-MAX_TILT_RADIANS, MAX_TILT_RADIANS);
 
+    let stroke_width = stroke_width_px(
+        data,
+        mw_us,
+        mh as usize,
+        sup_top,
+        sup_bottom,
+        rows_to_px,
+        cols_to_px,
+    );
+
     Some(LineMetrics {
         x_height,
         centerline_offset,
         width,
         center_u_offset,
         baseline_angle_delta,
+        stroke_width,
     })
+}
+
+/// Mean stroke width over the line's ink, in image-space pixels, as
+/// `2·area / perimeter`: for a stroke of width `w` and total length `L`,
+/// `area ≈ w·L` and `perimeter ≈ 2·L`, so the ratio recovers `w`, averaged over
+/// the whole line so junctions and serifs wash out. Perimeter counts ink texels
+/// with a 4-neighbour that is non-ink (peeking the real strip rows above/below
+/// the band so the band edge itself isn't miscounted as stroke boundary). The
+/// matte's row/column pixel pitches differ slightly; the result is scaled by
+/// their mean since a stroke is locally isotropic.
+fn stroke_width_px(
+    data: &[u8],
+    mw: usize,
+    mh: usize,
+    sup_top: usize,
+    sup_bottom: usize,
+    rows_to_px: f32,
+    cols_to_px: f32,
+) -> f32 {
+    let ink = |x: usize, y: usize| data[y * mw + x] >= STROKE_CUT;
+    let mut area: u32 = 0;
+    let mut perimeter: u32 = 0;
+    for y in sup_top..=sup_bottom {
+        for x in 0..mw {
+            if !ink(x, y) {
+                continue;
+            }
+            area += 1;
+            let up = y > 0 && ink(x, y - 1);
+            let down = y + 1 < mh && ink(x, y + 1);
+            let left = x > 0 && ink(x - 1, y);
+            let right = x + 1 < mw && ink(x + 1, y);
+            if !(up && down && left && right) {
+                perimeter += 1;
+            }
+        }
+    }
+    if area == 0 || perimeter == 0 {
+        return 0.0;
+    }
+    let stroke_matte = 2.0 * area as f32 / perimeter as f32;
+    stroke_matte * 0.5 * (rows_to_px + cols_to_px)
 }
 
 /// First and last columns (within the support rows) carrying real ink. A column

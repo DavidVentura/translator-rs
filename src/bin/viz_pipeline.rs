@@ -906,13 +906,16 @@ fn run(cli: Cli) -> Result<(), String> {
                     );
                 } else {
                     let masks = engine.ink_masks(&image, &boxes);
+                    let lines = recognize(engine, &image, &gray, &boxes, cli.script, true)
+                        .map_err(|e| format!("recognize: {e:?}"))?;
                     let mut canvas = rgba.clone();
                     let scale = PxScale::from(20.0);
-                    let mut csv =
-                        String::from("cx,cy,width,tight_h,x_height,centerline,tilt_deg\n");
+                    let mut csv = String::from(
+                        "cx,cy,width,tight_h,x_height,centerline,tilt_deg,stroke,weight,bold,text\n",
+                    );
                     // Thin lines so adjacent lines' boxes stay distinguishable.
                     let thin = 1;
-                    for (b, mask) in boxes.iter().zip(masks.iter()) {
+                    for ((b, mask), line) in boxes.iter().zip(masks.iter()).zip(lines.iter()) {
                         // Inflated oriented box (magenta) — the region the ink model
                         // actually searches — and the tight detection core (green).
                         draw_closed_polyline(
@@ -955,14 +958,14 @@ fn run(cli: Cli) -> Result<(), String> {
                             scale,
                             &font,
                             &format!(
-                                "{:.0}->{:.0} {:.1}deg",
-                                b.tight_box.height,
+                                "xh{:.0} w{:.2}{}",
                                 m.x_height,
-                                m.baseline_angle_delta.to_degrees()
+                                m.weight_ratio(),
+                                if m.is_bold() { " BOLD" } else { "" },
                             ),
                         );
                         csv.push_str(&format!(
-                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2}\n",
+                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2},{:.2},{:.3},{},{}\n",
                             b.tight_box.cx,
                             b.tight_box.cy,
                             b.tight_box.width,
@@ -970,6 +973,10 @@ fn run(cli: Cli) -> Result<(), String> {
                             m.x_height,
                             m.centerline_offset,
                             m.baseline_angle_delta.to_degrees(),
+                            m.stroke_width,
+                            m.weight_ratio(),
+                            m.is_bold(),
+                            line.text.replace(',', " "),
                         ));
                     }
                     save_png(&canvas, &cli.out_dir.join("x_height.png"))?;
