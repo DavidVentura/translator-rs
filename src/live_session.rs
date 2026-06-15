@@ -234,6 +234,8 @@ pub struct BlockSpec {
     /// `glyph_instances`. Block-local because they're shaped at upsert
     /// time; merged across blocks (deduped by key) at draw-list build.
     pub glyph_masks: HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
+    /// Render the block's translation bold (from the source lines' ink weight).
+    pub is_bold: bool,
 }
 
 /// Per-anchor live state. Each acquired anchor (engine
@@ -926,6 +928,7 @@ impl LiveSession {
         source_text: String,
         translated_text: String,
         language: String,
+        is_bold: bool,
         font_provider: &dyn crate::font_provider::FontProvider,
     ) {
         if strips.is_empty() {
@@ -952,6 +955,7 @@ impl LiveSession {
             content_hash: hash,
             glyph_instances: Vec::new(),
             glyph_masks: HashMap::new(),
+            is_bold,
         };
         // Both paths composite glyphs on the GPU from these pre-shaped instances;
         // shape them here (off the present thread, once per content change) so
@@ -2166,6 +2170,26 @@ impl LiveSession {
                 .collect();
         }
 
+        // Per-block bold: majority of the block's source lines that read bold
+        // (from the ink text-metrics, indexed parallel to `detections`/`entries`).
+        let block_bold: Vec<bool> = block_strip_indices
+            .iter()
+            .map(|idxs| {
+                let bold = idxs
+                    .iter()
+                    .filter(|&&j| {
+                        input
+                            .line_metrics
+                            .get(j)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|m| m.is_bold())
+                    })
+                    .count();
+                bold * 2 >= idxs.len().max(1)
+            })
+            .collect();
+
         // Pending placeholders: per-strip bg rects, no text. Only
         // upsert for blocks that don't already have a resident
         // overlay (i.e. first time we see this set of lines). For a
@@ -2194,6 +2218,7 @@ impl LiveSession {
                 String::new(),
                 String::new(),
                 input.to_lang.to_string(),
+                block_bold[i],
                 input.font_provider,
             );
         }
@@ -2430,6 +2455,7 @@ impl LiveSession {
                             src,
                             translated,
                             input.to_lang.to_string(),
+                            block_bold[bi],
                             input.font_provider,
                         );
                         block_translated[bi] = true;
@@ -3240,6 +3266,8 @@ fn build_block_text_block(
         },
         background_argb: 0,
         foreground_argb: block_fallback_fg,
+        // Live bold not wired yet (needs the weight on BlockSpec); still path is bold-aware.
+        is_bold: spec.is_bold,
     })
 }
 
@@ -3305,6 +3333,7 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
             oriented_box: l.bbox.clone(),
             tight_box: l.bbox.clone(),
             word_rects: Vec::new(),
+            is_bold: false,
         })
         .collect();
     let blocks =

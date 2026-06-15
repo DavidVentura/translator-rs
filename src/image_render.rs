@@ -656,6 +656,7 @@ fn render_per_line(
     }
 
     let language = opts.language.clone();
+    let bold = block.is_bold;
     let mut size = block
         .layout_hints
         .suggested_font_size_px
@@ -666,7 +667,7 @@ fn render_per_line(
     // can reuse this across the size-shrink loop.
     let shaped_full = {
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-            c.chain_for(script, false, false, false, &language, fonts)
+            c.chain_for(script, bold, false, false, &language, fonts)
                 .to_vec()
         };
         let mut chain_fn = chain_fn;
@@ -704,7 +705,7 @@ fn render_per_line(
             continue;
         }
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-            c.chain_for(script, false, false, false, &language, fonts)
+            c.chain_for(script, bold, false, false, &language, fonts)
                 .to_vec()
         };
         let mut chain_fn = chain_fn;
@@ -863,6 +864,7 @@ fn render_vertical_block_rect(
         return;
     }
     let language = opts.language.clone();
+    let bold = block.is_bold;
     let mut size = block
         .layout_hints
         .suggested_font_size_px
@@ -882,7 +884,7 @@ fn render_vertical_block_rect(
 
     let lines = loop {
         let candidate = wrap_into_block(translated, bh, size);
-        let line_h = estimate_line_height(translated, size, &language, cache, fonts);
+        let line_h = estimate_line_height(translated, size, &language, bold, cache, fonts);
         if line_h <= 0.0 {
             return;
         }
@@ -896,7 +898,7 @@ fn render_vertical_block_rect(
         size -= 1.0;
     };
 
-    let line_h = estimate_line_height(translated, size, &language, cache, fonts);
+    let line_h = estimate_line_height(translated, size, &language, bold, cache, fonts);
     // Baseline offset within the transposed rect; in image space it advances
     // leftward from the block's right edge. 0.8 leaves the same ascender room
     // the horizontal block layout reserves below the top edge.
@@ -907,7 +909,7 @@ fn render_vertical_block_rect(
             continue;
         }
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-            c.chain_for(script, false, false, false, &language, fonts)
+            c.chain_for(script, bold, false, false, &language, fonts)
                 .to_vec()
         };
         let mut chain_fn = chain_fn;
@@ -936,11 +938,12 @@ fn estimate_line_height(
     text: &str,
     size: f32,
     language: &str,
+    bold: bool,
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
 ) -> f32 {
     let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-        c.chain_for(script, false, false, false, language, fonts)
+        c.chain_for(script, bold, false, false, language, fonts)
             .to_vec()
     };
     let mut chain_fn = chain_fn;

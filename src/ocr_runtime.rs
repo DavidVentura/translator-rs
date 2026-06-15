@@ -265,6 +265,7 @@ fn still_ppocr_lines_to_blocks(
                 oriented_box,
                 tight_box,
                 word_rects: vec![line.rect],
+                is_bold: metrics.map_or(false, |m| m.is_bold()),
             }
         })
         .collect();

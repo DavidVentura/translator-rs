@@ -205,6 +205,11 @@ pub struct TextLine {
     /// for engines that don't expose a tighter metric.
     pub tight_box: OrientedRect,
     pub word_rects: Vec<Rect>,
+    /// Whether the source line reads as bold, from its ink stroke-to-x-height
+    /// weight ([`crate::text_metrics::LineMetrics::is_bold`]). Carried through
+    /// grouping so the overlay can render the translation bold. `false` for
+    /// engines/paths that don't measure weight.
+    pub is_bold: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -249,6 +254,9 @@ pub struct PreparedTextBlock {
     pub layout_hints: OverlayLayoutHints,
     pub background_argb: u32,
     pub foreground_argb: u32,
+    /// Render the translation bold, set when the block's source lines read bold
+    /// (ink stroke weight). The renderer requests a bold font face for the block.
+    pub is_bold: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -746,6 +754,7 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
         oriented_box: OrientedRect::axis_aligned(bb),
         tight_box,
         word_rects,
+        is_bold: a.is_bold || b.is_bold,
     }
 }
 
@@ -1062,6 +1071,7 @@ fn transpose_line(line: TextLine, frame_x: u32) -> TextLine {
             .into_iter()
             .map(|r| transpose_rect(r, frame_x))
             .collect(),
+        is_bold: line.is_bold,
     }
 }
 
@@ -1076,6 +1086,7 @@ fn untranspose_line(line: TextLine, frame_x: u32) -> TextLine {
             .into_iter()
             .map(|r| untranspose_rect(r, frame_x))
             .collect(),
+        is_bold: line.is_bold,
     }
 }
 
@@ -2121,6 +2132,10 @@ pub fn prepare_overlay_image(
     for (block, translated_text) in blocks.iter().zip(translated_blocks.iter()) {
         let block_bounds = block.bounds();
         let layout_hints = overlay_layout_hints(block, reading_order);
+        // Bold is a block property (a heading is its own paragraph): render the
+        // translation bold when most of the block's source lines read bold.
+        let block_is_bold =
+            block.lines.iter().filter(|l| l.is_bold).count() * 2 >= block.lines.len().max(1);
         match reading_order {
             ReadingOrder::LeftToRight => {
                 let mut prepared_lines = Vec::with_capacity(block.lines.len());
@@ -2150,6 +2165,7 @@ pub fn prepare_overlay_image(
                     layout_hints,
                     background_argb: block_background,
                     foreground_argb: block_foreground,
+                    is_bold: block_is_bold,
                 });
             }
             ReadingOrder::TopToBottomRightToLeft => {
@@ -2182,6 +2198,7 @@ pub fn prepare_overlay_image(
                     layout_hints,
                     background_argb: colors.background_argb,
                     foreground_argb: colors.foreground_argb,
+                    is_bold: block_is_bold,
                 });
             }
         }
@@ -2350,6 +2367,7 @@ pub fn build_text_blocks(
                 oriented_box: OrientedRect::axis_aligned(word.bounding_box),
                 tight_box: OrientedRect::axis_aligned(word.bounding_box),
                 word_rects: vec![word.bounding_box],
+                is_bold: false,
             });
         } else if let Some(line) = current_line.as_mut() {
             let delta = word.bounding_box.left.saturating_sub(last_right);
@@ -2368,6 +2386,7 @@ pub fn build_text_blocks(
                     oriented_box: OrientedRect::axis_aligned(word.bounding_box),
                     tight_box: OrientedRect::axis_aligned(word.bounding_box),
                     word_rects: vec![word.bounding_box],
+                    is_bold: false,
                 };
                 if !lines.is_empty() {
                     blocks.push(TextBlock {
@@ -2456,6 +2475,7 @@ mod tests {
             },
             tight_box: tight,
             word_rects: vec![rect],
+            is_bold: false,
         }
     }
 
@@ -2482,6 +2502,7 @@ mod tests {
             oriented_box: OrientedRect::axis_aligned(rect),
             tight_box: tight,
             word_rects: vec![rect],
+            is_bold: false,
         }
     }
 
@@ -2574,6 +2595,7 @@ mod tests {
                     oriented_box: super::OrientedRect::axis_aligned(top_rect),
                     tight_box: super::OrientedRect::axis_aligned(top_rect),
                     word_rects: vec![top_rect],
+                    is_bold: false,
                 },
                 TextLine {
                     text: "bottom".to_string(),
@@ -2581,6 +2603,7 @@ mod tests {
                     oriented_box: super::OrientedRect::axis_aligned(bottom_rect),
                     tight_box: super::OrientedRect::axis_aligned(bottom_rect),
                     word_rects: vec![bottom_rect],
+                    is_bold: false,
                 },
             ],
         }];
@@ -2623,6 +2646,42 @@ mod tests {
     }
 
     #[test]
+    fn block_bold_is_majority_of_source_lines() {
+        let rgba = vec![0xFFu8; 8 * 8 * 4];
+        let rect = Rect {
+            left: 1,
+            top: 1,
+            right: 7,
+            bottom: 6,
+        };
+        let make = |bold: bool| TextBlock {
+            lines: vec![TextLine {
+                text: "x".to_string(),
+                bounding_box: rect,
+                oriented_box: super::OrientedRect::axis_aligned(rect),
+                tight_box: super::OrientedRect::axis_aligned(rect),
+                word_rects: vec![rect],
+                is_bold: bold,
+            }],
+        };
+        let blocks = vec![make(true), make(false)];
+        let translated = vec!["a".to_string(), "b".to_string()];
+        let prepared = prepare_overlay_image(
+            &rgba,
+            8,
+            8,
+            &blocks,
+            &translated,
+            BackgroundMode::BlackOnWhite,
+            ReadingOrder::LeftToRight,
+            None,
+        )
+        .expect("overlay should prepare");
+        assert!(prepared.blocks[0].is_bold, "bold line → bold block");
+        assert!(!prepared.blocks[1].is_bold, "regular line → regular block");
+    }
+
+    #[test]
     fn autodetect_without_matte_falls_back_to_white_on_black() {
         // No ink matte: AutoDetect no longer samples the image — it flat-fills the
         // line black and colours the translated text white.
@@ -2645,6 +2704,7 @@ mod tests {
                 oriented_box: super::OrientedRect::axis_aligned(rect),
                 tight_box: super::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
+                is_bold: false,
             }],
         }];
 
@@ -3137,6 +3197,7 @@ mod tests {
                 angle_radians: theta,
             },
             word_rects: vec![rect],
+            is_bold: false,
         }
     }
 

@@ -96,6 +96,7 @@ fn book_page_grouping_dump() {
             oriented_box: b.oriented_box.clone(),
             tight_box: b.tight_box.clone(),
             word_rects: vec![b.rect.clone()],
+            is_bold: false,
         })
         .collect();
 
