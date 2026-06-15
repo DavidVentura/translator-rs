@@ -1136,13 +1136,18 @@ fn draw_shaped_line(
                             left,
                             top,
                         });
+                        // `fg_argb` is ARGB; the GPU glyph shader reads the instance
+                        // colour bytes as R,G,B,A, so pack RGBA explicitly. (`to_ne_bytes`
+                        // would emit B,G,R,A on little-endian — invisible for white text,
+                        // but it swaps R/B for coloured ink, turning navy into brown.)
+                        let [a, r, g, b] = fg_argb.to_be_bytes();
                         col.instances.push(GlyphInstanceData {
                             key,
                             pen_x: glyph_x,
                             pen_y: glyph_y,
                             cos: cos_angle,
                             sin: sin_angle,
-                            color: fg_argb.to_ne_bytes(),
+                            color: [r, g, b, a],
                         });
                     }
                     cursor_x += glyph.advance_x as f32 * scale;
