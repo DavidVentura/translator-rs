@@ -102,7 +102,7 @@ mnn-sys = { git = "https://github.com/DavidVentura/mnn-sys", optional = true }
 icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
 icu_locale_core = { version = "2.2", optional = true }
 lopdf = { version = "0.40", optional = true, default-features = false }
-ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
+ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout", "variable-fonts"] }
 subsetter = { version = "0.2", optional = true, default-features = false }
 rustybuzz = { version = "0.20", optional = true, default-features = false, features = ["std"] }
 unicode-bidi = { version = "0.3", optional = true, default-features = false, features = ["std", "hardcoded-data"] }

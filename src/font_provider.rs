@@ -40,6 +40,12 @@ pub struct FontRequest {
 pub struct FontHandle {
     pub path: PathBuf,
     pub ttc_index: u32,
+    /// Resolved font weight (100–900) of the face this handle points at. For a
+    /// variable font the file is the same across weights and the renderer drives
+    /// the `wght` axis to this value; for a static family it's the weight of the
+    /// picked file. `400` is regular. Part of the identity so bold and regular
+    /// cache as distinct faces/glyphs even when they share a file.
+    pub weight: u16,
 }
 
 impl FontHandle {
@@ -47,7 +53,13 @@ impl FontHandle {
         Self {
             path: path.into(),
             ttc_index,
+            weight: 400,
         }
+    }
+
+    pub fn with_weight(mut self, weight: u16) -> Self {
+        self.weight = weight;
+        self
     }
 }
 
