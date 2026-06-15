@@ -6,3 +6,10 @@ espeak-ng-data/*
 *.log
 *.pt
 __pycache__
+viz-out/
+*.png
+*.jpg
+*.json
+*.mp4
+*.bin
+*.map
