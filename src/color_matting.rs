@@ -97,7 +97,11 @@ const INK_ALPHA_CUT: u8 = 40;
 /// an absolute cut) so it adapts to the matte strength: a faint line still keeps
 /// its strongest pixels instead of falling back to the rim, which blends toward
 /// the page and washes the colour out.
-const FG_CORE_FRACTION: f32 = 0.6;
+/// Fraction of a line's matte-gated pixels, on the ink side of the luma
+/// distribution, used to estimate the foreground ink colour — i.e. sample the
+/// stroke cores (farthest from the page), not the washed median of the whole
+/// stroke.
+const FG_INK_FRACTION: f32 = 0.15;
 /// Minimum ink pixels in a strip to bother matting it. Below this the
 /// model found essentially no ink in the box — return `None` and let the
 /// caller fall back to default-pill rendering.
@@ -216,7 +220,9 @@ fn project_box_ink(
     let y1 = (max_y.ceil().max(0.0) as u32).min(h);
 
     let w_us = w as usize;
-    let mut ink: Vec<(Rgba<u8>, u8)> = Vec::new();
+    let mut ink: Vec<Rgba<u8>> = Vec::new();
+    let mut bg_luma_sum: u64 = 0;
+    let mut bg_count: u64 = 0;
     for py in y0..y1 {
         for px in x0..x1 {
             let dx = px as f32 + 0.5 - o.cx;
@@ -230,10 +236,13 @@ fn project_box_ink(
             let my = (((v + half_h) / o.height) * mh)
                 .floor()
                 .clamp(0.0, mh - 1.0) as u32;
-            let alpha = ink_mask.get_pixel(mx, my)[0];
-            if alpha >= INK_ALPHA_CUT {
+            let pixel = *image.get_pixel(px, py);
+            if ink_mask.get_pixel(mx, my)[0] >= INK_ALPHA_CUT {
                 union_ink[(py as usize) * w_us + px as usize] = true;
-                ink.push((*image.get_pixel(px, py), alpha));
+                ink.push(pixel);
+            } else {
+                bg_luma_sum += luma(pixel) as u64;
+                bg_count += 1;
             }
         }
     }
@@ -241,20 +250,36 @@ fn project_box_ink(
     if ink.len() < MIN_INK_PIXELS {
         return None;
     }
-    // Foreground colour from the strongest-alpha pixels *relative to this line's
-    // own matte*. The anti-aliased rim blends toward the page, so on thin/faint
-    // text it outnumbers the stroke cores and a plain median washes the colour to
-    // the background (a black URL line rendering white-on-white). A fixed alpha cut
-    // can leave a faint line with no cores at all; a relative cut keeps the most
-    // ink-like pixels whatever the matte strength, then medians their colour.
-    let max_alpha = ink.iter().map(|(_, a)| *a).max().unwrap_or(0);
-    let cut = (max_alpha as f32 * FG_CORE_FRACTION) as u8;
-    let core: Vec<Rgba<u8>> = ink
-        .iter()
-        .filter(|(_, a)| *a >= cut)
-        .map(|(p, _)| *p)
-        .collect();
-    Some(rgba_to_argb(median_color(&core)))
+    // Foreground colour = the ink's *core*, not the median of all ink pixels.
+    // The 48px matte is coarser than the source, so a high-alpha matte texel maps
+    // to a cluster of source pixels — the dark stroke centre plus its lighter
+    // anti-aliased edges — and the median lands between them, washing the colour
+    // toward the page (low-contrast lines render near-invisible). Instead take the
+    // pixels farthest from the background: sort the matte-gated pixels by luma and
+    // keep the extreme fraction on the ink side (darkest for dark-on-light text,
+    // lightest for light-on-dark), then median those. Direction comes from the
+    // background luma so it works either way.
+    let bg_luma = if bg_count > 0 {
+        (bg_luma_sum / bg_count) as u8
+    } else {
+        255
+    };
+    let mut by_luma: Vec<Rgba<u8>> = ink;
+    by_luma.sort_by_key(|&p| luma(p));
+    let ink_is_dark = luma(by_luma[by_luma.len() / 2]) < bg_luma;
+    let k = ((by_luma.len() as f32 * FG_INK_FRACTION).ceil() as usize)
+        .clamp(MIN_INK_PIXELS, by_luma.len());
+    let core = if ink_is_dark {
+        &by_luma[..k]
+    } else {
+        &by_luma[by_luma.len() - k..]
+    };
+    Some(rgba_to_argb(median_color(core)))
+}
+
+/// BT.601 luma of an RGBA pixel (alpha ignored).
+fn luma(c: Rgba<u8>) -> u8 {
+    ((c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114) / 1000).min(255) as u8
 }
 
 /// Dewarp a detection's oriented box into a rectified RGBA strip, sample
