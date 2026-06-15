@@ -157,6 +157,9 @@ pub struct ProcessFrameResult {
 pub enum AsyncKind {
     Acquire,
     Refresh,
+    /// Cheap recolor: reuse the cached ink masks + detection boxes, re-sample
+    /// only the colours from a fresh frame (no detect/rec/translate).
+    Recolor,
 }
 
 /// Opaque token returned by `process_frame` on a gray-only frame when an
@@ -196,6 +199,24 @@ struct LastEmittedH {
 }
 
 const LOSS_HIDE_AFTER_FRAMES: u32 = 4;
+
+/// Fractional change in a locked anchor's frame mean luma (vs the value at the
+/// last recolor/acquire) that arms an ink recolor — i.e. the camera re-exposed
+/// or shifted white balance enough that the frozen strip colours drift.
+const RECOLOR_LUMA_DELTA: f32 = 0.06;
+
+/// Per-anchor inputs cached at acquire so a recolor can re-sample colours from a
+/// fresh frame without re-running the ink model, detection, or recognition. The
+/// masks are the model's geometry (stroke positions); only the colours sampled
+/// through them drift as the camera changes.
+struct RecolorCache {
+    /// Detection boxes in recognition-resolution coords (as passed to the model).
+    scaled_boxes: Vec<DetectedTextBox>,
+    /// Recognition→canonical scale, to lift the fresh strips back to canonical.
+    rec_scale: f32,
+    /// The ink model's per-box mattes from acquire (1:1 with `scaled_boxes`).
+    ink_masks: Vec<Option<image::GrayImage>>,
+}
 
 /// Dispatch the Relocalizer (`engine.relocalize`) to the async worker every
 /// Nth frame. The CoarseTracker tracks every frame; the worker runs
@@ -243,6 +264,12 @@ enum PendingJob {
         generation: u64,
     },
     Refresh {
+        frame: Arc<LiveFrame>,
+        display_crop: Rect,
+        config: PipelineConfig,
+        generation: u64,
+    },
+    Recolor {
         frame: Arc<LiveFrame>,
         display_crop: Rect,
         config: PipelineConfig,
@@ -553,6 +580,11 @@ pub struct LiveTrackerPipeline {
     pending_refresh_target: Mutex<Option<(u64, [f32; 9])>>,
     pending_compose: Mutex<Option<(u64, [f32; 9])>>,
     matted_strips: Mutex<HashMap<u64, Vec<Option<MattedStrip>>>>,
+    /// Per-anchor recolor inputs (cached at acquire) keyed by anchor id.
+    recolor_cache: Mutex<HashMap<u64, RecolorCache>>,
+    /// `(anchor_id, frame mean luma at the last recolor/acquire)` — the baseline
+    /// the per-frame luma-delta trigger compares against. Owned by `process_frame`.
+    recolor_baseline: Mutex<Option<(u64, f32)>>,
     generation: AtomicU64,
     config: Mutex<PipelineConfig>,
     catalog: Arc<TranslatorSession>,
@@ -588,6 +620,8 @@ impl LiveTrackerPipeline {
             pending_refresh_target: Mutex::new(None),
             pending_compose: Mutex::new(None),
             matted_strips: Mutex::new(HashMap::new()),
+            recolor_cache: Mutex::new(HashMap::new()),
+            recolor_baseline: Mutex::new(None),
             generation: AtomicU64::new(0),
             config: Mutex::new(PipelineConfig::default()),
             catalog,
@@ -624,6 +658,12 @@ impl LiveTrackerPipeline {
                         config,
                         generation,
                     } => pipeline.run_refresh_inner(&frame, display_crop, &config, generation),
+                    PendingJob::Recolor {
+                        frame,
+                        display_crop,
+                        config,
+                        generation,
+                    } => pipeline.run_recolor_inner(&frame, display_crop, &config, generation),
                 };
                 if let Ok(mut slot) = pipeline.last_telemetry.lock() {
                     *slot = Some(telemetry);
@@ -766,6 +806,9 @@ impl LiveTrackerPipeline {
         let t_gray = Instant::now();
         let (tracker_gray, det_to_full) = self.prepare_tracker_gray(frame, cfg.det_max_pixels)?;
         let gray_build_ms = t_gray.elapsed().as_secs_f64() * 1000.0;
+        // Global exposure proxy for the ink-recolor trigger (see the `Locked`
+        // arm below); cheap subsampled mean of the per-frame tracker gray.
+        let frame_mean_luma = gray_mean(&tracker_gray);
 
         // No-op unless an empty-detect backoff is armed; then it watches for
         // the scene changing so the next acquire can fire immediately.
@@ -957,6 +1000,11 @@ impl LiveTrackerPipeline {
                         }
                     }
                     Lifecycle::Locked if should_refresh => Some(AsyncKind::Refresh),
+                    Lifecycle::Locked
+                        if self.recolor_trigger_fires(tracker_anchor, frame_mean_luma) =>
+                    {
+                        Some(AsyncKind::Recolor)
+                    }
                     _ => None,
                 }
             };
@@ -1220,6 +1268,15 @@ impl LiveTrackerPipeline {
                     generation,
                 });
                 (false, started)
+            }
+            AsyncKind::Recolor => {
+                worker.try_dispatch(PendingJob::Recolor {
+                    frame: Arc::clone(frame),
+                    display_crop,
+                    config: cfg.clone(),
+                    generation,
+                });
+                (false, false)
             }
         }
     }
@@ -1518,28 +1575,138 @@ impl LiveTrackerPipeline {
                 .catalog
                 .ppocr_ink_masks(rgb, &scaled)
                 .unwrap_or_default();
-            let strips = crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
+            let mut strips =
+                crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
+            lift_strips_to_canonical(&mut strips, rec_scale);
+            // Cache the model output (masks) + boxes so a later recolor can
+            // re-sample colours from a fresh frame without re-running the model.
+            if let Ok(mut cache) = self.recolor_cache.lock() {
+                cache.insert(
+                    anchor_id,
+                    RecolorCache {
+                        scaled_boxes: scaled,
+                        rec_scale,
+                        ink_masks,
+                    },
+                );
+            }
             // `mat_detections` returns only the boxes that matted (keyed by
             // `box_index`); the block grouping downstream indexes strips
             // positionally against `detected`, so re-expand to that shape.
             let mut matted: Vec<Option<MattedStrip>> = vec![None; detected.len()];
-            for mut s in strips {
-                if rec_scale != 1.0 {
-                    let inv = 1.0 / rec_scale;
-                    s.canonical_cx *= inv;
-                    s.canonical_cy *= inv;
-                    s.canonical_width *= inv;
-                    s.canonical_height *= inv;
-                }
+            for s in strips {
                 let idx = s.box_index;
                 matted[idx] = Some(s);
             }
             matted
         };
+        // Force the luma trigger to re-baseline against this fresh acquire.
+        if let Ok(mut base) = self.recolor_baseline.lock() {
+            *base = None;
+        }
         if let Ok(mut store) = self.matted_strips.lock() {
             store.insert(anchor_id, matted);
         }
         Ok(())
+    }
+
+    /// Per-frame ink-recolor trigger: fire when this locked anchor's frame mean
+    /// luma has drifted past [`RECOLOR_LUMA_DELTA`] vs the value at the last
+    /// recolor/acquire — i.e. the camera re-exposed / shifted white balance so
+    /// the frozen strip colours no longer match. Re-baselines on fire (and on the
+    /// first sample / anchor change). No-op when there's no cached matting to
+    /// recolour. Mutates the baseline, so call only on the Locked path.
+    fn recolor_trigger_fires(&self, anchor_id: u64, mean_luma: f32) -> bool {
+        let have_cache = self
+            .recolor_cache
+            .lock()
+            .map(|c| c.contains_key(&anchor_id))
+            .unwrap_or(false);
+        if !have_cache {
+            return false;
+        }
+        let mut base = match self.recolor_baseline.lock() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        match *base {
+            Some((a, b)) if a == anchor_id && b > 0.0 => {
+                if (mean_luma - b).abs() / b > RECOLOR_LUMA_DELTA {
+                    *base = Some((anchor_id, mean_luma));
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                *base = Some((anchor_id, mean_luma));
+                false
+            }
+        }
+    }
+
+    /// Cheap recolor job (worker thread): re-sample the matted strips' colours
+    /// from the freshly provided RGBA frame using the cached ink masks + boxes,
+    /// then recolour the locked anchor's overlay in place. No detection,
+    /// recognition, or translation — only colours change.
+    fn run_recolor_inner(
+        &self,
+        frame: &Arc<LiveFrame>,
+        display_crop: Rect,
+        cfg: &PipelineConfig,
+        generation: u64,
+    ) -> AcquireTelemetry {
+        let t = Instant::now();
+        let ms = || t.elapsed().as_secs_f64() * 1000.0;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return canceled_telemetry(0, 0.0);
+        }
+        let anchor_id = match self.last_root_to_view.lock() {
+            Ok(g) => match *g {
+                Some((a, _)) => a,
+                None => return error_telemetry("recolor: nothing locked"),
+            },
+            Err(_) => return error_telemetry("recolor: last_root_to_view poisoned"),
+        };
+        let (scaled_boxes, rec_scale, ink_masks) = match self.recolor_cache.lock() {
+            Ok(c) => match c.get(&anchor_id) {
+                Some(rc) => (rc.scaled_boxes.clone(), rc.rec_scale, rc.ink_masks.clone()),
+                None => return error_telemetry("recolor: no cache for anchor"),
+            },
+            Err(_) => return error_telemetry("recolor: cache poisoned"),
+        };
+        let mut strips = {
+            let mut state = match frame.state().lock() {
+                Ok(s) => s,
+                Err(_) => return error_telemetry("recolor: frame.state poisoned"),
+            };
+            // GPU gray-only frames arrive pre-oriented (`reset_oriented_split`);
+            // an inline RGBA frame (Android) needs the oriented RGB built here.
+            if state.cached.is_none()
+                && state
+                    .ensure_oriented_with_rgb(display_crop, cfg.det_max_pixels)
+                    .is_err()
+            {
+                return error_telemetry("recolor: ensure_oriented failed");
+            }
+            let Some(oriented) = state.cached.as_ref() else {
+                return error_telemetry("recolor: no oriented rgb");
+            };
+            let Some(rgb) = oriented.rgb.as_ref() else {
+                return error_telemetry("recolor: oriented has no rgb");
+            };
+            crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled_boxes, &ink_masks)
+        };
+        lift_strips_to_canonical(&mut strips, rec_scale);
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return canceled_telemetry(anchor_id, ms());
+        }
+        self.session
+            .recolor_anchor(anchor_id, &strips, &*self.font_provider);
+        AcquireTelemetry {
+            total_ms: ms(),
+            ..Default::default()
+        }
     }
 
     /// Stage 6: rec + translate. Looks up the canonical quadrant
@@ -1855,6 +2022,39 @@ fn error_telemetry(msg: &'static str) -> AcquireTelemetry {
     AcquireTelemetry {
         error: Some(msg.into()),
         ..Default::default()
+    }
+}
+
+/// Subsampled mean luma of a gray frame — a cheap global-exposure proxy for the
+/// ink-recolor trigger. Every 8th byte is plenty for a whole-frame mean.
+fn gray_mean(gray: &image::GrayImage) -> f32 {
+    let raw = gray.as_raw();
+    if raw.is_empty() {
+        return 0.0;
+    }
+    let (mut sum, mut n) = (0u64, 0u64);
+    let mut i = 0;
+    while i < raw.len() {
+        sum += raw[i] as u64;
+        n += 1;
+        i += 8;
+    }
+    sum as f32 / n.max(1) as f32
+}
+
+/// Lift matted strips' canonical geometry from recognition resolution back to
+/// canonical coords (no-op at `rec_scale == 1.0`). Shared by acquire matting and
+/// the recolor job so both place strips in the same frame.
+fn lift_strips_to_canonical(strips: &mut [MattedStrip], rec_scale: f32) {
+    if rec_scale == 1.0 {
+        return;
+    }
+    let inv = 1.0 / rec_scale;
+    for s in strips.iter_mut() {
+        s.canonical_cx *= inv;
+        s.canonical_cy *= inv;
+        s.canonical_width *= inv;
+        s.canonical_height *= inv;
     }
 }
 
