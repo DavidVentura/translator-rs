@@ -106,7 +106,7 @@ const FG_INK_FRACTION: f32 = 0.15;
 /// reconstructed background. A floor, not a stretch: faithful colours above this
 /// pass through untouched; only genuinely low-contrast lines (device chrome,
 /// shadowed page edges) get pushed darker/lighter to stay readable.
-const FG_MIN_CONTRAST: f32 = 2.5;
+const FG_MIN_CONTRAST: f32 = 3.5;
 /// Minimum ink pixels in a strip to bother matting it. Below this the
 /// model found essentially no ink in the box — return `None` and let the
 /// caller fall back to default-pill rendering.
