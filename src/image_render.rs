@@ -313,7 +313,10 @@ impl FontCache {
         gid: u16,
         size_px: u32,
         scale: f32,
+        bold: bool,
     ) -> Option<&GlyphMask> {
+        // `fid` is already bold-folded by the caller, so bold and regular get
+        // distinct atlas slots even when they share a `FontHandle`.
         let key = (fid, gid, size_px);
         if self.glyphs.contains_key(&key) {
             stat_glyph_hit();
@@ -321,7 +324,14 @@ impl FontCache {
             let t = std::time::Instant::now();
             let gm = self
                 .face(handle)
-                .and_then(|face| raster_glyph(face, gid, scale));
+                .and_then(|face| raster_glyph(face, gid, scale))
+                .map(|gm| {
+                    if bold {
+                        embolden(gm, embolden_radius(size_px))
+                    } else {
+                        gm
+                    }
+                });
             stat_raster(t.elapsed().as_micros() as u64);
             self.glyphs.insert(key, gm);
         }
@@ -741,13 +751,8 @@ fn render_per_line(
             cos,
             sin,
             size,
-            // HACK(bold viz): until the platform font provider serves a bold face,
-            // paint bold blocks red so the propagated flag is visible.
-            if bold {
-                0xFFFF_0000
-            } else {
-                prepared_line.foreground_argb
-            },
+            prepared_line.foreground_argb,
+            bold,
         );
     }
 }
@@ -934,12 +939,8 @@ fn render_vertical_block_rect(
             0.0,
             1.0,
             size,
-            // HACK(bold viz): red bold until the provider serves a bold face.
-            if bold {
-                0xFFFF_0000
-            } else {
-                block.foreground_argb
-            },
+            block.foreground_argb,
+            bold,
         );
         baseline_offset += line_h;
     }
@@ -1017,6 +1018,7 @@ fn draw_shaped_line(
     sin_angle: f32,
     font_size: f32,
     fg_argb: u32,
+    bold: bool,
 ) {
     // cursor_x advances in line-local space (along the reading direction). The image-space
     // pen position for each glyph is obtained by rotating the local pen offset by the line's
@@ -1032,7 +1034,7 @@ fn draw_shaped_line(
     for run in &line.runs {
         let scale = font_size / run.units_per_em as f32;
         if axis_aligned {
-            let fid = cache.font_id(&run.handle);
+            let fid = bold_fid(cache.font_id(&run.handle), bold);
             for glyph in &run.glyphs {
                 let glyph_x = origin_x + cursor_x + glyph.offset_x as f32 * scale;
                 let glyph_y = origin_y - glyph.offset_y as f32 * scale;
@@ -1042,7 +1044,9 @@ fn draw_shaped_line(
                         width,
                         height,
                     } => {
-                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
+                        if let Some(gm) =
+                            cache.glyph(fid, &run.handle, glyph.gid, size_px, scale, bold)
+                        {
                             blit_mask(
                                 canvas,
                                 *width,
@@ -1058,7 +1062,9 @@ fn draw_shaped_line(
                     }
                     GlyphSink::Collect(col) => {
                         let key = (fid, glyph.gid, size_px);
-                        if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
+                        if let Some(gm) =
+                            cache.glyph(fid, &run.handle, glyph.gid, size_px, scale, bold)
+                        {
                             let (cov, w, h, left, top) =
                                 (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
                             col.masks.entry(key).or_insert_with(|| GlyphMaskData {
@@ -1121,30 +1127,33 @@ fn draw_shaped_line(
                         let (mask, placement) = Mask::new(commands.as_slice())
                             .format(Format::Alpha)
                             .render();
+                        let mut gm = GlyphMask {
+                            cov: mask,
+                            w: placement.width,
+                            h: placement.height,
+                            left: placement.left,
+                            top: placement.top,
+                        };
+                        if bold {
+                            gm = embolden(gm, embolden_radius(size_px));
+                        }
                         blit_mask(
-                            canvas,
-                            *width,
-                            *height,
-                            &mask,
-                            placement.left,
-                            placement.top,
-                            placement.width,
-                            placement.height,
-                            fg_argb,
+                            canvas, *width, *height, &gm.cov, gm.left, gm.top, gm.w, gm.h, fg_argb,
                         );
                     }
                     cursor_x += glyph.advance_x as f32 * scale;
                 }
             }
             GlyphSink::Collect(col) => {
-                let fid = cache.font_id(&run.handle);
+                let fid = bold_fid(cache.font_id(&run.handle), bold);
                 for glyph in &run.glyphs {
                     let pen_local_x = cursor_x + glyph.offset_x as f32 * scale;
                     let pen_local_y = -(glyph.offset_y as f32) * scale;
                     let glyph_x = origin_x + pen_local_x * cos_angle - pen_local_y * sin_angle;
                     let glyph_y = origin_y + pen_local_x * sin_angle + pen_local_y * cos_angle;
                     let key = (fid, glyph.gid, size_px);
-                    if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale) {
+                    if let Some(gm) = cache.glyph(fid, &run.handle, glyph.gid, size_px, scale, bold)
+                    {
                         let (cov, w, h, left, top) = (gm.cov.clone(), gm.w, gm.h, gm.left, gm.top);
                         col.masks.entry(key).or_insert_with(|| GlyphMaskData {
                             key,
@@ -1259,6 +1268,58 @@ impl ttf_parser::OutlineBuilder for OutlineSink<'_> {
     }
 }
 
+/// Fold a bold flag into a font id so bold and regular cache under distinct atlas
+/// keys. Needed because a variable font resolves both weights to the *same*
+/// `FontHandle` (e.g. Android's Roboto is one file with a `wght` axis), so the id
+/// alone can't tell them apart.
+fn bold_fid(fid: u32, bold: bool) -> u32 {
+    if bold { fid | 0x8000_0000 } else { fid }
+}
+
+/// Faux-bold emboldening radius (px) for a pixel size — ~4% of the size, min 1.
+fn embolden_radius(size_px: u32) -> u32 {
+    ((size_px as f32 * 0.04).round() as u32).max(1)
+}
+
+/// Synthetic bold: dilate a coverage mask by `r` px (a Chebyshev max-filter),
+/// growing its bounds by `r` on every side. Used when bold is requested but the
+/// resolved face only exposes the regular outline — the common case on devices
+/// whose system font is a variable font we can't drive the weight axis on.
+/// Thickening the strokes is a faithful-enough overlay bold.
+fn embolden(gm: GlyphMask, r: u32) -> GlyphMask {
+    if r == 0 {
+        return gm;
+    }
+    let (w, h) = (gm.w, gm.h);
+    let nw = w + 2 * r;
+    let nh = h + 2 * r;
+    let mut out = vec![0u8; (nw * nh) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let v = gm.cov[(y * w + x) as usize];
+            if v == 0 {
+                continue;
+            }
+            for dy in 0..=2 * r {
+                let row = ((y + dy) * nw) as usize;
+                for dx in 0..=2 * r {
+                    let i = row + (x + dx) as usize;
+                    if out[i] < v {
+                        out[i] = v;
+                    }
+                }
+            }
+        }
+    }
+    GlyphMask {
+        cov: out,
+        w: nw,
+        h: nh,
+        left: gm.left - r as i32,
+        top: gm.top - r as i32,
+    }
+}
+
 fn blit_mask(
     canvas: &mut [u8],
     width: u32,
@@ -1273,7 +1334,11 @@ fn blit_mask(
     if mask_w == 0 || mask_h == 0 {
         return;
     }
-    let fg_bytes = fg_argb.to_ne_bytes();
+    // `fg_argb` is ARGB; the canvas is R,G,B,A. Decompose big-endian so R/B
+    // aren't swapped (`to_ne_bytes` emits B,G,R,A on little-endian — invisible
+    // for black/white text, but it turns coloured ink the wrong colour).
+    let [_, r, g, b] = fg_argb.to_be_bytes();
+    let fg_bytes = [r, g, b];
     for my in 0..mask_h {
         let py = placement_top + my as i32;
         if py < 0 || py >= height as i32 {
