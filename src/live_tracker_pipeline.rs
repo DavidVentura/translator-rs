@@ -553,6 +553,11 @@ pub struct LiveTrackerPipeline {
     pending_refresh_target: Mutex<Option<(u64, [f32; 9])>>,
     pending_compose: Mutex<Option<(u64, [f32; 9])>>,
     matted_strips: Mutex<HashMap<u64, Vec<Option<MattedStrip>>>>,
+    /// Per-anchor ink text-metrics from the matting stage (indexed parallel to
+    /// the anchor's detections), consumed by `run_post_detect` to re-fit each
+    /// line's grouping box. Lives alongside `matted_strips` because both are
+    /// produced from the same per-frame ink mattes.
+    line_metrics: Mutex<HashMap<u64, Vec<Option<crate::text_metrics::LineMetrics>>>>,
     generation: AtomicU64,
     config: Mutex<PipelineConfig>,
     catalog: Arc<TranslatorSession>,
@@ -588,6 +593,7 @@ impl LiveTrackerPipeline {
             pending_refresh_target: Mutex::new(None),
             pending_compose: Mutex::new(None),
             matted_strips: Mutex::new(HashMap::new()),
+            line_metrics: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             config: Mutex::new(PipelineConfig::default()),
             catalog,
@@ -1518,6 +1524,24 @@ impl LiveTrackerPipeline {
                 .catalog
                 .ppocr_ink_masks(rgb, &scaled)
                 .unwrap_or_default();
+            // Text-metrics off the same mattes. Measured against the *canonical*
+            // box dims (not the rec-scaled `scaled`), so the recovered x-height /
+            // width / offsets come out in canonical coords like `detected`.
+            let metrics: Vec<Option<crate::text_metrics::LineMetrics>> = detected
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let mask = ink_masks.get(i)?.as_ref()?;
+                    crate::text_metrics::measure_line(
+                        mask,
+                        d.oriented_box.width,
+                        d.oriented_box.height,
+                    )
+                })
+                .collect();
+            if let Ok(mut store) = self.line_metrics.lock() {
+                store.insert(anchor_id, metrics);
+            }
             let strips = crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
             // `mat_detections` returns only the boxes that matted (keyed by
             // `box_index`); the block grouping downstream indexes strips
@@ -1561,6 +1585,11 @@ impl LiveTrackerPipeline {
             Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
             Err(_) => Vec::new(),
         };
+        let line_metrics: Vec<Option<crate::text_metrics::LineMetrics>> =
+            match self.line_metrics.lock() {
+                Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
         let canonical_quadrant = self
             .engine
             .lock()
@@ -1581,6 +1610,7 @@ impl LiveTrackerPipeline {
             anchor_id,
             canonical_quadrant,
             &matted_strips,
+            &line_metrics,
             &cancel,
         )
     }
@@ -1763,6 +1793,7 @@ impl LiveTrackerPipeline {
                 available_codes: &available_codes,
                 font_provider: &*self.font_provider,
                 matted_strips: &[],
+                line_metrics: &[],
                 rec_batch_size: cfg.rec_batch_size,
                 canonical_quadrant,
             },
@@ -1963,6 +1994,7 @@ pub(crate) fn acquire_rec_translate(
     anchor_id: u64,
     canonical_quadrant: Option<Quadrant>,
     matted_strips: &[Option<MattedStrip>],
+    line_metrics: &[Option<crate::text_metrics::LineMetrics>],
     cancel: &dyn Fn() -> bool,
 ) -> Result<PostDetectOutcome, &'static str> {
     let available_codes: Vec<LanguageCode> = catalog
@@ -1990,6 +2022,7 @@ pub(crate) fn acquire_rec_translate(
             available_codes: &available_codes,
             font_provider,
             matted_strips,
+            line_metrics,
             rec_batch_size,
             canonical_quadrant,
         },

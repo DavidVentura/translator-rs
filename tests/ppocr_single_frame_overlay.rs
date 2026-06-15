@@ -225,6 +225,7 @@ fn run_case(
             available_codes: &available_codes,
             font_provider,
             matted_strips: &[],
+            line_metrics: &[],
             rec_batch_size: 8,
             canonical_quadrant: Some(q),
         },

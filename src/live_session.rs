@@ -1871,6 +1871,11 @@ pub struct PostDetectInput<'a> {
     /// Per-detection matted strip (indexed parallel to `detections`).
     /// Empty falls back to the legacy pill for every strip.
     pub matted_strips: &'a [Option<MattedStrip>],
+    /// Per-detection ink text-metrics (indexed parallel to `detections`).
+    /// Re-fits each line's *grouping* box (x-height, ink width, centre, tilt)
+    /// off the real ink; empty keeps the detection box. Does not touch the
+    /// overlay footprint (`SurfaceLine.bbox`), only the merge decision.
+    pub line_metrics: &'a [Option<crate::text_metrics::LineMetrics>],
     /// Translate-block batch size. Production uses 4; sim may pick a
     /// smaller value to keep per-frame work bounded.
     pub rec_batch_size: usize,
@@ -2067,20 +2072,57 @@ impl LiveSession {
         let block_strip_indices: Vec<Vec<usize>>;
         let block_strips: Vec<Vec<OrientedRect>>;
         let block_ids: Vec<u64>;
+        // Per-detection ink-refit grouping box, in surface coords: re-fit the
+        // detection box to the matte (x-height, ink width, centre, tilt) and put
+        // it through the *same* projection + angle-snap as `surface_boxes`. `None`
+        // where no metric refined it — grouping then keeps the line's accumulated
+        // bbox, so the behaviour with matting off is unchanged. The overlay
+        // footprint always stays the accumulated `SurfaceLine.bbox`; only the
+        // merge decision sees this refined box.
+        let refit_boxes: Vec<Option<OrientedRect>> = input
+            .detections
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let m = input.line_metrics.get(i).copied().flatten()?;
+                let refined = m.refit(d.tight_box.clone());
+                let mut sb = match input.h_view_to_surface {
+                    None => refined,
+                    Some(h) => project_oriented_rect(&refined, &h).unwrap_or(refined),
+                };
+                if let Some(q) = input.canonical_quadrant {
+                    sb.angle_radians = align_angle_to_canonical(sb.angle_radians, q.radians());
+                }
+                Some(sb)
+            })
+            .collect();
         {
             let states_guard = self.anchor_states.lock();
-            let snapshot_lines: Vec<crate::surface_map::SurfaceLine> = match states_guard {
+            // `snapshot_lines` carry the accumulated bbox (used for id lookup and,
+            // downstream, the overlay rects); `group_lines` are copies whose bbox is
+            // the ink-refit box where available, fed only to the merge decision.
+            let (snapshot_lines, group_lines): (
+                Vec<crate::surface_map::SurfaceLine>,
+                Vec<crate::surface_map::SurfaceLine>,
+            ) = match states_guard {
                 Ok(ref s) => match s.get(&input.anchor_id) {
                     Some(state) => entries
                         .iter()
-                        .filter_map(|e| state.map.get(e.line_id).cloned())
-                        .collect(),
-                    None => Vec::new(),
+                        .zip(&refit_boxes)
+                        .filter_map(|(e, rb)| {
+                            state.map.get(e.line_id).cloned().map(|sl| {
+                                let bbox = rb.clone().unwrap_or_else(|| sl.bbox.clone());
+                                let group = crate::surface_map::SurfaceLine { bbox, ..sl.clone() };
+                                (sl, group)
+                            })
+                        })
+                        .unzip(),
+                    None => (Vec::new(), Vec::new()),
                 },
-                Err(_) => Vec::new(),
+                Err(_) => (Vec::new(), Vec::new()),
             };
             let groups = group_surface_lines_into_blocks_in_quadrant(
-                &snapshot_lines,
+                &group_lines,
                 input
                     .canonical_quadrant
                     .unwrap_or(crate::coords::Quadrant::R0),

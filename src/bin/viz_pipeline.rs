@@ -928,7 +928,7 @@ fn run(cli: Cli) -> Result<(), String> {
                             thin,
                         );
                         let Some(mask) = mask else { continue };
-                        let Some(m) = translator::matte_metrics::matte_line_metrics(
+                        let Some(m) = translator::text_metrics::measure_line(
                             mask,
                             b.oriented_box.width,
                             b.oriented_box.height,

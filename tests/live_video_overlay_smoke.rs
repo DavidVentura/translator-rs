@@ -318,6 +318,7 @@ fn video_frames_drive_live_overlay_pipeline() {
                     available_codes: &available_codes,
                     font_provider: &font_provider,
                     matted_strips: &[],
+                    line_metrics: &[],
                     rec_batch_size: env_usize("LIVE_VIDEO_REC_BATCH_SIZE").unwrap_or(8),
                     canonical_quadrant: None,
                 },

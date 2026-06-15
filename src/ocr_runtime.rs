@@ -6,11 +6,11 @@ use crate::catalog::CatalogSnapshot;
 use crate::catalog::{OcrPack, PackKind, PpocrScript};
 use crate::language_detect::detect_language_robust_code;
 use crate::live_frame::OrientedImage;
-use crate::matte_metrics::{MatteLineMetrics, matte_line_metrics};
 use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine};
 use crate::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock, prepare_overlay_image};
 use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
 use crate::settings::BackgroundMode;
+use crate::text_metrics::{LineMetrics, measure_line};
 use crate::translate::Translator;
 
 pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
@@ -121,12 +121,12 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     } else {
         (Vec::new(), None)
     };
-    let matte_metrics = box_matte_metrics(&det_boxes, &ink_masks);
+    let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
 
     let blocks = still_ppocr_lines_to_blocks(
         &det_boxes,
         lines,
-        &matte_metrics,
+        &text_metrics,
         min_confidence,
         reading_order,
     );
@@ -210,16 +210,16 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent
 /// ink band); the caller then keeps the box's own tight height and angle.
 #[cfg(feature = "ppocr")]
-fn box_matte_metrics(
+fn box_line_metrics(
     boxes: &[DetectedTextBox],
     masks: &[Option<image::GrayImage>],
-) -> Vec<Option<MatteLineMetrics>> {
+) -> Vec<Option<LineMetrics>> {
     boxes
         .iter()
         .enumerate()
         .map(|(i, b)| {
             let mask = masks.get(i)?.as_ref()?;
-            matte_line_metrics(mask, b.oriented_box.width, b.oriented_box.height)
+            measure_line(mask, b.oriented_box.width, b.oriented_box.height)
         })
         .collect()
 }
@@ -236,7 +236,7 @@ fn box_matte_metrics(
 fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
-    matte_metrics: &[Option<MatteLineMetrics>],
+    text_metrics: &[Option<LineMetrics>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -247,7 +247,7 @@ fn still_ppocr_lines_to_blocks(
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())
-        .zip(matte_metrics.iter())
+        .zip(text_metrics.iter())
         .filter(|((_, line), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
         .map(|((b, line), metrics)| {
             let delta = metrics.map_or(0.0, |m| m.baseline_angle_delta);
