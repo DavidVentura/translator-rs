@@ -212,7 +212,7 @@ const RELOCK_OVERLAP_THRESHOLD: f32 = 0.65;
 /// surface area as already-covered. Surface coords are anchor-
 /// resolution, so 24 px = ~2-3% of typical viewport extent.
 const COVERAGE_PAD_PX: f32 = 24.0;
-const ENABLE_COLOR_MATTING: bool = false;
+const ENABLE_COLOR_MATTING: bool = true;
 
 /// Defaults divided by [`RELOCALIZER_CADENCE`] so wall-time hysteresis matches
 /// step 1. The engine counts in frames *it sees*; at cadence N each engine tick
@@ -1518,16 +1518,21 @@ impl LiveTrackerPipeline {
                 .catalog
                 .ppocr_ink_masks(rgb, &scaled)
                 .unwrap_or_default();
-            let mut matted =
-                crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
-            if rec_scale != 1.0 {
-                let inv = 1.0 / rec_scale;
-                for m in matted.iter_mut().flatten() {
-                    m.canonical_cx *= inv;
-                    m.canonical_cy *= inv;
-                    m.canonical_width *= inv;
-                    m.canonical_height *= inv;
+            let strips = crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
+            // `mat_detections` returns only the boxes that matted (keyed by
+            // `box_index`); the block grouping downstream indexes strips
+            // positionally against `detected`, so re-expand to that shape.
+            let mut matted: Vec<Option<MattedStrip>> = vec![None; detected.len()];
+            for mut s in strips {
+                if rec_scale != 1.0 {
+                    let inv = 1.0 / rec_scale;
+                    s.canonical_cx *= inv;
+                    s.canonical_cy *= inv;
+                    s.canonical_width *= inv;
+                    s.canonical_height *= inv;
                 }
+                let idx = s.box_index;
+                matted[idx] = Some(s);
             }
             matted
         };

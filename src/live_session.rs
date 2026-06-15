@@ -3066,21 +3066,36 @@ fn localize_visuals(
         .collect()
 }
 
-/// Background color for a block's i-th pill: the matted per-strip color when the
-/// matting resolved a uniform bg, else the anchor default (or a debug palette
-/// entry keyed by block id when `DEBUG_PER_BLOCK_BG_COLOR`).
+/// Background color for a block's i-th pill: the matted strip's reconstructed
+/// background (its mean RGB, opaque) when this strip matted, else the anchor
+/// default (or a debug palette entry keyed by block id when
+/// `DEBUG_PER_BLOCK_BG_COLOR`). The strip's RGB is the rim-free background
+/// field, so this is a faithful solid even where the old uniform-bg estimate
+/// would have come out too dark.
 fn block_pill_color(spec: &BlockSpec, i: usize, block_id: u64, bg_rgba: [u8; 4]) -> [u8; 4] {
     let default_bg = if DEBUG_PER_BLOCK_BG_COLOR {
         DEBUG_BG_PALETTE[(block_id as usize) % DEBUG_BG_PALETTE.len()]
     } else {
         bg_rgba
     };
-    spec.matted_strips
-        .get(i)
-        .and_then(|m| m.as_ref())
-        .and_then(|m| m.bg_uniform_argb)
-        .map(argb_to_rgba_bytes)
-        .unwrap_or(default_bg)
+    match spec.matted_strips.get(i).and_then(|m| m.as_ref()) {
+        Some(strip) => strip_bg_mean_rgba(strip),
+        None => default_bg,
+    }
+}
+
+/// Mean RGB of a matted strip's reconstructed background field, as an opaque
+/// RGBA pill colour.
+fn strip_bg_mean_rgba(strip: &crate::color_matting::MattedStrip) -> [u8; 4] {
+    let px = strip.strip_rgba.chunks_exact(4);
+    let n = px.len().max(1) as u64;
+    let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+    for c in px {
+        r += c[0] as u64;
+        g += c[1] as u64;
+        b += c[2] as u64;
+    }
+    [(r / n) as u8, (g / n) as u8, (b / n) as u8, 255]
 }
 
 /// Build one block's `PreparedTextBlock` (per-line oriented text boxes + layout
@@ -3104,8 +3119,7 @@ fn build_block_text_block(
     let foreground_argb: u32 = spec
         .matted_strips
         .iter()
-        .find_map(|m| m.as_ref().map(|s| s.ink_is_dark))
-        .map(|dark| if dark { 0xFF10_1010 } else { 0xFFFF_FFFF })
+        .find_map(|m| m.as_ref().map(|s| s.fg_argb))
         .unwrap_or(0xFFFF_FFFF);
     let lines: Vec<PreparedTextLine> = local
         .iter()

@@ -43,18 +43,23 @@ use image::{GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 
 use crate::DetectedTextBox;
 
-/// Per-detection matting result. The `strip_rgba` is a rectified RGBA
-/// image where the source text has been removed and replaced with the
-/// inpainted background. To get this back into canonical-frame coords
-/// at render time, treat the strip as an axis-aligned bitmap centred
-/// at `(canonical_cx, canonical_cy)` with dimensions `canonical_width`
-/// × `canonical_height`, rotated by `canonical_angle_radians`. This
-/// matches the oriented-rect convention used elsewhere in the project.
+/// Per-detection matting result, shared by the still-image and live-camera
+/// overlays. The `strip_rgba` is a rectified RGBA image: every RGB pixel is
+/// the reconstructed background field, and the **alpha channel is coverage** —
+/// opaque (255) where the source ink was (and has been erased), transparent
+/// (0) elsewhere. Consumers composite through that coverage: the still path
+/// blits the strip back into the source image so only the erased ink pixels
+/// are overwritten; the live path uploads it as a warped quad so the live
+/// camera shows through between glyphs. To map it back into canonical-frame
+/// coords, treat the strip as an axis-aligned bitmap centred at
+/// `(canonical_cx, canonical_cy)` with dimensions `canonical_width` ×
+/// `canonical_height`, rotated by `canonical_angle_radians`.
 #[derive(Clone, Debug)]
 pub struct MattedStrip {
     /// Index of the source detection in the original `boxes` slice.
     pub box_index: usize,
-    /// Rectified strip RGBA, row-major, 4 bytes per pixel.
+    /// Rectified strip RGBA, row-major, 4 bytes per pixel. RGB is the
+    /// reconstructed background field; alpha is the (dilated) ink coverage.
     pub strip_rgba: Vec<u8>,
     /// Strip dimensions in pixels.
     pub strip_width: u32,
@@ -71,18 +76,12 @@ pub struct MattedStrip {
     /// extent.
     pub canonical_width: f32,
     pub canonical_height: f32,
-    /// True if the source ink was darker than the background (most
-    /// printed text on a light page). Used by callers to pick a
-    /// readable fg colour for translated text without re-scanning the
-    /// strip's luma.
-    pub ink_is_dark: bool,
-    /// `Some(argb)` when the ring-median background is uniform enough
-    /// to use as a single solid pill colour (low MAD across ring
-    /// samples). `None` when the background varies significantly
-    /// (gradient, shadow crossing, etc.) — caller should fall back to
-    /// the default dark pill rather than painting a single colour
-    /// that would visibly mismatch on one side. Higher byte is alpha.
-    pub bg_uniform_argb: Option<u32>,
+    /// Foreground colour for translated text: the median of the source
+    /// ink pixels (the real ink colour, not a binary dark/light pick).
+    /// Higher byte is alpha. The ink samples are the confident stroke
+    /// cores, so this is free of the anti-aliased-rim contamination that
+    /// skewed the old background-colour estimate.
+    pub fg_argb: u32,
 }
 
 /// Confidence above which a model ink-mask pixel is treated as ink (to
@@ -94,23 +93,11 @@ const INK_ALPHA_CUT: u8 = 40;
 /// model found essentially no ink in the box — return `None` and let the
 /// caller fall back to default-pill rendering.
 const MIN_INK_PIXELS: usize = 6;
-/// Minimum background samples needed before judging the bg "uniform".
-const MIN_BG_SAMPLES: usize = 24;
 /// Side of the square tiles the background field is reconstructed on, in
 /// strip pixels. Each tile takes the median of its non-ink pixels; the
 /// grid is then bilinearly upsampled, so this trades smoothness (larger)
 /// against following tight background detail (smaller).
 pub(crate) const BG_BLOCK: u32 = 10;
-
-/// Per-box ink metadata the model mask can't give us directly: the ink
-/// class (for picking a readable translated-text colour) and a
-/// uniform-background colour (for the solid-pill fallback). Both are
-/// derived from the box pixels the mask partitions into ink/bg.
-#[derive(Clone, Copy)]
-struct BoxInk {
-    ink_is_dark: bool,
-    bg_uniform_argb: Option<u32>,
-}
 
 /// Compute matted strips for each detection from the ink model's per-box
 /// masks. `ink_masks` is 1:1 with `boxes` (the output of
@@ -131,25 +118,22 @@ pub fn mat_detections(
     rgba: &RgbaImage,
     boxes: &[DetectedTextBox],
     ink_masks: &[Option<GrayImage>],
-) -> Vec<Option<MattedStrip>> {
+) -> Vec<MattedStrip> {
     let (w, h) = rgba.dimensions();
     let mut union_ink = vec![false; (w as usize) * (h as usize)];
-    let mut meta: Vec<Option<BoxInk>> = Vec::with_capacity(boxes.len());
-    meta.resize_with(boxes.len(), || None);
+    let mut fg: Vec<Option<u32>> = Vec::with_capacity(boxes.len());
+    fg.resize_with(boxes.len(), || None);
     for (idx, b) in boxes.iter().enumerate() {
         let Some(Some(mask)) = ink_masks.get(idx) else {
             continue;
         };
-        meta[idx] = project_box_ink(rgba, b, mask, w, h, &mut union_ink);
+        fg[idx] = project_box_ink(rgba, b, mask, w, h, &mut union_ink);
     }
 
     boxes
         .iter()
         .enumerate()
-        .map(|(idx, b)| {
-            let ink = meta[idx]?;
-            mat_strip_for_detection(rgba, idx, b, &union_ink, w, h, ink)
-        })
+        .filter_map(|(idx, b)| mat_strip_for_detection(rgba, idx, b, &union_ink, w, h, fg[idx]?))
         .collect()
 }
 
@@ -175,11 +159,12 @@ pub fn union_ink_mask(
 
 /// Project one box's model mask into the shared image-space `union_ink`
 /// (set a source pixel when its `(u, v)` in the box's oriented frame maps
-/// to a model-mask alpha above the cut), and derive the box's ink class
-/// and uniform-bg colour from the pixels the mask partitions. Iterates
-/// the box's source-space bounding box directly, so the union is dense at
-/// full resolution with no projection gaps. Returns `None` when the model
-/// found essentially no ink.
+/// to a model-mask alpha above the cut), and derive the box's foreground
+/// colour — the median of its ink pixels — for the translated text.
+/// Iterates the box's source-space bounding box directly, so the union is
+/// dense at full resolution with no projection gaps. Returns `None` (the
+/// box renders with the flat-fill fallback) when the model found
+/// essentially no ink.
 fn project_box_ink(
     image: &RgbaImage,
     detected: &DetectedTextBox,
@@ -187,7 +172,7 @@ fn project_box_ink(
     w: u32,
     h: u32,
     union_ink: &mut [bool],
-) -> Option<BoxInk> {
+) -> Option<u32> {
     let o = detected.oriented_box;
     if o.width <= 1.0 || o.height <= 1.0 {
         return None;
@@ -223,7 +208,6 @@ fn project_box_ink(
 
     let w_us = w as usize;
     let mut ink_samples: Vec<Rgba<u8>> = Vec::new();
-    let mut bg_samples: Vec<Rgba<u8>> = Vec::new();
     for py in y0..y1 {
         for px in x0..x1 {
             let dx = px as f32 + 0.5 - o.cx;
@@ -237,12 +221,9 @@ fn project_box_ink(
             let my = (((v + half_h) / o.height) * mh)
                 .floor()
                 .clamp(0.0, mh - 1.0) as u32;
-            let pixel = *image.get_pixel(px, py);
             if ink_mask.get_pixel(mx, my)[0] >= INK_ALPHA_CUT {
                 union_ink[(py as usize) * w_us + px as usize] = true;
-                ink_samples.push(pixel);
-            } else {
-                bg_samples.push(pixel);
+                ink_samples.push(*image.get_pixel(px, py));
             }
         }
     }
@@ -250,20 +231,7 @@ fn project_box_ink(
     if ink_samples.len() < MIN_INK_PIXELS {
         return None;
     }
-    let ink_is_dark = if bg_samples.is_empty() {
-        true
-    } else {
-        luma(median_color(&ink_samples)) < luma(median_color(&bg_samples))
-    };
-    let bg_uniform_argb = if bg_samples.len() >= MIN_BG_SAMPLES {
-        uniform_bg_argb(&bg_samples, median_color(&bg_samples))
-    } else {
-        None
-    };
-    Some(BoxInk {
-        ink_is_dark,
-        bg_uniform_argb,
-    })
+    Some(rgba_to_argb(median_color(&ink_samples)))
 }
 
 /// Dewarp a detection's oriented box into a rectified RGBA strip, sample
@@ -278,7 +246,7 @@ fn mat_strip_for_detection(
     union_ink: &[bool],
     w: u32,
     h: u32,
-    ink: BoxInk,
+    fg_argb: u32,
 ) -> Option<MattedStrip> {
     let oriented = detected.oriented_box;
     if oriented.width <= 1.0 || oriented.height <= 1.0 {
@@ -333,12 +301,9 @@ fn mat_strip_for_detection(
     // text (a block almost always has some non-ink pixel nearby).
     let bg = background_field(&strip_image, &strip_mask, strip_w, strip_h, BG_BLOCK);
     let mut strip_bytes = Vec::with_capacity((strip_w * strip_h * 4) as usize);
-    for (px, (m, b)) in strip_image.iter().zip(strip_mask.iter().zip(bg.iter())) {
-        if *m {
-            strip_bytes.extend_from_slice(&[b[0], b[1], b[2], 255]);
-        } else {
-            strip_bytes.extend_from_slice(&[px[0], px[1], px[2], px[3]]);
-        }
+    for (m, b) in strip_mask.iter().zip(bg.iter()) {
+        let coverage = if *m { 255 } else { 0 };
+        strip_bytes.extend_from_slice(&[b[0], b[1], b[2], coverage]);
     }
 
     Some(MattedStrip {
@@ -351,79 +316,8 @@ fn mat_strip_for_detection(
         canonical_angle_radians: oriented.angle_radians,
         canonical_width: strip_w as f32,
         canonical_height: strip_h as f32,
-        ink_is_dark: ink.ink_is_dark,
-        bg_uniform_argb: ink.bg_uniform_argb,
+        fg_argb,
     })
-}
-
-/// Decide whether the ring samples cluster around a single bg colour
-/// (return `Some(argb)`) or spread across multiple — gradient, shadow
-/// boundary, mixed bg — in which case the caller should fall back to
-/// the neutral dark pill (`None`).
-///
-/// Approach: 4-bit-per-channel histogram (16³ = 4096 buckets) over the
-/// ring's RGB. For each bucket, sum its own count plus the counts in
-/// its 26 axis-neighbour buckets (3×3×3 cube minus the centre). This
-/// "smoothed" count is robust to sensor noise that straddles a bucket
-/// boundary — a uniform white wall with ±4 levels of noise won't get
-/// artificially split across two buckets. If the smoothed peak holds
-/// at least `UNIFORM_PEAK_THRESHOLD` of the total samples, the bg is
-/// uniform; return the original median as the representative colour
-/// (cheaper and just as accurate as a per-cluster mean given the
-/// noise floor we're in).
-fn uniform_bg_argb(samples: &[Rgba<u8>], median: Rgba<u8>) -> Option<u32> {
-    /// Smoothed-peak fraction required to call the bg "uniform."
-    /// 0.6 is a starting point: pure white walls land near 1.0,
-    /// gentle shadows drop into the 0.3–0.5 range. Tune from device
-    /// data once we see how it behaves in the wild.
-    const UNIFORM_PEAK_THRESHOLD: f32 = 0.6;
-    const SHIFT: u32 = 4;
-    const LEVELS: u32 = 16;
-    if samples.is_empty() {
-        return None;
-    }
-    // 4096-entry sparse histogram. HashMap is enough at this size; we
-    // run once per detection (not per frame) so the alloc is fine.
-    let mut hist: std::collections::HashMap<(u8, u8, u8), u32> = std::collections::HashMap::new();
-    for c in samples {
-        let key = (c[0] >> SHIFT, c[1] >> SHIFT, c[2] >> SHIFT);
-        *hist.entry(key).or_insert(0) += 1;
-    }
-    let total = samples.len() as f32;
-    let mut best_smoothed: u32 = 0;
-    for (&(r, g, b), _) in &hist {
-        let mut s = 0u32;
-        for dr in -1i32..=1 {
-            let rr = r as i32 + dr;
-            if rr < 0 || rr >= LEVELS as i32 {
-                continue;
-            }
-            for dg in -1i32..=1 {
-                let gg = g as i32 + dg;
-                if gg < 0 || gg >= LEVELS as i32 {
-                    continue;
-                }
-                for db in -1i32..=1 {
-                    let bb = b as i32 + db;
-                    if bb < 0 || bb >= LEVELS as i32 {
-                        continue;
-                    }
-                    s += hist
-                        .get(&(rr as u8, gg as u8, bb as u8))
-                        .copied()
-                        .unwrap_or(0);
-                }
-            }
-        }
-        if s > best_smoothed {
-            best_smoothed = s;
-        }
-    }
-    if (best_smoothed as f32) / total >= UNIFORM_PEAK_THRESHOLD {
-        Some(rgba_to_argb(median))
-    } else {
-        None
-    }
 }
 
 fn rgba_to_argb(c: Rgba<u8>) -> u32 {
@@ -587,11 +481,4 @@ pub(crate) fn median_color(colors: &[Rgba<u8>]) -> Rgba<u8> {
     b.sort_unstable();
     let mid = r.len() / 2;
     Rgba([r[mid], g[mid], b[mid], 255])
-}
-
-pub(crate) fn luma(c: Rgba<u8>) -> u8 {
-    let r = c[0] as u32;
-    let g = c[1] as u32;
-    let b = c[2] as u32;
-    ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8
 }
