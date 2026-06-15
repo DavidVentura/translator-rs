@@ -3134,14 +3134,26 @@ fn build_block_text_block(
     if spec.display_text.trim().is_empty() {
         return None;
     }
-    let foreground_argb: u32 = spec
+    // Block-level fallback ink colour (first strip that matted) for lines whose
+    // own strip produced no matte.
+    let block_fallback_fg: u32 = spec
         .matted_strips
         .iter()
         .find_map(|m| m.as_ref().map(|s| s.fg_argb))
         .unwrap_or(0xFFFF_FFFF);
     let lines: Vec<PreparedTextLine> = local
         .iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(i, v)| {
+            // Per-line ink colour from this line's own strip: a block that spans a
+            // light→shadow gradient needs each line coloured independently, else a
+            // single block colour is unreadable on the lighter or darker lines.
+            let foreground_argb = spec
+                .matted_strips
+                .get(i)
+                .and_then(|m| m.as_ref())
+                .map(|s| s.fg_argb)
+                .unwrap_or(block_fallback_fg);
             let text_box = OrientedRect {
                 cx: v.cx,
                 cy: v.cy,
@@ -3185,7 +3197,7 @@ fn build_block_text_block(
             suggested_font_size_px: suggested_font_px,
         },
         background_argb: 0,
-        foreground_argb,
+        foreground_argb: block_fallback_fg,
     })
 }
 
