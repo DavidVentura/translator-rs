@@ -741,7 +741,13 @@ fn render_per_line(
             cos,
             sin,
             size,
-            prepared_line.foreground_argb,
+            // HACK(bold viz): until the platform font provider serves a bold face,
+            // paint bold blocks red so the propagated flag is visible.
+            if bold {
+                0xFFFF_0000
+            } else {
+                prepared_line.foreground_argb
+            },
         );
     }
 }
@@ -928,7 +934,12 @@ fn render_vertical_block_rect(
             0.0,
             1.0,
             size,
-            block.foreground_argb,
+            // HACK(bold viz): red bold until the provider serves a bold face.
+            if bold {
+                0xFFFF_0000
+            } else {
+                block.foreground_argb
+            },
         );
         baseline_offset += line_h;
     }
