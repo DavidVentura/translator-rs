@@ -13,8 +13,9 @@
 //! reprojection.
 //!
 //! At acquire time, the `MattedStrip` produced here feeds the GPU overlay
-//! compositor: its color drives the pill, and the GPU warps the baked overlay
-//! per-frame by the planar-tracker homography (canonical → viewport coords).
+//! compositor as a textured quad (its coverage alpha lets the camera show
+//! through between strokes), and the GPU warps the baked overlay per-frame by
+//! the planar-tracker homography (canonical → viewport coords).
 //!
 //! ## Pipeline per detection
 //!
@@ -25,15 +26,17 @@
 //!    the matte via the oriented frame, and set the union where the alpha
 //!    clears `INK_ALPHA_CUT`. The union lets a tall strip erase the
 //!    neighbouring lines that fall inside its padding.
-//! 3. Derive the box's ink class (dark/light) and a uniform-bg colour
-//!    from the pixels the matte partitions — the model says *what* is
-//!    ink, the pixels say what colour it and the background are.
+//! 3. Derive the box's foreground colour as the median of its ink pixels —
+//!    the model says *what* is ink, the pixels say what colour it is — for
+//!    the translated text.
 //! 4. Dewarp the camera + union ink mask into a rectified strip aligned
 //!    to the oriented box, growing the fill mask by a height-proportional
 //!    radius so the original ink's anti-aliased rim is erased too.
 //! 5. Replace the masked pixels with a block-median background field
 //!    (`background_field`): smooth, gradient-following, and robust in
 //!    dense text where a directional inpaint can't find clean samples.
+//!    The strip's alpha records that coverage so consumers paint only the
+//!    erased pixels.
 //!
 //! Output: rectified RGBA strip + the oriented-box parameters
 //! needed to re-warp it back to canonical-frame coords.
@@ -111,9 +114,9 @@ pub(crate) const BG_BLOCK: u32 = 10;
 /// too. Without it, a later strip would composite a neighbour's untouched
 /// original text back over a line an earlier strip had already erased.
 ///
-/// Returns one entry per input box; entries are `None` when the box has
-/// no model mask, a degenerate oriented box, or the model found no ink —
-/// the caller falls back to default-pill rendering for those.
+/// Returns one strip per box that matted, each tagged with its `box_index`;
+/// boxes with no model mask, a degenerate oriented box, or no ink are simply
+/// absent (the caller renders those with the flat-fill fallback).
 pub fn mat_detections(
     rgba: &RgbaImage,
     boxes: &[DetectedTextBox],
