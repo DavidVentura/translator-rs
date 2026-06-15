@@ -24,7 +24,11 @@ apt-get update -qq
 apt-get install -y -qq \
   python3-pip fontconfig \
   fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-cjk fonts-ubuntu \
+  libraqm0 \
   wamerican
+# libraqm0: Pillow needs it for RAQM layout (Arabic cursive joining, Devanagari
+# conjuncts, Tamil/Thai). Without it PIL silently falls back to basic layout and the
+# shaped-script samples render as malformed, unjoined glyphs.
 
 # Only fetch Python packages that are missing (torch is preinstalled on a PyTorch image).
 missing=""
