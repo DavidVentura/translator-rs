@@ -42,10 +42,18 @@ class InkUNet(nn.Module):
         self.dec2 = conv_block(base * 4, base * 2)
         self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
         self.dec1 = conv_block(base * 2, base)
-        # Two output channels: [0] ink coverage matte, [1] bold (per-pixel weight).
-        # Shared decoder — bold is one extra 1x1 output, ~free at inference. Old
-        # 1-channel checkpoints won't load this head; train fresh (or copy weight[0]).
-        self.head = nn.Conv2d(base, 2, 1)
+        # Matte: sharp per-pixel coverage, a 1x1 (1px RF) is right.
+        self.matte_head = nn.Conv2d(base, 1, 1)
+        # Bold is stroke-width *relative to glyph size* — a regional, multi-scale
+        # judgment a 1px-RF head can't make (it only sees "is this dark", not "thick
+        # for this letter"). Dilated 3x3s give it ~25px RF (≈ x-height) at full res.
+        self.bold_head = nn.Sequential(
+            nn.Conv2d(base, base, 3, padding=4, dilation=4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base, base, 3, padding=8, dilation=8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base, 1, 1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
@@ -59,7 +67,8 @@ class InkUNet(nn.Module):
             e3 = self.dec3(torch.cat([self.up3(e4), e3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.head(d1)  # (B, 2, H, W) logits: [matte, bold]; sigmoid at the call site
+        # (B, 2, H, W) logits: [matte, bold]; sigmoid at the call site.
+        return torch.cat([self.matte_head(d1), self.bold_head(d1)], dim=1)
 
 
 def param_count(model: nn.Module) -> int:
