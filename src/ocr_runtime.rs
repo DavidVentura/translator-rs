@@ -6,6 +6,7 @@ use crate::catalog::CatalogSnapshot;
 use crate::catalog::{OcrPack, PackKind, PpocrScript};
 use crate::language_detect::detect_language_robust_code;
 use crate::live_frame::OrientedImage;
+use crate::matte_metrics::{MatteLineMetrics, matte_line_metrics};
 use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine};
 use crate::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock, prepare_overlay_image};
 use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
@@ -108,7 +109,27 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
-    let blocks = still_ppocr_lines_to_blocks(&det_boxes, lines, min_confidence, reading_order);
+    // Per-box ink mattes feed both paragraph grouping (x-height + baseline-tilt
+    // recovery, applied to each line before it groups) and the overlay erase
+    // (the union ink mask). Compute them once, here, before grouping needs them.
+    let (ink_masks, ink_rgba) = if ppocr.has_ink() {
+        let rgba = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
+            .expect("rgba image from caller-owned bytes");
+        let dynimg = image::DynamicImage::ImageRgba8(rgba);
+        let masks = ppocr.ink_masks(&dynimg, &det_boxes);
+        (masks, Some(dynimg.into_rgba8()))
+    } else {
+        (Vec::new(), None)
+    };
+    let matte_metrics = box_matte_metrics(&det_boxes, &ink_masks);
+
+    let blocks = still_ppocr_lines_to_blocks(
+        &det_boxes,
+        lines,
+        &matte_metrics,
+        min_confidence,
+        reading_order,
+    );
     let source_code = match source_selection {
         OcrSourceSelection::Specific { language_code } => language_code.clone(),
         OcrSourceSelection::Auto => {
@@ -127,24 +148,13 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         }
     };
 
-    // Per-box ink mattes → one full-image union mask. The overlay erase replaces
-    // just the inked pixels with a reconstructed background instead of flat-filling
-    // each line's rect. `None` when no ink model is installed → flat-fill fallback.
-    let ink_union = if ppocr.has_ink() {
-        match image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec()) {
-            Some(rgba) => {
-                let dynimg = image::DynamicImage::ImageRgba8(rgba);
-                let masks = ppocr.ink_masks(&dynimg, &det_boxes);
-                let rgba = dynimg.as_rgba8().expect("rgba8");
-                Some(crate::color_matting::union_ink_mask(
-                    rgba, &det_boxes, &masks,
-                ))
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    // The same per-box mattes → one full-image union mask. The overlay erase
+    // replaces just the inked pixels with a reconstructed background instead of
+    // flat-filling each line's rect. `None` when no ink model is installed →
+    // flat-fill fallback.
+    let ink_union = ink_rgba
+        .as_ref()
+        .map(|rgba| crate::color_matting::union_ink_mask(rgba, &det_boxes, &ink_masks));
 
     finalize_image_overlay(
         engine,
@@ -196,14 +206,37 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
     }
 }
 
+/// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
+/// `None` for a box with no matte (no ink model, degenerate box, or no coherent
+/// ink band); the caller then keeps the box's own tight height and angle.
+#[cfg(feature = "ppocr")]
+fn box_matte_metrics(
+    boxes: &[DetectedTextBox],
+    masks: &[Option<image::GrayImage>],
+) -> Vec<Option<MatteLineMetrics>> {
+    boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let mask = masks.get(i)?.as_ref()?;
+            matte_line_metrics(mask, b.oriented_box.width, b.oriented_box.height)
+        })
+        .collect()
+}
+
 /// Pair the still-path detector boxes with their recognised lines, carrying the
 /// tight oriented rect forward into [`TextLine`] so paragraph grouping has the
 /// glyph-tight metric (the `RecognizedTextLine` shape doesn't carry it on its
-/// own).
+/// own). Where the ink matte resolved a line's typography, rebuild that tight box
+/// from the matte band — its height becomes the glyph-content-stable x-height, its
+/// centre snaps to the band centreline, and its angle is corrected by the recovered
+/// baseline tilt — so grouping keys size *and* spacing on the real ink, not the
+/// detection box. The render `oriented_box` gets the same tilt correction.
 #[cfg(feature = "ppocr")]
 fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
+    matte_metrics: &[Option<MatteLineMetrics>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -214,13 +247,25 @@ fn still_ppocr_lines_to_blocks(
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())
-        .filter(|(_, line)| !line.text.trim().is_empty() && line.confidence >= min_score)
-        .map(|(b, line)| TextLine {
-            text: line.text,
-            bounding_box: line.rect,
-            oriented_box: line.oriented_box,
-            tight_box: b.tight_box,
-            word_rects: vec![line.rect],
+        .zip(matte_metrics.iter())
+        .filter(|((_, line), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
+        .map(|((b, line), metrics)| {
+            let delta = metrics.map_or(0.0, |m| m.baseline_angle_delta);
+            let mut oriented_box = line.oriented_box;
+            oriented_box.angle_radians += delta;
+
+            // Re-fit the grouping box to the actual ink (x-height, ink width,
+            // centred on the ink) where the matte resolved it; otherwise keep the
+            // detection box. The inflated `oriented_box` (render/erase footprint)
+            // only takes the tilt correction.
+            let tight_box = metrics.map_or(b.tight_box, |m| m.refit(b.tight_box));
+            TextLine {
+                text: line.text,
+                bounding_box: line.rect,
+                oriented_box,
+                tight_box,
+                word_rects: vec![line.rect],
+            }
         })
         .collect();
     match reading_order {

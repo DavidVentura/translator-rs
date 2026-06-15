@@ -49,6 +49,7 @@ pub mod live_session;
 pub mod live_tracker_pipeline;
 #[cfg(feature = "planar-tracker")]
 pub mod live_worker;
+pub mod matte_metrics;
 #[cfg(feature = "ppocr")]
 mod mnn_inference;
 #[cfg(feature = "mucab")]

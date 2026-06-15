@@ -50,6 +50,7 @@ options:
   --script <slug>      recognizer script: latin, cyrillic, arabic, devanagari,
                        korean, el, eslav, ta, te, th (default: latin)
   --font <path>        TTF for overlay labels (default: DejaVuSans)
+  --rotate <dir>       rotate input before processing: cw|ccw|180 (default: none)
   --stages <a,b,...>   comma-separated stages to run (default: all available)
   --list               list stage names and exit
   -h, --help           show this help
@@ -68,6 +69,7 @@ enum Stage {
     Boxes,
     OrientedBoxes,
     BoxHeights,
+    XHeight,
     RecognizeDeskew,
     RecognizeNoDeskew,
     BboxStrips,
@@ -80,12 +82,13 @@ enum Stage {
 }
 
 impl Stage {
-    const ALL: [Stage; 14] = [
+    const ALL: [Stage; 15] = [
         Stage::Input,
         Stage::Heatmap,
         Stage::Boxes,
         Stage::OrientedBoxes,
         Stage::BoxHeights,
+        Stage::XHeight,
         Stage::RecognizeDeskew,
         Stage::RecognizeNoDeskew,
         Stage::BboxStrips,
@@ -104,6 +107,7 @@ impl Stage {
             Stage::Boxes => "boxes",
             Stage::OrientedBoxes => "oriented-boxes",
             Stage::BoxHeights => "box-heights",
+            Stage::XHeight => "x-height",
             Stage::RecognizeDeskew => "recognize-deskew",
             Stage::RecognizeNoDeskew => "recognize-nodeskew",
             Stage::BboxStrips => "bbox-strips",
@@ -129,6 +133,9 @@ impl Stage {
             Stage::BoxHeights => {
                 "tight (green) vs unclip-inflated (magenta) rects, labeled tight→inflated height"
             }
+            Stage::XHeight => {
+                "inflated search box (magenta), tight detection core (green), ink-matte x-height band (cyan); needs ink model"
+            }
             Stage::RecognizeDeskew => "recognition overlay, deskewed strips (the working path)",
             Stage::RecognizeNoDeskew => "recognition overlay, axis-aligned strips (the failure)",
             Stage::BboxStrips => "per-box axis-aligned crops, pre-deskew",
@@ -148,6 +155,25 @@ impl Stage {
 // CLI
 // ---------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rotate {
+    None,
+    Cw,
+    Ccw,
+    Half,
+}
+
+impl Rotate {
+    fn apply(self, img: DynamicImage) -> DynamicImage {
+        match self {
+            Rotate::None => img,
+            Rotate::Cw => img.rotate90(),
+            Rotate::Ccw => img.rotate270(),
+            Rotate::Half => img.rotate180(),
+        }
+    }
+}
+
 struct Cli {
     input: PathBuf,
     out_dir: PathBuf,
@@ -158,6 +184,7 @@ struct Cli {
     script: PpocrScript,
     font: PathBuf,
     stages: Vec<Stage>,
+    rotate: Rotate,
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
@@ -199,6 +226,7 @@ fn parse_cli() -> Result<Cli, String> {
     let mut script = PpocrScript::Latin;
     let mut font = PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
     let mut stages = Stage::ALL.to_vec();
+    let mut rotate = Rotate::None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -221,6 +249,16 @@ fn parse_cli() -> Result<Cli, String> {
             "--ink" => ink = Some(PathBuf::from(next("--ink")?)),
             "--docaligner" => docaligner = PathBuf::from(next("--docaligner")?),
             "--font" => font = PathBuf::from(next("--font")?),
+            "--rotate" => {
+                let v = next("--rotate")?;
+                rotate = match v.as_str() {
+                    "cw" | "90" => Rotate::Cw,
+                    "ccw" | "270" => Rotate::Ccw,
+                    "180" => Rotate::Half,
+                    "0" | "none" => Rotate::None,
+                    other => return Err(format!("unknown --rotate: {other} (cw|ccw|180)")),
+                };
+            }
             "--script" => {
                 let slug = next("--script")?;
                 script = script_from_slug(&slug)
@@ -262,6 +300,7 @@ fn parse_cli() -> Result<Cli, String> {
         script,
         font,
         stages,
+        rotate,
     })
 }
 
@@ -682,6 +721,7 @@ fn main() {
 fn run(cli: Cli) -> Result<(), String> {
     let image = image::open(&cli.input)
         .map_err(|e| format!("failed to open {}: {e}", cli.input.display()))?;
+    let image = cli.rotate.apply(image);
     let rgba = image.to_rgba8();
     let gray = image.to_luma8();
     println!(
@@ -740,6 +780,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Stage::Boxes
                 | Stage::OrientedBoxes
                 | Stage::BoxHeights
+                | Stage::XHeight
                 | Stage::RecognizeDeskew
                 | Stage::RecognizeNoDeskew
                 | Stage::BboxStrips
@@ -856,6 +897,85 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 fs::write(cli.out_dir.join("box_heights.csv"), csv)
                     .map_err(|e| format!("box_heights.csv: {e}"))?;
+            }
+            Stage::XHeight => {
+                let engine = engine.as_ref().expect("engine for x-height");
+                if !engine.has_ink() {
+                    println!(
+                        "  no ink model (pass --ink or put ink.mnn in the model dir); skipping"
+                    );
+                } else {
+                    let masks = engine.ink_masks(&image, &boxes);
+                    let mut canvas = rgba.clone();
+                    let scale = PxScale::from(20.0);
+                    let mut csv =
+                        String::from("cx,cy,width,tight_h,x_height,centerline,tilt_deg\n");
+                    // Thin lines so adjacent lines' boxes stay distinguishable.
+                    let thin = 1;
+                    for (b, mask) in boxes.iter().zip(masks.iter()) {
+                        // Inflated oriented box (magenta) — the region the ink model
+                        // actually searches — and the tight detection core (green).
+                        draw_closed_polyline(
+                            &mut canvas,
+                            &b.oriented_box.corners(),
+                            Rgba([230, 30, 200, 255]),
+                            thin,
+                        );
+                        draw_closed_polyline(
+                            &mut canvas,
+                            &b.tight_box.corners(),
+                            Rgba([30, 220, 30, 255]),
+                            thin,
+                        );
+                        let Some(mask) = mask else { continue };
+                        let Some(m) = translator::matte_metrics::matte_line_metrics(
+                            mask,
+                            b.oriented_box.width,
+                            b.oriented_box.height,
+                        ) else {
+                            continue;
+                        };
+                        // Matte band in cyan: box re-fit to actual ink on both axes.
+                        let band = m.refit(b.tight_box);
+                        draw_closed_polyline(
+                            &mut canvas,
+                            &band.corners(),
+                            Rgba([0, 200, 255, 255]),
+                            thin,
+                        );
+
+                        let corners = b.tight_box.corners();
+                        let lx = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+                        let ly = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+                        draw_text_mut(
+                            &mut canvas,
+                            Rgba([0, 160, 255, 255]),
+                            lx as i32,
+                            (ly as i32 - 22).max(0),
+                            scale,
+                            &font,
+                            &format!(
+                                "{:.0}->{:.0} {:.1}deg",
+                                b.tight_box.height,
+                                m.x_height,
+                                m.baseline_angle_delta.to_degrees()
+                            ),
+                        );
+                        csv.push_str(&format!(
+                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2}\n",
+                            b.tight_box.cx,
+                            b.tight_box.cy,
+                            b.tight_box.width,
+                            b.tight_box.height,
+                            m.x_height,
+                            m.centerline_offset,
+                            m.baseline_angle_delta.to_degrees(),
+                        ));
+                    }
+                    save_png(&canvas, &cli.out_dir.join("x_height.png"))?;
+                    fs::write(cli.out_dir.join("x_height.csv"), csv)
+                        .map_err(|e| format!("x_height.csv: {e}"))?;
+                }
             }
             Stage::Heatmap => {
                 let engine = engine.as_ref().expect("engine for heatmap");

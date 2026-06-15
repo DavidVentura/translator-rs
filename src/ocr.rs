@@ -462,11 +462,6 @@ pub struct ParagraphGroupingOptions {
     /// belonging to the same column. Used both for justified text (left edges align tightly)
     /// and ragged-right (same column edge, varying right edges).
     pub edge_alignment_tolerance: f32,
-    /// Maximum first-line indent in median-tight-height units. Body lines that sit further
-    /// LEFT than the running `column_left` by up to this amount are accepted, and `column_left`
-    /// shifts to follow them — that's how an indented first line plus flush body gets glued
-    /// into one paragraph.
-    pub max_first_line_indent: f32,
     /// "List-item start" gate. When the next line starts with an uppercase letter or a digit
     /// AND the inter-line gap (in median-tight-height units) exceeds this value, treat the new
     /// line as a fresh item and break. Catches menus / lists where each row starts with a
@@ -491,7 +486,6 @@ impl Default for ParagraphGroupingOptions {
             max_gap_ratio: 4.0,
             max_overlap_ratio: 0.5,
             edge_alignment_tolerance: 0.6,
-            max_first_line_indent: 4.0,
             list_item_break_gap_ratio: 0.8,
             max_list_item_word_count: 4,
         }
@@ -601,7 +595,7 @@ struct ParaState {
     /// blocks, every line's left edge sits at this value (modulo first-line indent which
     /// drives the min downward when the body line arrives). This single value lets us reject
     /// new-column lines (large positive delta) while still admitting indented first lines
-    /// (negative delta within `max_first_line_indent`).
+    /// (any negative delta, which shifts the column edge to follow the flush body).
     column_left: f32,
     /// Running estimate of the paragraph's tight-height. Updated as a simple EMA so the gate
     /// drifts with the paragraph but isn't pinned to the first line.
@@ -768,9 +762,9 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
 ///   * **Vertical gap.** Baseline-to-baseline gap within `[-max_overlap_ratio, max_gap_ratio]`
 ///     median-tight-height units. Stops column-interleaved sort artifacts (large negative gap)
 ///     and blank-line paragraph breaks (large positive gap).
-///   * **Column alignment.** New line's left edge within `edge_alignment_tolerance` of running
-///     `column_left`, OR up to `max_first_line_indent` units to the left of it (in which case
-///     `column_left` shifts to follow the new line — handles first-line indent).
+///   * **Column alignment.** New line's left edge within `edge_alignment_tolerance` to the right
+///     of running `column_left`, or anywhere to the left of it (in which case `column_left`
+///     shifts to follow the new line — handles first-line indent of any depth).
 ///
 /// We don't gate on the oriented-rect angle in V1 — perspective shift and DB-mask jitter make
 /// the per-line angle estimate too unstable to trust as a paragraph-break signal.
@@ -907,11 +901,13 @@ fn group_lines_in_reading_frame(
                 };
                 let gap_ok = gap_ratio >= -opts.max_overlap_ratio && gap_ratio <= gap_upper;
 
+                // Column alignment: a line at or left of the running column edge
+                // confirms/establishes the flush-left column (the previous line was
+                // a first-line indent sitting to the right); a line to the right
+                // must fall within the edge tolerance. The old height-normalized
+                // indent cap rejected legitimately deep indents, so it's gone.
                 let delta = left - state.column_left;
-                let abs_delta = delta.abs();
-                let aligned = abs_delta <= opts.edge_alignment_tolerance * unit;
-                let indent_shift = delta < 0.0 && (-delta) <= opts.max_first_line_indent * unit;
-                let align_ok = aligned || indent_shift;
+                let align_ok = delta <= opts.edge_alignment_tolerance * unit;
 
                 // List-item check: a new short line that starts with an uppercase letter or
                 // digit, separated from the previous line by more than
@@ -977,7 +973,7 @@ fn group_lines_in_reading_frame(
                         "ppocr group break: \"{}\" h={:.1} top={:.1} left={:.1} \
                          vs prev unit={:.1} → height_excess={:.2} (limit {:.2}) \
                          gap_ratio={:.2} (overlap {:.2}, upper {:.2}, baseline {:?}, \
-                         list-item {:.2}) delta_left={:.1} (align {:.1}, indent {:.1}) \
+                         list-item {:.2}) delta_left={:.1} (align {:.1}) \
                          list_item={}",
                         truncate_for_log(&line.text),
                         h,
@@ -993,7 +989,6 @@ fn group_lines_in_reading_frame(
                         opts.list_item_break_gap_ratio,
                         delta,
                         opts.edge_alignment_tolerance * unit,
-                        opts.max_first_line_indent * unit,
                         list_item_start,
                     );
                 }
