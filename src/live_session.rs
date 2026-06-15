@@ -991,59 +991,6 @@ impl LiveSession {
         self.after_content_change();
     }
 
-    /// Refresh the colours of an already-built anchor overlay from freshly
-    /// re-sampled matted strips (same detections, a newer camera frame). Each
-    /// fresh strip is matched onto the block slot carrying the same `box_index`,
-    /// so geometry/text/grouping are untouched — only the strip's reconstructed
-    /// background and the glyphs' ink colour change. Used by the periodic ink
-    /// recolor when the camera re-exposes / shifts white balance. Bumps the
-    /// content version so the GPU rebakes.
-    pub fn recolor_anchor(
-        &self,
-        anchor_id: AnchorId,
-        fresh: &[crate::color_matting::MattedStrip],
-        font_provider: &dyn crate::font_provider::FontProvider,
-    ) {
-        let by_idx: HashMap<usize, &crate::color_matting::MattedStrip> =
-            fresh.iter().map(|m| (m.box_index, m)).collect();
-        let mut anchors = match self.overlay_anchors.lock() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-        let Some(anchor) = anchors.get_mut(&anchor_id) else {
-            return;
-        };
-        let mut changed = false;
-        for spec in anchor.blocks.values_mut() {
-            let mut block_changed = false;
-            for slot in spec.matted_strips.iter_mut() {
-                let Some(old) = slot.as_mut() else { continue };
-                let Some(new) = by_idx.get(&old.box_index) else {
-                    continue;
-                };
-                // Keep the original (correct) root geometry; swap only the
-                // re-sampled background texture + ink colour. The fresh strip was
-                // sampled in the current view, but the overlay warps the root quad
-                // by the same homography, so the view-rectified texture registers.
-                old.strip_rgba = new.strip_rgba.clone();
-                old.strip_width = new.strip_width;
-                old.strip_height = new.strip_height;
-                old.fg_argb = new.fg_argb;
-                block_changed = true;
-            }
-            if block_changed {
-                let (instances, masks) = self.shape_block_glyphs(spec, font_provider);
-                spec.glyph_instances = instances;
-                spec.glyph_masks = masks;
-                changed = true;
-            }
-        }
-        drop(anchors);
-        if changed {
-            self.after_content_change();
-        }
-    }
-
     /// Shape one block's glyphs into its own canvas-texel frame for the GPU
     /// compositor: pen positions are relative to the block's AABB origin
     /// (`canvas_geometry` over the block's own visuals) scaled by oversample, so
