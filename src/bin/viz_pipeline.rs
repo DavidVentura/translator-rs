@@ -959,6 +959,49 @@ fn run(cli: Cli) -> Result<(), String> {
                     }
                     println!("  wrote {n}/{} ink masks", masks.len());
                     index.insert("ink_count".into(), serde_json::json!(n));
+                    // Per-box foreground colour the matting algo picks, plus the
+                    // inpainted strip, so we can see whether a light fg is the
+                    // colour algo or a bad/misregistered matte.
+                    let rgba = image.to_rgba8();
+                    let strips = translator::color_matting::mat_detections(&rgba, &boxes, &masks);
+                    let fgdir = cli.out_dir.join("ink-fg");
+                    fs::create_dir_all(&fgdir).map_err(|e| format!("mkdir: {e}"))?;
+                    for s in &strips {
+                        let [_, r, g, b] = s.fg_argb.to_be_bytes();
+                        println!("  box {:03}: fg=#{r:02x}{g:02x}{b:02x}", s.box_index);
+                        image::RgbImage::from_pixel(160, 48, image::Rgb([r, g, b]))
+                            .save(fgdir.join(format!("fg-{:03}.png", s.box_index)))
+                            .ok();
+                        if let Some(strip) = image::RgbaImage::from_raw(
+                            s.strip_width,
+                            s.strip_height,
+                            s.strip_rgba.clone(),
+                        ) {
+                            strip
+                                .save(fgdir.join(format!("strip-{:03}.png", s.box_index)))
+                                .ok();
+                        }
+                        // Re-render the ink shape (coverage alpha) in the PICKED fg
+                        // colour over the inpainted background — i.e. what the overlay
+                        // would actually draw for this line. Compare against the
+                        // original crop to judge whether the picked colour is right.
+                        let mut rendered = image::RgbImage::new(s.strip_width, s.strip_height);
+                        for (idx, px) in s.strip_rgba.chunks_exact(4).enumerate() {
+                            let a = px[3] as f32 / 255.0;
+                            let blend =
+                                |fg: u8, bg: u8| (fg as f32 * a + bg as f32 * (1.0 - a)) as u8;
+                            let x = (idx as u32) % s.strip_width;
+                            let y = (idx as u32) / s.strip_width;
+                            rendered.put_pixel(
+                                x,
+                                y,
+                                image::Rgb([blend(r, px[0]), blend(g, px[1]), blend(b, px[2])]),
+                            );
+                        }
+                        rendered
+                            .save(fgdir.join(format!("render-{:03}.png", s.box_index)))
+                            .ok();
+                    }
                 }
             }
             Stage::CharFirings => {
