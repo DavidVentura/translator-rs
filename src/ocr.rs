@@ -1521,6 +1521,7 @@ impl RasterImageMut {
         })
     }
 
+    #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
     fn as_image(&self) -> RasterImage<'_> {
         RasterImage {
             width: self.width,
@@ -1539,61 +1540,6 @@ impl RasterImageMut {
                 let index = ((y * self.width + x) * 4) as usize;
                 self.rgba[index..index + 4].copy_from_slice(&bytes);
             }
-        }
-    }
-
-    fn fill_bilinear(&mut self, rect: Rect, tl: u32, tr: u32, bl: u32, br: u32) {
-        let Some(rect) = clamp_rect(rect, self.width, self.height) else {
-            return;
-        };
-        let w = rect.width();
-        let h = rect.height();
-        if w == 0 || h == 0 {
-            return;
-        }
-        let max_u = (w.saturating_sub(1).max(1)) as f32;
-        let max_v = (h.saturating_sub(1).max(1)) as f32;
-        let rgb = |c: u32| -> [f32; 3] {
-            [
-                channel_r(c) as f32,
-                channel_g(c) as f32,
-                channel_b(c) as f32,
-            ]
-        };
-        let tl_c = rgb(tl);
-        let tr_c = rgb(tr);
-        let bl_c = rgb(bl);
-        let br_c = rgb(br);
-
-        for y in rect.top..rect.bottom {
-            let v = (y - rect.top) as f32 / max_v;
-            let left = [
-                tl_c[0] + (bl_c[0] - tl_c[0]) * v,
-                tl_c[1] + (bl_c[1] - tl_c[1]) * v,
-                tl_c[2] + (bl_c[2] - tl_c[2]) * v,
-            ];
-            let right = [
-                tr_c[0] + (br_c[0] - tr_c[0]) * v,
-                tr_c[1] + (br_c[1] - tr_c[1]) * v,
-                tr_c[2] + (br_c[2] - tr_c[2]) * v,
-            ];
-            for x in rect.left..rect.right {
-                let u = (x - rect.left) as f32 / max_u;
-                let r = (left[0] + (right[0] - left[0]) * u).clamp(0.0, 255.0) as u8;
-                let g = (left[1] + (right[1] - left[1]) * u).clamp(0.0, 255.0) as u8;
-                let b = (left[2] + (right[2] - left[2]) * u).clamp(0.0, 255.0) as u8;
-                let bytes = argb(r, g, b).to_ne_bytes();
-                let idx = ((y * self.width + x) * 4) as usize;
-                self.rgba[idx..idx + 4].copy_from_slice(&bytes);
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn apply_fill_plan(&mut self, rect: Rect, plan: FillPlan) {
-        match plan {
-            FillPlan::Flat(color) => self.fill_rect(rect, color),
-            FillPlan::Bilinear { tl, tr, bl, br } => self.fill_bilinear(rect, tl, tr, bl, br),
         }
     }
 
@@ -1624,75 +1570,6 @@ impl RasterImageMut {
                     let index = ((y * self.width + x) * 4) as usize;
                     self.rgba[index..index + 4].copy_from_slice(&bytes);
                 }
-            }
-        }
-    }
-
-    /// Bilinear corner-color gradient in line-local (u, v) ∈ [0,1] space inside the rotated
-    /// rectangle. Mirrors `fill_bilinear`'s semantics so AutoDetect's gradient erase works
-    /// equally well on tilted lines.
-    fn fill_oriented_bilinear(&mut self, rect: OrientedRect, tl: u32, tr: u32, bl: u32, br: u32) {
-        if rect.is_axis_aligned(AXIS_ALIGNED_EPSILON_RAD) {
-            self.fill_bilinear(rect.to_aabb(), tl, tr, bl, br);
-            return;
-        }
-        if rect.width <= 0.0 || rect.height <= 0.0 {
-            return;
-        }
-        let cos = rect.angle_radians.cos();
-        let sin = rect.angle_radians.sin();
-        let Some(aabb) = clamp_rect(rect.to_aabb(), self.width, self.height) else {
-            return;
-        };
-        let hw = rect.width * 0.5;
-        let hh = rect.height * 0.5;
-        let rgb = |c: u32| -> [f32; 3] {
-            [
-                channel_r(c) as f32,
-                channel_g(c) as f32,
-                channel_b(c) as f32,
-            ]
-        };
-        let tl_c = rgb(tl);
-        let tr_c = rgb(tr);
-        let bl_c = rgb(bl);
-        let br_c = rgb(br);
-        for y in aabb.top..aabb.bottom {
-            for x in aabb.left..aabb.right {
-                let dx = x as f32 + 0.5 - rect.cx;
-                let dy = y as f32 + 0.5 - rect.cy;
-                let lx = dx * cos + dy * sin;
-                let ly = -dx * sin + dy * cos;
-                if lx.abs() > hw || ly.abs() > hh {
-                    continue;
-                }
-                let u = (lx + hw) / rect.width;
-                let v = (ly + hh) / rect.height;
-                let left = [
-                    tl_c[0] + (bl_c[0] - tl_c[0]) * v,
-                    tl_c[1] + (bl_c[1] - tl_c[1]) * v,
-                    tl_c[2] + (bl_c[2] - tl_c[2]) * v,
-                ];
-                let right = [
-                    tr_c[0] + (br_c[0] - tr_c[0]) * v,
-                    tr_c[1] + (br_c[1] - tr_c[1]) * v,
-                    tr_c[2] + (br_c[2] - tr_c[2]) * v,
-                ];
-                let r = (left[0] + (right[0] - left[0]) * u).clamp(0.0, 255.0) as u8;
-                let g = (left[1] + (right[1] - left[1]) * u).clamp(0.0, 255.0) as u8;
-                let b = (left[2] + (right[2] - left[2]) * u).clamp(0.0, 255.0) as u8;
-                let bytes = argb(r, g, b).to_ne_bytes();
-                let idx = ((y * self.width + x) * 4) as usize;
-                self.rgba[idx..idx + 4].copy_from_slice(&bytes);
-            }
-        }
-    }
-
-    fn apply_fill_plan_oriented(&mut self, rect: OrientedRect, plan: FillPlan) {
-        match plan {
-            FillPlan::Flat(color) => self.fill_oriented_rect(rect, color),
-            FillPlan::Bilinear { tl, tr, bl, br } => {
-                self.fill_oriented_bilinear(rect, tl, tr, bl, br)
             }
         }
     }
@@ -1814,21 +1691,6 @@ fn get_surrounding_average_color(image: &RasterImage<'_>, text_bounds: Rect) -> 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FillPlan {
-    Flat(u32),
-    Bilinear { tl: u32, tr: u32, bl: u32, br: u32 },
-}
-
-struct AutoDetectPaint {
-    fill: FillPlan,
-    colors: OverlayColors,
-}
-
-// Corner colors are considered uniform enough for a flat fill when every
-// channel is within this many units of the 4-corner average.
-const FLAT_FILL_DELTA: u32 = 4;
-
 fn otsu_threshold(histogram: &[u64; 256]) -> u8 {
     let total: u64 = histogram.iter().sum();
     if total == 0 {
@@ -1885,13 +1747,6 @@ fn average_corner_color(corners: [u32; 4]) -> u32 {
     argb((r / 4) as u8, (g / 4) as u8, (b / 4) as u8)
 }
 
-fn max_channel_delta(a: u32, b: u32) -> u32 {
-    let dr = (channel_r(a) as i32 - channel_r(b) as i32).unsigned_abs();
-    let dg = (channel_g(a) as i32 - channel_g(b) as i32).unsigned_abs();
-    let db = (channel_b(a) as i32 - channel_b(b) as i32).unsigned_abs();
-    dr.max(dg).max(db)
-}
-
 fn peak_luminance(histogram: &[u64; 256], low: usize, high_exclusive: usize) -> u8 {
     let mut best_count = 0u64;
     let mut best = ((low + high_exclusive.saturating_sub(1)) / 2) as u8;
@@ -1904,19 +1759,16 @@ fn peak_luminance(histogram: &[u64; 256], low: usize, high_exclusive: usize) -> 
     best
 }
 
-fn autodetect_paint(image: &RasterImage<'_>, bounds: Rect) -> AutoDetectPaint {
+fn autodetect_paint(image: &RasterImage<'_>, bounds: Rect) -> OverlayColors {
     let fallback = |bg: u32| {
         let fg = if luminance(bg) > 0.5 {
             argb(0, 0, 0)
         } else {
             argb(255, 255, 255)
         };
-        AutoDetectPaint {
-            fill: FillPlan::Flat(bg),
-            colors: OverlayColors {
-                background_argb: bg,
-                foreground_argb: fg,
-            },
+        OverlayColors {
+            background_argb: bg,
+            foreground_argb: fg,
         }
     };
 
@@ -2087,29 +1939,9 @@ fn autodetect_paint(image: &RasterImage<'_>, bounds: Rect) -> AutoDetectPaint {
         }
     });
 
-    let avg_bg = average_corner_color(corners);
-    let max_delta = corners
-        .iter()
-        .map(|&c| max_channel_delta(c, avg_bg))
-        .max()
-        .unwrap_or(0);
-    let fill = if max_delta <= FLAT_FILL_DELTA {
-        FillPlan::Flat(avg_bg)
-    } else {
-        FillPlan::Bilinear {
-            tl: corners[0],
-            tr: corners[1],
-            bl: corners[2],
-            br: corners[3],
-        }
-    };
-
-    AutoDetectPaint {
-        fill,
-        colors: OverlayColors {
-            background_argb: avg_bg,
-            foreground_argb,
-        },
+    OverlayColors {
+        background_argb: average_corner_color(corners),
+        foreground_argb,
     }
 }
 
@@ -2127,7 +1959,7 @@ fn get_overlay_colors(
             background_argb: argb(255, 255, 255),
             foreground_argb: argb(0, 0, 0),
         },
-        crate::BackgroundMode::AutoDetect => autodetect_paint(image, bounds).colors,
+        crate::BackgroundMode::AutoDetect => autodetect_paint(image, bounds),
     }
 }
 
@@ -2153,10 +1985,7 @@ fn erase_text_region(
     let _ = ink_mask;
     // The oriented rect carries the same DB-unclip + DET_BOX_BORDER inflation the AABB path
     // applies (see `oriented_rect_from_contour`), so it reliably covers ascenders/descenders
-    // without spilling sideways the way an AABB does for tilted lines. AutoDetect samples
-    // surrounding colours via the rect's AABB; that's only used to pick a colour, not for the
-    // erase shape itself.
-    let aabb = oriented.to_aabb();
+    // without spilling sideways the way an AABB does for tilted lines.
     match background_mode {
         crate::BackgroundMode::WhiteOnBlack => {
             let colors = OverlayColors {
@@ -2175,25 +2004,26 @@ fn erase_text_region(
             colors
         }
         crate::BackgroundMode::AutoDetect => {
-            // Sample fg/bg colours from the still-intact region first.
-            let paint = autodetect_paint(&image.as_image(), aabb);
-            // When the ink model gave us a matte, erase only its ink pixels and
-            // reconstruct the background under them, instead of flat-filling the
-            // whole rect — the page texture/gradient shows through untouched. The
-            // erase also returns the ink-median foreground colour (the real ink
-            // colour), the same derivation the live overlay uses for its text, so
-            // the translated text matches the source ink instead of an autodetect
-            // luma guess. Background still comes from the autodetect sample.
+            // No algorithmic colour guess. When the ink model matted the line we
+            // erase only its ink pixels (the page texture/gradient shows through
+            // untouched) and colour the translated text with the real ink-median
+            // foreground, the same derivation the live overlay uses. Lines the
+            // model couldn't matte fall back to a flat white-on-black pill.
             #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
             if let Some(mask) = ink_mask {
-                let fg = matte_erase_oriented(image, oriented, mask);
-                return OverlayColors {
-                    background_argb: paint.colors.background_argb,
-                    foreground_argb: fg.unwrap_or(paint.colors.foreground_argb),
-                };
+                if let Some(fg) = matte_erase_oriented(image, oriented, mask) {
+                    return OverlayColors {
+                        background_argb: argb(0, 0, 0),
+                        foreground_argb: fg,
+                    };
+                }
             }
-            image.apply_fill_plan_oriented(oriented, paint.fill);
-            paint.colors
+            let colors = OverlayColors {
+                background_argb: argb(0, 0, 0),
+                foreground_argb: argb(255, 255, 255),
+            };
+            image.fill_oriented_rect(oriented, colors.background_argb);
+            colors
         }
     }
 }
@@ -2795,6 +2625,50 @@ mod tests {
             OverlayLayoutMode::PerLine
         );
         assert_eq!(prepared.blocks[0].layout_hints.suggested_font_size_px, 2.0);
+    }
+
+    #[test]
+    fn autodetect_without_matte_falls_back_to_white_on_black() {
+        // No ink matte: AutoDetect no longer samples the image — it flat-fills the
+        // line black and colours the translated text white.
+        let width = 8;
+        let height = 8;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            rgba.extend_from_slice(&0xFFFF_FFFFu32.to_ne_bytes());
+        }
+        let rect = Rect {
+            left: 1,
+            top: 1,
+            right: 7,
+            bottom: 6,
+        };
+        let blocks = vec![TextBlock {
+            lines: vec![TextLine {
+                text: "hi".to_string(),
+                bounding_box: rect,
+                oriented_box: super::OrientedRect::axis_aligned(rect),
+                tight_box: super::OrientedRect::axis_aligned(rect),
+                word_rects: vec![rect],
+            }],
+        }];
+
+        let prepared = prepare_overlay_image(
+            &rgba,
+            width,
+            height,
+            &blocks,
+            &["x".to_string()],
+            BackgroundMode::AutoDetect,
+            ReadingOrder::LeftToRight,
+            None,
+        )
+        .expect("overlay should prepare");
+
+        let idx = ((2 * width + 3) * 4) as usize;
+        let erased = u32::from_ne_bytes(prepared.rgba_bytes[idx..idx + 4].try_into().unwrap());
+        assert_eq!(erased, 0xFF00_0000);
+        assert_eq!(prepared.blocks[0].lines[0].foreground_argb, 0xFFFF_FFFF);
     }
 
     #[test]
