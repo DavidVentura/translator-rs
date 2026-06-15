@@ -42,7 +42,10 @@ class InkUNet(nn.Module):
         self.dec2 = conv_block(base * 4, base * 2)
         self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
         self.dec1 = conv_block(base * 2, base)
-        self.head = nn.Conv2d(base, 1, 1)
+        # Two output channels: [0] ink coverage matte, [1] bold (per-pixel weight).
+        # Shared decoder — bold is one extra 1x1 output, ~free at inference. Old
+        # 1-channel checkpoints won't load this head; train fresh (or copy weight[0]).
+        self.head = nn.Conv2d(base, 2, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
@@ -56,7 +59,7 @@ class InkUNet(nn.Module):
             e3 = self.dec3(torch.cat([self.up3(e4), e3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.head(d1)  # logits; sigmoid at the call site
+        return self.head(d1)  # (B, 2, H, W) logits: [matte, bold]; sigmoid at the call site
 
 
 def param_count(model: nn.Module) -> int:

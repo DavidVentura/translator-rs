@@ -174,97 +174,159 @@ def random_text(rng: random.Random) -> str:
     return " ".join(words)
 
 
+def _latin_chunk(rng: random.Random) -> str:
+    """1–2 words for one run (the line is built from several runs)."""
+    words = random_text(rng).split(" ")
+    return " ".join(words[: rng.randint(1, 2)]) or "x"
+
+
+def _pick_font(rng: random.Random, script: str, bold: bool) -> tuple[str, object]:
+    if script in SHAPED:
+        return rng.choice(shaped_fonts(script)), ImageFont.Layout.RAQM
+    pool = (
+        _heavy_fonts(script == "cjk")
+        if bold
+        else (cjk_font_paths() if script == "cjk" else font_paths())
+    )
+    return rng.choice(pool), ImageFont.Layout.BASIC
+
+
+def _run_text(rng: random.Random, script: str) -> str:
+    if script in SHAPED:
+        return shaped_text(rng, script)
+    if script == "cjk":
+        return cjk_text(rng)
+    return _latin_chunk(rng)
+
+
+def _run_plan(rng: random.Random) -> list[tuple[str, bool]]:
+    """A line is 1–4 runs laid left-to-right; each picks its own script and weight,
+    so one strip mixes scripts and mixes bold/regular at *run* (word) granularity."""
+    runs = []
+    for _ in range(rng.randint(1, 4)):
+        r = rng.random()
+        script = (
+            "cjk"
+            if r < 0.18
+            else (SHAPED_NAMES[rng.randrange(len(SHAPED_NAMES))] if r < 0.36 else "latin")
+        )
+        runs.append((script, rng.random() < 0.45))
+    return runs
+
+
+def _cjk_units(rng: random.Random, txt: str, is_bold: bool) -> list[tuple[str, bool]]:
+    """CJK emphasis: a contiguous middle span goes bold while the rest stays regular,
+    rendered flush (no spaces). CJK has no inter-word gap, so this is where the model
+    must find the weight seam from stroke thickness alone, mid-string. Latin/shaped
+    vary weight only at run boundaries (where a space already cues it)."""
+    if is_bold or len(txt) < 3 or rng.random() < 0.5:
+        return [(txt, is_bold)]
+    i = rng.randint(1, len(txt) - 2)
+    j = rng.randint(i + 1, len(txt) - 1)
+    return [(txt[:i], False), (txt[i:j], True), (txt[j:], False)]
+
+
 def render_coverage(
     rng: random.Random, width: int, height: int, log: dict | None = None
-) -> tuple[np.ndarray, np.ndarray]:
-    """Antialiased glyph coverage on a height x width canvas.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Antialiased glyph coverage for a multi-run line on a height x width canvas.
 
-    Returns `(total, fill)`: `total` is the union coverage including any outline
-    stroke (this is the training label — outlines are ink); `fill` is the glyph
-    core only, so the caller can give the outline ring its own color. They're
-    identical when the text isn't outlined.
+    Returns `(total, fill, bold)`: `total` is the union coverage incl. any outline
+    stroke (the matte label — outlines are ink); `fill` is the glyph core only (so
+    the caller can colour the outline ring); `bold` is the union coverage of the
+    *bold* runs only (the per-pixel bold label). `fill` aliases `total` when there's
+    no outline.
     """
     # Render oversized then rotate, so the rotation doesn't clip glyphs.
     pad = max(8, height // 2)
-    canvas = Image.new("L", (width + 2 * pad, height + 2 * pad), 0)
-    draw = ImageDraw.Draw(canvas)
+    size = (width + 2 * pad, height + 2 * pad)
+    total = Image.new("L", size, 0)
+    td = ImageDraw.Draw(total)
+    boldc = Image.new("L", size, 0)
+    bd = ImageDraw.Draw(boldc)
     jitter = max(1, height // 12)
     stroke = rng.randint(1, max(1, height // 10)) if rng.random() < 0.2 else 0
-    # The fill canvas (glyph core, no stroke) only differs from `total` when the text
-    # is outlined; rendering glyphs is the per-sample hotspot, so skip the second draw
-    # entirely when there's no stroke and alias `fill` to `total`.
     outlined = stroke > 0
-    fill_canvas = Image.new("L", canvas.size, 0) if outlined else None
+    fill_canvas = Image.new("L", size, 0) if outlined else None
     fill_draw = ImageDraw.Draw(fill_canvas) if outlined else None
-    # Script mix. CJK (dense thick strokes, tiny counters) and the shaped scripts
-    # (Arabic cursive, Devanagari roof + conjuncts, Tamil thick curves, Thai) are stroke
-    # regimes Latin alone misses; teach them directly. Shaped scripts need raqm layout.
-    r = rng.random()
-    use_cjk = r < 0.22
-    shaped = SHAPED_NAMES[rng.randrange(len(SHAPED_NAMES))] if 0.22 <= r < 0.44 else None
-    heavy = not shaped and rng.random() < 0.4  # heavy/black weights for superbold strokes
-    if shaped:
-        fonts = shaped_fonts(shaped)
-    elif heavy:
-        fonts = _heavy_fonts(use_cjk)
-    else:
-        fonts = cjk_font_paths() if use_cjk else font_paths()
-    layout = ImageFont.Layout.RAQM if shaped else ImageFont.Layout.BASIC
-    for attempt in range(8):
-        path = rng.choice(fonts)
-        size = rng.randint(max(7, int(height * 0.45)), max(8, int(height * 0.95)))
-        try:
-            font = ImageFont.truetype(path, size=size, layout_engine=layout)
-            if shaped:
-                text = shaped_text(rng, shaped)
-            elif use_cjk:
-                text = cjk_text(rng)
-            else:
-                text = random_text(rng)
-            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-            if right - left < 8 or bottom - top < 4:
+
+    font_px = rng.randint(max(7, int(height * 0.45)), max(8, int(height * 0.95)))
+    x = pad + rng.randint(-jitter, 2 * jitter)
+    y0 = pad + rng.randint(-jitter, jitter)
+    scripts, bold_runs, last_font = [], 0, "?"
+    drew = False
+    for script, is_bold in _run_plan(rng):
+        text = _run_text(rng, script)
+        units = _cjk_units(rng, text, is_bold) if script == "cjk" else [(text, is_bold)]
+        for s, ub in units:
+            if not s.strip():
                 continue
-        except OSError:
-            continue
-        x = pad + rng.randint(-jitter, 2 * jitter) - left
-        y = pad + (height - (bottom - top)) // 2 + rng.randint(-jitter, jitter) - top
-        draw.text((x, y), text, font=font, fill=255, stroke_width=stroke, stroke_fill=255)
-        if outlined:
-            fill_draw.text((x, y), text, font=font, fill=255)
-        break
+            path, layout = _pick_font(rng, script, ub)
+            try:
+                font = ImageFont.truetype(path, size=font_px, layout_engine=layout)
+                l, t, r, b = td.textbbox((0, 0), s, font=font)
+            except OSError:
+                continue
+            if r - l < 1 or b - t < 1:
+                continue
+            y = y0 + (height - (b - t)) // 2 - t
+            td.text((x, y), s, font=font, fill=255, stroke_width=stroke, stroke_fill=255)
+            if outlined:
+                fill_draw.text((x, y), s, font=font, fill=255)
+            if ub:
+                bd.text((x, y), s, font=font, fill=255, stroke_width=stroke, stroke_fill=255)
+                bold_runs += 1
+            # CJK is set flush (no inter-unit gap); spaced scripts get a word gap.
+            gap = 0 if script == "cjk" else rng.randint(font_px // 6, font_px // 2)
+            x += int(td.textlength(s, font=font)) + gap
+            drew, last_font = True, os.path.basename(path)
+            scripts.append(script)
+        if x > size[0] - pad:
+            break
+    if not drew:
+        z = np.zeros((height, width), dtype=np.float32)
+        return z, z, z  # caller retries
+
     if rng.random() < 0.5:
         angle = rng.uniform(-3.0, 3.0)
         center = (pad, pad + height // 2)
-        canvas = canvas.rotate(angle, resample=Image.BILINEAR, center=center)
+        total = total.rotate(angle, resample=Image.BILINEAR, center=center)
+        boldc = boldc.rotate(angle, resample=Image.BILINEAR, center=center)
         if outlined:
             fill_canvas = fill_canvas.rotate(angle, resample=Image.BILINEAR, center=center)
-    total = np.asarray(canvas, dtype=np.float32) / 255.0
-    fill = np.asarray(fill_canvas, dtype=np.float32) / 255.0 if outlined else total
+    tot = np.asarray(total, dtype=np.float32) / 255.0
+    bld = np.asarray(boldc, dtype=np.float32) / 255.0
+    fl = np.asarray(fill_canvas, dtype=np.float32) / 255.0 if outlined else tot
     thick_k = 0
     if height >= 48 and rng.random() < 0.4:
-        # Thicken to simulate super-heavy weight beyond what fonts provide: trains the
-        # solid thick interiors the matte otherwise only outlines (edge-starvation).
-        # Only on the large/display regime, with the kernel scaled to the text height —
-        # any dilation on small body text merges 'i' dots, closes counters, and fuses
-        # letters, corrupting the label and starving thin-stroke coverage.
+        # Thicken to simulate super-heavy weight beyond what fonts provide (see note
+        # below). Applied identically to total/bold/fill so the labels stay aligned.
         thick_k = int(np.clip(round(height / 40) * 2 + 1, 3, 11))
-        total = np.asarray(
-            Image.fromarray((total * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(thick_k)),
-            dtype=np.float32) / 255.0
-        if outlined:
-            fill = np.asarray(
-                Image.fromarray((fill * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(thick_k)),
-                dtype=np.float32) / 255.0
-        else:
-            fill = total
+
+        def mf(a: np.ndarray) -> np.ndarray:
+            return (
+                np.asarray(
+                    Image.fromarray((a * 255).astype(np.uint8)).filter(
+                        ImageFilter.MaxFilter(thick_k)
+                    ),
+                    dtype=np.float32,
+                )
+                / 255.0
+            )
+
+        tot, bld = mf(tot), mf(bld)
+        fl = mf(fl) if outlined else tot
     if log is not None:
-        log.update(font=os.path.basename(path), size=size,
-                   script=shaped or ("cjk" if use_cjk else "latin"),
-                   heavy=heavy, stroke=stroke, thick_k=thick_k)
-    return (
-        total[pad : pad + height, pad : pad + width],
-        fill[pad : pad + height, pad : pad + width],
-    )
+        log.update(
+            font=last_font,
+            size=font_px,
+            script="+".join(dict.fromkeys(scripts)),
+            heavy=bold_runs > 0,
+            stroke=stroke,
+            thick_k=thick_k,
+        )
+    crop = lambda a: a[pad : pad + height, pad : pad + width]  # noqa: E731
+    return crop(tot), crop(fl), crop(bld)
 
 
 @lru_cache(maxsize=64)
@@ -445,11 +507,13 @@ def sample(rng: random.Random | None = None, width: int | None = None):
     rng = rng or random.Random()
     width = width or rng.choice(WIDTHS)
     for _attempt in range(8):
-        cov, fill, native_h, native_w = _render_once(rng, width)
-        img, cov_out, ok = _composite_once(rng, cov, fill, native_h, native_w, width)
+        cov, fill, bold, native_h, native_w = _render_once(rng, width)
+        img, cov_out, bold_out, ok = _composite_once(
+            rng, cov, fill, bold, native_h, native_w, width
+        )
         if ok:
             break
-    return img, cov_out
+    return img, cov_out, bold_out
 
 
 def stream(rng: random.Random, width: int, reuse: int = 1):
@@ -461,14 +525,16 @@ def stream(rng: random.Random, width: int, reuse: int = 1):
     coverage, different appearance), which is benign augmentation for a matte target.
     """
     while True:
-        cov, fill, native_h, native_w = _render_once(rng, width)
+        cov, fill, bold, native_h, native_w = _render_once(rng, width)
         for _ in range(reuse):
-            img = cov_out = None
+            img = cov_out = bold_out = None
             for _try in range(3):
-                img, cov_out, ok = _composite_once(rng, cov, fill, native_h, native_w, width)
+                img, cov_out, bold_out, ok = _composite_once(
+                    rng, cov, fill, bold, native_h, native_w, width
+                )
                 if ok:
                     break
-            yield img, cov_out
+            yield img, cov_out, bold_out
 
 
 def _render_once(rng: random.Random, width: int, log: dict | None = None):
@@ -483,11 +549,11 @@ def _render_once(rng: random.Random, width: int, log: dict | None = None):
     if log is not None:
         log["native_h"] = native_h
     native_w = max(16, round(width * native_h / HEIGHT))
-    cov, fill = render_coverage(rng, native_w, native_h, log)
-    return cov, fill, native_h, native_w
+    cov, fill, bold = render_coverage(rng, native_w, native_h, log)
+    return cov, fill, bold, native_h, native_w
 
 
-def _composite_once(rng: random.Random, cov, fill, native_h: int, native_w: int, width: int,
+def _composite_once(rng: random.Random, cov, fill, bold, native_h: int, native_w: int, width: int,
                     log: dict | None = None):
     bg = gradient_field(rng, native_h, native_w, log)
     if rng.random() < 0.15:
@@ -541,9 +607,14 @@ def _composite_once(rng: random.Random, cov, fill, native_h: int, native_w: int,
             Image.fromarray(cov, mode="F").resize((width, HEIGHT), Image.BILINEAR),
             dtype=np.float32,
         )
+        bold = np.asarray(
+            Image.fromarray(bold, mode="F").resize((width, HEIGHT), Image.BILINEAR),
+            dtype=np.float32,
+        )
     return (
         img.astype(np.float32, copy=False),
         np.clip(cov, 0.0, 1.0).astype(np.float32, copy=False),
+        np.clip(bold, 0.0, 1.0).astype(np.float32, copy=False),
         ok,
     )
 
@@ -561,19 +632,21 @@ def main():
         # Replicate sample() but capture the per-sample params into `log`. Fresh log
         # per attempt — optional fields would otherwise leak from a failed retry.
         width = rng.choice(WIDTHS)
-        img = cov = None
+        img = cov = bold = None
         log: dict = {}
         for _ in range(8):
             log = {}
-            c, fl, nh, nw = _render_once(rng, width, log)
-            img, cov, ok = _composite_once(rng, c, fl, nh, nw, width, log)
+            c, fl, bl, nh, nw = _render_once(rng, width, log)
+            img, cov, bold, ok = _composite_once(rng, c, fl, bl, nh, nw, width, log)
             if ok:
                 break
         h, w = cov.shape
         band = 26
-        sheet = np.ones((band + h * 2 + 4, max(w, 360), 3), dtype=np.float32)
+        # Three stacked rows: composited image, matte label, bold label.
+        sheet = np.ones((band + h * 3 + 8, max(w, 360), 3), dtype=np.float32)
         sheet[band : band + h, :w] = img
-        sheet[band + h + 4 :, :w] = cov[..., None]
+        sheet[band + h + 4 : band + h * 2 + 4, :w] = cov[..., None]
+        sheet[band + h * 2 + 8 :, :w] = bold[..., None]
         pim = Image.fromarray((sheet * 255).astype(np.uint8))
         deg = " ".join(
             f"{kk}{log[kk]}" for kk in ("blur", "downsample", "jpeg", "noise", "squeeze",

@@ -39,22 +39,36 @@ class SyntheticStrips(IterableDataset):
         rng = random.Random(self.seed + worker * 7919 + os.getpid())
         gen = stream(rng, self.width, self.reuse)
         while True:
-            imgs, covs = [], []
+            imgs, covs, bolds = [], [], []
             for _ in range(self.batch):
-                img, cov = next(gen)
+                img, cov, bold = next(gen)
                 imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
                 covs.append(torch.from_numpy(cov[None]))
-            yield torch.stack(imgs), torch.stack(covs)
+                bolds.append(torch.from_numpy(bold[None]))
+            yield torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
 
 
 def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     rng = random.Random(seed)
-    imgs, covs = [], []
+    imgs, covs, bolds = [], [], []
     for _ in range(n):
-        img, cov = sample(rng, width=width)
+        img, cov, bold = sample(rng, width=width)
         imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
         covs.append(torch.from_numpy(cov[None]))
-    return torch.stack(imgs), torch.stack(covs)
+        bolds.append(torch.from_numpy(bold[None]))
+    return torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
+
+
+def ink_losses(logits, cov, bold):
+    """Matte BCE over the whole strip + bold BCE *masked to ink*. Bold is only
+    defined where there's ink, so masking keeps the empty background from drowning
+    the bold signal. Returns (total, matte, bold) for logging."""
+    matte_logit, bold_logit = logits[:, :1], logits[:, 1:]
+    loss_matte = F.binary_cross_entropy_with_logits(matte_logit, cov)
+    ink = (cov > 0.5).float()
+    bce = F.binary_cross_entropy_with_logits(bold_logit, (bold > 0.5).float(), reduction="none")
+    loss_bold = (bce * ink).sum() / ink.sum().clamp_min(1.0)
+    return loss_matte + 0.5 * loss_bold, loss_matte, loss_bold
 
 
 def main():
@@ -107,21 +121,22 @@ def main():
         prefetch_factor=4 if args.workers > 0 else None,
         pin_memory=device == "cuda",
     )
-    val_img, val_cov = validation_batch(n=args.val_batch, width=args.width)
-    val_img, val_cov = val_img.to(device), val_cov.to(device)
+    val_img, val_cov, val_bold = validation_batch(n=args.val_batch, width=args.width)
+    val_img, val_cov, val_bold = val_img.to(device), val_cov.to(device), val_bold.to(device)
 
     os.makedirs(args.out, exist_ok=True)
     model.train()
     t0 = time.time()
     running = 0.0
-    for step, (img, cov) in enumerate(loader, start=start_step + 1):
+    for step, (img, cov, bold) in enumerate(loader, start=start_step + 1):
         if step > args.steps:
             break
         img = img.to(device, non_blocking=device == "cuda")
         cov = cov.to(device, non_blocking=device == "cuda")
+        bold = bold.to(device, non_blocking=device == "cuda")
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss = F.binary_cross_entropy_with_logits(logits, cov)
+            loss, _, _ = ink_losses(logits, cov, bold)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -139,9 +154,12 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
-                val_loss = F.binary_cross_entropy_with_logits(train_model(val_img), val_cov).item()
+                vl, vm, vb = ink_losses(train_model(val_img), val_cov, val_bold)
             model.train()
-            print(f"step {step:>6}  VAL loss {val_loss:.4f}", flush=True)
+            print(
+                f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f})",
+                flush=True,
+            )
             state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                      "base": args.base, "levels": args.levels}
             torch.save(state, os.path.join(args.out, "ink-latest.pt"))
