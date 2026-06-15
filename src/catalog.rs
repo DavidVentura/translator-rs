@@ -7,9 +7,9 @@ mod wire;
 
 pub use model::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DeletePlan, DictionaryInfo, DownloadPlan,
-    DownloadTask, FileRole, InstalledTtsPack, LangAvailability, LanguageCatalog, LanguageFeature,
-    LanguageTtsRegionV2, LanguageTtsV2, OcrEngine, OcrPack, PackKind, PackRecord, PpocrScript,
-    ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
+    DownloadTask, FileRequirement, FileRole, InstalledTtsPack, LangAvailability, LanguageCatalog,
+    LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, OcrEngine, OcrPack, PackKind, PackRecord,
+    PpocrScript, ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 pub use planner::{
     CatalogSnapshot, FsPackInstallChecker, LanguageAvailabilityRow, LanguageOverview,

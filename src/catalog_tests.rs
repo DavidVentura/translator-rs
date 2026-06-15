@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use crate::api::{DictionaryCode, LanguageCode};
 use crate::catalog::{
-    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, FileRole, LangAvailability,
-    LanguageCatalog, LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, PackInstallChecker,
-    PackRecord, build_catalog_snapshot, plan_delete_superseded_files, plan_language_download,
+    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, FileRequirement, FileRole,
+    LangAvailability, LanguageCatalog, LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2,
+    PackInstallChecker, PackRecord, build_catalog_snapshot, plan_delete_superseded_files,
+    plan_language_download,
 };
 use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades};
 use crate::language::Language;
@@ -54,6 +55,7 @@ fn asset_file(name: &str, install_path: &str, size_bytes: u64) -> AssetFileV2 {
         install_marker_version: None,
         role: None,
         priority: 0,
+        requirement: FileRequirement::Required,
     }
 }
 
@@ -68,6 +70,19 @@ fn role_file(
         role: Some(FileRole::new(role)),
         priority,
         ..asset_file(name, install_path, size_bytes)
+    }
+}
+
+fn optional_role_file(
+    name: &str,
+    install_path: &str,
+    size_bytes: u64,
+    role: &str,
+    priority: i32,
+) -> AssetFileV2 {
+    AssetFileV2 {
+        requirement: FileRequirement::Optional,
+        ..role_file(name, install_path, size_bytes, role, priority)
     }
 }
 
@@ -628,6 +643,44 @@ fn lower_priority_alternative_keeps_pack_installed_and_offers_upgrade() {
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["ppocr/det_new.mnn"]);
     assert_eq!(upgrades.total_size, 40);
+}
+
+fn catalog_with_optional_ink() -> LanguageCatalog {
+    let mut catalog = catalog_with_detector_alternatives();
+    let detector = catalog.packs.get_mut("ocr-ppocr-detector").unwrap();
+    detector.files.push(optional_role_file(
+        "ink.mnn",
+        "ppocr/ink.mnn",
+        50,
+        FileRole::INK,
+        0,
+    ));
+    catalog
+}
+
+#[test]
+fn missing_optional_file_keeps_pack_installed_and_offers_it_as_upgrade() {
+    let catalog = catalog_with_optional_ink();
+    // Everything present except the optional ink model.
+    let checker =
+        FakeInstallChecker::with_files(&["ppocr/det_new.mnn", "ppocr/pulc.mnn", "ppocr/latin.mnn"]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    let detector_status = &snapshot.pack_statuses["ocr-ppocr-detector"];
+    assert!(detector_status.installed);
+    assert!(detector_status.missing_files.is_empty());
+
+    let en = [LanguageCode::from("en")];
+    let downloads = plan_ocr_engine_downloads(&snapshot, &en, "ppocr");
+    assert!(downloads.tasks.is_empty());
+
+    let upgrades = plan_ocr_engine_upgrades(&snapshot, &en, "ppocr");
+    let paths = upgrades
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["ppocr/ink.mnn"]);
 }
 
 #[test]

@@ -4,9 +4,9 @@ use crate::api::LanguageCode;
 use crate::language::Language;
 
 use super::model::{
-    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRole, InstalledTtsPack,
-    LangAvailability, LanguageCatalog, PackKind, PackRecord, ResolvedTtsVoiceFiles,
-    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
+    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole,
+    InstalledTtsPack, LangAvailability, LanguageCatalog, PackKind, PackRecord,
+    ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,8 +15,10 @@ pub struct PackInstallStatus {
     pub installed: bool,
     pub missing_files: Vec<AssetFileV2>,
     pub missing_dependency_ids: Vec<String>,
-    /// Higher-priority role alternatives than the best file on disk. The pack
-    /// still counts as installed; these are optional improvements.
+    /// Improvement downloads that don't gate `installed`: higher-priority role
+    /// alternatives than the best file on disk, plus optional-role files that
+    /// aren't present at all (a newly-added optional model on an already-
+    /// installed pack). Surfaced to the user as an available upgrade.
     pub upgrade_files: Vec<AssetFileV2>,
     /// Role alternatives on disk that are outranked by a better file also on
     /// disk, safe to delete.
@@ -181,7 +183,13 @@ where
                 .copied()
                 .collect::<Vec<_>>();
             let Some(best_present) = present.first() else {
-                missing_files.push(group[0].clone());
+                // No file of this role on disk. A required role gates the pack;
+                // an optional one is offered as an improvement upgrade instead so
+                // it doesn't mark an installed language as missing.
+                match group[0].requirement {
+                    FileRequirement::Required => missing_files.push(group[0].clone()),
+                    FileRequirement::Optional => upgrade_files.push(group[0].clone()),
+                }
                 continue;
             };
             if group[0].install_path != best_present.install_path {

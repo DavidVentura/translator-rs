@@ -63,6 +63,19 @@ impl FileRole {
     }
 }
 
+/// Whether a catalog file is needed for its pack to count as installed. A
+/// `Required` file that is absent marks the pack incomplete (the language shows
+/// as missing and the file is force-downloaded). An `Optional` file that is
+/// absent leaves the pack installed and is surfaced as an improvement upgrade
+/// instead, so a newly-added optional model (e.g. the ink matte) never demotes
+/// an already-installed language on app upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileRequirement {
+    #[default]
+    Required,
+    Optional,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetFileV2 {
     pub name: String,
@@ -77,6 +90,7 @@ pub struct AssetFileV2 {
     pub install_marker_version: Option<i32>,
     pub role: Option<FileRole>,
     pub priority: i32,
+    pub requirement: FileRequirement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

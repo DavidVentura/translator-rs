@@ -5,10 +5,10 @@ use serde::Deserialize;
 use crate::language::Language;
 
 use super::model::{
-    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, FileRole, LanguageCatalog,
-    LanguageFeature, LanguageInfo, LanguageResources, LanguageTtsRegionV2, LanguageTtsV2, OcrPack,
-    PackKind, PackRecord, PpocrScript, SupportPack, TranslationPack, TtsPack,
-    tts_pack_ids_from_config,
+    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, FileRequirement, FileRole,
+    LanguageCatalog, LanguageFeature, LanguageInfo, LanguageResources, LanguageTtsRegionV2,
+    LanguageTtsV2, OcrPack, PackKind, PackRecord, PpocrScript, SupportPack, TranslationPack,
+    TtsPack, tts_pack_ids_from_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -87,6 +87,8 @@ struct AssetFileWire {
     role: Option<String>,
     #[serde(default)]
     priority: i32,
+    #[serde(default)]
+    optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -217,6 +219,11 @@ impl From<AssetFileWire> for AssetFileV2 {
                 .filter(|value| !value.is_empty())
                 .map(FileRole::new),
             priority: value.priority,
+            requirement: if value.optional {
+                FileRequirement::Optional
+            } else {
+                FileRequirement::Required
+            },
         }
     }
 }
