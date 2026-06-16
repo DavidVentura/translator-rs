@@ -112,21 +112,36 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     // Per-box ink mattes feed both paragraph grouping (x-height + baseline-tilt
     // recovery, applied to each line before it groups) and the overlay erase
     // (the union ink mask). Compute them once, here, before grouping needs them.
-    let (ink_masks, ink_rgba) = if ppocr.has_ink() {
+    let (ink_strips, ink_rgba) = if ppocr.has_ink() {
         let rgba = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
             .expect("rgba image from caller-owned bytes");
         let dynimg = image::DynamicImage::ImageRgba8(rgba);
-        let masks = ppocr.ink_masks(&dynimg, &det_boxes);
-        (masks, Some(dynimg.into_rgba8()))
+        let strips = ppocr.ink_strips(&dynimg, &det_boxes);
+        (strips, Some(dynimg.into_rgba8()))
     } else {
         (Vec::new(), None)
     };
+    // The matte (ch0) drives grouping metrics + the overlay union mask; the bold channel
+    // (ch1), pooled per box and thresholded, is the typography weight when present.
+    let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
+        .iter()
+        .map(|s| s.as_ref().map(|s| s.matte.clone()))
+        .collect();
+    let model_bold: Vec<Option<bool>> = ink_strips
+        .iter()
+        .map(|s| {
+            s.as_ref()
+                .and_then(|s| s.pooled_bold())
+                .map(|p| p >= MODEL_BOLD_THRESHOLD)
+        })
+        .collect();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
 
     let blocks = still_ppocr_lines_to_blocks(
         &det_boxes,
         lines,
         &text_metrics,
+        &model_bold,
         min_confidence,
         reading_order,
     );
@@ -206,6 +221,12 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
     }
 }
 
+/// Pooled bold probability above which a line is rendered bold. ~0.65 puts thin-text
+/// false positives near zero (the acceptable failure is missing a bold, not emboldening
+/// thin text); the residual emboldening is on heavy-400 faces that read bold anyway.
+#[cfg(feature = "ppocr")]
+const MODEL_BOLD_THRESHOLD: f32 = 0.65;
+
 /// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent
 /// ink band); the caller then keeps the box's own tight height and angle.
@@ -237,6 +258,7 @@ fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
+    model_bold: &[Option<bool>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -244,8 +266,14 @@ fn still_ppocr_lines_to_blocks(
     // recognizer's built-in `rec_drop_score`: lines the model accepted but whose mean
     // CTC score sits below the user's bar are dropped before paragraph grouping.
     let min_score = min_confidence as f32 / 100.0;
-    // Bold is decided relative to this page's median weight.
-    let bold = crate::text_metrics::bold_flags(text_metrics);
+    // Bold from the ink model's bold channel (pooled + thresholded per box) where present;
+    // fall back to the geometric stroke-width heuristic for the legacy matte-only model.
+    let geometric_bold = crate::text_metrics::bold_flags(text_metrics);
+    let bold: Vec<bool> = model_bold
+        .iter()
+        .zip(geometric_bold.iter())
+        .map(|(m, &g)| m.unwrap_or(g))
+        .collect();
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())

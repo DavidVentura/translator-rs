@@ -259,6 +259,36 @@ impl PpocrInkModel {
     }
 }
 
+/// One box's ink-model output: the soft matte (ch0, always present) and the per-pixel
+/// bold logit-derived map (ch1, present only when a 2-channel bold model is loaded;
+/// `None` for the legacy matte-only model). Both are 0..255 at the 48px strip height.
+pub struct InkStrip {
+    pub matte: GrayImage,
+    pub bold: Option<GrayImage>,
+}
+
+/// Matte alpha (0..255) above which a pixel counts as ink for bold pooling.
+const INK_BOLD_ALPHA_CUT: u8 = 40;
+/// Need at least this many ink pixels to trust a pooled bold estimate.
+const INK_BOLD_MIN_PX: u64 = 30;
+
+impl InkStrip {
+    /// Mean bold probability (0..1) over the strip's ink pixels — the per-line weight
+    /// estimate the caller thresholds (≈0.65). `None` when there is no bold channel
+    /// (legacy matte-only model) or too little ink to be reliable.
+    pub fn pooled_bold(&self) -> Option<f32> {
+        let bold = self.bold.as_ref()?;
+        let (mut sum, mut n) = (0u64, 0u64);
+        for (m, b) in self.matte.iter().zip(bold.iter()) {
+            if *m >= INK_BOLD_ALPHA_CUT {
+                sum += *b as u64;
+                n += 1;
+            }
+        }
+        (n >= INK_BOLD_MIN_PX).then(|| sum as f32 / n as f32 / 255.0)
+    }
+}
+
 pub struct PpocrRecognizer {
     /// One MnnSession per parallel worker. Each is wrapped in a Mutex but contention is zero —
     /// the rayon worker at index `i` only touches `sessions[i]`. The Mutex is just there to
@@ -372,6 +402,19 @@ impl PpocrEngine {
         image: &DynamicImage,
         boxes: &[crate::ocr::DetectedTextBox],
     ) -> Vec<Option<GrayImage>> {
+        self.ink_strips(image, boxes)
+            .into_iter()
+            .map(|s| s.map(|s| s.matte))
+            .collect()
+    }
+
+    /// Like [`ink_masks`] but also returns the per-pixel bold map (ch1) when a 2-channel
+    /// bold model is loaded. The matte (ch0) is identical to `ink_masks`.
+    pub fn ink_strips(
+        &self,
+        image: &DynamicImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Vec<Option<InkStrip>> {
         let Some(ink) = &self.ink else {
             return boxes.iter().map(|_| None).collect();
         };
@@ -409,7 +452,12 @@ impl PpocrEngine {
         let n_batches = buckets.len();
 
         let t_inf = Instant::now();
-        let groups: Vec<Vec<(usize, GrayImage)>> = buckets
+        let sigmoid_u8 = |logit: f32| {
+            ((1.0 / (1.0 + (-logit).exp())) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        let groups: Vec<Vec<(usize, InkStrip)>> = buckets
             .par_iter()
             .map(|(bw, idxs)| {
                 let bw = *bw;
@@ -434,33 +482,40 @@ impl PpocrEngine {
                 if o.len() < nb * plane {
                     return Vec::new();
                 }
+                // Output is [nb, chans, h, bw]: chans=1 for the legacy matte-only model,
+                // 2 for the bold model (ch0=matte, ch1=bold). Each strip's planes are
+                // contiguous, so a strip's ch0 starts at slot*chans*plane.
+                let chans = o.len() / (nb * plane);
                 idxs.iter()
                     .enumerate()
                     .filter_map(|(slot, &j)| {
                         let (box_idx, tw) = (prepared[j].0, prepared[j].1.width());
-                        let obase = slot * plane;
-                        let mut buf = vec![0u8; (h * tw) as usize];
+                        let sbase = slot * chans * plane;
+                        let mut matte = vec![0u8; (h * tw) as usize];
+                        let mut bold = (chans >= 2).then(|| vec![0u8; (h * tw) as usize]);
                         for y in 0..h {
                             for x in 0..tw {
-                                let logit = o[obase + (y * bw + x) as usize];
-                                buf[(y * tw + x) as usize] = ((1.0 / (1.0 + (-logit).exp()))
-                                    * 255.0)
-                                    .round()
-                                    .clamp(0.0, 255.0)
-                                    as u8;
+                                let i = (y * bw + x) as usize;
+                                let o_i = (y * tw + x) as usize;
+                                matte[o_i] = sigmoid_u8(o[sbase + i]);
+                                if let Some(b) = bold.as_mut() {
+                                    b[o_i] = sigmoid_u8(o[sbase + plane + i]);
+                                }
                             }
                         }
-                        GrayImage::from_raw(tw, h, buf).map(|m| (box_idx, m))
+                        let matte = GrayImage::from_raw(tw, h, matte)?;
+                        let bold = bold.and_then(|b| GrayImage::from_raw(tw, h, b));
+                        Some((box_idx, InkStrip { matte, bold }))
                     })
                     .collect()
             })
             .collect();
         let inf_us = t_inf.elapsed().as_micros();
 
-        let mut out: Vec<Option<GrayImage>> = boxes.iter().map(|_| None).collect();
+        let mut out: Vec<Option<InkStrip>> = boxes.iter().map(|_| None).collect();
         for group in groups {
-            for (box_idx, mask) in group {
-                out[box_idx] = Some(mask);
+            for (box_idx, strip) in group {
+                out[box_idx] = Some(strip);
             }
         }
         if !prepared.is_empty() {

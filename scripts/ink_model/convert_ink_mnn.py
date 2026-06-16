@@ -28,15 +28,19 @@ def main():
     ap.add_argument("--int8", action="store_true",
                    help="weight-quantize to int8 (fast sdot GEMM on armv8.2+; overrides fp16)")
     ap.add_argument("--height", type=int, default=48, help="fixed input height to export at")
+    ap.add_argument("--onnx-only", action="store_true",
+                    help="export + verify ONNX, skip MNNConvert (e.g. on a box without it)")
     args = ap.parse_args()
 
     state = torch.load(args.ckpt, map_location="cpu")
     base, levels = state.get("base", 16), state.get("levels", 2)
-    model = InkUNet(base=base, levels=levels)
+    bold_from, bold_head = state.get("bold_from", 1), state.get("bold_head", "dilated")
+    model = InkUNet(base=base, levels=levels, bold_from=bold_from, bold_head=bold_head)
     model.load_state_dict(state["model"])
     model.eval()
     params = sum(p.numel() for p in model.parameters())
-    print(f"ckpt base={base} levels={levels} params={params:,}")
+    print(f"ckpt base={base} levels={levels} bold_from={bold_from} bold_head={bold_head} params={params:,} "
+          f"out_channels={model(torch.zeros(1, 3, 48, 64)).shape[1]}")
 
     onnx_path = args.onnx or str(Path(args.out).with_suffix(".onnx"))
     torch.onnx.export(
@@ -49,20 +53,27 @@ def main():
         opset_version=17,
     )
 
-    import onnxruntime as ort  # noqa: PLC0415
+    try:
+        import onnxruntime as ort  # noqa: PLC0415
 
-    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    # Widths must divide by 2**levels for the pooling (e.g. 16 at levels=4); round up.
-    mult = 2**levels
-    for n, width in ((1, 160), (1, 320), (8, 256), (4, 504)):
-        width += (-width) % mult
-        x = torch.rand(n, 3, 48, width)
-        with torch.no_grad():
-            ref = model(x).numpy()
-        got = sess.run(None, {"strip": x.numpy()})[0]
-        diff = float(np.abs(ref - got).max())
-        assert diff < 1e-3, f"onnx mismatch at ({n},{width}): {diff:.2e}"
-    print(f"onnx verified (max diff < 1e-3) -> {onnx_path}")
+        sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        # Widths must divide by 2**levels for the pooling (e.g. 16 at levels=4); round up.
+        mult = 2**levels
+        for n, width in ((1, 160), (1, 320), (8, 256), (4, 504)):
+            width += (-width) % mult
+            x = torch.rand(n, 3, 48, width)
+            with torch.no_grad():
+                ref = model(x).numpy()
+            got = sess.run(None, {"strip": x.numpy()})[0]
+            diff = float(np.abs(ref - got).max())
+            assert diff < 1e-3, f"onnx mismatch at ({n},{width}): {diff:.2e}"
+        print(f"onnx verified (max diff < 1e-3) -> {onnx_path}")
+    except ImportError:
+        print(f"onnxruntime not present, skipping verify -> {onnx_path}")
+
+    if args.onnx_only:
+        print("--onnx-only: stopping before MNNConvert")
+        return
 
     cmd = [args.mnnconvert, "-f", "ONNX", "--modelFile", onnx_path,
            "--MNNModel", args.out, "--bizCode", "ink"]

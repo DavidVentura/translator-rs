@@ -905,28 +905,33 @@ fn run(cli: Cli) -> Result<(), String> {
                         "  no ink model (pass --ink or put ink.mnn in the model dir); skipping"
                     );
                 } else {
-                    let masks = engine.ink_masks(&image, &boxes);
+                    let strips = engine.ink_strips(&image, &boxes);
                     let lines = recognize(engine, &image, &gray, &boxes, cli.script, true)
                         .map_err(|e| format!("recognize: {e:?}"))?;
                     let mut canvas = rgba.clone();
                     let scale = PxScale::from(20.0);
                     let mut csv = String::from(
-                        "cx,cy,width,tight_h,x_height,centerline,tilt_deg,stroke,weight,bold,text\n",
+                        "cx,cy,width,tight_h,x_height,centerline,tilt_deg,stroke,weight,geom_bold,model_bold_p,bold,text\n",
                     );
                     // Per-box metrics, then frame-relative bold over the whole page.
                     let metrics: Vec<Option<translator::text_metrics::LineMetrics>> = boxes
                         .iter()
-                        .zip(masks.iter())
-                        .map(|(b, mask)| {
-                            let mask = mask.as_ref()?;
+                        .zip(strips.iter())
+                        .map(|(b, strip)| {
+                            let s = strip.as_ref()?;
                             translator::text_metrics::measure_line(
-                                mask,
+                                &s.matte,
                                 b.oriented_box.width,
                                 b.oriented_box.height,
                             )
                         })
                         .collect();
-                    let bold = translator::text_metrics::bold_flags(&metrics);
+                    let geom_bold = translator::text_metrics::bold_flags(&metrics);
+                    // Per-box pooled bold prob from the ink model's bold channel (when present).
+                    let model_bold_p: Vec<Option<f32>> = strips
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.pooled_bold()))
+                        .collect();
                     // Thin lines so adjacent lines' boxes stay distinguishable.
                     let thin = 1;
                     for (i, (b, line)) in boxes.iter().zip(lines.iter()).enumerate() {
@@ -945,7 +950,10 @@ fn run(cli: Cli) -> Result<(), String> {
                             thin,
                         );
                         let Some(m) = metrics[i] else { continue };
-                        let is_bold = bold[i];
+                        // Model bold (pooled ch1 ≥ 0.65) where the bold channel exists; else
+                        // the geometric fallback — matching the runtime decision.
+                        let mp = model_bold_p[i];
+                        let is_bold = mp.map(|p| p >= 0.65).unwrap_or(geom_bold[i]);
                         // Matte band in cyan: box re-fit to actual ink on both axes.
                         let band = m.refit(b.tight_box);
                         draw_closed_polyline(
@@ -966,14 +974,15 @@ fn run(cli: Cli) -> Result<(), String> {
                             scale,
                             &font,
                             &format!(
-                                "xh{:.0} w{:.2}{}",
+                                "xh{:.0} w{:.2}{}{}",
                                 m.x_height,
                                 m.weight_ratio(),
+                                mp.map(|p| format!(" m{p:.2}")).unwrap_or_default(),
                                 if is_bold { " BOLD" } else { "" },
                             ),
                         );
                         csv.push_str(&format!(
-                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2},{:.2},{:.3},{},{}\n",
+                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2},{:.2},{:.3},{},{},{},{}\n",
                             b.tight_box.cx,
                             b.tight_box.cy,
                             b.tight_box.width,
@@ -983,6 +992,8 @@ fn run(cli: Cli) -> Result<(), String> {
                             m.baseline_angle_delta.to_degrees(),
                             m.stroke_width,
                             m.weight_ratio(),
+                            geom_bold[i],
+                            mp.map(|p| format!("{p:.3}")).unwrap_or_default(),
                             is_bold,
                             line.text.replace(',', " "),
                         ));
