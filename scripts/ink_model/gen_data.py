@@ -19,6 +19,7 @@ import subprocess
 from functools import lru_cache
 
 import numpy as np
+from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HEIGHT = 48
@@ -91,21 +92,32 @@ def cjk_font_paths() -> list[str]:
     return sorted(set(paths))
 
 
-@lru_cache(maxsize=2)
-def _heavy_fonts(cjk: bool) -> tuple[str, ...]:
-    base = cjk_font_paths() if cjk else font_paths()
-    heavy = tuple(p for p in base if any(t in p.lower() for t in HEAVY_TOKENS))
-    return heavy or tuple(base)
+@lru_cache(maxsize=4096)
+def _font_weight(path: str) -> int | None:
+    """The font's real OS/2 `usWeightClass` (100..900), or None if unreadable.
+    Ground truth for the bold label — filename tokens lie (a "heavy" CJK file with
+    no bold renders regular; "regular" pools hide medium/semibold faces), and the
+    label must match what's actually drawn or the bold head trains on noise."""
+    try:
+        return TTFont(path, fontNumber=0, lazy=True)["OS/2"].usWeightClass
+    except Exception:
+        return None
 
 
-@lru_cache(maxsize=2)
-def _regular_fonts(cjk: bool) -> tuple[str, ...]:
-    """Regular weights only — the full pool *minus* heavy fonts. A non-bold run must
-    not draw a bold/black face, or its pixels become bold ink with a regular label
-    and the bold head trains on contradictory targets."""
-    base = cjk_font_paths() if cjk else font_paths()
-    reg = tuple(p for p in base if not any(t in p.lower() for t in HEAVY_TOKENS))
-    return reg or tuple(base)
+def _weight_pool(paths: tuple[str, ...], bold: bool) -> tuple[str, ...]:
+    """Fonts whose real weight matches the label: ≥700 for bold, ≤400 for regular.
+    The 400–700 middle (medium/semibold) is dropped — it's the ambiguous band that
+    blurs a binary bold target."""
+    cut = (lambda w: w >= 700) if bold else (lambda w: w <= 400)
+    out = tuple(p for p in paths if (w := _font_weight(p)) is not None and cut(w))
+    return out or paths  # never empty (a script with no match falls back)
+
+
+@lru_cache(maxsize=16)
+def _weighted_fonts(script: str, bold: bool) -> tuple[str, ...]:
+    if script in SHAPED:
+        return _weight_pool(shaped_fonts(script), bold)
+    return _weight_pool(cjk_font_paths() if script == "cjk" else font_paths(), bold)
 
 
 # Connected/cursive scripts the Latin+CJK set misses: Arabic (cursive, RTL), the Indic
@@ -191,10 +203,10 @@ def _latin_chunk(rng: random.Random) -> str:
 
 
 def _pick_font(rng: random.Random, script: str, bold: bool) -> tuple[str, object]:
-    if script in SHAPED:
-        return rng.choice(shaped_fonts(script)), ImageFont.Layout.RAQM
-    pool = _heavy_fonts(script == "cjk") if bold else _regular_fonts(script == "cjk")
-    return rng.choice(pool), ImageFont.Layout.BASIC
+    # Weight-by-OS/2 for every script, *including* shaped — previously shaped runs
+    # ignored `bold` and drew a random-weight font, so their label was noise.
+    layout = ImageFont.Layout.RAQM if script in SHAPED else ImageFont.Layout.BASIC
+    return rng.choice(_weighted_fonts(script, bold)), layout
 
 
 def _run_text(rng: random.Random, script: str) -> str:
@@ -256,7 +268,11 @@ def render_coverage(
     fill_canvas = Image.new("L", size, 0) if outlined else None
     fill_draw = ImageDraw.Draw(fill_canvas) if outlined else None
 
-    font_px = rng.randint(max(7, int(height * 0.45)), max(8, int(height * 0.95)))
+    # The em floors at 20 px (x-height ~10) so the box-height floor actually bites: a
+    # 24 px box could otherwise draw an 11 px em (0.45·box) whose strokes are sub-pixel
+    # for bold. The 0.45–0.95 box-hug spread stays (loose boxes are real; they just then
+    # only occur at larger native heights).
+    font_px = rng.randint(max(20, int(height * 0.45)), max(21, int(height * 0.95)))
     x = pad + rng.randint(-jitter, 2 * jitter)
     y0 = pad + rng.randint(-jitter, jitter)
     scripts, bold_runs, last_font = [], 0, "?"
@@ -494,7 +510,15 @@ def legible(img: np.ndarray, cov: np.ndarray, native_h: int) -> bool:
     bg_mask = (cov < 0.05) & text_rows[:, None]
     if bg_mask.sum() < 30:
         return False
-    d = np.abs(np.median(img[ink_mask], axis=0) - np.median(img[bg_mask], axis=0))
+    # Subsample before the median: a contrast gate doesn't need the exact median over
+    # tens of thousands of pixels, and np.median's partition over the full native-res
+    # ink/bg arrays was ~6% of total gen time (worse on the big signage strips).
+    ink_px, bg_px = img[ink_mask], img[bg_mask]
+    if len(ink_px) > 400:
+        ink_px = ink_px[:: len(ink_px) // 400]
+    if len(bg_px) > 400:
+        bg_px = bg_px[:: len(bg_px) // 400]
+    d = np.abs(np.median(ink_px, axis=0) - np.median(bg_px, axis=0))
     # Small text needs more contrast: its fine inter-stroke gaps vanish at low contrast,
     # so the floor rises as native height shrinks (nh14 ~0.23, nh30+ flat at 0.13).
     thresh = 0.13 + max(0, 30 - native_h) * 0.006
@@ -504,8 +528,8 @@ def legible(img: np.ndarray, cov: np.ndarray, native_h: int) -> bool:
 def sample(rng: random.Random | None = None, width: int | None = None):
     """One training pair, generated at *native* scale then resized to height 48.
 
-    Real strips are dewarped crops whose source text is mostly 12–30 px tall; the
-    squash-to-48 widens and softens the antialiased glyph edges. Rendering directly
+    Real strips are dewarped crops whose source box is mostly 30–48 px tall; the
+    resize-to-48 only mildly rescales the antialiased glyph edges. Rendering directly
     at 48 px would teach the model edge statistics it never sees at inference, so we
     render/composite/degrade at a sampled native height and resample both image and
     label exactly like the pipeline does.
@@ -522,13 +546,16 @@ def sample(rng: random.Random | None = None, width: int | None = None):
     return img, cov_out, bold_out
 
 
-def stream(rng: random.Random, width: int, reuse: int = 1):
-    """Infinite (img, cov) pairs with glyph-raster reuse.
+def stream(rng: random.Random, width: int, reuse: int = 1, apply_degrade: bool = True):
+    """Infinite (img, cov, bold, native_h) pairs with glyph-raster reuse.
 
     Rasterizing text dominates generation cost, so each rendered coverage is reused
     across `reuse` composites with fresh background/ink/degradation — dividing the
     rasterization cost by `reuse`. The label repeats within a reuse group (same
     coverage, different appearance), which is benign augmentation for a matte target.
+
+    With `apply_degrade=False` the per-strip CPU degrade + legibility are skipped (the
+    GPU does them on the batch); `native_h` is yielded so the GPU can rescale blur.
     """
     while True:
         cov, fill, bold, native_h, native_w = _render_once(rng, width)
@@ -536,11 +563,11 @@ def stream(rng: random.Random, width: int, reuse: int = 1):
             img = cov_out = bold_out = None
             for _try in range(3):
                 img, cov_out, bold_out, ok = _composite_once(
-                    rng, cov, fill, bold, native_h, native_w, width
+                    rng, cov, fill, bold, native_h, native_w, width, apply_degrade=apply_degrade
                 )
                 if ok:
                     break
-            yield img, cov_out, bold_out
+            yield img, cov_out, bold_out, native_h
 
 
 def _render_once(rng: random.Random, width: int, log: dict | None = None):
@@ -551,7 +578,11 @@ def _render_once(rng: random.Random, width: int, log: dict | None = None):
     if rng.random() < 0.2:
         native_h = int(rng.uniform(48, 160))
     else:
-        native_h = int(rng.triangular(12, 48, 20))
+        # native_h is the detection-box height (ascender-to-descender band + padding),
+        # i.e. the oriented-box height the runtime dewarps and resizes to 48. Real source
+        # text sits ~30-48 px tall; 24 is a hard floor (below it the resize is a 2x+
+        # upsample and the stroke-width cue for bold goes sub-pixel). Mode 40.
+        native_h = int(rng.triangular(24, 48, 40))
     if log is not None:
         log["native_h"] = native_h
     native_w = max(16, round(width * native_h / HEIGHT))
@@ -560,7 +591,7 @@ def _render_once(rng: random.Random, width: int, log: dict | None = None):
 
 
 def _composite_once(rng: random.Random, cov, fill, bold, native_h: int, native_w: int, width: int,
-                    log: dict | None = None):
+                    log: dict | None = None, apply_degrade: bool = True):
     bg = gradient_field(rng, native_h, native_w, log)
     if rng.random() < 0.15:
         # Drop shadow: an offset dark replica behind the glyphs. It is *not* ink —
@@ -594,9 +625,14 @@ def _composite_once(rng: random.Random, cov, fill, bold, native_h: int, native_w
         if log is not None:
             log["outline"] = 1
     img = cov[..., None] * ink_field + (1 - cov[..., None]) * bg
-    img = degrade(img, rng, native_h, log)
-    ok = legible(img, cov, native_h)
-    if log is not None:
+    # Training skips this: degrade + the legibility gate run batched on the GPU instead
+    # (the legibility result becomes a per-strip loss mask, not a reject-and-retry).
+    if apply_degrade:
+        img = degrade(img, rng, native_h, log)
+        ok = legible(img, cov, native_h)
+    else:
+        ok = True
+    if apply_degrade and log is not None:
         im, bm = cov > 0.6, cov < 0.05
         if im.sum() > 10 and bm.sum() > 10:
             d = np.abs(np.median(img[im], axis=0) - np.median(img[bm], axis=0))

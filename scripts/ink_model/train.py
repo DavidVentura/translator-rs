@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 
+import gpu_degrade
 from gen_data import sample, stream
 from model import InkUNet, param_count
 
@@ -27,25 +28,30 @@ class SyntheticStrips(IterableDataset):
     below what the workers can generate. Use with `DataLoader(batch_size=None)`.
     """
 
-    def __init__(self, batch: int, width: int = 320, seed: int = 0, reuse: int = 1):
+    def __init__(self, batch: int, width: int = 320, seed: int = 0, reuse: int = 1,
+                 apply_degrade: bool = True):
         self.batch = batch
         self.width = width
         self.seed = seed
         self.reuse = reuse
+        self.apply_degrade = apply_degrade
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         worker = info.id if info else 0
         rng = random.Random(self.seed + worker * 7919 + os.getpid())
-        gen = stream(rng, self.width, self.reuse)
+        # apply_degrade=False (GPU path): degrade + legibility run batched on the GPU.
+        gen = stream(rng, self.width, self.reuse, apply_degrade=self.apply_degrade)
         while True:
-            imgs, covs, bolds = [], [], []
+            imgs, covs, bolds, nhs = [], [], [], []
             for _ in range(self.batch):
-                img, cov, bold = next(gen)
+                img, cov, bold, native_h = next(gen)
                 imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
                 covs.append(torch.from_numpy(cov[None]))
                 bolds.append(torch.from_numpy(bold[None]))
-            yield torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
+                nhs.append(native_h)
+            yield (torch.stack(imgs), torch.stack(covs), torch.stack(bolds),
+                   torch.tensor(nhs, dtype=torch.float32))
 
 
 def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
@@ -59,13 +65,19 @@ def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     return torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
 
 
-def ink_losses(logits, cov, bold, bold_weight=0.5):
+def ink_losses(logits, cov, bold, bold_weight=0.5, strip_w=None):
     """Matte BCE over the whole strip + bold BCE *masked to ink*. Bold is only
     defined where there's ink, so masking keeps the empty background from drowning
-    the bold signal. Returns (total, matte, bold) for logging."""
+    the bold signal. `strip_w` (B,) is the per-strip legibility weight (illegible
+    strips contribute zero, replacing the old reject-and-retry); None = all ones.
+    Returns (total, matte, bold) for logging."""
     matte_logit, bold_logit = logits[:, :1], logits[:, 1:]
-    loss_matte = F.binary_cross_entropy_with_logits(matte_logit, cov)
-    ink = (cov > 0.5).float()
+    if strip_w is None:
+        strip_w = torch.ones(logits.shape[0], device=logits.device)
+    w = strip_w.view(-1, 1, 1, 1)
+    bce_m = F.binary_cross_entropy_with_logits(matte_logit, cov, reduction="none")
+    loss_matte = (bce_m * w).sum() / w.expand_as(bce_m).sum().clamp_min(1.0)
+    ink = (cov > 0.5).float() * w
     bce = F.binary_cross_entropy_with_logits(bold_logit, (bold > 0.5).float(), reduction="none")
     loss_bold = (bce * ink).sum() / ink.sum().clamp_min(1.0)
     return loss_matte + bold_weight * loss_bold, loss_matte, loss_bold
@@ -88,12 +100,20 @@ def main():
     ap.add_argument("--reuse", type=int, default=1, help="composites per rasterized strip")
     ap.add_argument("--val-batch", type=int, default=32, help="validation set size")
     ap.add_argument("--bold-weight", type=float, default=0.5, help="weight on the bold BCE term")
+    ap.add_argument("--bold-from", type=int, default=1, help="decoder stage feeding the bold head (1=full,2=½,3=¼)")
+    ap.add_argument("--detach-bold", action="store_true", help="stop bold gradient into the trunk (matte-priority)")
+    ap.add_argument("--gpu-degrade", action="store_true",
+                    help="EXPERIMENTAL: batched degrade on the GPU (faster but degrade@48 ≠ @native; regresses quality)")
+    ap.add_argument("--bold-head", choices=["dilated", "1x1"], default="dilated",
+                    help="bold head: dilated 3×3 (default) or cheap 1×1")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = InkUNet(base=args.base, levels=args.levels).to(device)
-    print(f"device={device} base={args.base} levels={args.levels} params={param_count(model):,}")
+    model = InkUNet(base=args.base, levels=args.levels, bold_from=args.bold_from,
+                    detach_bold=args.detach_bold, bold_head=args.bold_head).to(device)
+    print(f"device={device} base={args.base} levels={args.levels} bold_from={args.bold_from} "
+          f"detach_bold={args.detach_bold} bold_head={args.bold_head} params={param_count(model):,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     start_step = 0
     if args.resume:
@@ -115,7 +135,8 @@ def main():
     )
 
     loader = DataLoader(
-        SyntheticStrips(batch=args.batch, width=args.width, reuse=args.reuse),
+        SyntheticStrips(batch=args.batch, width=args.width, reuse=args.reuse,
+                        apply_degrade=not args.gpu_degrade),
         batch_size=None,  # the dataset yields whole batches (one IPC transfer each)
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
@@ -125,19 +146,31 @@ def main():
     val_img, val_cov, val_bold = validation_batch(n=args.val_batch, width=args.width)
     val_img, val_cov, val_bold = val_img.to(device), val_cov.to(device), val_bold.to(device)
 
+    # GPU degrade state: a device RNG (augmentation randomness) + the cached DCT matrix.
+    degrade_gen = torch.Generator(device=device).manual_seed(0)
+    dct = gpu_degrade._dct8(device)
+
     os.makedirs(args.out, exist_ok=True)
     model.train()
     t0 = time.time()
     running = 0.0
-    for step, (img, cov, bold) in enumerate(loader, start=start_step + 1):
+    for step, (img, cov, bold, native_h) in enumerate(loader, start=start_step + 1):
         if step > args.steps:
             break
         img = img.to(device, non_blocking=device == "cuda")
         cov = cov.to(device, non_blocking=device == "cuda")
         bold = bold.to(device, non_blocking=device == "cuda")
+        native_h = native_h.to(device, non_blocking=device == "cuda")
+        # GPU degrade path (experimental): degrade + legibility batched on the GPU, illegible
+        # strips become zero-weight. Default path: strips arrive already CPU-degraded + legible.
+        strip_w = None
+        if args.gpu_degrade:
+            with torch.no_grad():
+                img = gpu_degrade.degrade_batch(img, native_h, degrade_gen, dct)
+                strip_w = gpu_degrade.legible_mask(img, cov, native_h).float()
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss, _, _ = ink_losses(logits, cov, bold, args.bold_weight)
+            loss, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -162,7 +195,8 @@ def main():
                 flush=True,
             )
             state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                     "base": args.base, "levels": args.levels}
+                     "base": args.base, "levels": args.levels, "bold_from": args.bold_from,
+                     "bold_head": args.bold_head}
             torch.save(state, os.path.join(args.out, "ink-latest.pt"))
     print("done")
 

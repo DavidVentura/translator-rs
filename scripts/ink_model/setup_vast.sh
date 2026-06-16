@@ -32,7 +32,7 @@ apt-get install -y -qq \
 
 # Only fetch Python packages that are missing (torch is preinstalled on a PyTorch image).
 missing=""
-for mod_pkg in torch:torch numpy:numpy PIL:pillow scipy:scipy; do
+for mod_pkg in torch:torch numpy:numpy PIL:pillow scipy:scipy fontTools:fonttools; do
   mod=${mod_pkg%%:*}; pkg=${mod_pkg##*:}
   python3 -c "import $mod" 2>/dev/null || missing="$missing $pkg"
 done

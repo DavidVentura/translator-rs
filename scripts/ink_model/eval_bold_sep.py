@@ -17,12 +17,12 @@ from gen_data import sample
 from model import InkUNet
 
 ck = torch.load(sys.argv[1] if len(sys.argv) > 1 else "ckpt/ink-latest.pt", map_location="cpu")
-model = InkUNet(base=ck["base"], levels=ck["levels"])
+model = InkUNet(base=ck["base"], levels=ck["levels"], bold_from=ck.get("bold_from", 1), bold_head=ck.get("bold_head", "dilated"))
 model.load_state_dict(ck["model"])
 model.eval()
 
 rng = random.Random(99)
-bold_scores, reg_scores, correct, n = [], [], 0, 0
+bold_scores, reg_scores, correct, n, rank_ok = [], [], 0, 0, 0
 for _ in range(400):
     img, cov, bold = sample(rng, width=320)
     ink = cov > 0.5
@@ -39,6 +39,8 @@ for _ in range(400):
     # per-region call at 0.5 → both correct?
     correct += int(bs >= 0.5) + int(rs < 0.5)
     n += 2
+    # relative (same-font, within-line): does the bold run outscore the regular run?
+    rank_ok += int(bs > rs)
 
 bold_scores, reg_scores = np.array(bold_scores), np.array(reg_scores)
 print(f"mixed strips: {len(bold_scores)}")
@@ -46,6 +48,7 @@ print(f"pooled bold-region score : mean {bold_scores.mean():.3f}  (want high)")
 print(f"pooled regular-region    : mean {reg_scores.mean():.3f}  (want low)")
 print(f"separation (bold-reg)    : {bold_scores.mean() - reg_scores.mean():+.3f}")
 print(f"per-region acc @0.5      : {correct / max(n,1):.1%}")
+print(f"pairwise ranking acc     : {rank_ok / max(len(bold_scores),1):.1%}  (same-font: bold run > regular run)")
 # best single threshold separating the two pooled distributions
 allv = np.concatenate([bold_scores, reg_scores])
 lbl = np.concatenate([np.ones_like(bold_scores), np.zeros_like(reg_scores)])
