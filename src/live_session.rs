@@ -1880,6 +1880,10 @@ pub struct PostDetectInput<'a> {
     /// off the real ink; empty keeps the detection box. Does not touch the
     /// overlay footprint (`SurfaceLine.bbox`), only the merge decision.
     pub line_metrics: &'a [Option<crate::text_metrics::LineMetrics>],
+    /// Per-detection bold flag from the ink model's bold channel (pooled +
+    /// thresholded), indexed parallel to `detections`. `None` per box when the
+    /// model has no bold channel; empty falls back to not-bold.
+    pub model_bold: &'a [Option<bool>],
     /// Translate-block batch size. Production uses 4; sim may pick a
     /// smaller value to keep per-frame work bounded.
     pub rec_batch_size: usize,
@@ -2170,16 +2174,14 @@ impl LiveSession {
                 .collect();
         }
 
-        // Per-block bold: majority of the block's source lines that read bold.
-        // Boldness is decided relative to this frame's median weight (indexed
-        // parallel to `detections`/`entries`).
-        let line_bold = crate::text_metrics::bold_flags(input.line_metrics);
+        // Per-block bold: majority of the block's source lines the ink model's bold
+        // channel flagged (pooled per box ≥ threshold; indexed parallel to `detections`).
         let block_bold: Vec<bool> = block_strip_indices
             .iter()
             .map(|idxs| {
                 let bold = idxs
                     .iter()
-                    .filter(|&&j| line_bold.get(j).copied().unwrap_or(false))
+                    .filter(|&&j| input.model_bold.get(j).copied().flatten().unwrap_or(false))
                     .count();
                 bold * 2 >= idxs.len().max(1)
             })

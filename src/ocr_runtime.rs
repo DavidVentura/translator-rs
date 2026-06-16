@@ -225,7 +225,7 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
 /// false positives near zero (the acceptable failure is missing a bold, not emboldening
 /// thin text); the residual emboldening is on heavy-400 faces that read bold anyway.
 #[cfg(feature = "ppocr")]
-const MODEL_BOLD_THRESHOLD: f32 = 0.65;
+pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.65;
 
 /// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent
@@ -266,14 +266,9 @@ fn still_ppocr_lines_to_blocks(
     // recognizer's built-in `rec_drop_score`: lines the model accepted but whose mean
     // CTC score sits below the user's bar are dropped before paragraph grouping.
     let min_score = min_confidence as f32 / 100.0;
-    // Bold from the ink model's bold channel (pooled + thresholded per box) where present;
-    // fall back to the geometric stroke-width heuristic for the legacy matte-only model.
-    let geometric_bold = crate::text_metrics::bold_flags(text_metrics);
-    let bold: Vec<bool> = model_bold
-        .iter()
-        .zip(geometric_bold.iter())
-        .map(|(m, &g)| m.unwrap_or(g))
-        .collect();
+    // Bold from the ink model's bold channel (pooled + thresholded per box). A box with
+    // no bold channel (legacy matte-only model) or no ink reads as not-bold.
+    let bold: Vec<bool> = model_bold.iter().map(|m| m.unwrap_or(false)).collect();
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())

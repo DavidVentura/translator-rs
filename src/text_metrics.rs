@@ -61,17 +61,6 @@ const MAX_TILT_RADIANS: f32 = 0.26; // ~15°
 /// stroke, drop out either way. Floored at `INK_CUT` so a weak matte still has a
 /// core.
 const STROKE_CORE_FRAC: f32 = 0.6;
-/// Bold is decided *relative to the frame*, not by an absolute weight: a line is
-/// bold when its weight ratio is at least this multiple of the frame's median.
-/// Camera blur and scale shift every line's measured stroke up together, so an
-/// absolute cutoff over-fires on a blurred frame; the ratio-to-median is immune
-/// to that common shift and keys on a line being genuinely heavier than its
-/// neighbours.
-pub const BOLD_REL_FACTOR: f32 = 1.35;
-/// Absolute floor on the weight ratio for bold, so a frame of uniformly thin
-/// text (low median) can't promote a slightly-above-median line to bold.
-pub const BOLD_MIN_RATIO: f32 = 0.22;
-
 /// Typography recovered from one line's ink matte, in the source image's pixel
 /// space (converted out of strip space via the box dimensions).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,7 +94,8 @@ pub struct LineMetrics {
 
 impl LineMetrics {
     /// Stroke width relative to x-height — a size-invariant font-weight proxy.
-    /// Compared against the frame median by [`bold_flags`] to decide bold.
+    /// Kept as a `viz_pipeline` diagnostic; bold is now decided by the ink model's
+    /// bold channel, not this ratio.
     pub fn weight_ratio(&self) -> f32 {
         self.stroke_width / self.x_height.max(1e-3)
     }
@@ -208,30 +198,6 @@ pub fn measure_line(matte: &GrayImage, box_width: f32, box_height: f32) -> Optio
         baseline_angle_delta,
         stroke_width,
     })
-}
-
-/// Per-line bold flags for one frame's lines, decided *relative* to the frame's
-/// median weight (see [`BOLD_REL_FACTOR`]): a line is bold when it's both
-/// meaningfully heavier than the median and above the absolute floor
-/// [`BOLD_MIN_RATIO`]. 1:1 with `metrics`; `None` entries (no matte) are `false`.
-/// Frame-relative rather than absolute because camera blur and scale lift every
-/// line's measured stroke together, which an absolute cutoff would read as
-/// everything-is-bold.
-pub fn bold_flags(metrics: &[Option<LineMetrics>]) -> Vec<bool> {
-    let mut ratios: Vec<f32> = metrics
-        .iter()
-        .filter_map(|m| m.map(|m| m.weight_ratio()))
-        .collect();
-    if ratios.is_empty() {
-        return vec![false; metrics.len()];
-    }
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = ratios[ratios.len() / 2].max(1e-3);
-    let threshold = (median * BOLD_REL_FACTOR).max(BOLD_MIN_RATIO);
-    metrics
-        .iter()
-        .map(|m| m.is_some_and(|m| m.weight_ratio() >= threshold))
-        .collect()
 }
 
 /// Mean stroke width over the line's ink, in image-space pixels, as

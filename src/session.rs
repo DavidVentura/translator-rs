@@ -479,6 +479,19 @@ impl TranslatorSession {
         Ok(ppocr.ink_masks(rgb, boxes))
     }
 
+    /// Like [`ppocr_ink_masks`] but keeps each strip's bold channel (ch1) so the live
+    /// path can decide typography weight from the model instead of a geometric heuristic.
+    #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+    pub(crate) fn ppocr_ink_strips(
+        &self,
+        rgb: &image::DynamicImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+    ) -> Result<Vec<Option<crate::ppocr::InkStrip>>, TranslatorError> {
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        Ok(ppocr.ink_strips(rgb, boxes))
+    }
+
     /// Estimate the scene's reading-direction quadrant from a set of
     /// detections against the supplied `OrientedImage`. Wraps
     /// [`crate::live_session::estimate_canonical_quadrant`] so callers

@@ -1045,6 +1045,7 @@ impl LiveScreenPipeline {
             quadrant,
             &[],
             &[],
+            &[],
             &cancel,
         );
         let rec_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
