@@ -21,7 +21,7 @@ import urllib.request
 from glob import glob
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_hebrew import CHARSET
+from gen_hebrew import candidate_charset
 
 LEIPZIG = {
     "heb_wikipedia_2021_100K": "https://downloads.wortschatz-leipzig.de/corpora/heb_wikipedia_2021_100K.tar.gz",
@@ -37,7 +37,7 @@ TRANSLATE = str.maketrans({
     "–": "-", "—": "-", "−": "-",
     " ": " ", "‎": "", "‏": "", "…": "...",
 })
-ALLOWED = set(CHARSET)
+ALLOWED = set(candidate_charset())
 HEBREW = re.compile(r"[א-ת]")
 
 

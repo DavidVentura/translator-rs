@@ -34,13 +34,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", required=True)
     ap.add_argument("--names", required=True, help="comma-separated Leipzig corpus names")
-    ap.add_argument("--charset-from", required=True, help="module exposing CHARSET (gen_indic / gen_hebrew)")
+    ap.add_argument("--charset-from", required=True, help="module exposing candidate_charset() (gen_indic / gen_hebrew)")
     ap.add_argument("--work-dir", default="/tmp/leipzig")
     ap.add_argument("--download", action="store_true")
     ap.add_argument("--strip-marks", default="", help="hex codepoint range to delete, e.g. 0591-05C7 (Hebrew niqqud)")
     args = ap.parse_args()
 
-    allowed = set(importlib.import_module(args.charset_from).CHARSET)
+    allowed = set(importlib.import_module(args.charset_from).candidate_charset())
     marks = None
     if args.strip_marks:
         lo, hi = (int(x, 16) for x in args.strip_marks.split("-"))

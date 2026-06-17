@@ -15,6 +15,8 @@ a font covering the line's chars is auto-selected. ~25% Latin lines keep Latin a
 """
 
 import random
+import unicodedata as ud
+from functools import lru_cache
 
 import recgen
 
@@ -42,7 +44,11 @@ import recgen
 
 LATIN = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DIGITS = "0123456789"
-PUNCT = " .,:;!?'\"()[]/%-+&@#।॥"  # incl. Indic danda + double danda (shared sentence terminators)
+COMMON_PUNCT = " .,:;!?'\"()/%-+&"
+# Rare in running prose but real on signs/prices/documents, so kept regardless of corpus
+# frequency (the frequency trim would drop them) and synth-covered to a training floor:
+# brackets, danda + double danda (shared sentence terminators), and currency marks.
+KEEP_PUNCT = "[]@#।॥₹৳૱"
 
 # Zero-width joiner/non-joiner steer conjunct formation but are invisible; strip them
 # from text/labels (the model can't predict an invisible char) and accept canonical forms.
@@ -57,15 +63,45 @@ SCRIPTS = {
     "mlym": {"lang": "ml", "block": (0x0D00, 0x0D7F), "cons": (0x0D15, 0x0D39), "matra": (0x0D3E, 0x0D4C), "digit": (0x0D66, 0x0D6F)},
 }
 
-CHARSET = LATIN + DIGITS + PUNCT + "".join(
-    chr(c) for s in SCRIPTS.values() for c in range(s["block"][0], s["block"][1] + 1)
-)
+_NATIVE_DIGITS = "".join(chr(c) for s in SCRIPTS.values() for c in range(s["digit"][0], s["digit"][1] + 1))
+BASE = frozenset(LATIN + DIGITS + COMMON_PUNCT)
+KEEP_SET = frozenset(KEEP_PUNCT) | frozenset(_NATIVE_DIGITS)
 
 # Map a codepoint to its script for routing corpus lines.
 _BLOCK2SCRIPT = {name: s["block"] for name, s in SCRIPTS.items()}
 
 
-def _line_script(line: str) -> str | None:
+def _assigned(ch: str) -> bool:
+    try:
+        ud.name(ch)
+        return True
+    except ValueError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _fonts() -> tuple[str, ...]:
+    return tuple(sorted(set(
+        f for s in SCRIPTS.values() for f in recgen.discover_fonts(s["lang"])
+    ) | set(recgen.discover_fonts("en"))))
+
+
+@lru_cache(maxsize=1)
+def candidate_charset() -> frozenset:
+    """Every glyph the merged model could legitimately emit: base + curated keep-set + the
+    four Unicode blocks, restricted to assigned codepoints that at least one discovered font
+    can render. The raw block range is ~20% unassigned holes / unrenderable chars; those are
+    dead CTC classes that only act as confusable sinks, so they are excluded here (and thus
+    from keys.txt and from font-coverage)."""
+    block = "".join(chr(c) for s in SCRIPTS.values() for c in range(s["block"][0], s["block"][1] + 1))
+    sup = "".join(sorted(BASE | KEEP_SET | set(block)))
+    covered = set()
+    for p in _fonts():
+        covered |= recgen._covered(p, sup)
+    return frozenset(ch for ch in sup if ord(ch) in covered and _assigned(ch))
+
+
+def line_script(line: str) -> str | None:
     for ch in line:
         for name, (lo, hi) in _BLOCK2SCRIPT.items():
             if lo <= ord(ch) <= hi:
@@ -73,12 +109,59 @@ def _line_script(line: str) -> str | None:
     return None
 
 
-def _rand_word(rng, s):
+def _script_of(ch: str) -> dict | None:
+    o = ord(ch)
+    for s in SCRIPTS.values():
+        if s["block"][0] <= o <= s["block"][1]:
+            return s
+    return None
+
+
+def _kept_range(lo: int, hi: int, kept: frozenset) -> list[str]:
+    return [chr(c) for c in range(lo, hi + 1) if chr(c) in kept]
+
+
+def synth_tail(glyph: str, rng: random.Random, kept: frozenset) -> str:
+    """A short, plausible same-script context line containing `glyph`, drawing only from
+    kept glyphs — used by build_corpus to lift a corpus-starved glyph to a training floor.
+    Routed by Unicode category so a matra attaches to a consonant, a digit joins a run, an
+    independent letter stands as its own syllable, and punctuation/currency wrap a word."""
+    s = _script_of(glyph)
+    cat = ud.category(glyph)
+    if s is None:  # base-plane latin / punctuation / currency
+        if cat == "Sc":
+            return f"{rng.randint(1, 99999)}{glyph}"
+        word = "".join(rng.choice(LATIN) for _ in range(rng.randint(2, 7)))
+        return f"{word}{glyph}{word[::-1]}" if cat.startswith("P") else word + glyph
+    cons = _kept_range(*s["cons"], kept) or [chr(s["cons"][0])]
+    matras = _kept_range(*s["matra"], kept)
+    digits = _kept_range(*s["digit"], kept)
+
+    def syllable() -> str:
+        return rng.choice(cons) + (rng.choice(matras) if matras and rng.random() < 0.5 else "")
+
+    if cat == "Nd":
+        pool = digits or [glyph]
+        return "".join([glyph] + [rng.choice(pool) for _ in range(rng.randint(1, 4))])
+    if cat in ("Mn", "Mc"):  # matra / combining sign — must follow a consonant
+        parts = [syllable() for _ in range(rng.randint(0, 2))] + [rng.choice(cons) + glyph]
+        rng.shuffle(parts)
+        return " ".join(parts)
+    if cat == "Lo":  # independent vowel / rare letter — a syllable of its own
+        core = glyph + (rng.choice(matras) if matras and rng.random() < 0.4 else "")
+        lead = [syllable()] if rng.random() < 0.7 else []
+        return " ".join(lead + [core, syllable()])
+    return " ".join(syllable() for _ in range(rng.randint(1, 3))) + glyph
+
+
+def _rand_word(rng, s, vocab):
+    cons = _kept_range(*s["cons"], vocab) or [chr(s["cons"][0])]
+    matras = _kept_range(*s["matra"], vocab)
     out = []
     for _ in range(rng.randint(1, 5)):
-        syl = chr(rng.randint(*s["cons"]))
-        if rng.random() < 0.55:
-            syl += chr(rng.randint(*s["matra"]))
+        syl = rng.choice(cons)
+        if matras and rng.random() < 0.55:
+            syl += rng.choice(matras)
         out.append(syl)
     return "".join(out)
 
@@ -93,7 +176,7 @@ def _latin_line(rng):
     return " ".join(toks)
 
 
-def gen_pair(rng: random.Random, corpus: list[str]) -> tuple[str, str]:
+def gen_pair(rng: random.Random, corpus: list[str], vocab: frozenset) -> tuple[str, str]:
     budget = rng.randint(6, recgen.MAX_LABEL_LEN)
     if rng.random() < 0.25:
         text = recgen.join_to_budget(rng, _latin_line(rng).split(), budget)
@@ -103,15 +186,15 @@ def gen_pair(rng: random.Random, corpus: list[str]) -> tuple[str, str]:
         text = recgen.join_to_budget(rng, words[start:], budget)
     else:
         s = SCRIPTS[rng.choice(list(SCRIPTS))]
-        text = recgen.join_to_budget(rng, [_rand_word(rng, s) for _ in range(rng.randint(1, 5))], budget)
+        text = recgen.join_to_budget(rng, [_rand_word(rng, s, vocab) for _ in range(rng.randint(1, 5))], budget)
     return text, text  # Indic: render and label are both the logical string
 
 
 def _build_spec() -> recgen.Spec:
-    fonts = tuple(sorted(set(
-        f for s in SCRIPTS.values() for f in recgen.discover_fonts(s["lang"])
-    ) | set(recgen.discover_fonts("en"))))
-    return recgen.Spec(name="indic", fonts=fonts, charset=CHARSET, reorder=True, gen_pair=gen_pair)
+    return recgen.Spec(
+        name="indic", fonts=_fonts(), charset="".join(sorted(candidate_charset())),
+        reorder=True, gen_pair=gen_pair,
+    )
 
 
 if __name__ == "__main__":

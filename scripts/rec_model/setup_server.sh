@@ -5,13 +5,13 @@
 #
 # Stage the rec files first from the local machine, then run this on the server:
 #   scp -i ~/.ssh/davidkey -P <port> \
-#       gen_hebrew.py recgen.py ../synth_core.py prep_hebrew_corpus.py \
-#       paddle/hebrew_latin_dict.txt paddle/hebrew_finetune.yml data/hebrew_corpus.txt \
+#       gen_hebrew.py recgen.py ../synth_core.py prep_hebrew_corpus.py build_corpus.py \
+#       paddle/hebrew_finetune.yml data/hebrew_corpus.txt \
 #       root@<host>:/root/rec/
 #   ssh -i ~/.ssh/davidkey -p <port> root@<host> 'bash /root/rec/setup_server.sh'
 #
-# hebrew_corpus.txt is optional — if absent it is rebuilt from Leipzig via
-# prep_hebrew_corpus.py --download.
+# data/hebrew_corpus.txt is the RAW corpus (rebuilt from Leipzig if absent); build_corpus
+# derives the balanced corpus + hebrew_latin_dict.txt (keys) at bootstrap.
 set -euo pipefail
 
 REC_DIR=${REC_DIR:-/root/rec}
@@ -94,13 +94,20 @@ echo "=== [5/6] dataset -> $DATA_DIR ($((N_WORKERS*N_PER)) train + $VAL_N val) =
 # crashes mid-read ("... does not exist!") and you get two runs fighting one GPU.
 pkill -9 -f "tools/train.py" 2>/dev/null && sleep 2 || true
 cd "$REC_DIR"
+# hebrew_corpus.txt is the RAW Leipzig corpus (rebuilt via prep_hebrew_corpus if absent).
+# build_corpus turns it into the glyph-floored training corpus + the matching keys.txt in one
+# pass: drops any unrenderable class and floors corpus-starved-but-real glyphs (geresh, gershayim,
+# currency, brackets). keys + corpus emit together so they can't drift. The balanced corpus is a
+# build artifact (not committed/staged).
 [ -f hebrew_corpus.txt ] || python3 prep_hebrew_corpus.py --download --out hebrew_corpus.txt
+python3 build_corpus.py --module gen_hebrew --raw hebrew_corpus.txt \
+  --out-corpus hebrew_corpus.bal.txt --out-keys hebrew_latin_dict.txt
 rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR/images"
 for k in $(seq 0 $((N_WORKERS-1))); do
-  python3 gen_hebrew.py --out "$DATA_DIR" --n "$N_PER" --seed "$k" --prefix "w$k" --corpus hebrew_corpus.txt --neg-frac "$NEG_FRAC" >/dev/null 2>&1 &
+  python3 gen_hebrew.py --out "$DATA_DIR" --n "$N_PER" --seed "$k" --prefix "w$k" --corpus hebrew_corpus.bal.txt --dict hebrew_latin_dict.txt --neg-frac "$NEG_FRAC" >/dev/null 2>&1 &
 done
 # val stays text-only so the acc metric is meaningful (empty-label CTC eval is ill-defined).
-python3 gen_hebrew.py --out "$DATA_DIR" --n "$VAL_N" --seed 1000 --prefix val --corpus hebrew_corpus.txt >/dev/null 2>&1 &
+python3 gen_hebrew.py --out "$DATA_DIR" --n "$VAL_N" --seed 1000 --prefix val --corpus hebrew_corpus.bal.txt --dict hebrew_latin_dict.txt >/dev/null 2>&1 &
 wait
 cat "$DATA_DIR"/labels_w*.txt > "$DATA_DIR/train_list.txt"
 cat "$DATA_DIR"/labels_val*.txt > "$DATA_DIR/val_list.txt"

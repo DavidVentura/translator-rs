@@ -2,10 +2,12 @@
 # Bootstrap a fresh GPU box to fine-tune the MERGED Indic recognizer
 # (Bengali + Gujarati + Kannada + Malayalam + Latin). Sibling of setup_server.sh
 # (Hebrew); shares the recgen.py core. Stage first from the local machine:
-#   scp -P <port> recgen.py gen_indic.py prep_corpus.py paddle/indic_latin_dict.txt \
+#   scp -P <port> recgen.py gen_indic.py ../synth_core.py prep_corpus.py build_corpus.py \
 #       paddle/indic_finetune.yml data/indic_corpus.txt root@<host>:/root/rec/
 #   ssh -p <port> root@<host> 'bash /root/rec/setup_indic.sh'
-# indic_corpus.txt optional — rebuilt from Leipzig via prep_corpus.py if absent.
+# data/indic_corpus.txt is the RAW corpus (rebuilt from Leipzig if absent); build_corpus derives
+# the balanced corpus + indic_latin_dict.txt (keys) at bootstrap. The committed keys are the
+# canonical class list (for the bucket/Rust side); the box regenerates an identical one.
 set -euo pipefail
 
 REC_DIR=${REC_DIR:-/root/rec}
@@ -89,12 +91,19 @@ mkdir -p "$REC_DIR/pretrain"
 
 echo "=== [5/6] dataset -> $DATA_DIR ($((N_WORKERS*N_PER)) train + $VAL_N val) ==="
 cd "$REC_DIR"
+# indic_corpus.txt is the RAW Leipzig corpus (rebuilt via prep_corpus if absent). build_corpus
+# turns it into the balanced/glyph-floored training corpus + the matching keys.txt in one pass:
+# drops dead/archaic CTC classes, equalizes the four scripts (Bengali wiki+news is 2x the rest),
+# and floors naturally-rare glyphs (native digits, danda, currency). keys + corpus emit together
+# so they can't drift. The balanced corpus is a build artifact (not committed/staged).
 [ -f indic_corpus.txt ] || python3 prep_corpus.py --charset-from gen_indic --download --out indic_corpus.txt --names "$LEIPZIG"
+python3 build_corpus.py --module gen_indic --raw indic_corpus.txt \
+  --out-corpus indic_corpus.bal.txt --out-keys indic_latin_dict.txt
 rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR/images"
 for k in $(seq 0 $((N_WORKERS-1))); do
-  python3 gen_indic.py --out "$DATA_DIR" --n "$N_PER" --seed "$k" --prefix "w$k" --corpus indic_corpus.txt >/dev/null 2>&1 &
+  python3 gen_indic.py --out "$DATA_DIR" --n "$N_PER" --seed "$k" --prefix "w$k" --corpus indic_corpus.bal.txt --dict indic_latin_dict.txt >/dev/null 2>&1 &
 done
-python3 gen_indic.py --out "$DATA_DIR" --n "$VAL_N" --seed 1000 --prefix val --corpus indic_corpus.txt >/dev/null 2>&1 &
+python3 gen_indic.py --out "$DATA_DIR" --n "$VAL_N" --seed 1000 --prefix val --corpus indic_corpus.bal.txt --dict indic_latin_dict.txt >/dev/null 2>&1 &
 wait || true   # a worker's non-zero exit must not abort the bootstrap (set -e)
 cat "$DATA_DIR"/labels_w*.txt > "$DATA_DIR/train_list.txt"
 cat "$DATA_DIR"/labels_val*.txt > "$DATA_DIR/val_list.txt"

@@ -50,7 +50,11 @@ class Spec:
     fonts: tuple[str, ...]
     charset: str
     reorder: bool
-    gen_pair: Callable[[random.Random, list[str]], tuple[str, str]]
+    gen_pair: Callable[[random.Random, list[str], frozenset], tuple[str, str]]
+    # The model's output classes (keys.txt), used to constrain the generators' random
+    # fallbacks so a synthesized label can never contain an out-of-dict glyph. Filled
+    # from --dict by run_cli; the corpus path is already kept-only (build_corpus).
+    vocab: frozenset = frozenset()
 
 
 # ---------------------------------------------------------------- fonts / shaping
@@ -248,7 +252,7 @@ def make_negative(rng: random.Random, spec: Spec, corpus: list[str]) -> np.ndarr
     else:
         cov = None
         for _ in range(4):
-            render_text, _ = spec.gen_pair(rng, corpus)
+            render_text, _ = spec.gen_pair(rng, corpus, spec.vocab)
             fonts = fonts_for(render_text, spec.fonts, spec.charset)
             if render_text.strip() and fonts:
                 cov = shape_render(render_text, rng.choice(fonts), rng.randint(16, 40), rng, spec.reorder)
@@ -282,7 +286,7 @@ def sample(rng: random.Random, spec: Spec, corpus: list[str], neg_frac: float = 
     if neg_frac and rng.random() < neg_frac:
         return make_negative(rng, spec, corpus), ""
     for _ in range(8):
-        render_text, label = spec.gen_pair(rng, corpus)
+        render_text, label = spec.gen_pair(rng, corpus, spec.vocab)
         if not render_text.strip():
             continue
         fonts = fonts_for(render_text, spec.fonts, spec.charset)
@@ -355,12 +359,16 @@ def run_cli(spec: Spec, *, annotate=lambda s: s, extra_args=lambda ap: None):
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--corpus", help="UTF-8 file, one line per row")
+    ap.add_argument("--dict", required=True, help="keys.txt (the model's output classes); constrains random fallbacks")
     ap.add_argument("--neg-frac", type=float, default=0.0)
     ap.add_argument("--inspect", action="store_true")
     ap.add_argument("--prefix", default="")
     extra_args(ap)
     args = ap.parse_args()
 
+    spec.vocab = frozenset(
+        ch for ch in (ln.rstrip("\n") for ln in open(args.dict, encoding="utf-8")) if ch
+    )
     corpus = [ln.strip() for ln in open(args.corpus, encoding="utf-8")] if args.corpus else []
     corpus = [c for c in corpus if c]
     rng = random.Random(args.seed)
