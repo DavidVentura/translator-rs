@@ -79,12 +79,29 @@ fn main() {
             .to_string_lossy()
             .to_string();
 
+        // Per-strip bounding box from the (unclipped) contour, in image space — used by the
+        // eval to flag detector garbage (tiny ottakshara/subscript fragments swallowed by a
+        // larger line box) so they don't pollute the recognizer metric.
+        let mut bj = String::from("{\n");
         for (i, b) in boxes.iter().enumerate() {
             let contour = contour_points(&b.contour);
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for (x, y) in &contour {
+                x0 = x0.min(*x);
+                y0 = y0.min(*y);
+                x1 = x1.max(*x);
+                y1 = y1.max(*y);
+            }
+            let comma = if i + 1 < boxes.len() { "," } else { "" };
+            bj.push_str(&format!(
+                "  \"{i:02}\": [{x0:.1}, {y0:.1}, {x1:.1}, {y1:.1}]{comma}\n"
+            ));
             if let Some(strip) = dewarp_contour_to_strip_rgb(&rgb, &contour, None, 0.0) {
                 strip.save(sdir.join(format!("{name}-{i:02}.png"))).unwrap();
             }
         }
+        bj.push_str("}\n");
+        fs::write(out.join(format!("{name}.boxes.json")), bj).unwrap();
 
         let scripts = vec![script; boxes.len()];
         let lines = engine
