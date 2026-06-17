@@ -23,7 +23,10 @@ BS=${BS:-512}
 
 echo "=== [1/6] reclaim disk ==="
 rm -rf /root/.cache/uv /root/.cache/pip /root/.cache/huggingface /root/.cache/torch /tmp/pip-* 2>/dev/null || true
-df -h / | tail -1
+# Reclaim /dev/shm: leaked paddle dataloader shm segments from any prior killed run, plus a
+# stale sibling dataset dir (e.g. /dev/shm/heb left from a Hebrew run) — both fill the 15G tmpfs.
+find /dev/shm -maxdepth 1 -name 'paddle_*' -exec rm -rf {} + 2>/dev/null || true
+df -h / /dev/shm | tail -2
 
 echo "=== [2/6] paddlepaddle-gpu (cu129) + GPU smoke ==="
 if ! python3 -m pip --version >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq python3-pip; fi

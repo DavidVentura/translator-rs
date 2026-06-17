@@ -5,8 +5,8 @@
 #
 # Stage the rec files first from the local machine, then run this on the server:
 #   scp -i ~/.ssh/davidkey -P <port> \
-#       gen_hebrew.py prep_hebrew_corpus.py paddle/hebrew_latin_dict.txt \
-#       paddle/hebrew_finetune.yml data/hebrew_corpus.txt \
+#       gen_hebrew.py recgen.py ../synth_core.py prep_hebrew_corpus.py \
+#       paddle/hebrew_latin_dict.txt paddle/hebrew_finetune.yml data/hebrew_corpus.txt \
 #       root@<host>:/root/rec/
 #   ssh -i ~/.ssh/davidkey -p <port> root@<host> 'bash /root/rec/setup_server.sh'
 #
@@ -20,6 +20,15 @@ PADDLEOCR_DIR=${PADDLEOCR_DIR:-/root/PaddleOCR}
 CONFIG=${CONFIG:-$REC_DIR/hebrew_finetune.yml}
 PRETRAINED_URL="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/PP-OCRv6_small_rec_pretrained.pdparams"
 
+# PERF SIZING (vast.ai/Docker box): `nproc` lies — the container is CFS time-quota-capped,
+# not core-pinned. Check `cat /sys/fs/cgroup/cpu.max` (quota/period = real cores; one box was
+# ~11.5) and `cpu.stat` nr_throttled. The quota is smeared across all visible cores, so `top`
+# shows every one of the 24 at ~50% = the real ~12 fully used (NOT headroom; top's idle% is
+# host-wide = other tenants). Size train num_workers (yml) + these gen workers to the QUOTA
+# (~12), not nproc: more oversubscribes & throttles the driver, fewer starves the GPU.
+# Don't tune from nvidia-smi GPU-util% either — it's "time a kernel ran", not SM busyness; a
+# sawtooth to 0% at 70% "util" + ~50% power.draw is the GPU starving on the CPU pipeline, not
+# compute. Use power.draw, avg_reader_cost vs avg_batch_cost, and the throttle counters.
 N_WORKERS=${N_WORKERS:-20}                   # parallel generator processes
 N_PER=${N_PER:-15000}                        # lines per worker (20*15000 = 300K)
 VAL_N=${VAL_N:-8000}
@@ -27,11 +36,14 @@ VAL_N=${VAL_N:-8000}
 # garbage (<=0.6) from real text (>=0.93). Set NEG_FRAC>0 only to A/B the gate.
 NEG_FRAC=${NEG_FRAC:-0}                        # fraction of non-text negatives in TRAIN (empty labels)
 EPOCHS=${EPOCHS:-20}
-BS=${BS:-256}
+BS=${BS:-512}                                 # 16G fits ~512 at 48px multiscale; bs256 left the GPU at ~50% power
 
 echo "=== [1/6] reclaim disk (uv/pip/hf caches from any prior tenant) ==="
 rm -rf /root/.cache/uv /root/.cache/pip /root/.cache/huggingface /root/.cache/torch /tmp/pip-* 2>/dev/null || true
-df -h / | tail -1
+# Reclaim /dev/shm: leaked paddle dataloader shm segments from any prior killed run fill the
+# 15G tmpfs and OOM the next dataset regen ("No space left on device").
+find /dev/shm -maxdepth 1 -name 'paddle_*' -exec rm -rf {} + 2>/dev/null || true
+df -h / /dev/shm | tail -2
 
 echo "=== [2/6] paddlepaddle-gpu (cu129, runs on Blackwell) + GPU smoke test ==="
 if ! python3 -m pip --version >/dev/null 2>&1; then
@@ -51,14 +63,16 @@ echo "=== [3/6] system libs for opencv + Hebrew book/serif fonts + repo + python
 apt-get update -qq
 # fontconfig is REQUIRED (gen_hebrew uses fc-list); bare images may lack it.
 apt-get install -y -qq fontconfig libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1
-# fonts-noto-core = reliable Hebrew baseline (Noto Sans/Serif Hebrew). fonts-culmus
-# = classic faces (David CLM, Frank Ruehl CLM, ...) + fonts-sil-ezra serif, the
-# round-2 fix for confusable letter pairs. Fonts live in 'universe'; enable it and
-# install best-effort so a missing package never halts the run.
+# fonts-noto-core = reliable Hebrew baseline (Noto Sans/Serif Hebrew). The Debian/Ubuntu
+# package is `culmus` (NOT `fonts-culmus`) = classic faces (David CLM, Frank Ruehl CLM,
+# ...); + fonts-sil-ezra serif, the round-2 fix for confusable letter pairs. Install each
+# package separately so one missing name never aborts the whole apt-get (and the others).
 apt-get install -y -qq software-properties-common 2>/dev/null || true
 add-apt-repository -y universe 2>/dev/null || true
 apt-get update -qq || true
-apt-get install -y -qq fonts-noto-core fonts-culmus fonts-sil-ezra || echo "WARN: some Hebrew font packages unavailable"
+for fpkg in culmus fonts-sil-ezra fonts-noto-core; do
+  apt-get install -y -qq "$fpkg" || { echo "FATAL: Hebrew font package $fpkg failed to install"; exit 1; }
+done
 fc-cache -f >/dev/null 2>&1 || true
 nheb=$(fc-list :lang=he | wc -l)
 echo "hebrew fonts available: $nheb"
@@ -76,6 +90,9 @@ mkdir -p "$REC_DIR/pretrain"
   wget -q -O "$REC_DIR/pretrain/PP-OCRv6_small_rec_pretrained.pdparams" "$PRETRAINED_URL"
 
 echo "=== [5/6] dataset -> $DATA_DIR ($((N_WORKERS*N_PER)) train + $VAL_N val) ==="
+# Stop any train from a previous run BEFORE wiping its dataset, or its dataloader
+# crashes mid-read ("... does not exist!") and you get two runs fighting one GPU.
+pkill -9 -f "tools/train.py" 2>/dev/null && sleep 2 || true
 cd "$REC_DIR"
 [ -f hebrew_corpus.txt ] || python3 prep_hebrew_corpus.py --download --out hebrew_corpus.txt
 rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR/images"

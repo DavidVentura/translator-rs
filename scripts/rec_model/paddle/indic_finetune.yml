@@ -99,6 +99,10 @@ Train:
         image_shape: [48, 320, 3]
         max_text_length: *max_text_length
     - RecAug:
+        # tia (MLS text-distortion) warp is pure-Python per-pixel and ate ~85% of
+        # dataloader CPU; geometry comes from the generator's cheap cv2 warp
+        # (synth_core.warp_maps, shared via recgen), so disable it here.
+        tia_prob: 0.0
     - MultiLabelEncode:
         gtc_encode: NRTRLabelEncode
     - KeepKeys:
