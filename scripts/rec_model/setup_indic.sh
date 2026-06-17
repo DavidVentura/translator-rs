@@ -32,8 +32,10 @@ df -h / /dev/shm | tail -2
 
 echo "=== [2/6] paddlepaddle-gpu (cu129) + GPU smoke ==="
 if ! python3 -m pip --version >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq python3-pip; fi
+# uv resolves + installs the PaddleOCR dep tree far faster than pip (parallel downloads).
+python3 -m pip install -q uv
 if ! python3 -c "import paddle" 2>/dev/null; then
-  python3 -m pip install --no-cache-dir "paddlepaddle-gpu==3.2.0" -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+  uv pip install --system "paddlepaddle-gpu==3.2.0" --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/
 fi
 python3 - <<'PY'
 import paddle
@@ -82,7 +84,7 @@ for l in bn gu kn ml; do echo "  $l fonts: $(fc-list :lang=$l | wc -l)"; done
 miss=0; for l in bn gu kn ml; do [ "$(fc-list :lang=$l | wc -l)" -gt 0 ] || miss=1; done
 [ "$miss" = 0 ] || { echo "FATAL: missing fonts for some Indic script; generation would hang"; exit 1; }
 [ -d "$PADDLEOCR_DIR" ] || git clone --depth 1 -q https://github.com/PaddlePaddle/PaddleOCR.git "$PADDLEOCR_DIR"
-python3 -m pip install --no-cache-dir -q -r "$PADDLEOCR_DIR/requirements.txt" uharfbuzz freetype-py
+uv pip install --system -r "$PADDLEOCR_DIR/requirements.txt" uharfbuzz freetype-py
 
 echo "=== [4/6] pretrained v6 small weights ==="
 mkdir -p "$REC_DIR/pretrain"

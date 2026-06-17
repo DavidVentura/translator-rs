@@ -27,6 +27,7 @@ COMMON_PUNCT = " .,:;!?'\"()/-"
 # brackets/symbols, currency, and the Hebrew maqaf/geresh/gershayim (acronyms, ordinals).
 KEEP_PUNCT = "[]%+&@#₪€$"
 HEBREW_PUNCT = "־׳״"  # maqaf, geresh, gershayim
+HEBREW_FINALS = "ךםןףץ"  # final forms — only ever word-final in real Hebrew
 
 BASE = frozenset(HEBREW_LETTERS + LATIN + DIGITS + COMMON_PUNCT)
 KEEP_SET = frozenset(KEEP_PUNCT) | frozenset(HEBREW_PUNCT)
@@ -64,7 +65,12 @@ def synth_tail(glyph: str, rng: random.Random, kept: frozenset) -> str:
     """A short LOGICAL-order line containing `glyph` (gen_pair re-bidis it to visual), drawing
     only from kept glyphs — covers the corpus's structural gaps: acronym/ordinal gershayim and
     geresh, maqaf-joined compounds, the apostrophe inside transliterated Latin, and currency."""
-    letters = [c for c in HEBREW_LETTERS if c in kept] or list(HEBREW_LETTERS)
+    # Draw wrapping letters from NON-FINAL forms only: ך ם ן ף ץ occur word-finally in real
+    # Hebrew, so seeding them in these short synthetic contexts (mostly mid-word) taught the
+    # model that e.g. final-mem can sit mid-word, corrupting the ס/ם (samekh/final-mem)
+    # discrimination. Final forms enter labels only via real corpus words, where position is right.
+    letters = [c for c in HEBREW_LETTERS if c in kept and c not in HEBREW_FINALS] \
+        or [c for c in HEBREW_LETTERS if c not in HEBREW_FINALS]
     if glyph == "׳":  # geresh: single-letter abbreviation (ר׳, ד׳)
         return rng.choice(letters) + glyph
     if glyph == "״":  # gershayim: acronym (צה״ל, ד״ר)

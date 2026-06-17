@@ -49,8 +49,10 @@ echo "=== [2/6] paddlepaddle-gpu (cu129, runs on Blackwell) + GPU smoke test ===
 if ! python3 -m pip --version >/dev/null 2>&1; then
   apt-get update -qq && apt-get install -y -qq python3-pip
 fi
+# uv resolves + installs the PaddleOCR dep tree far faster than pip (parallel downloads).
+python3 -m pip install -q uv
 if ! python3 -c "import paddle" 2>/dev/null; then
-  python3 -m pip install --no-cache-dir "paddlepaddle-gpu==3.2.0" -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+  uv pip install --system "paddlepaddle-gpu==3.2.0" --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/
 fi
 python3 - <<'PY'
 import paddle
@@ -82,7 +84,7 @@ echo "hebrew fonts available: $nheb"
 # (label_ops.py: "if len(text) == 0 or ..."). A len-0 CTC target (all blank) is valid.
 sed -i 's/if len(text) == 0 or len(text) > self.max_text_len:/if len(text) > self.max_text_len:/' \
   "$PADDLEOCR_DIR/ppocr/data/imaug/label_ops.py"
-python3 -m pip install --no-cache-dir -q -r "$PADDLEOCR_DIR/requirements.txt" uharfbuzz python-bidi freetype-py
+uv pip install --system -r "$PADDLEOCR_DIR/requirements.txt" uharfbuzz python-bidi freetype-py
 
 echo "=== [4/6] pretrained v6 small weights ==="
 mkdir -p "$REC_DIR/pretrain"
