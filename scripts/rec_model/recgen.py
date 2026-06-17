@@ -25,6 +25,7 @@ import io
 import os
 import random
 import subprocess
+import sys
 import traceback
 from dataclasses import dataclass
 from functools import lru_cache
@@ -34,6 +35,10 @@ import freetype
 import numpy as np
 import uharfbuzz as hb
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synth_core import apply_warp, legible, warp_maps  # noqa: E402
 
 STRIP_HEIGHT = 48
 MAX_LABEL_LEN = 25
@@ -197,7 +202,14 @@ def compose(rng: random.Random, cov: np.ndarray, native_h: int) -> np.ndarray:
     h, w = cov.shape
     bg = background(rng, h, w)
     ink = random_color(rng)
-    if float(bg.mean()) > 0.5:
+    if rng.random() < 0.35:
+        # Low-contrast band: ink sits close to the background mean, so the model trains on
+        # faint text down to barely-readable (the legibility gate trims anything below
+        # readable). Without this every sample is high-contrast and the recognizer fails on
+        # faint text. Mirrors the ink generator's low-contrast force.
+        mean_bg = bg.mean(axis=(0, 1))
+        ink = np.clip(mean_bg + np.sign(ink - mean_bg) * rng.uniform(0.05, 0.30), 0, 1).astype(np.float32)
+    elif float(bg.mean()) > 0.5:
         ink = ink * rng.uniform(0.0, 0.35)
     else:
         ink = 1.0 - (1.0 - ink) * rng.uniform(0.0, 0.35)
@@ -276,17 +288,33 @@ def sample(rng: random.Random, spec: Spec, corpus: list[str], neg_frac: float = 
         fonts = fonts_for(render_text, spec.fonts, spec.charset)
         if not fonts:
             continue
-        native_h = rng.randint(22, 60)
-        px = max(8, int(native_h * rng.uniform(0.62, 0.9)))
+        # native_h is the detector's oriented-box height; real source text sits ~30-48 px
+        # tall, so floor at 30 — below it the strip is a 2x+ upsample of text the detector
+        # never emits. Floor the em at 20 px as well: a small box renders sub-pixel strokes,
+        # and few-pixel discriminative glyph features collapse before the head can separate
+        # confusable letters. Mirrors the ink generator's render floor.
+        native_h = rng.randint(30, 60)
+        px = max(20, int(native_h * rng.uniform(0.62, 0.9)))
         cov = shape_render(render_text, rng.choice(fonts), px, rng, spec.reorder)
         if cov is None or cov.shape[1] < 8:
             continue
         strip_h = max(native_h, cov.shape[0])
         top = (strip_h - cov.shape[0]) // 2
-        strip = np.zeros((strip_h, cov.shape[1] + rng.randint(2, max(3, native_h))), np.float32)
+        # Cap horizontal whitespace to ~32px in the resized 48px strip: the detector's boxes
+        # never trail more than that, so don't train on wider blank margins (native_h*2//3
+        # native px -> 32 display px after the 48-row resize, independent of native_h).
+        strip = np.zeros((strip_h, cov.shape[1] + rng.randint(2, max(3, native_h * 2 // 3))), np.float32)
         lpad = rng.randint(1, max(2, strip.shape[1] - cov.shape[1] - 1))
         strip[top:top + cov.shape[0], lpad:lpad + cov.shape[1]] = cov
+        # Mild geometric warp (rotation/bend/perspective) on the coverage, so the residual
+        # distortion left after the live pipeline's de-warp is represented. Mostly flat.
+        if rng.random() < 0.6:
+            strip = apply_warp(strip, *warp_maps(rng, *strip.shape))
         img = compose(rng, strip, strip_h)
+        # Drop strips whose degraded ink no longer contrasts with its background: det/rec
+        # gate what reaches the recognizer, so illegible (to a human) text is label noise.
+        if not legible(img, strip, strip_h):
+            continue
         if img.shape[1] * STRIP_HEIGHT / img.shape[0] > 1200:
             continue
         return _to_strip(img), label

@@ -12,15 +12,19 @@ Importable: sample() -> (image float32 HxWx3 in 0..1, coverage float32 HxW)
 """
 
 import argparse
-import io
 import os
 import random
 import subprocess
+import sys
 from functools import lru_cache
 
 import numpy as np
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synth_core import coord_grid as _coord_grid, degrade, legible, random_color  # noqa: E402
 
 HEIGHT = 48
 WIDTHS = list(range(96, 513, 16))
@@ -351,21 +355,6 @@ def render_coverage(
     return crop(tot), crop(fl), crop(bld)
 
 
-@lru_cache(maxsize=64)
-def _coord_grid(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
-    """Read-only (yy, xx) pixel grids, cached per size — callers only read them."""
-    yy, xx = np.mgrid[0:h, 0:w]
-    yy = np.ascontiguousarray(yy, dtype=np.float32)
-    xx = np.ascontiguousarray(xx, dtype=np.float32)
-    yy.flags.writeable = False
-    xx.flags.writeable = False
-    return yy, xx
-
-
-def random_color(rng: random.Random) -> np.ndarray:
-    return np.array([rng.random(), rng.random(), rng.random()], dtype=np.float32)
-
-
 def gradient_field(rng: random.Random, h: int, w: int, log: dict | None = None) -> np.ndarray:
     """HxWx3 background in 0..1: solid, gradient, color blocks, or busy texture.
 
@@ -411,118 +400,6 @@ def gradient_field(rng: random.Random, h: int, w: int, log: dict | None = None) 
     ) / 255.0
     mix = rng.uniform(0.5, 1.0)
     return mix * blob + (1 - mix) * c0
-
-
-def degrade(img: np.ndarray, rng: random.Random, native_h: int, log: dict | None = None) -> np.ndarray:
-    """Camera/screen degradations applied to the composited image only.
-
-    Blur scales with the native text height: a 1.8 px gaussian erases 12 px text
-    outright but is realistic camera softness on 40 px text. Det/rec gate what
-    reaches the ink model, so training must not contain text they would reject.
-    """
-    pil = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8))
-    if rng.random() < 0.5:
-        sigma = rng.uniform(0.3, min(0.35 + native_h * 0.032, 2.0))
-        pil = pil.filter(ImageFilter.GaussianBlur(sigma))
-        if log is not None:
-            log["blur"] = round(sigma, 2)
-    if native_h >= 24 and rng.random() < 0.25:
-        # Crude motion blur: directional box kernel. Skipped on tiny text, where even a
-        # 3px smear destroys the glyph.
-        k = rng.choice([3, 5])
-        if log is not None:
-            log["motion"] = k
-        kernel = [0.0] * (k * k)
-        if rng.random() < 0.5:
-            for i in range(k):
-                kernel[(k // 2) * k + i] = 1.0 / k
-        else:
-            for i in range(k):
-                kernel[i * k + k // 2] = 1.0 / k
-        pil = pil.filter(ImageFilter.Kernel((k, k), kernel, scale=1.0))
-    if rng.random() < 0.35:
-        scale = rng.uniform(0.55, 0.85)
-        small = pil.resize(
-            (max(8, int(pil.width * scale)), max(8, int(pil.height * scale))), Image.BILINEAR
-        )
-        pil = small.resize((pil.width, pil.height), Image.BILINEAR)
-        if log is not None:
-            log["downsample"] = round(scale, 2)
-    if rng.random() < 0.7:
-        q = rng.randint(45, 95)
-        buf = io.BytesIO()
-        pil.save(buf, format="JPEG", quality=q)
-        buf.seek(0)
-        pil = Image.open(buf).convert("RGB")
-        if log is not None:
-            log["jpeg"] = q
-    out = np.asarray(pil, dtype=np.float32) / 255.0
-    if rng.random() < 0.5:
-        h, w = out.shape[:2]
-        yy, xx = _coord_grid(h, w)
-        angle = rng.uniform(0, 2 * np.pi)
-        t = (np.cos(angle) * xx / w) + (np.sin(angle) * yy / h)
-        t = (t - t.min()) / max(t.max() - t.min(), 1e-6)
-        shade = rng.uniform(0.55, 1.0) + t * rng.uniform(0.0, 0.45)
-        out = out * np.clip(shade, 0.4, 1.2)[..., None]
-        if log is not None:
-            log["shade"] = 1
-    if rng.random() < 0.25:
-        # Hard-edged cast shadow: a sharp brightness step across the strip. A strong
-        # illumination edge looks like a stroke to the model unless it has trained on
-        # shadows that aren't ink (the label is untouched).
-        h, w = out.shape[:2]
-        yy, xx = _coord_grid(h, w)
-        angle = rng.uniform(0, 2 * np.pi)
-        proj = (np.cos(angle) * xx / w) + (np.sin(angle) * yy / h)
-        edge = rng.uniform(proj.min(), proj.max())
-        shadow = np.where(proj < edge, rng.uniform(0.4, 0.8), 1.0).astype(np.float32)
-        out = out * shadow[..., None]
-        if log is not None:
-            log["hardshadow"] = 1
-    if rng.random() < 0.6:
-        nsig = rng.uniform(0.005, 0.04)
-        out = out + np.random.default_rng(rng.getrandbits(32)).normal(
-            0, nsig, out.shape
-        ).astype(np.float32)
-        if log is not None:
-            log["noise"] = round(nsig, 3)
-    if rng.random() < 0.3:
-        lo, hi = rng.uniform(0.0, 0.08), rng.uniform(0.85, 1.0)
-        out = out * (hi - lo) + lo
-        if log is not None:
-            log["squeeze"] = round(hi - lo, 2)
-    return np.clip(out, 0, 1)
-
-
-def legible(img: np.ndarray, cov: np.ndarray, native_h: int) -> bool:
-    """Reject pairs whose degraded ink no longer contrasts with its background.
-
-    Det/rec sit upstream of the ink model at inference, so unreadable text never
-    reaches it — training on it would teach the model to hallucinate ink. Compare
-    median ink color against median background color within the text's own rows
-    (global background medians lie on gradient strips).
-    """
-    ink_mask = cov > 0.6
-    if ink_mask.sum() < 30:
-        return False
-    text_rows = ink_mask.any(axis=1)
-    bg_mask = (cov < 0.05) & text_rows[:, None]
-    if bg_mask.sum() < 30:
-        return False
-    # Subsample before the median: a contrast gate doesn't need the exact median over
-    # tens of thousands of pixels, and np.median's partition over the full native-res
-    # ink/bg arrays was ~6% of total gen time (worse on the big signage strips).
-    ink_px, bg_px = img[ink_mask], img[bg_mask]
-    if len(ink_px) > 400:
-        ink_px = ink_px[:: len(ink_px) // 400]
-    if len(bg_px) > 400:
-        bg_px = bg_px[:: len(bg_px) // 400]
-    d = np.abs(np.median(ink_px, axis=0) - np.median(bg_px, axis=0))
-    # Small text needs more contrast: its fine inter-stroke gaps vanish at low contrast,
-    # so the floor rises as native height shrinks (nh14 ~0.23, nh30+ flat at 0.13).
-    thresh = 0.13 + max(0, 30 - native_h) * 0.006
-    return float(d.max()) > thresh
 
 
 def sample(rng: random.Random | None = None, width: int | None = None):
