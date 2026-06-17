@@ -43,6 +43,11 @@ name = "ink_bench"
 path = "src/bin/ink_bench.rs"
 required-features = ["ppocr"]
 
+[[bin]]
+name = "golden_eval"
+path = "src/bin/golden_eval.rs"
+required-features = ["ppocr"]
+
 [features]
 default = []
 translate-cli = ["dep:toml"]
