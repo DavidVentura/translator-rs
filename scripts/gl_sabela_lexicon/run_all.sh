@@ -42,9 +42,13 @@ PIPER_RS="${PIPER_RS:-$HOME/git/piper-rs}"
 cargo run --release --quiet --manifest-path "$PIPER_RS/Cargo.toml" --bin gl_lexicon_residual -- \
   "$WORK/gl_lexicon.txt" "$WORK/gl_lexicon_residual.txt"
 
-step "compress residual (seekable zstd, zeekstd format) + report"
+step "abbreviations (cotovia abr.txt) + assemble shipped lexicon"
+python3 "$HERE/build_abbreviations.py" "$GLDIR/abr.txt" "$WORK/gl_abbr.tsv"
+cat "$WORK/gl_abbr.tsv" "$WORK/gl_lexicon_residual.txt" > "$WORK/gl_lexicon_shipped.txt"
+
+step "compress shipped lexicon (seekable zstd, zeekstd format) + report"
 cargo run --release --quiet --manifest-path "$HERE/zeekstd_encode/Cargo.toml" -- \
-  "$WORK/gl_lexicon_residual.txt" "$WORK/gl_lexicon.txt.zst"
+  "$WORK/gl_lexicon_shipped.txt" "$WORK/gl_lexicon.txt.zst"
 echo "full:     $(wc -l <"$WORK/gl_lexicon.txt") entries"
-echo "residual: $(wc -l <"$WORK/gl_lexicon_residual.txt") entries"
+echo "residual: $(wc -l <"$WORK/gl_lexicon_residual.txt") entries + $(wc -l <"$WORK/gl_abbr.tsv") abbreviations"
 echo "zst:      $(wc -c <"$WORK/gl_lexicon.txt.zst") bytes (shipped)"
