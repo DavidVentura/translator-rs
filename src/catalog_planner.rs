@@ -640,6 +640,9 @@ pub fn resolve_tts_voice_files_for_pack(
             .iter()
             .find(|file| file.name.ends_with("tokens.txt")),
         "coqui_vits" | "sherpa_vits" => pack_files.iter().find(|file| file.name == "config.json"),
+        "cotovia_vits" => pack_files
+            .iter()
+            .find(|file| file.name.ends_with("lexicon.txt")),
         _ => pack_files
             .iter()
             .find(|file| file.name.ends_with(".onnx.json")),

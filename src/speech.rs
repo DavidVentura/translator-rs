@@ -7,8 +7,8 @@ use crate::tts::{
     PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
 };
 use piper_rs::{
-    Backend, BoundaryAfter, CoquiVitsModel, KokoroMnnModel, KokoroModel, MmsModel,
-    PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
+    Backend, BoundaryAfter, CoquiVitsModel, CotoviaVitsModel, KokoroMnnModel, KokoroModel,
+    MmsModel, PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
 };
 
 fn log_debug(message: impl AsRef<str>) {
@@ -52,6 +52,7 @@ enum SpeechModel {
     KokoroMnn(KokoroMnnModel),
     Mms(MmsModel),
     CoquiVits(CoquiVitsModel),
+    CotoviaVits(CotoviaVitsModel),
     SherpaVits(SherpaVitsModel),
 }
 
@@ -160,6 +161,15 @@ fn available_voices(model: &SpeechModel) -> Vec<(String, i64)> {
             })
             .unwrap_or_default(),
         SpeechModel::CoquiVits(model) => model
+            .voices()
+            .map(|voices| {
+                voices
+                    .iter()
+                    .map(|(name, id)| (name.clone(), *id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        SpeechModel::CotoviaVits(model) => model
             .voices()
             .map(|voices| {
                 voices
@@ -512,6 +522,11 @@ fn load_speech_model(
         )
         .map(SpeechModel::CoquiVits)
         .map_err(|err| format!("Failed to load Coqui VITS voice: {err}")),
+        "cotovia_vits" => {
+            CotoviaVitsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
+                .map(SpeechModel::CotoviaVits)
+                .map_err(|err| format!("Failed to load Cotovia VITS voice: {err}"))
+        }
         "sherpa_vits" => {
             SherpaVitsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
                 .map(SpeechModel::SherpaVits)
@@ -681,6 +696,9 @@ fn phonemize(model: &mut SpeechModel, text: &str) -> Result<String, String> {
         SpeechModel::CoquiVits(model) => model
             .phonemize(text)
             .map_err(|err| format!("Speech synthesis failed: {err}")),
+        SpeechModel::CotoviaVits(model) => model
+            .phonemize(text)
+            .map_err(|err| format!("Speech synthesis failed: {err}")),
         SpeechModel::SherpaVits(model) => model
             .phonemize(text)
             .map_err(|err| format!("Speech synthesis failed: {err}")),
@@ -800,6 +818,9 @@ fn synthesize(
                     .map_err(|err| format!("Speech synthesis failed: {err}"))
             }
         }
+        SpeechModel::CotoviaVits(model) => model
+            .synthesize(text, effective_speaker_id, Some(clamped_speech_speed))
+            .map_err(|err| format!("Speech synthesis failed: {err}")),
     }
 }
 
