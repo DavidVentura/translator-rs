@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use piper_rs::{Backend, CoquiVitsModel, KokoroModel, MmsModel, PiperModel, SherpaVitsModel};
+use piper_rs::{
+    Backend, CoquiVitsModel, CotoviaVitsModel, KokoroModel, MmsModel, PiperModel, SherpaVitsModel,
+};
 use serde::Deserialize;
 use translator::tts::{PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks};
 
@@ -424,6 +426,7 @@ fn synthesize_pack_sample(
         "mimic3" => synthesize_mimic3(pack_key, pack, catalog, bucket_dir, text)?,
         "mms" => synthesize_mms(pack_key, catalog, bucket_dir, text)?,
         "coqui_vits" => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
+        "cotovia_vits" => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
         "sherpa_vits" => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
         "kokoro" => synthesize_kokoro(pack_key, pack, catalog, bucket_dir, text)?,
         other => return Err(format!("Unsupported engine `{other}` for `{pack_key}`")),
@@ -522,6 +525,27 @@ fn synthesize_piper(
         }
         .map_err(|err| format!("Failed to synthesize Piper voice `{pack_key}`: {err}"))
     })
+}
+
+fn synthesize_cotovia(
+    pack_key: &str,
+    catalog: &Catalog,
+    bucket_dir: &Path,
+    text: &str,
+) -> Result<(Vec<f32>, u32), String> {
+    let model_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
+        file.name.ends_with(".onnx")
+    })?;
+    // the shared cotovia lexicon lives in a dependency pack
+    let lexicon_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
+        file.name.ends_with("lexicon.txt.zst")
+    })?;
+    let mut model = CotoviaVitsModel::new(&model_path, &lexicon_path, &Backend::Cpu)
+        .map_err(|err| format!("Failed to load Cotovia VITS model `{pack_key}`: {err}"))?;
+    // cotovia_vits tokenizes internally; synthesize the whole sample text.
+    model
+        .synthesize(text, None, None)
+        .map_err(|err| format!("Failed to synthesize Cotovia VITS voice `{pack_key}`: {err}"))
 }
 
 fn synthesize_mimic3(
