@@ -25,32 +25,41 @@ static OrtStatusPtr ORT_API_CALL my_Run(
     const char *const *input_names, const OrtValue *const *inputs, size_t input_len,
     const char *const *output_names, size_t output_names_len, OrtValue **outputs) {
   for (size_t i = 0; i < input_len; i++) {
-    if (strcmp(input_names[i], "input") != 0) {
+    int is_input = strcmp(input_names[i], "input") == 0;
+    int is_scales = strcmp(input_names[i], "scales") == 0;
+    if (!is_input && !is_scales) {
       continue;
     }
     const OrtValue *v = inputs[i];
     OrtTensorTypeAndShapeInfo *info = NULL;
     if (g_real->GetTensorTypeAndShape(v, &info) != NULL) {
-      break;
+      continue;
     }
     size_t count = 0;
     g_real->GetTensorShapeElementCount(info, &count);
     void *data = NULL;
     g_real->GetTensorMutableData((OrtValue *)v, &data);
-    const int64_t *ids = (const int64_t *)data;
 
     const char *path = getenv("ORT_DUMP_FILE");
     FILE *f = path ? fopen(path, "a") : stderr;
-    fprintf(f, "IDS");
-    for (size_t k = 0; k < count; k++) {
-      fprintf(f, " %lld", (long long)ids[k]);
+    if (is_input) {
+      const int64_t *ids = (const int64_t *)data;
+      fprintf(f, "IDS");
+      for (size_t k = 0; k < count; k++) {
+        fprintf(f, " %lld", (long long)ids[k]);
+      }
+    } else {
+      const float *sc = (const float *)data;
+      fprintf(f, "SCALES");
+      for (size_t k = 0; k < count; k++) {
+        fprintf(f, " %g", sc[k]);
+      }
     }
     fprintf(f, "\n");
     if (path) {
       fclose(f);
     }
     g_real->ReleaseTensorTypeAndShapeInfo(info);
-    break;
   }
   return g_real->Run(session, run_options, input_names, inputs, input_len,
                      output_names, output_names_len, outputs);
