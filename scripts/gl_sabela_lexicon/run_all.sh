@@ -37,9 +37,9 @@ echo "union wordlist: $(wc -l <"$WORK/words_all.txt")"
 step "extract word -> ids lexicon (stub voice; JOBS=${JOBS:-4} cores)"
 JOBS="${JOBS:-4}" bash "$HERE/parallel_extract.sh" "$AHO" "$WORK/words_all.txt" "$WORK/gl_lexicon.txt"
 
-step "compress + report"
-zstd -19 -q -f "$WORK/gl_lexicon.txt" -o "$WORK/gl_lexicon.txt.zst" 2>/dev/null || \
-  echo "(zstd cli missing; raw lexicon at $WORK/gl_lexicon.txt)"
+step "compress (seekable zstd, zeekstd format) + report"
+cargo run --release --quiet --manifest-path "$HERE/zeekstd_encode/Cargo.toml" -- \
+  "$WORK/gl_lexicon.txt" "$WORK/gl_lexicon.txt.zst"
 echo "entries: $(wc -l <"$WORK/gl_lexicon.txt")"
 echo "raw:  $(wc -c <"$WORK/gl_lexicon.txt") bytes"
-[ -f "$WORK/gl_lexicon.txt.zst" ] && echo "zstd: $(wc -c <"$WORK/gl_lexicon.txt.zst") bytes"
+echo "zst:  $(wc -c <"$WORK/gl_lexicon.txt.zst") bytes"
