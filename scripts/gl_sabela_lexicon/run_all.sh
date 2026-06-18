@@ -37,9 +37,14 @@ echo "union wordlist: $(wc -l <"$WORK/words_all.txt")"
 step "extract word -> ids lexicon (stub voice; JOBS=${JOBS:-4} cores)"
 JOBS="${JOBS:-4}" bash "$HERE/parallel_extract.sh" "$AHO" "$WORK/words_all.txt" "$WORK/gl_lexicon.txt"
 
-step "compress (seekable zstd, zeekstd format) + report"
+step "residual (drop entries the g2p reproduces) — DERIVED from gl_g2p, regenerate on g2p change"
+PIPER_RS="${PIPER_RS:-$HOME/git/piper-rs}"
+cargo run --release --quiet --manifest-path "$PIPER_RS/Cargo.toml" --bin gl_lexicon_residual -- \
+  "$WORK/gl_lexicon.txt" "$WORK/gl_lexicon_residual.txt"
+
+step "compress residual (seekable zstd, zeekstd format) + report"
 cargo run --release --quiet --manifest-path "$HERE/zeekstd_encode/Cargo.toml" -- \
-  "$WORK/gl_lexicon.txt" "$WORK/gl_lexicon.txt.zst"
-echo "entries: $(wc -l <"$WORK/gl_lexicon.txt")"
-echo "raw:  $(wc -c <"$WORK/gl_lexicon.txt") bytes"
-echo "zst:  $(wc -c <"$WORK/gl_lexicon.txt.zst") bytes"
+  "$WORK/gl_lexicon_residual.txt" "$WORK/gl_lexicon.txt.zst"
+echo "full:     $(wc -l <"$WORK/gl_lexicon.txt") entries"
+echo "residual: $(wc -l <"$WORK/gl_lexicon_residual.txt") entries"
+echo "zst:      $(wc -c <"$WORK/gl_lexicon.txt.zst") bytes (shipped)"
