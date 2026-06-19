@@ -658,7 +658,7 @@ impl SimPipeline {
                         .clone()
                         .unwrap_or_else(|| "und".to_string());
                     self.session
-                        .ingest_rec(active, line_id, line.text.trim(), &lang);
+                        .ingest_rec(active, line_id, line.text.trim(), &lang, &[]);
                 }
             }
             Err(e) => log::warn!("rec failed: {e:?}"),

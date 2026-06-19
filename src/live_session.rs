@@ -22,7 +22,6 @@ use crate::color_matting::MattedStrip;
 use crate::homography::{invert, project};
 use crate::live_frame::OrientedImage;
 use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine};
-use crate::routing::MixedTextTranslationResult;
 use crate::surface_map::{AddResult, SurfaceLineId, SurfaceLineObservation, SurfaceMap};
 
 /// Anchor identifier as the engine emits it. Mirrors
@@ -858,12 +857,22 @@ impl LiveSession {
             } else {
                 String::new()
             };
+            let cached_bold_ranges = if !needs_rec {
+                state
+                    .map
+                    .get(line_id)
+                    .map(|l| l.source_bold_ranges.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             out.push(DetectionOutcome {
                 line_id,
                 kind,
                 needs_rec,
                 cached_source_text,
                 cached_source_language,
+                cached_bold_ranges,
             });
         }
         out
@@ -879,11 +888,13 @@ impl LiveSession {
         line_id: SurfaceLineId,
         source_text: &str,
         source_language: &str,
+        bold_ranges: &[crate::ocr::BoldRange],
     ) {
         if let Ok(mut states) = self.anchor_states.lock() {
             if let Some(state) = states.get_mut(&anchor_id) {
                 if let Some(line) = state.map.get_mut(line_id) {
                     line.source_text = source_text.to_string();
+                    line.source_bold_ranges = bold_ranges.to_vec();
                     if !source_language.is_empty() {
                         line.source_language = source_language.to_string();
                     }
@@ -1199,13 +1210,13 @@ pub trait LiveRecognizer {
 /// `TranslatorSession::translate_mixed_texts`'s signature. The sim
 /// passes [`NoopTranslator`] (no translation models loaded).
 pub trait LiveTranslator {
-    fn translate_mixed_texts(
+    fn translate_mixed_texts_with_alignment(
         &self,
         inputs: &[String],
         forced_source_code: Option<&str>,
         target_code: &str,
         available_language_codes: &[LanguageCode],
-    ) -> Result<MixedTextTranslationResult, String>;
+    ) -> Result<crate::routing::MixedAlignedTranslationResult, String>;
 }
 
 #[cfg(feature = "ppocr")]
@@ -1229,15 +1240,15 @@ impl LiveRecognizer for &crate::session::TranslatorSession {
 }
 
 impl LiveTranslator for &crate::session::TranslatorSession {
-    fn translate_mixed_texts(
+    fn translate_mixed_texts_with_alignment(
         &self,
         inputs: &[String],
         forced_source_code: Option<&str>,
         target_code: &str,
         available_language_codes: &[LanguageCode],
-    ) -> Result<MixedTextTranslationResult, String> {
+    ) -> Result<crate::routing::MixedAlignedTranslationResult, String> {
         (*self)
-            .translate_mixed_texts(
+            .translate_mixed_texts_with_alignment(
                 inputs,
                 forced_source_code,
                 target_code,
@@ -1253,21 +1264,22 @@ impl LiveTranslator for &crate::session::TranslatorSession {
 pub struct NoopTranslator;
 
 impl LiveTranslator for NoopTranslator {
-    fn translate_mixed_texts(
+    fn translate_mixed_texts_with_alignment(
         &self,
         inputs: &[String],
         _forced: Option<&str>,
         _target: &str,
         _available: &[LanguageCode],
-    ) -> Result<MixedTextTranslationResult, String> {
+    ) -> Result<crate::routing::MixedAlignedTranslationResult, String> {
         let translations = inputs
             .iter()
-            .map(|s| crate::routing::TextTranslation {
+            .map(|s| crate::translate::TranslationWithAlignment {
+                alignments: crate::translate::identity_char_alignments(s),
                 source_text: s.clone(),
                 translated_text: s.clone(),
             })
             .collect();
-        Ok(MixedTextTranslationResult {
+        Ok(crate::routing::MixedAlignedTranslationResult {
             translations,
             nothing_reason: None,
         })
@@ -1879,10 +1891,11 @@ pub struct PostDetectInput<'a> {
     /// off the real ink; empty keeps the detection box. Does not touch the
     /// overlay footprint (`SurfaceLine.bbox`), only the merge decision.
     pub line_metrics: &'a [Option<crate::text_metrics::LineMetrics>],
-    /// Per-detection bold flag from the ink model's bold channel (pooled +
-    /// thresholded), indexed parallel to `detections`. `None` per box when the
-    /// model has no bold channel; empty falls back to not-bold.
-    pub model_bold: &'a [Option<bool>],
+    /// Per-detection ink bold column profile (indexed parallel to `detections`). Pooled
+    /// per word against each line's CTC firings to recover per-word bold; whole-strip
+    /// pooled for the fallback. `None` per box when the model has no bold channel; empty
+    /// falls back to not-bold.
+    pub bold_profiles: &'a [Option<crate::text_metrics::BoldProfile>],
     /// Translate-block batch size. Production uses 4; sim may pick a
     /// smaller value to keep per-frame work bounded.
     pub rec_batch_size: usize,
@@ -2021,6 +2034,9 @@ impl LiveSession {
             line_id: SurfaceLineId,
             source_text: String,
             source_code: String,
+            /// Per-word bold ranges over `source_text` (trimmed), pooled from this run's ink
+            /// bold profile + the line's CTC firings, or restored from the rec cache.
+            bold_ranges: Vec<crate::ocr::BoldRange>,
             rec_attempted: bool,
         }
         let mut entries: Vec<Entry> = input
@@ -2035,6 +2051,7 @@ impl LiveSession {
                     line_id: outcome.line_id,
                     source_text: String::new(),
                     source_code: input.from_lang.to_string(),
+                    bold_ranges: Vec::new(),
                     rec_attempted: false,
                 };
                 if !outcome.needs_rec && !outcome.cached_source_text.is_empty() {
@@ -2044,6 +2061,7 @@ impl LiveSession {
                     } else {
                         outcome.cached_source_language.clone()
                     };
+                    e.bold_ranges = outcome.cached_bold_ranges.clone();
                     e.rec_attempted = true;
                 }
                 e
@@ -2172,19 +2190,6 @@ impl LiveSession {
                 })
                 .collect();
         }
-
-        // Per-block bold: majority of the block's source lines the ink model's bold
-        // channel flagged (pooled per box ≥ threshold; indexed parallel to `detections`).
-        let block_bold: Vec<bool> = block_strip_indices
-            .iter()
-            .map(|idxs| {
-                let bold = idxs
-                    .iter()
-                    .filter(|&&j| input.model_bold.get(j).copied().flatten().unwrap_or(false))
-                    .count();
-                bold * 2 >= idxs.len().max(1)
-            })
-            .collect();
 
         // Pending placeholders: per-strip bg rects, no text. Only
         // upsert for blocks that don't already have a resident
@@ -2317,6 +2322,11 @@ impl LiveSession {
                         entries[idx].source_code = code.clone();
                     }
                 }
+                entries[idx].bold_ranges = entry_bold_ranges(
+                    &entries[idx].source_text,
+                    line,
+                    input.bold_profiles.get(idx),
+                );
                 let bi = block_of_entry[idx];
                 if block_rec_remaining[bi] > 0 {
                     block_rec_remaining[bi] -= 1;
@@ -2326,6 +2336,7 @@ impl LiveSession {
                     entries[idx].line_id,
                     &entries[idx].source_text,
                     &entries[idx].source_code,
+                    &entries[idx].bold_ranges,
                 );
             }
 
@@ -2344,47 +2355,69 @@ impl LiveSession {
                 .collect();
 
             if !ready_blocks.is_empty() {
-                let block_sources: Vec<String> = ready_blocks
+                // Per ready block: the joined source text and the per-word bold ranges
+                // re-based onto it. Both walk the block's strips in the same order with the
+                // same non-empty filter and `\n` separator, so the bold offsets line up with
+                // the text the translator sees.
+                let block_built: Vec<(String, Vec<crate::ocr::BoldRange>)> = ready_blocks
                     .iter()
                     .map(|&bi| {
-                        block_strip_indices[bi]
-                            .iter()
-                            .map(|&i| entries[i].source_text.as_str())
-                            .filter(|t| !t.is_empty())
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        let mut text = String::new();
+                        let mut bold: Vec<crate::ocr::BoldRange> = Vec::new();
+                        for &i in &block_strip_indices[bi] {
+                            let s = entries[i].source_text.as_str();
+                            if s.is_empty() {
+                                continue;
+                            }
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            let base = text.len() as u32;
+                            text.push_str(s);
+                            for r in &entries[i].bold_ranges {
+                                bold.push(crate::ocr::BoldRange {
+                                    start: base + r.start,
+                                    end: base + r.end,
+                                });
+                            }
+                        }
+                        (text, crate::ocr::merge_bold_ranges(bold))
                     })
                     .collect();
-                let kept: Vec<(usize, String)> = ready_blocks
+                let kept: Vec<(usize, String, Vec<crate::ocr::BoldRange>)> = ready_blocks
                     .drain(..)
-                    .zip(block_sources)
-                    .filter(|(_, s)| !s.trim().is_empty())
+                    .zip(block_built)
+                    .filter(|(_, (s, _))| !s.trim().is_empty())
+                    .map(|(bi, (s, b))| (bi, s, b))
                     .collect();
                 if !kept.is_empty() {
-                    let inputs: Vec<String> = kept.iter().map(|(_, s)| s.clone()).collect();
+                    let inputs: Vec<String> = kept.iter().map(|(_, s, _)| s.clone()).collect();
                     let forced = if input.is_auto_source {
                         None
                     } else {
                         Some(input.from_lang)
                     };
-                    let result = translator.translate_mixed_texts(
+                    let result = translator.translate_mixed_texts_with_alignment(
                         &inputs,
                         forced,
                         input.to_lang,
                         input.available_codes,
                     );
-                    let by_src: std::collections::HashMap<String, String> = match result {
+                    let by_src: std::collections::HashMap<
+                        String,
+                        crate::translate::TranslationWithAlignment,
+                    > = match result {
                         Ok(res) => res
                             .translations
                             .into_iter()
-                            .map(|t| (t.source_text, t.translated_text))
+                            .map(|t| (t.source_text.clone(), t))
                             .collect(),
                         Err(e) => {
                             log::warn!("[post_detect] translate batch failed: {e}");
                             std::collections::HashMap::new()
                         }
                     };
-                    for (bi, src) in kept {
+                    for (bi, src, src_bold) in kept {
                         if cancel() {
                             return PostDetectOutcome {
                                 anchor_id: input.anchor_id,
@@ -2393,15 +2426,18 @@ impl LiveSession {
                                 ..Default::default()
                             };
                         }
-                        let translated = by_src.get(&src).cloned().unwrap_or_default();
+                        // Recognized fine, but the translation is missing (untranslatable
+                        // input, or absent from the batch result) or came back empty. Mark
+                        // handled so it isn't retried each batch, and drop it so its
+                        // placeholder bg is removed below — the sharp original beneath beats
+                        // an opaque, text-less box pinned over it.
+                        let Some(twa) = by_src.get(&src) else {
+                            block_translated[bi] = true;
+                            block_dropped[bi] = true;
+                            continue;
+                        };
+                        let translated = twa.translated_text.clone();
                         if translated.trim().is_empty() {
-                            // Recognized fine, but translation came back
-                            // empty (untranslatable input, or missing from
-                            // the batch result). Mark handled so it isn't
-                            // retried each batch, and drop it so its
-                            // placeholder bg is removed below — the sharp
-                            // original beneath beats an opaque, text-less
-                            // box pinned over it.
                             block_translated[bi] = true;
                             block_dropped[bi] = true;
                             continue;
@@ -2442,18 +2478,16 @@ impl LiveSession {
                                 .collect()
                         };
                         let kept_mats = pick_matted_for_block(input.matted_strips, &kept_indices);
-                        // Whole-block weight from the ink bold channel. Live keeps block
-                        // granularity (per-word would need the bold strips + CTC firings
-                        // paired at rec time and an aligned mixed-translate); the still path
-                        // is per-word.
-                        let block_bold_ranges = if block_bold[bi] && !translated.trim().is_empty() {
-                            vec![crate::ocr::BoldRange {
-                                start: 0,
-                                end: translated.len() as u32,
-                            }]
-                        } else {
-                            Vec::new()
-                        };
+                        // Per-word bold projected from the source onto the translation via the
+                        // model's token alignments (identity for passthrough), mirroring the
+                        // still path.
+                        let src_ranges: Vec<(u32, u32)> =
+                            src_bold.iter().map(|r| (r.start, r.end)).collect();
+                        let block_bold_ranges: Vec<crate::ocr::BoldRange> =
+                            crate::translate::remap_byte_ranges_through_alignment(&src_ranges, twa)
+                                .into_iter()
+                                .map(|(start, end)| crate::ocr::BoldRange { start, end })
+                                .collect();
                         self.ingest_translation(input.anchor_id, &line_ids, &translated);
                         self.upsert_block(
                             input.anchor_id,
@@ -2563,6 +2597,52 @@ impl LiveSession {
             surviving_block_ids,
             canceled: false,
         }
+    }
+}
+
+/// Per-word bold ranges over `source_text` (the trimmed recognized line), pooling this run's
+/// ink bold `profile` against the line's CTC firings. Falls back to a whole-line range when
+/// the firings aren't usable but the whole strip pooled bold, and to nothing without a profile.
+/// Mirrors the still path's `line_bold_ranges`.
+fn entry_bold_ranges(
+    source_text: &str,
+    line: &RecognizedTextLine,
+    profile: Option<&Option<crate::text_metrics::BoldProfile>>,
+) -> Vec<crate::ocr::BoldRange> {
+    let Some(profile) = profile.and_then(|p| p.as_ref()) else {
+        return Vec::new();
+    };
+    if source_text.is_empty() {
+        return Vec::new();
+    }
+    let firings: Vec<(char, f32)> = line
+        .firings
+        .iter()
+        .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
+        .collect();
+    let word_ranges = crate::text_metrics::word_bold_ranges(
+        source_text,
+        &firings,
+        crate::ocr::is_cjk_text(source_text),
+        profile,
+        crate::text_metrics::MODEL_BOLD_THRESHOLD,
+    );
+    if !word_ranges.is_empty() {
+        return word_ranges
+            .into_iter()
+            .map(|(start, end)| crate::ocr::BoldRange { start, end })
+            .collect();
+    }
+    let whole_bold = profile
+        .whole_pooled_bold()
+        .is_some_and(|p| p >= crate::text_metrics::MODEL_BOLD_THRESHOLD);
+    if whole_bold {
+        vec![crate::ocr::BoldRange {
+            start: 0,
+            end: source_text.len() as u32,
+        }]
+    } else {
+        Vec::new()
     }
 }
 
@@ -2706,6 +2786,9 @@ pub struct DetectionOutcome {
     /// Cached source language from a prior rec, when `!needs_rec`.
     /// Empty otherwise.
     pub cached_source_language: String,
+    /// Cached per-word bold ranges over `cached_source_text`, when `!needs_rec`. Empty
+    /// otherwise.
+    pub cached_bold_ranges: Vec<crate::ocr::BoldRange>,
 }
 
 impl DetectionOutcome {
@@ -2716,6 +2799,7 @@ impl DetectionOutcome {
             needs_rec: true,
             cached_source_text: String::new(),
             cached_source_language: String::new(),
+            cached_bold_ranges: Vec::new(),
         }
     }
 }

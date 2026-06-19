@@ -273,11 +273,6 @@ pub struct InkStrip {
     pub src_map: Option<Vec<(f32, f32)>>,
 }
 
-/// Matte alpha (0..255) above which a pixel counts as ink for bold pooling.
-const INK_BOLD_ALPHA_CUT: u8 = 40;
-/// Need at least this many ink pixels to trust a pooled bold estimate.
-const INK_BOLD_MIN_PX: u64 = 30;
-
 impl InkStrip {
     /// Mean bold probability (0..1) over the strip's ink pixels — the per-line weight
     /// estimate the caller thresholds (≈0.65). `None` when there is no bold channel
@@ -286,12 +281,19 @@ impl InkStrip {
         let bold = self.bold.as_ref()?;
         let (mut sum, mut n) = (0u64, 0u64);
         for (m, b) in self.matte.iter().zip(bold.iter()) {
-            if *m >= INK_BOLD_ALPHA_CUT {
+            if *m >= crate::text_metrics::INK_BOLD_ALPHA_CUT {
                 sum += *b as u64;
                 n += 1;
             }
         }
-        (n >= INK_BOLD_MIN_PX).then(|| sum as f32 / n as f32 / 255.0)
+        (n >= crate::text_metrics::INK_BOLD_MIN_PX).then(|| sum as f32 / n as f32 / 255.0)
+    }
+
+    /// Reduce the strip's bold + matte channels to a per-reading-axis-column
+    /// [`crate::text_metrics::BoldProfile`]. `None` when there is no bold channel (legacy
+    /// matte-only model).
+    pub fn bold_profile(&self) -> Option<crate::text_metrics::BoldProfile> {
+        crate::text_metrics::BoldProfile::from_strip(self.bold.as_ref()?, &self.matte)
     }
 }
 
@@ -2308,10 +2310,7 @@ fn decode_ctc(
     }
 }
 
-/// A firing gap wider than this multiple of the line's median character advance starts a
-/// new word — the fallback for recognizer models/charsets that under-emit the space class.
-/// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
-const WORD_GAP_FACTOR: f32 = 1.8;
+use crate::text_metrics::WORD_GAP_FACTOR;
 
 /// Median strip-advance between consecutive decoded characters. Robust to the few large
 /// inter-word gaps, which are high outliers the median ignores. Returns 1.0 for fewer than
@@ -2358,131 +2357,6 @@ fn word_ranges(chars: &[RecChar]) -> Vec<Range<usize>> {
         ranges.push(start..last + 1);
     }
     ranges
-}
-
-/// Median reading-axis advance between consecutive firings (robust to the few large
-/// inter-word gaps). Returns 1.0 for fewer than two firings, disabling gap splitting.
-fn firing_median_advance(firings: &[(char, f32)]) -> f32 {
-    if firings.len() < 2 {
-        return 1.0;
-    }
-    let mut adv: Vec<f32> = firings.windows(2).map(|w| w[1].1 - w[0].1).collect();
-    adv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    adv[adv.len() / 2]
-}
-
-/// Word units (inclusive `(start, end)` firing index ranges over non-whitespace firings),
-/// split on the recognizer's space class or a firing gap wider than [`WORD_GAP_FACTOR`]×
-/// the median advance.
-fn firing_word_units(firings: &[(char, f32)]) -> Vec<(usize, usize)> {
-    let gap_thresh = WORD_GAP_FACTOR * firing_median_advance(firings);
-    let mut units = Vec::new();
-    let mut cur: Option<(usize, usize)> = None;
-    for (i, (c, at)) in firings.iter().enumerate() {
-        if c.is_whitespace() {
-            if let Some((s, l)) = cur.take() {
-                units.push((s, l));
-            }
-            continue;
-        }
-        cur = match cur {
-            None => Some((i, i)),
-            Some((s, l)) => {
-                if at - firings[l].1 > gap_thresh {
-                    units.push((s, l));
-                    Some((i, i))
-                } else {
-                    Some((s, i))
-                }
-            }
-        };
-    }
-    if let Some((s, l)) = cur {
-        units.push((s, l));
-    }
-    units
-}
-
-/// Mean bold probability (0..1) over the ink (matte-gated) pixels in the strip's
-/// reading-axis fraction window `[frac_lo, frac_hi)`. 0.0 when the window has no ink.
-fn pool_bold_columns(bold: &GrayImage, matte: &GrayImage, frac_lo: f32, frac_hi: f32) -> f32 {
-    let (w, h) = matte.dimensions();
-    let x0 = (frac_lo * w as f32).floor().clamp(0.0, w as f32) as u32;
-    let x1 = (frac_hi * w as f32).ceil().clamp(0.0, w as f32) as u32;
-    let (mut sum, mut n) = (0u64, 0u64);
-    for y in 0..h {
-        for x in x0..x1 {
-            if matte.get_pixel(x, y)[0] >= INK_BOLD_ALPHA_CUT {
-                sum += bold.get_pixel(x, y)[0] as u64;
-                n += 1;
-            }
-        }
-    }
-    if n == 0 {
-        return 0.0;
-    }
-    sum as f32 / n as f32 / 255.0
-}
-
-/// Bold byte ranges within `text`, from CTC firings paired with the ink bold strip. Word
-/// units come from the firings (space class / gaps for space scripts, per glyph for CJK);
-/// each unit's reading-axis window is pooled over the bold channel and, if it clears
-/// `threshold`, the matching text word's byte range is emitted. Units map onto text words
-/// positionally; returns empty (caller falls back to a per-line estimate) if the firings
-/// are absent or the unit and word counts disagree.
-pub fn word_bold_ranges(
-    text: &str,
-    firings: &[(char, f32)],
-    is_cjk: bool,
-    bold: &GrayImage,
-    matte: &GrayImage,
-    threshold: f32,
-) -> Vec<(u32, u32)> {
-    if firings.is_empty() || matte.width() == 0 || bold.dimensions() != matte.dimensions() {
-        return Vec::new();
-    }
-    let units: Vec<(usize, usize)> = if is_cjk {
-        firings
-            .iter()
-            .enumerate()
-            .filter(|(_, (c, _))| !c.is_whitespace())
-            .map(|(i, _)| (i, i))
-            .collect()
-    } else {
-        firing_word_units(firings)
-    };
-    let base = text.as_ptr() as usize;
-    let text_words: Vec<(usize, usize)> = if is_cjk {
-        text.char_indices()
-            .filter(|(_, c)| !c.is_whitespace())
-            .map(|(b, c)| (b, b + c.len_utf8()))
-            .collect()
-    } else {
-        text.split_whitespace()
-            .map(|w| {
-                let s = w.as_ptr() as usize - base;
-                (s, s + w.len())
-            })
-            .collect()
-    };
-    if units.len() != text_words.len() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for (k, &(s, _)) in units.iter().enumerate() {
-        let lo = firings[s].1.clamp(0.0, 1.0);
-        let hi = if k + 1 < units.len() {
-            firings[units[k + 1].0].1.clamp(0.0, 1.0)
-        } else {
-            1.0
-        }
-        .max(lo);
-        if pool_bold_columns(bold, matte, lo, hi) >= threshold {
-            let (bs, be) = text_words[k];
-            out.push((bs as u32, be as u32));
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -3688,7 +3562,7 @@ mod tests {
         assert!(bow.abs() < 1.0, "expected flat spine, got {bow:.2} px bow");
     }
 
-    use super::{TiltEstimate, frame_consensus_angle, resolve_box_angle};
+    use super::{TiltEstimate, resolve_box_angle};
 
     fn committed(deg: f32) -> TiltEstimate {
         let a = deg.to_radians();
@@ -3697,27 +3571,6 @@ mod tests {
             vote: Some(a),
             committed: true,
         }
-    }
-
-    #[test]
-    fn consensus_needs_a_quorum_then_takes_the_median() {
-        assert!(frame_consensus_angle(&[0.1, 0.2]).is_none());
-        let votes = [0.30, 0.10, 0.20, 0.15, 0.25];
-        let m = frame_consensus_angle(&votes).expect("quorum reached");
-        assert!((m - 0.20).abs() < 1e-6, "median vote, got {m}");
-    }
-
-    #[test]
-    fn near_horizontal_consensus_snaps_to_exactly_flat() {
-        // A visibly-upright page whose votes carry sub-degree median noise (~0.5°) collapses to
-        // exactly 0° so every box renders crisp, rather than inheriting the fractional tilt.
-        let half_deg = 0.5f32.to_radians();
-        let votes = [half_deg; 5];
-        assert_eq!(frame_consensus_angle(&votes), Some(0.0));
-        // A genuinely tilted scene (~5°) is past the deadzone and keeps its measured direction.
-        let five_deg = 5.0f32.to_radians();
-        let m = frame_consensus_angle(&[five_deg; 5]).expect("quorum reached");
-        assert!((m - five_deg).abs() < 1e-6);
     }
 
     #[test]

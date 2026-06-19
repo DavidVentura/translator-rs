@@ -317,6 +317,24 @@ impl TranslatorSession {
         )
     }
 
+    #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+    pub(crate) fn translate_mixed_texts_with_alignment(
+        &self,
+        inputs: &[String],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[LanguageCode],
+    ) -> Result<crate::routing::MixedAlignedTranslationResult, TranslatorError> {
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap).translate_mixed_texts_with_alignment(
+            inputs,
+            forced_source_code.map(LanguageCode::from).as_ref(),
+            &LanguageCode::from(target_code),
+            available_language_codes,
+        )
+    }
+
     pub fn translate_structured_fragments(
         &self,
         fragments: &[StyledFragment],

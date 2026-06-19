@@ -61,6 +61,187 @@ const MAX_TILT_RADIANS: f32 = 0.26; // ~15°
 /// stroke, drop out either way. Floored at `INK_CUT` so a weak matte still has a
 /// core.
 const STROKE_CORE_FRAC: f32 = 0.6;
+
+/// Matte alpha (0..255) above which a pixel counts as ink for bold pooling.
+pub(crate) const INK_BOLD_ALPHA_CUT: u8 = 40;
+/// Need at least this many ink pixels to trust a pooled bold estimate.
+pub(crate) const INK_BOLD_MIN_PX: u64 = 30;
+/// Mean pooled bold (0..1) at or above which a word/line counts as bold.
+pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.5;
+/// A firing gap wider than this multiple of the line's median character advance starts a
+/// new word — the fallback for recognizer models/charsets that under-emit the space class.
+/// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
+pub(crate) const WORD_GAP_FACTOR: f32 = 1.8;
+
+/// Per-reading-axis-column reduction of an ink strip's bold channel: for each strip column,
+/// the matte-gated sum of the bold channel and the count of ink pixels, prefix-summed so any
+/// reading-axis fraction window pools in O(1). The strip's height never escapes pooling, so
+/// this is all the live acquire stage needs to keep to recover per-word bold at rec time —
+/// far smaller than the 2-D strips, and indexed by the same reading-axis fraction the CTC
+/// firings use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoldProfile {
+    width: u32,
+    /// `psum[x]` = Σ bold over ink pixels in columns `[0, x)`; length `width + 1`.
+    psum: Vec<u64>,
+    /// `pcount[x]` = ink pixel count in columns `[0, x)`; length `width + 1`.
+    pcount: Vec<u64>,
+}
+
+impl BoldProfile {
+    pub fn from_strip(bold: &GrayImage, matte: &GrayImage) -> Option<Self> {
+        if bold.dimensions() != matte.dimensions() || matte.width() == 0 {
+            return None;
+        }
+        let (w, h) = matte.dimensions();
+        let mut psum = vec![0u64; w as usize + 1];
+        let mut pcount = vec![0u64; w as usize + 1];
+        for x in 0..w {
+            let (mut s, mut c) = (0u64, 0u64);
+            for y in 0..h {
+                if matte.get_pixel(x, y)[0] >= INK_BOLD_ALPHA_CUT {
+                    s += bold.get_pixel(x, y)[0] as u64;
+                    c += 1;
+                }
+            }
+            psum[x as usize + 1] = psum[x as usize] + s;
+            pcount[x as usize + 1] = pcount[x as usize] + c;
+        }
+        Some(Self {
+            width: w,
+            psum,
+            pcount,
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Mean bold (0..1) over the whole strip's ink, or `None` when there is too little ink to
+    /// trust — the whole-line fallback weight, matching [`crate::ppocr::InkStrip::pooled_bold`].
+    pub fn whole_pooled_bold(&self) -> Option<f32> {
+        let n = self.pcount[self.width as usize];
+        (n >= INK_BOLD_MIN_PX).then(|| self.psum[self.width as usize] as f32 / n as f32 / 255.0)
+    }
+
+    /// Mean bold probability (0..1) over the ink pixels in the reading-axis fraction window
+    /// `[frac_lo, frac_hi)`. 0.0 when the window has no ink.
+    fn pool(&self, frac_lo: f32, frac_hi: f32) -> f32 {
+        let w = self.width as f32;
+        let x0 = (frac_lo * w).floor().clamp(0.0, w) as usize;
+        let x1 = (frac_hi * w).ceil().clamp(0.0, w) as usize;
+        let n = self.pcount[x1] - self.pcount[x0];
+        if n == 0 {
+            return 0.0;
+        }
+        (self.psum[x1] - self.psum[x0]) as f32 / n as f32 / 255.0
+    }
+}
+
+/// Median reading-axis advance between consecutive firings (robust to the few large
+/// inter-word gaps). Returns 1.0 for fewer than two firings, disabling gap splitting.
+fn firing_median_advance(firings: &[(char, f32)]) -> f32 {
+    if firings.len() < 2 {
+        return 1.0;
+    }
+    let mut adv: Vec<f32> = firings.windows(2).map(|w| w[1].1 - w[0].1).collect();
+    adv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    adv[adv.len() / 2]
+}
+
+/// Word units (inclusive `(start, end)` firing index ranges over non-whitespace firings),
+/// split on the recognizer's space class or a firing gap wider than [`WORD_GAP_FACTOR`]×
+/// the median advance.
+fn firing_word_units(firings: &[(char, f32)]) -> Vec<(usize, usize)> {
+    let gap_thresh = WORD_GAP_FACTOR * firing_median_advance(firings);
+    let mut units = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+    for (i, (c, at)) in firings.iter().enumerate() {
+        if c.is_whitespace() {
+            if let Some((s, l)) = cur.take() {
+                units.push((s, l));
+            }
+            continue;
+        }
+        cur = match cur {
+            None => Some((i, i)),
+            Some((s, l)) => {
+                if at - firings[l].1 > gap_thresh {
+                    units.push((s, l));
+                    Some((i, i))
+                } else {
+                    Some((s, i))
+                }
+            }
+        };
+    }
+    if let Some((s, l)) = cur {
+        units.push((s, l));
+    }
+    units
+}
+
+/// Bold byte ranges within `text`, from CTC firings paired with the ink bold profile. Word
+/// units come from the firings (space class / gaps for space scripts, per glyph for CJK);
+/// each unit's reading-axis window is pooled over the bold profile and, if it clears
+/// `threshold`, the matching text word's byte range is emitted. Units map onto text words
+/// positionally; returns empty (caller falls back to a per-line estimate) if the firings
+/// are absent or the unit and word counts disagree.
+pub fn word_bold_ranges(
+    text: &str,
+    firings: &[(char, f32)],
+    is_cjk: bool,
+    profile: &BoldProfile,
+    threshold: f32,
+) -> Vec<(u32, u32)> {
+    if firings.is_empty() || profile.width() == 0 {
+        return Vec::new();
+    }
+    let units: Vec<(usize, usize)> = if is_cjk {
+        firings
+            .iter()
+            .enumerate()
+            .filter(|(_, (c, _))| !c.is_whitespace())
+            .map(|(i, _)| (i, i))
+            .collect()
+    } else {
+        firing_word_units(firings)
+    };
+    let base = text.as_ptr() as usize;
+    let text_words: Vec<(usize, usize)> = if is_cjk {
+        text.char_indices()
+            .filter(|(_, c)| !c.is_whitespace())
+            .map(|(b, c)| (b, b + c.len_utf8()))
+            .collect()
+    } else {
+        text.split_whitespace()
+            .map(|w| {
+                let s = w.as_ptr() as usize - base;
+                (s, s + w.len())
+            })
+            .collect()
+    };
+    if units.len() != text_words.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (k, &(s, _)) in units.iter().enumerate() {
+        let lo = firings[s].1.clamp(0.0, 1.0);
+        let hi = if k + 1 < units.len() {
+            firings[units[k + 1].0].1.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+        .max(lo);
+        if profile.pool(lo, hi) >= threshold {
+            let (bs, be) = text_words[k];
+            out.push((bs as u32, be as u32));
+        }
+    }
+    out
+}
+
 /// Typography recovered from one line's ink matte, in the source image's pixel
 /// space (converted out of strip space via the box dimensions).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -446,6 +627,30 @@ fn least_squares(xs: &[f32], ys: &[f32], keep: &[bool]) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_bold_ranges_marks_only_the_bold_word() {
+        // 100×10 strip, fully inked; the left half is bold (255), the right half is not (0).
+        let matte = GrayImage::from_pixel(100, 10, image::Luma([255]));
+        let bold = GrayImage::from_fn(100, 10, |x, _| image::Luma([if x < 50 { 255 } else { 0 }]));
+        let profile = BoldProfile::from_strip(&bold, &matte).expect("profile");
+        // "aa bb": first word fires in the bold half, second word in the plain half.
+        let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
+        let ranges = word_bold_ranges("aa bb", &firings, false, &profile, MODEL_BOLD_THRESHOLD);
+        assert_eq!(ranges, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn bold_profile_pool_matches_a_direct_mean() {
+        let matte = GrayImage::from_fn(20, 8, |x, _| {
+            image::Luma([if x % 2 == 0 { 255 } else { 0 }])
+        });
+        let bold = GrayImage::from_pixel(20, 8, image::Luma([200]));
+        let profile = BoldProfile::from_strip(&bold, &matte).expect("profile");
+        // Only the 10 even (inked) columns contribute; each is bold 200/255.
+        assert!((profile.pool(0.0, 1.0) - 200.0 / 255.0).abs() < 1e-6);
+        assert_eq!(profile.whole_pooled_bold(), Some(200.0 / 255.0));
+    }
 
     /// Paint a matte where each column's ink spans `[centre(x)-half, centre(x)+half]`
     /// rows at full alpha, with `centre(x) = c0 + slope*x`.

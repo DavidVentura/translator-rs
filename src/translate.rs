@@ -178,6 +178,29 @@ impl<'a> Translator<'a> {
         .map_err(TranslatorError::translation)
     }
 
+    #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+    pub(crate) fn translate_mixed_texts_with_alignment(
+        &mut self,
+        inputs: &[String],
+        forced_source_code: Option<&LanguageCode>,
+        target_code: &LanguageCode,
+        available_language_codes: &[LanguageCode],
+    ) -> Result<crate::routing::MixedAlignedTranslationResult, TranslatorError> {
+        let available_language_codes = available_language_codes
+            .iter()
+            .map(|code| code.as_str().to_string())
+            .collect::<Vec<_>>();
+        crate::routing::translate_mixed_texts_with_alignment_in_snapshot(
+            self.engine,
+            self.snapshot,
+            inputs,
+            forced_source_code.map(LanguageCode::as_str),
+            target_code.as_str(),
+            &available_language_codes,
+        )
+        .map_err(TranslatorError::translation)
+    }
+
     pub fn translate_structured_fragments(
         &mut self,
         fragments: &[StyledFragment],
@@ -359,7 +382,12 @@ pub(crate) fn remap_byte_ranges_through_alignment(
 /// One-to-one character alignment for an untranslated passthrough (e.g. source
 /// language equals target): char `i` of the source maps to char `i` of the
 /// "translation". Used by the document translators when no model is run.
-#[cfg(any(feature = "odt", feature = "epub"))]
+#[cfg(any(
+    feature = "odt",
+    feature = "epub",
+    feature = "ppocr",
+    feature = "planar-tracker"
+))]
 pub(crate) fn identity_char_alignments(text: &str) -> Vec<TokenAlignment> {
     let count = text.chars().count() as u64;
     (0..count)

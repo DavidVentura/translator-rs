@@ -127,7 +127,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .map(|s| {
             s.as_ref()
                 .and_then(|s| s.pooled_bold())
-                .map(|p| p >= MODEL_BOLD_THRESHOLD)
+                .map(|p| p >= crate::text_metrics::MODEL_BOLD_THRESHOLD)
         })
         .collect();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
@@ -145,16 +145,15 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
                 .iter()
                 .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
                 .collect();
-            let word_ranges = match (strip, strip.and_then(|s| s.bold.as_ref())) {
-                (Some(s), Some(bold)) => crate::ppocr::word_bold_ranges(
+            let word_ranges = match strip.and_then(|s| s.bold_profile()) {
+                Some(profile) => crate::text_metrics::word_bold_ranges(
                     &line.text,
                     &firings,
                     scripts[i] == PpocrScript::Cj,
-                    bold,
-                    &s.matte,
-                    MODEL_BOLD_THRESHOLD,
+                    &profile,
+                    crate::text_metrics::MODEL_BOLD_THRESHOLD,
                 ),
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             if !word_ranges.is_empty() {
                 word_ranges
@@ -255,9 +254,6 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
         score: b.score,
     }
 }
-
-#[cfg(feature = "ppocr")]
-pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.5;
 
 /// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent

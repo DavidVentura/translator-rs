@@ -45,6 +45,10 @@ pub struct SurfaceLine {
     pub source_text: String,
     /// Translated text for this line. Mirrors `source_text` policy.
     pub translated_text: String,
+    /// Per-word bold byte ranges over `source_text` (trimmed), pooled from the ink bold
+    /// channel + CTC firings at the last rec. Cached so lines that skip re-rec (held camera)
+    /// keep their per-word weight instead of falling back to a whole-line estimate.
+    pub source_bold_ranges: Vec<crate::ocr::BoldRange>,
     /// BCP-47 source language tag (e.g. "nl", "en"), or empty when
     /// the source language wasn't recorded.
     pub source_language: String,
@@ -269,6 +273,7 @@ impl SurfaceMap {
             bbox: obs.bbox,
             source_text: obs.source_text,
             translated_text: obs.translated_text,
+            source_bold_ranges: Vec::new(),
             source_language: obs.source_language,
             observation_count: 1,
             last_rec_extent: None,

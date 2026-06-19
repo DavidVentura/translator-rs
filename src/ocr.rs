@@ -414,6 +414,20 @@ fn is_cjk_char(c: char) -> bool {
         || (0x1100..=0x11FF).contains(&cp)
 }
 
+/// Whether a line should be word-segmented per glyph (CJK) rather than on spaces/gaps: true
+/// when at least half its non-space characters are CJK. The still path keys this off the
+/// recognizer's script class; the live path has only the recognized text.
+pub fn is_cjk_text(s: &str) -> bool {
+    let (mut cjk, mut total) = (0usize, 0usize);
+    for c in s.chars().filter(|c| !c.is_whitespace()) {
+        total += 1;
+        if is_cjk_char(c) {
+            cjk += 1;
+        }
+    }
+    total > 0 && cjk * 2 >= total
+}
+
 impl TextBlock {
     pub fn source_text(&self) -> String {
         self.lines

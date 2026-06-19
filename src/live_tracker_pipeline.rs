@@ -558,10 +558,10 @@ pub struct LiveTrackerPipeline {
     /// line's grouping box. Lives alongside `matted_strips` because both are
     /// produced from the same per-frame ink mattes.
     line_metrics: Mutex<HashMap<u64, Vec<Option<crate::text_metrics::LineMetrics>>>>,
-    /// Per-anchor per-box bold flags from the ink model's bold channel (pooled +
-    /// thresholded), indexed parallel to the anchor's detections. `None` per box when
-    /// the model has no bold channel; populated alongside `line_metrics`.
-    model_bold: Mutex<HashMap<u64, Vec<Option<bool>>>>,
+    /// Per-anchor per-box ink bold column profiles, indexed parallel to the anchor's
+    /// detections. Pooled per word against CTC firings in `run_post_detect`. `None` per box
+    /// when the model has no bold channel; populated alongside `line_metrics`.
+    bold_profiles: Mutex<HashMap<u64, Vec<Option<crate::text_metrics::BoldProfile>>>>,
     generation: AtomicU64,
     config: Mutex<PipelineConfig>,
     catalog: Arc<TranslatorSession>,
@@ -598,7 +598,7 @@ impl LiveTrackerPipeline {
             pending_compose: Mutex::new(None),
             matted_strips: Mutex::new(HashMap::new()),
             line_metrics: Mutex::new(HashMap::new()),
-            model_bold: Mutex::new(HashMap::new()),
+            bold_profiles: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             config: Mutex::new(PipelineConfig::default()),
             catalog,
@@ -1536,15 +1536,12 @@ impl LiveTrackerPipeline {
                 .catalog
                 .ppocr_ink_strips(rgb, &scaled, canonical_quadrant)
                 .unwrap_or_default();
-            // Bold per box from the model's ch1 (pooled + thresholded), parallel to
-            // `detected`; `None` per box when the model has no bold channel.
-            let model_bold: Vec<Option<bool>> = ink_strips
+            // Bold column profile per box from the model's ch1, parallel to `detected`;
+            // pooled per word against CTC firings at rec time. `None` per box when the model
+            // has no bold channel.
+            let bold_profiles: Vec<Option<crate::text_metrics::BoldProfile>> = ink_strips
                 .iter()
-                .map(|s| {
-                    s.as_ref()
-                        .and_then(|s| s.pooled_bold())
-                        .map(|p| p >= crate::ocr_runtime::MODEL_BOLD_THRESHOLD)
-                })
+                .map(|s| s.as_ref().and_then(|s| s.bold_profile()))
                 .collect();
             let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
                 .iter()
@@ -1572,8 +1569,8 @@ impl LiveTrackerPipeline {
             if let Ok(mut store) = self.line_metrics.lock() {
                 store.insert(anchor_id, metrics);
             }
-            if let Ok(mut store) = self.model_bold.lock() {
-                store.insert(anchor_id, model_bold);
+            if let Ok(mut store) = self.bold_profiles.lock() {
+                store.insert(anchor_id, bold_profiles);
             }
             let strips = crate::color_matting::mat_detections(
                 &rgb.to_rgba8(),
@@ -1628,10 +1625,11 @@ impl LiveTrackerPipeline {
                 Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
                 Err(_) => Vec::new(),
             };
-        let model_bold: Vec<Option<bool>> = match self.model_bold.lock() {
-            Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        let bold_profiles: Vec<Option<crate::text_metrics::BoldProfile>> =
+            match self.bold_profiles.lock() {
+                Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
         let canonical_quadrant = self
             .engine
             .lock()
@@ -1653,7 +1651,7 @@ impl LiveTrackerPipeline {
             canonical_quadrant,
             &matted_strips,
             &line_metrics,
-            &model_bold,
+            &bold_profiles,
             &cancel,
         )
     }
@@ -1837,7 +1835,7 @@ impl LiveTrackerPipeline {
                 font_provider: &*self.font_provider,
                 matted_strips: &[],
                 line_metrics: &[],
-                model_bold: &[],
+                bold_profiles: &[],
                 rec_batch_size: cfg.rec_batch_size,
                 canonical_quadrant,
             },
@@ -2039,7 +2037,7 @@ pub(crate) fn acquire_rec_translate(
     canonical_quadrant: Option<Quadrant>,
     matted_strips: &[Option<MattedStrip>],
     line_metrics: &[Option<crate::text_metrics::LineMetrics>],
-    model_bold: &[Option<bool>],
+    bold_profiles: &[Option<crate::text_metrics::BoldProfile>],
     cancel: &dyn Fn() -> bool,
 ) -> Result<PostDetectOutcome, &'static str> {
     let available_codes: Vec<LanguageCode> = catalog
@@ -2068,7 +2066,7 @@ pub(crate) fn acquire_rec_translate(
             font_provider,
             matted_strips,
             line_metrics,
-            model_bold,
+            bold_profiles,
             rec_batch_size,
             canonical_quadrant,
         },
