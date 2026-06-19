@@ -47,13 +47,13 @@ use image::{GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 use crate::DetectedTextBox;
 
 /// Per-detection matting result, shared by the still-image and live-camera
-/// overlays. The `strip_rgba` is a rectified RGBA image: every RGB pixel is
-/// the reconstructed background field, and the **alpha channel is coverage** —
-/// opaque (255) where the source ink was (and has been erased), transparent
-/// (0) elsewhere. Consumers composite through that coverage: the still path
-/// blits the strip back into the source image so only the erased ink pixels
-/// are overwritten; the live path uploads it as a warped quad so the live
-/// camera shows through between glyphs. To map it back into canonical-frame
+/// overlays. The `strip_rgba` is a rectified RGBA image — an opaque "pill": its
+/// RGB is the original sampled background everywhere except under the strokes,
+/// where it is the reconstructed background field, and the **alpha is opacity**,
+/// full inside the text band and feathered to zero across the outer padding. The
+/// live path uploads it as a warped quad; because the pill content already
+/// matches the scene, a slightly-off tracker homography slides a matching patch
+/// instead of exposing the ink-shaped mask. To map it back into canonical-frame
 /// coords, treat the strip as an axis-aligned bitmap centred at
 /// `(canonical_cx, canonical_cy)` with dimensions `canonical_width` ×
 /// `canonical_height`, rotated by `canonical_angle_radians`.
@@ -493,10 +493,29 @@ fn mat_strip_for_detection(
     // inpaint walk fails: gradients (the field follows them) and dense
     // text (a block almost always has some non-ink pixel nearby).
     let bg = background_field(&strip_image, &strip_mask, strip_w, strip_h, BG_BLOCK);
+    // Opaque "pill": the strip carries the *original* sampled background everywhere except
+    // under the strokes, where it carries the reconstructed field. The alpha is full inside
+    // the text band and feathers to zero across the outer padding, so a slightly-off
+    // homography slides a patch whose content already matches the scene instead of dragging
+    // the ink-shaped coverage mask across it. (The old coverage alpha let the live camera
+    // show through between glyphs, which on a small lighting shift drew a distracting
+    // high-contrast outline along each stroke.)
+    let feather = (strip_h as f32 * 0.25).max(2.0);
     let mut strip_bytes = Vec::with_capacity((strip_w * strip_h * 4) as usize);
-    for (m, b) in strip_mask.iter().zip(bg.iter()) {
-        let coverage = if *m { 255 } else { 0 };
-        strip_bytes.extend_from_slice(&[b[0], b[1], b[2], coverage]);
+    for sy in 0..strip_h {
+        for sx in 0..strip_w {
+            let i = (sy * strip_w + sx) as usize;
+            let px = if strip_mask[i] {
+                let b = bg[i];
+                [b[0], b[1], b[2]]
+            } else {
+                let o = strip_image[i];
+                [o[0], o[1], o[2]]
+            };
+            let edge = (sx.min(strip_w - 1 - sx)).min(sy.min(strip_h - 1 - sy)) as f32;
+            let alpha = ((edge / feather).clamp(0.0, 1.0) * 255.0).round() as u8;
+            strip_bytes.extend_from_slice(&[px[0], px[1], px[2], alpha]);
+        }
     }
 
     Some(MattedStrip {
