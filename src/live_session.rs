@@ -234,8 +234,9 @@ pub struct BlockSpec {
     /// `glyph_instances`. Block-local because they're shaped at upsert
     /// time; merged across blocks (deduped by key) at draw-list build.
     pub glyph_masks: HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
-    /// Render the block's translation bold (from the source lines' ink weight).
-    pub is_bold: bool,
+    /// Bold byte ranges within `display_text` (per-word weight carried through translation).
+    /// Empty = not bold; `[0, len)` = whole block bold.
+    pub bold_ranges: Vec<crate::ocr::BoldRange>,
 }
 
 /// Per-anchor live state. Each acquired anchor (engine
@@ -928,7 +929,7 @@ impl LiveSession {
         source_text: String,
         translated_text: String,
         language: String,
-        is_bold: bool,
+        bold_ranges: Vec<crate::ocr::BoldRange>,
         font_provider: &dyn crate::font_provider::FontProvider,
     ) {
         if strips.is_empty() {
@@ -955,7 +956,7 @@ impl LiveSession {
             content_hash: hash,
             glyph_instances: Vec::new(),
             glyph_masks: HashMap::new(),
-            is_bold,
+            bold_ranges,
         };
         // Both paths composite glyphs on the GPU from these pre-shaped instances;
         // shape them here (off the present thread, once per content change) so
@@ -2213,7 +2214,7 @@ impl LiveSession {
                 String::new(),
                 String::new(),
                 input.to_lang.to_string(),
-                block_bold[i],
+                Vec::new(),
                 input.font_provider,
             );
         }
@@ -2441,6 +2442,18 @@ impl LiveSession {
                                 .collect()
                         };
                         let kept_mats = pick_matted_for_block(input.matted_strips, &kept_indices);
+                        // Whole-block weight from the ink bold channel. Live keeps block
+                        // granularity (per-word would need the bold strips + CTC firings
+                        // paired at rec time and an aligned mixed-translate); the still path
+                        // is per-word.
+                        let block_bold_ranges = if block_bold[bi] && !translated.trim().is_empty() {
+                            vec![crate::ocr::BoldRange {
+                                start: 0,
+                                end: translated.len() as u32,
+                            }]
+                        } else {
+                            Vec::new()
+                        };
                         self.ingest_translation(input.anchor_id, &line_ids, &translated);
                         self.upsert_block(
                             input.anchor_id,
@@ -2450,7 +2463,7 @@ impl LiveSession {
                             src,
                             translated,
                             input.to_lang.to_string(),
-                            block_bold[bi],
+                            block_bold_ranges,
                             input.font_provider,
                         );
                         block_translated[bi] = true;
@@ -3261,11 +3274,7 @@ fn build_block_text_block(
         },
         background_argb: 0,
         foreground_argb: block_fallback_fg,
-        // Live carries block-level weight via `is_bold`; the renderer treats an empty
-        // `bold_ranges` + `is_bold` as a whole-block bold run. Per-word live bold (CTC
-        // firings + alignment carry) is wired on the still path, not yet here.
-        is_bold: spec.is_bold,
-        bold_ranges: Vec::new(),
+        bold_ranges: spec.bold_ranges.clone(),
     })
 }
 
@@ -3331,7 +3340,6 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
             oriented_box: l.bbox.clone(),
             tight_box: l.bbox.clone(),
             word_rects: Vec::new(),
-            is_bold: false,
             bold_ranges: Vec::new(),
         })
         .collect();

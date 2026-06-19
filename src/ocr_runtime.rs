@@ -176,7 +176,6 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         &det_boxes,
         lines,
         &text_metrics,
-        &model_bold,
         &line_bold_ranges,
         min_confidence,
         reading_order,
@@ -291,7 +290,6 @@ fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
-    model_bold: &[Option<bool>],
     line_bold_ranges: &[Vec<crate::ocr::BoldRange>],
     min_confidence: u32,
     reading_order: ReadingOrder,
@@ -300,19 +298,13 @@ fn still_ppocr_lines_to_blocks(
     // recognizer's built-in `rec_drop_score`: lines the model accepted but whose mean
     // CTC score sits below the user's bar are dropped before paragraph grouping.
     let min_score = min_confidence as f32 / 100.0;
-    // Bold from the ink model's bold channel (pooled + thresholded per box). A box with
-    // no bold channel (legacy matte-only model) or no ink reads as not-bold.
-    let bold: Vec<bool> = model_bold.iter().map(|m| m.unwrap_or(false)).collect();
     let text_lines: Vec<TextLine> = boxes
         .iter()
         .zip(lines.into_iter())
         .zip(text_metrics.iter())
-        .zip(bold.iter())
         .zip(line_bold_ranges.iter())
-        .filter(|((((_, line), _), _), _)| {
-            !line.text.trim().is_empty() && line.confidence >= min_score
-        })
-        .map(|((((b, line), metrics), &is_bold), bold_ranges)| {
+        .filter(|(((_, line), _), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
+        .map(|(((b, line), metrics), bold_ranges)| {
             let delta = metrics.map_or(0.0, |m| m.baseline_angle_delta);
             let mut oriented_box = line.oriented_box;
             oriented_box.angle_radians += delta;
@@ -328,7 +320,6 @@ fn still_ppocr_lines_to_blocks(
                 oriented_box,
                 tight_box,
                 word_rects: vec![line.rect],
-                is_bold,
                 bold_ranges: bold_ranges.clone(),
             }
         })

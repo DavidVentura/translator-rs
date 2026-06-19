@@ -669,30 +669,23 @@ fn render_per_line(
     }
 
     let language = opts.language.clone();
-    let bold = block.is_bold;
     // Per-word bold ranges, rebased onto the trimmed `translated` string (block.bold_ranges
-    // index the untrimmed translated text). Empty → uniform `bold` for the whole block.
+    // index the untrimmed translated text). A whole-bold block is one `[0, len)` range.
     let trim_lead = block.translated_text.len() - block.translated_text.trim_start().len();
-    let bold_spans: Vec<(usize, usize)> = if block.bold_ranges.is_empty() {
-        // No per-word data: fall back to the block-level flag (whole block bold or not).
-        if block.is_bold {
-            vec![(0, translated.len())]
-        } else {
-            Vec::new()
-        }
-    } else {
-        block
-            .bold_ranges
-            .iter()
-            .filter_map(|r| {
-                let s = (r.start as usize).saturating_sub(trim_lead);
-                let e = (r.end as usize)
-                    .saturating_sub(trim_lead)
-                    .min(translated.len());
-                (s < e).then_some((s, e))
-            })
-            .collect()
-    };
+    let bold_spans: Vec<(usize, usize)> = block
+        .bold_ranges
+        .iter()
+        .filter_map(|r| {
+            let s = (r.start as usize).saturating_sub(trim_lead);
+            let e = (r.end as usize)
+                .saturating_sub(trim_lead)
+                .min(translated.len());
+            (s < e).then_some((s, e))
+        })
+        .collect();
+    // Break/size shaping uses one weight; pick bold when any run is bold (conservative —
+    // bold is wider, so lines won't overflow when the real runs are mixed).
+    let bold = !bold_spans.is_empty();
     let mut size = block
         .layout_hints
         .suggested_font_size_px
@@ -946,7 +939,8 @@ fn render_vertical_block_rect(
         return;
     }
     let language = opts.language.clone();
-    let bold = block.is_bold;
+    // Vertical CJK keeps one weight per block (no per-glyph runs); bold if any run is bold.
+    let bold = !block.bold_ranges.is_empty();
     let mut size = block
         .layout_hints
         .suggested_font_size_px

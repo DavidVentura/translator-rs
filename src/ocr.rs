@@ -229,14 +229,9 @@ pub struct TextLine {
     /// for engines that don't expose a tighter metric.
     pub tight_box: OrientedRect,
     pub word_rects: Vec<Rect>,
-    /// Whether the source line reads as bold, from its ink stroke-to-x-height
-    /// weight ([`crate::text_metrics::LineMetrics::is_bold`]). Carried through
-    /// grouping so the overlay can render the translation bold. `false` for
-    /// engines/paths that don't measure weight.
-    pub is_bold: bool,
-    /// Bold byte ranges within `text` from per-word ink-bold pooling. Empty when no
-    /// per-word data is available; the overlay then falls back to `is_bold` for the
-    /// whole line. A whole-bold line is `[0, text.len())`.
+    /// Bold byte ranges within `text`, from per-word ink-bold pooling (CTC firings paired
+    /// with the ink model's bold channel). Empty = not bold; a whole-bold line is
+    /// `[0, text.len())`. Carried through grouping so the overlay renders mixed-weight lines.
     pub bold_ranges: Vec<BoldRange>,
 }
 
@@ -282,11 +277,9 @@ pub struct PreparedTextBlock {
     pub layout_hints: OverlayLayoutHints,
     pub background_argb: u32,
     pub foreground_argb: u32,
-    /// Render the translation bold, set when the block's source lines read bold
-    /// (ink stroke weight). The renderer requests a bold font face for the block.
-    pub is_bold: bool,
-    /// Bold byte ranges within `translated_text` (per-word weight carried through
-    /// translation). Empty → the renderer falls back to `is_bold` for the whole block.
+    /// Bold byte ranges within `translated_text` — per-word weight carried through
+    /// translation (empty = not bold; `[0, len)` = whole block bold). The renderer splits
+    /// each line into bold/regular runs on these.
     pub bold_ranges: Vec<BoldRange>,
 }
 
@@ -855,7 +848,6 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
         oriented_box: OrientedRect::axis_aligned(bb),
         tight_box,
         word_rects,
-        is_bold: a.is_bold || b.is_bold,
         bold_ranges,
     }
 }
@@ -1173,7 +1165,6 @@ fn transpose_line(line: TextLine, frame_x: u32) -> TextLine {
             .into_iter()
             .map(|r| transpose_rect(r, frame_x))
             .collect(),
-        is_bold: line.is_bold,
         bold_ranges: line.bold_ranges,
     }
 }
@@ -1189,7 +1180,6 @@ fn untranspose_line(line: TextLine, frame_x: u32) -> TextLine {
             .into_iter()
             .map(|r| untranspose_rect(r, frame_x))
             .collect(),
-        is_bold: line.is_bold,
         bold_ranges: line.bold_ranges,
     }
 }
@@ -2238,11 +2228,7 @@ pub fn prepare_overlay_image(
     {
         let block_bounds = block.bounds();
         let layout_hints = overlay_layout_hints(block, reading_order);
-        // Bold is a block property (a heading is its own paragraph): render the
-        // translation bold when most of the block's source lines read bold.
-        let block_is_bold =
-            block.lines.iter().filter(|l| l.is_bold).count() * 2 >= block.lines.len().max(1);
-        // Per-word bold carried through translation; empty falls back to `block_is_bold`.
+        // Per-word bold carried through translation (byte ranges into the translated text).
         let bold_ranges = block_bold_ranges.get(index).cloned().unwrap_or_default();
         match reading_order {
             ReadingOrder::LeftToRight => {
@@ -2273,7 +2259,6 @@ pub fn prepare_overlay_image(
                     layout_hints,
                     background_argb: block_background,
                     foreground_argb: block_foreground,
-                    is_bold: block_is_bold,
                     bold_ranges: bold_ranges.clone(),
                 });
             }
@@ -2307,7 +2292,6 @@ pub fn prepare_overlay_image(
                     layout_hints,
                     background_argb: colors.background_argb,
                     foreground_argb: colors.foreground_argb,
-                    is_bold: block_is_bold,
                     bold_ranges,
                 });
             }
@@ -2477,7 +2461,6 @@ pub fn build_text_blocks(
                 oriented_box: OrientedRect::axis_aligned(word.bounding_box),
                 tight_box: OrientedRect::axis_aligned(word.bounding_box),
                 word_rects: vec![word.bounding_box],
-                is_bold: false,
                 bold_ranges: Vec::new(),
             });
         } else if let Some(line) = current_line.as_mut() {
@@ -2497,7 +2480,6 @@ pub fn build_text_blocks(
                     oriented_box: OrientedRect::axis_aligned(word.bounding_box),
                     tight_box: OrientedRect::axis_aligned(word.bounding_box),
                     word_rects: vec![word.bounding_box],
-                    is_bold: false,
                     bold_ranges: Vec::new(),
                 };
                 if !lines.is_empty() {
@@ -2587,7 +2569,7 @@ mod tests {
             },
             tight_box: tight,
             word_rects: vec![rect],
-            is_bold: false,
+            bold_ranges: Vec::new(),
         }
     }
 
@@ -2614,7 +2596,7 @@ mod tests {
             oriented_box: OrientedRect::axis_aligned(rect),
             tight_box: tight,
             word_rects: vec![rect],
-            is_bold: false,
+            bold_ranges: Vec::new(),
         }
     }
 
@@ -2707,7 +2689,7 @@ mod tests {
                     oriented_box: super::OrientedRect::axis_aligned(top_rect),
                     tight_box: super::OrientedRect::axis_aligned(top_rect),
                     word_rects: vec![top_rect],
-                    is_bold: false,
+                    bold_ranges: Vec::new(),
                 },
                 TextLine {
                     text: "bottom".to_string(),
@@ -2715,7 +2697,7 @@ mod tests {
                     oriented_box: super::OrientedRect::axis_aligned(bottom_rect),
                     tight_box: super::OrientedRect::axis_aligned(bottom_rect),
                     word_rects: vec![bottom_rect],
-                    is_bold: false,
+                    bold_ranges: Vec::new(),
                 },
             ],
         }];
@@ -2727,6 +2709,7 @@ mod tests {
             height,
             &blocks,
             &translated,
+            &[],
             BackgroundMode::BlackOnWhite,
             ReadingOrder::LeftToRight,
             None,
@@ -2758,7 +2741,7 @@ mod tests {
     }
 
     #[test]
-    fn block_bold_is_majority_of_source_lines() {
+    fn block_bold_ranges_pass_through_to_prepared() {
         let rgba = vec![0xFFu8; 8 * 8 * 4];
         let rect = Rect {
             left: 1,
@@ -2766,31 +2749,40 @@ mod tests {
             right: 7,
             bottom: 6,
         };
-        let make = |bold: bool| TextBlock {
+        let make = || TextBlock {
             lines: vec![TextLine {
                 text: "x".to_string(),
                 bounding_box: rect,
                 oriented_box: super::OrientedRect::axis_aligned(rect),
                 tight_box: super::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
-                is_bold: bold,
+                bold_ranges: Vec::new(),
             }],
         };
-        let blocks = vec![make(true), make(false)];
+        let blocks = vec![make(), make()];
         let translated = vec!["a".to_string(), "b".to_string()];
+        let block_bold_ranges = vec![vec![super::BoldRange { start: 0, end: 1 }], Vec::new()];
         let prepared = prepare_overlay_image(
             &rgba,
             8,
             8,
             &blocks,
             &translated,
+            &block_bold_ranges,
             BackgroundMode::BlackOnWhite,
             ReadingOrder::LeftToRight,
             None,
         )
         .expect("overlay should prepare");
-        assert!(prepared.blocks[0].is_bold, "bold line → bold block");
-        assert!(!prepared.blocks[1].is_bold, "regular line → regular block");
+        assert_eq!(
+            prepared.blocks[0].bold_ranges,
+            vec![super::BoldRange { start: 0, end: 1 }],
+            "bold range carried to the prepared block"
+        );
+        assert!(
+            prepared.blocks[1].bold_ranges.is_empty(),
+            "regular block has no bold ranges"
+        );
     }
 
     #[test]
@@ -2816,7 +2808,7 @@ mod tests {
                 oriented_box: super::OrientedRect::axis_aligned(rect),
                 tight_box: super::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
-                is_bold: false,
+                bold_ranges: Vec::new(),
             }],
         }];
 
@@ -2826,6 +2818,7 @@ mod tests {
             height,
             &blocks,
             &["x".to_string()],
+            &[],
             BackgroundMode::AutoDetect,
             ReadingOrder::LeftToRight,
             None,
@@ -3309,7 +3302,7 @@ mod tests {
                 angle_radians: theta,
             },
             word_rects: vec![rect],
-            is_bold: false,
+            bold_ranges: Vec::new(),
         }
     }
 
