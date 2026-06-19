@@ -3261,8 +3261,11 @@ fn build_block_text_block(
         },
         background_argb: 0,
         foreground_argb: block_fallback_fg,
-        // Live bold not wired yet (needs the weight on BlockSpec); still path is bold-aware.
+        // Live carries block-level weight via `is_bold`; the renderer treats an empty
+        // `bold_ranges` + `is_bold` as a whole-block bold run. Per-word live bold (CTC
+        // firings + alignment carry) is wired on the still path, not yet here.
         is_bold: spec.is_bold,
+        bold_ranges: Vec::new(),
     })
 }
 
@@ -3329,6 +3332,7 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
             tight_box: l.bbox.clone(),
             word_rects: Vec::new(),
             is_bold: false,
+            bold_ranges: Vec::new(),
         })
         .collect();
     let blocks =

@@ -260,7 +260,12 @@ impl<'a> Translator<'a> {
     /// Alignment translation for documents, with cancellation + per-sentence
     /// progress. `Ok(None)` means no translation plan (passthrough); a
     /// cancelled run errors with `TranslatorErrorKind::Cancelled`.
-    #[cfg(any(feature = "odt", feature = "epub"))]
+    #[cfg(any(
+        feature = "odt",
+        feature = "epub",
+        feature = "ppocr",
+        feature = "planar-tracker"
+    ))]
     pub(crate) fn translate_texts_with_alignment_ctx(
         &mut self,
         from_code: &LanguageCode,
@@ -299,6 +304,56 @@ pub struct TranslationWithAlignment {
     pub source_text: String,
     pub translated_text: String,
     pub alignments: Vec<TokenAlignment>,
+}
+
+/// Byte offset of each char in `s`, plus a trailing `s.len()` sentinel — index by char
+/// position to convert char offsets (what [`TokenAlignment`] uses) to byte offsets.
+fn char_byte_offsets(s: &str) -> Vec<usize> {
+    let mut v: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
+    v.push(s.len());
+    v
+}
+
+/// Project source byte ranges onto the translation via the char-offset alignments: each
+/// source range becomes the byte span covering every target token aligned to a source token
+/// it overlaps. Used to carry per-word bold from the OCR source text onto the translated
+/// text. Returns coalesced, sorted target byte ranges; empty when there are no alignments.
+pub(crate) fn remap_byte_ranges_through_alignment(
+    src_ranges: &[(u32, u32)],
+    twa: &TranslationWithAlignment,
+) -> Vec<(u32, u32)> {
+    if src_ranges.is_empty() || twa.alignments.is_empty() {
+        return Vec::new();
+    }
+    let src_char_byte = char_byte_offsets(&twa.source_text);
+    let tgt_char_byte = char_byte_offsets(&twa.translated_text);
+    let tgt_len = twa.translated_text.len();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &(bs, be) in src_ranges {
+        let c0 = src_char_byte.partition_point(|&b| b < bs as usize);
+        let c1 = src_char_byte.partition_point(|&b| b < be as usize);
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for a in &twa.alignments {
+            if (a.src_begin as usize) < c1 && (a.src_end as usize) > c0 {
+                lo = lo.min(a.tgt_begin as usize);
+                hi = hi.max(a.tgt_end as usize);
+            }
+        }
+        if lo < hi {
+            let s = tgt_char_byte.get(lo).copied().unwrap_or(0);
+            let e = tgt_char_byte.get(hi).copied().unwrap_or(tgt_len);
+            out.push((s as u32, e as u32));
+        }
+    }
+    out.sort_by_key(|r| r.0);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(out.len());
+    for r in out {
+        match merged.last_mut() {
+            Some(last) if r.0 <= last.1 => last.1 = last.1.max(r.1),
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// One-to-one character alignment for an untranslated passthrough (e.g. source

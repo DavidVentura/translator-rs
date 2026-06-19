@@ -189,6 +189,30 @@ pub struct DetectedWord {
     pub end_line: bool,
 }
 
+/// A byte range `[start, end)` of bold text within a string (line, block source, or
+/// translated block). Empty range list means "no per-word bold information"; a single
+/// `[0, len)` means the whole string is bold. Carries per-word weight through grouping and
+/// translation so the overlay can render mixed-weight lines, not one bold flag per block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct BoldRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Sort and coalesce touching/overlapping bold ranges into a minimal set.
+pub fn merge_bold_ranges(mut ranges: Vec<BoldRange>) -> Vec<BoldRange> {
+    ranges.sort_by_key(|r| r.start);
+    let mut out: Vec<BoldRange> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextLine {
     pub text: String,
@@ -210,6 +234,10 @@ pub struct TextLine {
     /// grouping so the overlay can render the translation bold. `false` for
     /// engines/paths that don't measure weight.
     pub is_bold: bool,
+    /// Bold byte ranges within `text` from per-word ink-bold pooling. Empty when no
+    /// per-word data is available; the overlay then falls back to `is_bold` for the
+    /// whole line. A whole-bold line is `[0, text.len())`.
+    pub bold_ranges: Vec<BoldRange>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,6 +285,9 @@ pub struct PreparedTextBlock {
     /// Render the translation bold, set when the block's source lines read bold
     /// (ink stroke weight). The renderer requests a bold font face for the block.
     pub is_bold: bool,
+    /// Bold byte ranges within `translated_text` (per-word weight carried through
+    /// translation). Empty → the renderer falls back to `is_bold` for the whole block.
+    pub bold_ranges: Vec<BoldRange>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -341,6 +372,21 @@ pub struct RecognizedTextLine {
     /// OCR. `None` in forced-source mode or when post-OCR language detection could not choose
     /// a translation source.
     pub source_code: Option<String>,
+    /// Per-character CTC firings, in the final text's order. The caller pairs these with the
+    /// ink bold strip to pool bold per word. Only populated for single-chunk, non-RTL lines
+    /// where the firings line up 1:1 with `text`; empty otherwise (the caller then falls back
+    /// to a per-line bold estimate).
+    pub firings: Vec<CharFiring>,
+}
+
+/// One CTC firing: a recognised character (as a Unicode scalar) and where its run fired
+/// along the strip's reading axis (`0..=1`). `u32` rather than `char` so the type is
+/// FFI-safe as a `uniffi::Record` field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct CharFiring {
+    pub ch: u32,
+    pub at: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -422,6 +468,54 @@ impl TextBlock {
             out.push_str(line);
         }
         out
+    }
+
+    /// Like [`Self::translation_text`] but also returns the block's bold byte ranges, each
+    /// line's per-word [`TextLine::bold_ranges`] re-based onto the joined string (accounting
+    /// for per-line trim, the dropped soft hyphen, and the space/concat separator). Drives
+    /// per-word bold through translation; empty when no line carried bold ranges.
+    pub fn translation_text_with_bold(&self) -> (String, Vec<BoldRange>) {
+        let mut out = String::new();
+        let mut bold: Vec<BoldRange> = Vec::new();
+        for line in &self.lines {
+            let trimmed = line.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lead = line.text.len() - line.text.trim_start().len();
+            let trail_end = line.text.trim_end().len();
+            if !out.is_empty() {
+                let prev_last = out.chars().next_back();
+                let next_first = trimmed.chars().next();
+                match (prev_last, next_first) {
+                    (Some(prev), Some(next))
+                        if matches!(prev, '-' | '\u{2010}' | '\u{00AD}') && next.is_lowercase() =>
+                    {
+                        out.pop();
+                    }
+                    (Some(prev), Some(next)) if is_cjk_char(prev) && is_cjk_char(next) => {}
+                    _ => out.push(' '),
+                }
+            }
+            let base = out.len();
+            out.push_str(trimmed);
+            for r in &line.bold_ranges {
+                let s = (r.start as usize).max(lead);
+                let e = (r.end as usize).min(trail_end);
+                if s < e {
+                    bold.push(BoldRange {
+                        start: (base + s - lead) as u32,
+                        end: (base + e - lead) as u32,
+                    });
+                }
+            }
+        }
+        let len = out.len() as u32;
+        for r in bold.iter_mut() {
+            r.end = r.end.min(len);
+        }
+        bold.retain(|r| r.start < r.end);
+        (out, merge_bold_ranges(bold))
     }
 
     pub fn bounds(&self) -> Rect {
@@ -728,9 +822,16 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
     let a_right = tight_right(&a);
     let b_left = tight_left(&b);
     let b_right = tight_right(&b);
+    let a_text_len = a.text.len();
     let mut text = a.text;
     text.push_str(separator);
     text.push_str(&b.text);
+    let b_offset = (a_text_len + separator.len()) as u32;
+    let mut bold_ranges = a.bold_ranges;
+    bold_ranges.extend(b.bold_ranges.iter().map(|r| BoldRange {
+        start: r.start + b_offset,
+        end: r.end + b_offset,
+    }));
     let new_left = a_left.min(b_left);
     let new_right = a_right.max(b_right);
     let new_cx = (new_left + new_right) * 0.5;
@@ -755,6 +856,7 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
         tight_box,
         word_rects,
         is_bold: a.is_bold || b.is_bold,
+        bold_ranges,
     }
 }
 
@@ -1072,6 +1174,7 @@ fn transpose_line(line: TextLine, frame_x: u32) -> TextLine {
             .map(|r| transpose_rect(r, frame_x))
             .collect(),
         is_bold: line.is_bold,
+        bold_ranges: line.bold_ranges,
     }
 }
 
@@ -1087,6 +1190,7 @@ fn untranspose_line(line: TextLine, frame_x: u32) -> TextLine {
             .map(|r| untranspose_rect(r, frame_x))
             .collect(),
         is_bold: line.is_bold,
+        bold_ranges: line.bold_ranges,
     }
 }
 
@@ -2122,6 +2226,7 @@ pub fn prepare_overlay_image(
     height: u32,
     blocks: &[TextBlock],
     translated_blocks: &[String],
+    block_bold_ranges: &[Vec<BoldRange>],
     background_mode: crate::BackgroundMode,
     reading_order: ReadingOrder,
     ink_mask: Option<&[bool]>,
@@ -2129,13 +2234,16 @@ pub fn prepare_overlay_image(
     let mut image = RasterImageMut::new(rgba_bytes, width, height)?;
     let mut prepared_blocks = Vec::with_capacity(blocks.len());
 
-    for (block, translated_text) in blocks.iter().zip(translated_blocks.iter()) {
+    for (index, (block, translated_text)) in blocks.iter().zip(translated_blocks.iter()).enumerate()
+    {
         let block_bounds = block.bounds();
         let layout_hints = overlay_layout_hints(block, reading_order);
         // Bold is a block property (a heading is its own paragraph): render the
         // translation bold when most of the block's source lines read bold.
         let block_is_bold =
             block.lines.iter().filter(|l| l.is_bold).count() * 2 >= block.lines.len().max(1);
+        // Per-word bold carried through translation; empty falls back to `block_is_bold`.
+        let bold_ranges = block_bold_ranges.get(index).cloned().unwrap_or_default();
         match reading_order {
             ReadingOrder::LeftToRight => {
                 let mut prepared_lines = Vec::with_capacity(block.lines.len());
@@ -2166,6 +2274,7 @@ pub fn prepare_overlay_image(
                     background_argb: block_background,
                     foreground_argb: block_foreground,
                     is_bold: block_is_bold,
+                    bold_ranges: bold_ranges.clone(),
                 });
             }
             ReadingOrder::TopToBottomRightToLeft => {
@@ -2199,6 +2308,7 @@ pub fn prepare_overlay_image(
                     background_argb: colors.background_argb,
                     foreground_argb: colors.foreground_argb,
                     is_bold: block_is_bold,
+                    bold_ranges,
                 });
             }
         }
@@ -2368,6 +2478,7 @@ pub fn build_text_blocks(
                 tight_box: OrientedRect::axis_aligned(word.bounding_box),
                 word_rects: vec![word.bounding_box],
                 is_bold: false,
+                bold_ranges: Vec::new(),
             });
         } else if let Some(line) = current_line.as_mut() {
             let delta = word.bounding_box.left.saturating_sub(last_right);
@@ -2387,6 +2498,7 @@ pub fn build_text_blocks(
                     tight_box: OrientedRect::axis_aligned(word.bounding_box),
                     word_rects: vec![word.bounding_box],
                     is_bold: false,
+                    bold_ranges: Vec::new(),
                 };
                 if !lines.is_empty() {
                     blocks.push(TextBlock {

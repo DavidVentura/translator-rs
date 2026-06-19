@@ -670,6 +670,29 @@ fn render_per_line(
 
     let language = opts.language.clone();
     let bold = block.is_bold;
+    // Per-word bold ranges, rebased onto the trimmed `translated` string (block.bold_ranges
+    // index the untrimmed translated text). Empty → uniform `bold` for the whole block.
+    let trim_lead = block.translated_text.len() - block.translated_text.trim_start().len();
+    let bold_spans: Vec<(usize, usize)> = if block.bold_ranges.is_empty() {
+        // No per-word data: fall back to the block-level flag (whole block bold or not).
+        if block.is_bold {
+            vec![(0, translated.len())]
+        } else {
+            Vec::new()
+        }
+    } else {
+        block
+            .bold_ranges
+            .iter()
+            .filter_map(|r| {
+                let s = (r.start as usize).saturating_sub(trim_lead);
+                let e = (r.end as usize)
+                    .saturating_sub(trim_lead)
+                    .min(translated.len());
+                (s < e).then_some((s, e))
+            })
+            .collect()
+    };
     let mut size = block
         .layout_hints
         .suggested_font_size_px
@@ -713,6 +736,7 @@ fn render_per_line(
         return;
     };
 
+    let mut span_cursor = 0usize;
     for (line_text, prepared_line) in lines_text.iter().zip(block.lines.iter()) {
         if line_text.trim().is_empty() {
             continue;
@@ -726,6 +750,14 @@ fn render_per_line(
         if line_shape.runs.is_empty() {
             continue;
         }
+        // Locate this line inside `translated` so the block's bold spans map to line-local
+        // byte offsets. Lines are word slices of `translated` in order, so search forward.
+        let line_start = translated[span_cursor..]
+            .find(line_text.as_str())
+            .map(|p| span_cursor + p)
+            .unwrap_or(span_cursor);
+        span_cursor = line_start + line_text.len();
+        let segments = split_line_by_bold(line_text, line_start, &bold_spans);
         // Origin in image space at line-local cursor=0 along the baseline. In line-local
         // coords this point is at u=-width/2 (left edge); the v coord is chosen so the
         // glyph mass (ascent + descent) is centered on the rect's centre. For a rect
@@ -743,20 +775,57 @@ fn render_per_line(
         let descent_px = (line_shape.line_height_px(size) - ascent_px).max(0.0);
         let v_from_center = (ascent_px - descent_px) * 0.5;
         // perp_down direction (line-local +v) in image space is (-sin, cos).
-        let origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
-        let origin_y = oriented.cy - half_w * sin + v_from_center * cos;
-        draw_shaped_line(
-            sink,
-            &line_shape,
-            cache,
-            origin_x,
-            origin_y,
-            cos,
-            sin,
-            size,
-            prepared_line.foreground_argb,
-        );
+        let mut origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
+        let mut origin_y = oriented.cy - half_w * sin + v_from_center * cos;
+        // Draw each bold/regular run with its own font chain, advancing the baseline cursor
+        // by the run's width so mixed-weight lines (a bold lead-in, a bold term) render in
+        // the right faces instead of one weight for the whole block.
+        for (seg_text, seg_bold) in &segments {
+            let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
+                c.chain_for(script, *seg_bold, false, false, &language, fonts)
+                    .to_vec()
+            };
+            let mut chain_fn = chain_fn;
+            let seg_shape = shape_line(seg_text, &mut chain_fn, cache);
+            if seg_shape.runs.is_empty() {
+                continue;
+            }
+            draw_shaped_line(
+                sink,
+                &seg_shape,
+                cache,
+                origin_x,
+                origin_y,
+                cos,
+                sin,
+                size,
+                prepared_line.foreground_argb,
+            );
+            let w = seg_shape.width_px(size);
+            origin_x += cos * w;
+            origin_y += sin * w;
+        }
     }
+}
+
+/// Split a rendered line into consecutive `(text, is_bold)` runs by the block's bold byte
+/// spans (`line_start` is the line's byte offset within the trimmed translated text). A run
+/// boundary falls wherever boldness flips; coalesces same-weight chars.
+fn split_line_by_bold(
+    line: &str,
+    line_start: usize,
+    bold: &[(usize, usize)],
+) -> Vec<(String, bool)> {
+    let is_bold_at = |gb: usize| bold.iter().any(|&(s, e)| gb >= s && gb < e);
+    let mut segs: Vec<(String, bool)> = Vec::new();
+    for (i, ch) in line.char_indices() {
+        let b = is_bold_at(line_start + i);
+        match segs.last_mut() {
+            Some((s, sb)) if *sb == b => s.push(ch),
+            _ => segs.push((ch.to_string(), b)),
+        }
+    }
+    segs
 }
 
 /// Split `text` into per-line slices that fit within `target_widths` at the

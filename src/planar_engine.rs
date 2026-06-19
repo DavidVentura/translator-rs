@@ -2340,6 +2340,7 @@ pub fn render_text_overlay_bitmap(
                 background_argb: it.bg_argb,
                 foreground_argb: it.fg_argb,
                 is_bold: false,
+                bold_ranges: Vec::new(),
             }
         })
         .collect();

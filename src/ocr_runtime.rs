@@ -132,11 +132,52 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .collect();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
 
+    // Per-word bold from the ink bold channel + the line's CTC firings. Falls back to a
+    // whole-line range when the model pooled bold but firings weren't usable (RTL,
+    // multi-chunk), and to nothing when neither fired.
+    let line_bold_ranges: Vec<Vec<crate::ocr::BoldRange>> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let strip = ink_strips.get(i).and_then(|s| s.as_ref());
+            let firings: Vec<(char, f32)> = line
+                .firings
+                .iter()
+                .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
+                .collect();
+            let word_ranges = match (strip, strip.and_then(|s| s.bold.as_ref())) {
+                (Some(s), Some(bold)) => crate::ppocr::word_bold_ranges(
+                    &line.text,
+                    &firings,
+                    scripts[i] == PpocrScript::Cj,
+                    bold,
+                    &s.matte,
+                    MODEL_BOLD_THRESHOLD,
+                ),
+                _ => Vec::new(),
+            };
+            if !word_ranges.is_empty() {
+                word_ranges
+                    .into_iter()
+                    .map(|(start, end)| crate::ocr::BoldRange { start, end })
+                    .collect()
+            } else if model_bold[i].unwrap_or(false) && !line.text.is_empty() {
+                vec![crate::ocr::BoldRange {
+                    start: 0,
+                    end: line.text.len() as u32,
+                }]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
     let blocks = still_ppocr_lines_to_blocks(
         &det_boxes,
         lines,
         &text_metrics,
         &model_bold,
+        &line_bold_ranges,
         min_confidence,
         reading_order,
     );
@@ -251,6 +292,7 @@ fn still_ppocr_lines_to_blocks(
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
     model_bold: &[Option<bool>],
+    line_bold_ranges: &[Vec<crate::ocr::BoldRange>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -266,8 +308,11 @@ fn still_ppocr_lines_to_blocks(
         .zip(lines.into_iter())
         .zip(text_metrics.iter())
         .zip(bold.iter())
-        .filter(|(((_, line), _), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
-        .map(|(((b, line), metrics), &is_bold)| {
+        .zip(line_bold_ranges.iter())
+        .filter(|((((_, line), _), _), _)| {
+            !line.text.trim().is_empty() && line.confidence >= min_score
+        })
+        .map(|((((b, line), metrics), &is_bold), bold_ranges)| {
             let delta = metrics.map_or(0.0, |m| m.baseline_angle_delta);
             let mut oriented_box = line.oriented_box;
             oriented_box.angle_radians += delta;
@@ -284,6 +329,7 @@ fn still_ppocr_lines_to_blocks(
                 tight_box,
                 word_rects: vec![line.rect],
                 is_bold,
+                bold_ranges: bold_ranges.clone(),
             }
         })
         .collect();
@@ -562,7 +608,7 @@ fn finalize_image_overlay(
     ink_mask: Option<&[bool]>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
     let t_translate = std::time::Instant::now();
-    let translated_blocks = {
+    let (translated_blocks, block_bold_ranges) = {
         let mut engine_guard = engine.lock().expect("bergamot engine lock poisoned");
         translate_block_texts(
             &mut engine_guard,
@@ -581,6 +627,7 @@ fn finalize_image_overlay(
         height,
         &blocks,
         &translated_blocks,
+        &block_bold_ranges,
         background_mode,
         reading_order,
         ink_mask,
@@ -596,17 +643,20 @@ fn finalize_image_overlay(
     result
 }
 
+type BlockBold = Vec<crate::ocr::BoldRange>;
+
 fn translate_block_texts(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     source_code: &LanguageCode,
     target_code: &LanguageCode,
     blocks: &[TextBlock],
-) -> Result<Vec<String>, TranslatorError> {
-    let block_texts = blocks
+) -> Result<(Vec<String>, Vec<BlockBold>), TranslatorError> {
+    let sources: Vec<(String, BlockBold)> = blocks
         .iter()
-        .map(TextBlock::translation_text)
-        .collect::<Vec<_>>();
+        .map(TextBlock::translation_text_with_bold)
+        .collect();
+    let block_texts: Vec<String> = sources.iter().map(|(t, _)| t.clone()).collect();
     let non_empty_indices = block_texts
         .iter()
         .enumerate()
@@ -617,25 +667,58 @@ fn translate_block_texts(
         return Err(TranslatorError::ocr("No text found in image"));
     }
 
+    // Identity: no model runs, so the source bold ranges already index the output text.
     if source_code == target_code {
-        return Ok(block_texts);
+        let bold = sources.into_iter().map(|(_, b)| b).collect();
+        return Ok((block_texts, bold));
     }
 
     let texts_to_translate = non_empty_indices
         .iter()
         .map(|&index| block_texts[index].clone())
         .collect::<Vec<_>>();
-    let translated = Translator::new(engine, snapshot).translate_texts(
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let on_progress = |_: usize, _: usize| {};
+    let ctx = crate::bergamot::TranslateCtx {
+        cancel: &cancel,
+        on_progress: &on_progress,
+    };
+    let aligned = Translator::new(engine, snapshot).translate_texts_with_alignment_ctx(
         source_code,
         target_code,
         &texts_to_translate,
+        &ctx,
     )?;
 
-    Ok(merge_translated_block_texts(
-        &block_texts,
-        &non_empty_indices,
-        translated,
-    ))
+    let mut translated_blocks = block_texts;
+    let mut target_bold: Vec<BlockBold> = vec![Vec::new(); blocks.len()];
+    match aligned {
+        Some(results) => {
+            for (slot, &bi) in non_empty_indices.iter().enumerate() {
+                let twa = &results[slot];
+                let src_ranges: Vec<(u32, u32)> =
+                    sources[bi].1.iter().map(|r| (r.start, r.end)).collect();
+                target_bold[bi] =
+                    crate::translate::remap_byte_ranges_through_alignment(&src_ranges, twa)
+                        .into_iter()
+                        .map(|(start, end)| crate::ocr::BoldRange { start, end })
+                        .collect();
+                translated_blocks[bi] = twa.translated_text.clone();
+            }
+        }
+        None => {
+            // No alignment plan for this pair — translate plainly and drop per-word bold.
+            let translated = Translator::new(engine, snapshot).translate_texts(
+                source_code,
+                target_code,
+                &texts_to_translate,
+            )?;
+            for (slot, &bi) in non_empty_indices.iter().enumerate() {
+                translated_blocks[bi] = translated[slot].clone();
+            }
+        }
+    }
+    Ok((translated_blocks, target_bold))
 }
 
 fn merge_translated_block_texts(
