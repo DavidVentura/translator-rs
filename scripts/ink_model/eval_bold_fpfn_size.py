@@ -52,7 +52,9 @@ for _ in range(1500):
         pred = torch.sigmoid(model(x))[0, 1].numpy()
     s = float(pred[ink].mean())
     bucket = next((lo, hi) for lo, hi in BUCKETS if lo <= nh < hi)
-    agg[bucket]["bold" if target else "reg"].append(s)
+    # GT from the measured stroke target (see eval_bold_fpfn), not the is_bold flag.
+    gt_bold = b[ink].mean() >= g.BOLD_GT_THRESHOLD
+    agg[bucket]["bold" if gt_bold else "reg"].append(s)
 
 print("native_h    FP(reg->bold)  FN(bold->reg)   (n_reg/n_bold)")
 for lo, hi in BUCKETS:

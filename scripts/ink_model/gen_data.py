@@ -21,6 +21,7 @@ from functools import lru_cache
 import numpy as np
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from scipy.ndimage import distance_transform_edt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +46,7 @@ FONT_BLOCKLIST = (
     "math",
     "braille",
     "awesome",
+    "d050000l",  # URW Zapf-Dingbats clone: maps ASCII to pictographs, no descriptive name
 )
 
 # Unicode blocks for dense-script samples. Noto CJK (the :lang=ko fonts) covers all
@@ -54,6 +56,22 @@ CJK_BLOCKS = ((0xAC00, 0xD7A3), (0x4E00, 0x9FFF), (0x3040, 0x30FF))
 # Filename markers for heavy weights. The random font pool is mostly regular weight,
 # so display-style superbold strokes are under-trained and the matte under-covers them.
 HEAVY_TOKENS = ("bold", "black", "heavy", "extrabold", "extrablack", "semibold", "-bd", "-blk")
+
+
+def _blocked_font(path: str) -> bool:
+    """Pictographic/symbol font we don't want in the Latin pool. Filename tokens catch
+    most; the name table catches descriptively-named ones whose file is opaque (a font
+    literally named "… Dingbats"). There's no clean metadata flag for an ASCII-mapped
+    pictographic font, so this stays an explicit token list rather than a heuristic that
+    might drop real text fonts."""
+    if any(b in path.lower() for b in FONT_BLOCKLIST):
+        return True
+    try:
+        nm = TTFont(path, fontNumber=0, lazy=True)["name"]
+    except Exception:
+        return False
+    fam = ((nm.getDebugName(1) or "") + " " + (nm.getDebugName(4) or "")).lower()
+    return any(b in fam for b in FONT_BLOCKLIST)
 
 
 @lru_cache(maxsize=1)
@@ -67,10 +85,9 @@ def font_paths() -> list[str]:
     paths = []
     for line in out.splitlines():
         p = line.split(":")[0].strip()
-        low = p.lower()
-        if not (low.endswith(".ttf") or low.endswith(".otf")):
+        if not p.lower().endswith((".ttf", ".otf")):
             continue
-        if any(b in low for b in FONT_BLOCKLIST):
+        if _blocked_font(p):
             continue
         paths.append(p)
     if not paths:
@@ -109,10 +126,12 @@ def _font_weight(path: str) -> int | None:
 
 
 def _weight_pool(paths: tuple[str, ...], bold: bool) -> tuple[str, ...]:
-    """Fonts whose real weight matches the label: ≥700 for bold, ≤400 for regular.
-    The 400–700 middle (medium/semibold) is dropped — it's the ambiguous band that
-    blurs a binary bold target."""
-    cut = (lambda w: w >= 700) if bold else (lambda w: w <= 400)
+    """Fonts biased toward the run's intended weight: ≥550 for bold, ≤550 for regular.
+    The 400–700 middle is now *included* on both sides — the bold target is a measured
+    stroke width (`_font_stroke_ratio`), not a binary class, so medium/semibold is signal
+    along the continuum, not label noise. The bias only keeps heavy faces from being
+    swamped by the mostly-regular pool."""
+    cut = (lambda w: w >= 550) if bold else (lambda w: w <= 550)
     out = tuple(p for p in paths if (w := _font_weight(p)) is not None and cut(w))
     return out or paths  # never empty (a script with no match falls back)
 
@@ -248,6 +267,60 @@ def _cjk_units(rng: random.Random, txt: str, is_bold: bool) -> list[tuple[str, b
     return [(txt[:i], False), (txt[i:j], True), (txt[j:], False)]
 
 
+# Continuous bold label: per-run glyph stroke width / em, mapped to [0,1] and painted
+# flat over each run's ink. Measured from the rendered raster (distance transform), never
+# from font metadata — a 400-weight face that draws thick reads as thick. The measurement
+# is cached per (font, script) so the distance transform runs at most once per font in a
+# worker, never per training strip (per-strip it bottlenecks the dataloader). LO/HI bracket
+# the regular→bold stroke-ratio band and set where the inference threshold lands; calibrate
+# on the real font pool (gen_data --out dumps the per-strip mean as `bμ`).
+STROKE_RATIO_LO = 0.06
+STROKE_RATIO_HI = 0.16
+# Boundary in normalised target space where a strip/region counts as "should render bold".
+# LO/HI are calibrated so a nominal weight-700 Bold lands near 0.5, so both the eval
+# ground-truth split and the runtime decision threshold start from this value.
+BOLD_GT_THRESHOLD = 0.5
+_REF_EM = 96
+_REF_LATIN = "Hxnodbpqgesa AOMW 2580"
+_REF_CJK = "永国體書速達"
+
+
+def _ref_text(script: str) -> str:
+    if script in SHAPED:
+        _, lo, hi = SHAPED[script]
+        return "".join(chr(c) for c in range(lo, min(hi + 1, lo + 8)))
+    return _REF_CJK if script == "cjk" else _REF_LATIN
+
+
+@lru_cache(maxsize=8192)
+def _font_stroke_ratio(path: str, script: str) -> float:
+    """Stroke width / em for a font, measured once and cached. The per-strip hot path must
+    never run a distance transform, so this renders a representative string at a reference
+    em, distance-transforms the ink, and takes a high percentile of the radius as the
+    stroke half-width. One font file is one weight, so this is the per-font-weight stroke
+    width; per-glyph variation within a font is second-order and pooled out downstream."""
+    layout = ImageFont.Layout.RAQM if script in SHAPED else ImageFont.Layout.BASIC
+    try:
+        font = ImageFont.truetype(path, _REF_EM, layout_engine=layout)
+    except OSError:
+        return STROKE_RATIO_LO
+    text = _ref_text(script)
+    canvas = Image.new("L", (_REF_EM * (len(text) + 2), _REF_EM * 3), 0)
+    ImageDraw.Draw(canvas).text((_REF_EM, _REF_EM), text, font=font, fill=255)
+    mask = np.asarray(canvas) > 127
+    if mask.sum() < 16:
+        return STROKE_RATIO_LO
+    half = float(np.percentile(distance_transform_edt(mask)[mask], 85))
+    return 2.0 * half / _REF_EM
+
+
+def _target_q(ratio: float) -> int:
+    """Stroke ratio → 0..255 fill, where LO..HI maps to 0..255 (the [0,1] regression target
+    the bold head learns, quantised for an antialiased PIL draw)."""
+    t = (ratio - STROKE_RATIO_LO) / (STROKE_RATIO_HI - STROKE_RATIO_LO)
+    return round(255 * min(1.0, max(0.0, t)))
+
+
 def render_coverage(
     rng: random.Random, width: int, height: int, log: dict | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -255,17 +328,18 @@ def render_coverage(
 
     Returns `(total, fill, bold)`: `total` is the union coverage incl. any outline
     stroke (the matte label — outlines are ink); `fill` is the glyph core only (so
-    the caller can colour the outline ring); `bold` is the union coverage of the
-    *bold* runs only (the per-pixel bold label). `fill` aliases `total` when there's
-    no outline.
+    the caller can colour the outline ring); `bold` is the continuous per-pixel
+    stroke-width target in [0,1] (each run painted with its cached `_font_stroke_ratio`,
+    LO..HI → 0..1), the regression label for the bold head. `fill` aliases `total` when
+    there's no outline.
     """
     # Render oversized then rotate, so the rotation doesn't clip glyphs.
     pad = max(8, height // 2)
     size = (width + 2 * pad, height + 2 * pad)
     total = Image.new("L", size, 0)
     td = ImageDraw.Draw(total)
-    boldc = Image.new("L", size, 0)
-    bd = ImageDraw.Draw(boldc)
+    boldval = Image.new("L", size, 0)  # per-pixel stroke-width target (0..255 = LO..HI)
+    bvd = ImageDraw.Draw(boldval)
     jitter = max(1, height // 12)
     stroke = rng.randint(1, max(1, height // 10)) if rng.random() < 0.2 else 0
     outlined = stroke > 0
@@ -299,8 +373,11 @@ def render_coverage(
             td.text((x, y), s, font=font, fill=255, stroke_width=stroke, stroke_fill=255)
             if outlined:
                 fill_draw.text((x, y), s, font=font, fill=255)
+            # Bold target = the glyph-core stroke width (no outline ring), painted flat at
+            # this run's cached per-font value. A CJK mid-string span or a run boundary thus
+            # carries a real weight seam the model must read from stroke thickness.
+            bvd.text((x, y), s, font=font, fill=_target_q(_font_stroke_ratio(path, script)))
             if ub:
-                bd.text((x, y), s, font=font, fill=255, stroke_width=stroke, stroke_fill=255)
                 bold_runs += 1
             # CJK is set flush (no inter-unit gap); spaced scripts get a word gap.
             gap = 0 if script == "cjk" else rng.randint(font_px // 6, font_px // 2)
@@ -317,16 +394,17 @@ def render_coverage(
         angle = rng.uniform(-3.0, 3.0)
         center = (pad, pad + height // 2)
         total = total.rotate(angle, resample=Image.BILINEAR, center=center)
-        boldc = boldc.rotate(angle, resample=Image.BILINEAR, center=center)
+        # NEAREST keeps the stroke-width value flat instead of blending it toward 0 at edges.
+        boldval = boldval.rotate(angle, resample=Image.NEAREST, center=center)
         if outlined:
             fill_canvas = fill_canvas.rotate(angle, resample=Image.BILINEAR, center=center)
     tot = np.asarray(total, dtype=np.float32) / 255.0
-    bld = np.asarray(boldc, dtype=np.float32) / 255.0
+    bv = np.asarray(boldval, dtype=np.float32) / 255.0
     fl = np.asarray(fill_canvas, dtype=np.float32) / 255.0 if outlined else tot
     thick_k = 0
     if height >= 48 and rng.random() < 0.4:
         # Thicken to simulate super-heavy weight beyond what fonts provide (see note
-        # below). Applied identically to total/bold/fill so the labels stay aligned.
+        # below). Applied identically to total/fill so the matte labels stay aligned.
         thick_k = int(np.clip(round(height / 40) * 2 + 1, 3, 11))
 
         def mf(a: np.ndarray) -> np.ndarray:
@@ -340,8 +418,14 @@ def render_coverage(
                 / 255.0
             )
 
-        tot, bld = mf(tot), mf(bld)
+        tot = mf(tot)
         fl = mf(fl) if outlined else tot
+        # Thickening adds real stroke width, so the target must rise: grow the value region
+        # with the matte, then bump every ink pixel by the added width ((k-1) px / em) in
+        # normalised LO..HI units.
+        bump = (thick_k - 1) / (font_px * (STROKE_RATIO_HI - STROKE_RATIO_LO))
+        grown = mf(bv)
+        bv = np.where(grown > 0, np.clip(grown + bump, 0.0, 1.0), 0.0).astype(np.float32)
     if log is not None:
         log.update(
             font=last_font,
@@ -352,7 +436,7 @@ def render_coverage(
             thick_k=thick_k,
         )
     crop = lambda a: a[pad : pad + height, pad : pad + width]  # noqa: E731
-    return crop(tot), crop(fl), crop(bld)
+    return crop(tot), crop(fl), crop(bv)
 
 
 def gradient_field(rng: random.Random, h: int, w: int, log: dict | None = None) -> np.ndarray:
@@ -560,6 +644,8 @@ def main():
             if ok:
                 break
         h, w = cov.shape
+        ink = cov > 0.5
+        bmu = float(bold[ink].mean()) if ink.any() else 0.0  # mean stroke target over ink
         band = 26
         # Three stacked rows: composited image, matte label, bold label.
         sheet = np.ones((band + h * 3 + 8, max(w, 360), 3), dtype=np.float32)
@@ -571,7 +657,7 @@ def main():
             f"{kk}{log[kk]}" for kk in ("blur", "downsample", "jpeg", "noise", "squeeze",
                                         "motion", "shade", "hardshadow") if kk in log)
         head = (f"{i:03d} nh{log.get('native_h')} sz{log.get('size')} k{log.get('thick_k', 0)} "
-                f"{log.get('script', '')} {'HVY ' if log.get('heavy') else ''}"
+                f"bμ{bmu:.2f} {log.get('script', '')} {'HVY ' if log.get('heavy') else ''}"
                 f"{log.get('bg', '')} ct{log.get('contrast', '?')}")
         d = ImageDraw.Draw(pim)
         d.text((2, 1), head, fill=(220, 0, 0))

@@ -46,7 +46,9 @@ def run(score_fn, key_fn):
         x = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))[None]
         with torch.no_grad():
             pred = torch.sigmoid(model(x))[0, 1].numpy()
-        ok_call = int(float(pred[ink].mean()) >= 0.5) == int(target)
+        # GT from the measured stroke target (see eval_bold_fpfn), not the is_bold flag.
+        gt = int(b[ink].mean() >= g.BOLD_GT_THRESHOLD)
+        ok_call = int(float(pred[ink].mean()) >= 0.5) == gt
         k = key_fn(script, nh)
         agg.setdefault(k, [0, 0])
         agg[k][0] += ok_call

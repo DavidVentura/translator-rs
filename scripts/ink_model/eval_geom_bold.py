@@ -1,6 +1,11 @@
 """Architecture A/B: can *geometric* bold (stroke_width / x_height, classical, no
 learned channel) separate bold from regular as well as the learned bold head?
 
+Largely historical now: the learned bold head regresses a measured stroke-width target
+(gen_data `_font_stroke_ratio`), i.e. essentially this same geometric quantity, so the
+A/B has collapsed. Kept as the no-learning baseline; GT here is still the is_bold intent
+flag (the question is whether geometry recovers the intended weight).
+
 This is the ceiling test — geometric bold is computed on the ground-truth coverage
 (a perfect matte). If it can't separate here, it loses to the learned head; if it's
 competitive, it's worth running on a real model matte (and would let us ship the

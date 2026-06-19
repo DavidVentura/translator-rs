@@ -19,8 +19,9 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    model = InkUNet()
     state = torch.load(args.ckpt, map_location="cpu")
+    model = InkUNet(base=state["base"], levels=state["levels"],
+                    bold_from=state.get("bold_from", 1), bold_head=state.get("bold_head", "dilated"))
     model.load_state_dict(state["model"])
     model.eval()
 

@@ -49,7 +49,8 @@ for _ in range(1600):
     with torch.no_grad():
         pred = torch.sigmoid(model(x))[0, 1].numpy()
     scores.append(float(pred[ink].mean()))
-    labels.append(int(target))
+    # GT from the measured stroke target (see eval_bold_fpfn), not the is_bold flag.
+    labels.append(int(bold[ink].mean() >= g.BOLD_GT_THRESHOLD))
 
 scores, labels = np.array(scores), np.array(labels)
 nreg, nbold = (labels == 0).sum(), (labels == 1).sum()

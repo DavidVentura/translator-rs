@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import torch
 
-from gen_data import sample
+from gen_data import BOLD_GT_THRESHOLD, sample
 from model import InkUNet
 
 ck = torch.load(sys.argv[1] if len(sys.argv) > 1 else "ckpt/ink-latest.pt", map_location="cpu")
@@ -26,8 +26,10 @@ bold_scores, reg_scores, correct, n, rank_ok = [], [], 0, 0, 0
 for _ in range(400):
     img, cov, bold = sample(rng, width=320)
     ink = cov > 0.5
-    bmask = ink & (bold > 0.5)
-    rmask = ink & (bold <= 0.5)
+    # `bold` is the continuous stroke-width target now, so this splits ink into
+    # measured-thick vs measured-thin pixels within the strip.
+    bmask = ink & (bold > BOLD_GT_THRESHOLD)
+    rmask = ink & (bold <= BOLD_GT_THRESHOLD)
     if bmask.sum() < 40 or rmask.sum() < 40:
         continue  # need both regions present to measure separation
     x = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))[None]

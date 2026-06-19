@@ -12,7 +12,7 @@ import sys
 import numpy as np
 import torch
 
-from gen_data import _composite_once, _render_once
+from gen_data import _composite_once, _render_once, BOLD_GT_THRESHOLD
 from model import InkUNet
 
 ck = torch.load(sys.argv[1] if len(sys.argv) > 1 else "ckpt/ink-latest.pt", map_location="cpu")
@@ -36,7 +36,8 @@ agg = {b: [0, 0] for b in buckets}  # correct, total per-region calls
 for _ in range(800):
     img, cov, bold, nh = sample_nh(rng, 320)
     ink = cov > 0.5
-    bm, rm = ink & (bold > 0.5), ink & (bold <= 0.5)
+    # `bold` is the continuous stroke-width target: split ink into measured thick/thin.
+    bm, rm = ink & (bold > BOLD_GT_THRESHOLD), ink & (bold <= BOLD_GT_THRESHOLD)
     if bm.sum() < 40 or rm.sum() < 40:
         continue
     x = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))[None]

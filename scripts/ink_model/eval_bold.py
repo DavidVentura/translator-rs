@@ -1,5 +1,8 @@
 """Quick visual eval of the 2-channel ink model: image | bold label | bold pred.
 
+The bold label/pred are the continuous stroke-width target in [0,1] (brighter = thicker),
+not a binary mask.
+
   python3 eval_bold.py ckpt/ink-latest.pt /tmp/bold_eval.png
 """
 
@@ -17,7 +20,8 @@ ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "ckpt/ink-latest.pt"
 out_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/bold_eval.png"
 
 ck = torch.load(ckpt_path, map_location="cpu")
-model = InkUNet(base=ck["base"], levels=ck["levels"])
+model = InkUNet(base=ck["base"], levels=ck["levels"], bold_from=ck.get("bold_from", 1),
+                bold_head=ck.get("bold_head", "dilated"))
 model.load_state_dict(ck["model"])
 model.eval()
 

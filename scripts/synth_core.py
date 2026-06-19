@@ -24,6 +24,13 @@ import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 
+# OpenCV ignores OMP_NUM_THREADS and defaults its pool to the host core count (nproc),
+# which on a CFS-quota'd container (e.g. vast.ai: nproc 80, quota 19) means every
+# dataloader worker spawns ~80 cv2 threads — the container self-oversubscribes its own
+# quota and gets CFS-throttled to a crawl. One thread per process; parallelism comes from
+# the workers, not from cv2 internally.
+cv2.setNumThreads(1)
+
 
 @lru_cache(maxsize=64)
 def coord_grid(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:

@@ -18,6 +18,11 @@ import gpu_degrade
 from gen_data import sample, stream
 from model import InkUNet, param_count
 
+# Module level so spawn workers (which re-import this module but never run main) share via
+# /tmp files instead of the default file_descriptor strategy, whose shm/semaphore leak piles
+# prefetched batches into RAM-backed /dev/shm and OOMs mid-run.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 
 class SyntheticStrips(IterableDataset):
     """Infinite stream of pre-stacked batches.
@@ -65,12 +70,21 @@ def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     return torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
 
 
-def ink_losses(logits, cov, bold, bold_weight=0.5, strip_w=None):
-    """Matte BCE over the whole strip + bold BCE *masked to ink*. Bold is only
-    defined where there's ink, so masking keeps the empty background from drowning
-    the bold signal. `strip_w` (B,) is the per-strip legibility weight (illegible
-    strips contribute zero, replacing the old reject-and-retry); None = all ones.
-    Returns (total, matte, bold) for logging."""
+def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5, bold_asym_t0=0.15):
+    """Matte BCE over the whole strip + asymmetric bold L1 *masked to ink*. `bold` is the
+    continuous per-pixel stroke-width target in [0,1] (gen_data `_font_stroke_ratio`,
+    LO..HI → 0..1), not a binary class: the head regresses how thick the ink is so the
+    runtime can threshold boldness wherever it wants.
+
+    The bold term is base L1 (keeps calibration everywhere) plus an extra penalty for
+    *overshoot* (predicting bolder than truth) concentrated on *thin* ink (low target):
+    plain L1 is lenient near 0, so thin text drifts up and gets falsely emboldened, which
+    a binary BCE used to slam to 0. `bold_asym` scales that overshoot penalty and
+    `bold_asym_t0` is where the thinness gate fades to 0 (so genuine bold, target >= t0, is
+    pure L1 — undisturbed). Undershoot (missing a bold) is never extra-penalised; it's the
+    benign side of the asymmetric preference. Masking to ink keeps the empty background out.
+    `strip_w` (B,) is the per-strip legibility weight (illegible strips contribute zero);
+    None = all ones. Returns (total, matte, bold) for logging."""
     matte_logit, bold_logit = logits[:, :1], logits[:, 1:]
     if strip_w is None:
         strip_w = torch.ones(logits.shape[0], device=logits.device)
@@ -78,8 +92,10 @@ def ink_losses(logits, cov, bold, bold_weight=0.5, strip_w=None):
     bce_m = F.binary_cross_entropy_with_logits(matte_logit, cov, reduction="none")
     loss_matte = (bce_m * w).sum() / w.expand_as(bce_m).sum().clamp_min(1.0)
     ink = (cov > 0.5).float() * w
-    bce = F.binary_cross_entropy_with_logits(bold_logit, (bold > 0.5).float(), reduction="none")
-    loss_bold = (bce * ink).sum() / ink.sum().clamp_min(1.0)
+    err = torch.sigmoid(bold_logit) - bold
+    thin_gate = torch.clamp(1.0 - bold / bold_asym_t0, min=0.0)
+    pen = err.abs() + bold_asym * torch.relu(err) * thin_gate
+    loss_bold = (pen * ink).sum() / ink.sum().clamp_min(1.0)
     return loss_matte + bold_weight * loss_bold, loss_matte, loss_bold
 
 
@@ -90,6 +106,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--width", type=int, default=320)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--prefetch", type=int, default=4,
+                    help="DataLoader prefetch_factor; lower on low-RAM boxes (each in-flight batch is ~150MB)")
     ap.add_argument("--out", default="ckpt")
     ap.add_argument("--resume", default=None)
     ap.add_argument("--log-every", type=int, default=100)
@@ -99,7 +117,11 @@ def main():
     ap.add_argument("--levels", type=int, default=2, help="U-Net depth (3 = bigger RF)")
     ap.add_argument("--reuse", type=int, default=1, help="composites per rasterized strip")
     ap.add_argument("--val-batch", type=int, default=32, help="validation set size")
-    ap.add_argument("--bold-weight", type=float, default=0.5, help="weight on the bold BCE term")
+    ap.add_argument("--bold-weight", type=float, default=1.5, help="weight on the bold L1 term")
+    ap.add_argument("--bold-asym", type=float, default=1.5,
+                    help="extra penalty on emboldening thin ink (overshoot on low-target); 0 = plain L1")
+    ap.add_argument("--bold-asym-t0", type=float, default=0.15,
+                    help="target above which the thin-overshoot penalty fades to 0 (bold left as pure L1)")
     ap.add_argument("--bold-from", type=int, default=1, help="decoder stage feeding the bold head (1=full,2=½,3=¼)")
     ap.add_argument("--detach-bold", action="store_true", help="stop bold gradient into the trunk (matte-priority)")
     ap.add_argument("--gpu-degrade", action="store_true",
@@ -107,6 +129,13 @@ def main():
     ap.add_argument("--bold-head", choices=["dilated", "1x1"], default="dilated",
                     help="bold head: dilated 3×3 (default) or cheap 1×1")
     args = ap.parse_args()
+
+    # spawn (not fork) workers: plain fork inherits the parent's cv2/fontconfig/freetype +
+    # CUDA state, and with a broad font set the workers deterministically hit a poisoned
+    # native lock and deadlock a few hundred steps in (single-process never does). spawn
+    # gives each worker a clean interpreter — bulletproof, at the cost of re-importing torch
+    # per worker (~2GB), so size --workers to RAM (needs a ~32GB box for ~10 workers).
+    mp_ctx = "spawn" if args.workers > 0 else None
 
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -140,8 +169,11 @@ def main():
         batch_size=None,  # the dataset yields whole batches (one IPC transfer each)
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
-        prefetch_factor=4 if args.workers > 0 else None,
-        pin_memory=device == "cuda",
+        prefetch_factor=args.prefetch if args.workers > 0 else None,
+        # No pin_memory: this job is dataloader-bound (the GPU waits on the CPU), so pinned
+        # host buffers buy nothing and just add non-reclaimable RAM pressure on a 15GB box.
+        pin_memory=False,
+        multiprocessing_context=mp_ctx,
     )
     val_img, val_cov, val_bold = validation_batch(n=args.val_batch, width=args.width)
     val_img, val_cov, val_bold = val_img.to(device), val_cov.to(device), val_bold.to(device)
@@ -170,7 +202,8 @@ def main():
                 strip_w = gpu_degrade.legible_mask(img, cov, native_h).float()
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w)
+            loss, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
+                                    bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -188,7 +221,8 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
-                vl, vm, vb = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight)
+                vl, vm, vb = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight,
+                                        bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0)
             model.train()
             print(
                 f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f})",

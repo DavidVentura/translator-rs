@@ -48,7 +48,10 @@ for _ in range(1500):
     with torch.no_grad():
         pred = torch.sigmoid(model(x))[0, 1].numpy()
     scores.append(float(pred[ink].mean()))
-    labels.append(int(target))
+    # GT is the *measured* stroke target, not the is_bold intent flag: a weight-550
+    # semibold drawn from the bold pool genuinely reads ~0.4, and the head is trained to
+    # output that, so judging it bold would be wrong.
+    labels.append(int(bold[ink].mean() >= g.BOLD_GT_THRESHOLD))
 
 scores, labels = np.array(scores), np.array(labels)
 reg, bold = scores[labels == 0], scores[labels == 1]

@@ -53,7 +53,8 @@ for _ in range(1000):
     with torch.no_grad():
         pred = torch.sigmoid(model(x))[0, 1].numpy()
     scores.append(float(pred[ink].mean()))
-    labels.append(int(target))
+    # GT from the measured stroke target (see eval_bold_fpfn), not the is_bold flag.
+    labels.append(int(bold[ink].mean() >= g.BOLD_GT_THRESHOLD))
 
 scores, labels = np.array(scores), np.array(labels)
 print(f"uniform-line strips: {len(scores)}  (bold fraction {labels.mean():.2f})")
