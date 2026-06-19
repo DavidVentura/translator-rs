@@ -473,10 +473,11 @@ impl TranslatorSession {
         &self,
         rgb: &image::DynamicImage,
         boxes: &[crate::ocr::DetectedTextBox],
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<Option<image::GrayImage>>, TranslatorError> {
         let snap = self.snapshot();
         let ppocr = self.ppocr_engine(&snap)?;
-        Ok(ppocr.ink_masks(rgb, boxes))
+        Ok(ppocr.ink_masks(rgb, boxes, canonical_quadrant))
     }
 
     /// Like [`ppocr_ink_masks`] but keeps each strip's bold channel (ch1) so the live
@@ -486,10 +487,11 @@ impl TranslatorSession {
         &self,
         rgb: &image::DynamicImage,
         boxes: &[crate::ocr::DetectedTextBox],
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<Option<crate::ppocr::InkStrip>>, TranslatorError> {
         let snap = self.snapshot();
         let ppocr = self.ppocr_engine(&snap)?;
-        Ok(ppocr.ink_strips(rgb, boxes))
+        Ok(ppocr.ink_strips(rgb, boxes, canonical_quadrant))
     }
 
     /// Estimate the scene's reading-direction quadrant from a set of
@@ -587,24 +589,13 @@ impl TranslatorSession {
             .as_ref()
             .expect("recognize path requires build_with_rgb");
         // PPOCR needs a gray buffer in the **same orientation** as
-        // `rgb` (display orient) so its per-box strip crops line up.
-        // `oriented.gray` is sensor-orient now (the tracker's frame),
-        // so we derive a display-orient gray on the fly from `rgb`.
-        // Fires per-recognize call (acquire / refresh), not per-frame.
-        let rgb8 = rgb.to_rgb8();
-        let gray_display = image::imageops::grayscale(&rgb8);
         match source_selection {
             OcrSourceSelection::Auto => {
-                let predictions = ppocr.classify_text_boxes_image(
-                    rgb,
-                    &gray_display,
-                    boxes,
-                    canonical_quadrant,
-                )?;
+                let predictions =
+                    ppocr.classify_text_boxes_image(rgb, boxes, canonical_quadrant)?;
                 let scripts = route_ppocr_predictions(&ppocr, &predictions, boxes)?;
                 let mut lines = ppocr.recognize_text_in_boxes_image(
                     rgb,
-                    &gray_display,
                     boxes,
                     &scripts,
                     PpocrProfile::Live,
@@ -626,7 +617,6 @@ impl TranslatorSession {
                 let scripts = vec![script; boxes.len()];
                 ppocr.recognize_text_in_boxes_image(
                     rgb,
-                    &gray_display,
                     boxes,
                     &scripts,
                     PpocrProfile::Live,

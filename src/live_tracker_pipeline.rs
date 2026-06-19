@@ -1517,6 +1517,13 @@ impl LiveTrackerPipeline {
         anchor_id: u64,
         detected: &[DetectedTextBox],
     ) -> Result<(), &'static str> {
+        // Same resolved quadrant the recognizer used, so the ink strip's contour dewarp
+        // matches the rec strip and the bold channel lines up with the CTC firings.
+        let canonical_quadrant = self
+            .engine
+            .lock()
+            .ok()
+            .and_then(|e| e.canonical_rotation_for(anchor_id));
         let matted: Vec<Option<MattedStrip>> = {
             let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
             let oriented = state.cached.as_ref().expect("oriented still cached");
@@ -1527,7 +1534,7 @@ impl LiveTrackerPipeline {
             let rgb = oriented.rgb.as_ref().expect("with_rgb path");
             let ink_strips = self
                 .catalog
-                .ppocr_ink_strips(rgb, &scaled)
+                .ppocr_ink_strips(rgb, &scaled, canonical_quadrant)
                 .unwrap_or_default();
             // Bold per box from the model's ch1 (pooled + thresholded), parallel to
             // `detected`; `None` per box when the model has no bold channel.
@@ -1542,6 +1549,10 @@ impl LiveTrackerPipeline {
             let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
                 .iter()
                 .map(|s| s.as_ref().map(|s| s.matte.clone()))
+                .collect();
+            let ink_src_maps: Vec<Option<Vec<(f32, f32)>>> = ink_strips
+                .iter()
+                .map(|s| s.as_ref().and_then(|s| s.src_map.clone()))
                 .collect();
             // Text-metrics off the same mattes. Measured against the *canonical*
             // box dims (not the rec-scaled `scaled`), so the recovered x-height /
@@ -1564,7 +1575,12 @@ impl LiveTrackerPipeline {
             if let Ok(mut store) = self.model_bold.lock() {
                 store.insert(anchor_id, model_bold);
             }
-            let strips = crate::color_matting::mat_detections(&rgb.to_rgba8(), &scaled, &ink_masks);
+            let strips = crate::color_matting::mat_detections(
+                &rgb.to_rgba8(),
+                &scaled,
+                &ink_masks,
+                &ink_src_maps,
+            );
             // `mat_detections` returns only the boxes that matted (keyed by
             // `box_index`); the block grouping downstream indexes strips
             // positionally against `detected`, so re-expand to that shape.

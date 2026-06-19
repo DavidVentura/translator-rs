@@ -265,6 +265,12 @@ impl PpocrInkModel {
 pub struct InkStrip {
     pub matte: GrayImage,
     pub bold: Option<GrayImage>,
+    /// Source-image `(x, y)` each matte/bold column-row sampled, row-major over
+    /// the strip's own `matte.width() × matte.height()`. Lets the matting scatter
+    /// the strip back into image space (the strip is a curl-straightened contour
+    /// dewarp, so there is no single affine inverse). `None` for the oriented-box
+    /// fallback (a box with no contour), where matting uses the affine instead.
+    pub src_map: Option<Vec<(f32, f32)>>,
 }
 
 /// Matte alpha (0..255) above which a pixel counts as ink for bold pooling.
@@ -401,8 +407,9 @@ impl PpocrEngine {
         &self,
         image: &DynamicImage,
         boxes: &[crate::ocr::DetectedTextBox],
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Vec<Option<GrayImage>> {
-        self.ink_strips(image, boxes)
+        self.ink_strips(image, boxes, canonical_quadrant)
             .into_iter()
             .map(|s| s.map(|s| s.matte))
             .collect()
@@ -414,6 +421,7 @@ impl PpocrEngine {
         &self,
         image: &DynamicImage,
         boxes: &[crate::ocr::DetectedTextBox],
+        canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Vec<Option<InkStrip>> {
         let Some(ink) = &self.ink else {
             return boxes.iter().map(|_| None).collect();
@@ -421,15 +429,38 @@ impl PpocrEngine {
         let h = PpocrInkModel::HEIGHT;
         let t_pre = Instant::now();
         let rgb = image.to_rgb8();
+        let thickness_pad = self.detector.pool_comp();
 
-        // Dewarp each box's oriented text band straight to a 48px strip (width a multiple of
-        // 8), in parallel — the per-pixel warp dominates `pre` and the strips are
-        // independent. Using the oriented box (not the contour) keeps this rectification
-        // identical to the matting strip's, so the mask registers 1:1 there.
-        let prepared: Vec<(usize, RgbImage)> = boxes
+        // Dewarp each box's text band straight to a 48px strip (width a multiple of the
+        // pooling factor), in parallel — the per-pixel warp dominates `pre` and the strips
+        // are independent. Prefer the recognizer's curl-straightened contour dewarp with the
+        // *same* params (contour, quadrant, thickness_pad), so the bold channel's columns
+        // line up with the rec CTC firing fractions; keep the per-pixel source map so the
+        // matting can scatter the matte back to image space. A box with no usable contour
+        // falls back to the oriented-box affine (no map; no per-word bold there).
+        let prepared: Vec<(usize, RgbImage, Option<Vec<(f32, f32)>>)> = boxes
             .par_iter()
             .enumerate()
             .filter_map(|(i, b)| {
+                let contour: Option<Vec<(f32, f32)>> = (!b.contour.is_empty()
+                    && b.contour.len() % 2 == 0)
+                    .then(|| b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect());
+                if let Some(natural) = contour
+                    .as_deref()
+                    .and_then(|c| contour_strip_warp(c, canonical_quadrant, thickness_pad))
+                {
+                    let content_w = ((natural.width as f32 * h as f32 / natural.height as f32)
+                        .round() as u32)
+                        .max(PpocrInkModel::POOL_MULTIPLE)
+                        .next_multiple_of(PpocrInkModel::POOL_MULTIPLE);
+                    let warp = ContourStripWarp {
+                        width: content_w,
+                        height: h,
+                        ..natural
+                    };
+                    let (strip, map) = render_contour_strip_rgb_with_map(&rgb, &warp);
+                    return Some((i, strip, Some(map)));
+                }
                 let o = &b.oriented_box;
                 if o.width <= 1.0 || o.height <= 1.0 {
                     return None;
@@ -437,7 +468,7 @@ impl PpocrEngine {
                 let aw = ((o.width * h as f32 / o.height).round() as u32)
                     .max(PpocrInkModel::POOL_MULTIPLE);
                 let w = aw.next_multiple_of(PpocrInkModel::POOL_MULTIPLE);
-                Some((i, dewarp_oriented_to_strip_rgb(&rgb, o, w, h)))
+                Some((i, dewarp_oriented_to_strip_rgb(&rgb, o, w, h), None))
             })
             .collect();
         let pre_us = t_pre.elapsed().as_micros();
@@ -445,7 +476,7 @@ impl PpocrEngine {
         // Bucket by *exact* width (same-width strips batch into one call, no padding), then
         // run buckets in parallel — one MNN session per rayon worker, no lock contention.
         let mut by_width: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
-        for (j, (_, r)) in prepared.iter().enumerate() {
+        for (j, (_, r, _)) in prepared.iter().enumerate() {
             by_width.entry(r.width()).or_default().push(j);
         }
         let buckets: Vec<(u32, Vec<usize>)> = by_width.into_iter().collect();
@@ -505,7 +536,15 @@ impl PpocrEngine {
                         }
                         let matte = GrayImage::from_raw(tw, h, matte)?;
                         let bold = bold.and_then(|b| GrayImage::from_raw(tw, h, b));
-                        Some((box_idx, InkStrip { matte, bold }))
+                        let src_map = prepared[j].2.clone();
+                        Some((
+                            box_idx,
+                            InkStrip {
+                                matte,
+                                bold,
+                                src_map,
+                            },
+                        ))
                     })
                     .collect()
             })
@@ -727,7 +766,6 @@ impl PpocrEngine {
     pub fn classify_text_boxes_image(
         &self,
         image: &DynamicImage,
-        gray: &GrayImage,
         boxes: &[crate::ocr::DetectedTextBox],
         canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<Option<PpocrScriptPrediction>>, TranslatorError> {
@@ -737,14 +775,7 @@ impl PpocrEngine {
                 "ppocr script classifier is not available",
             ));
         };
-        let crops = crop_text_strips(
-            image,
-            gray,
-            boxes,
-            canonical_quadrant,
-            self.detector.pool_comp(),
-        )
-        .0;
+        let crops = crop_text_strips(image, boxes, canonical_quadrant, self.detector.pool_comp()).0;
         let image_area = (image.width() as f32) * (image.height() as f32);
         let mut predictions = vec![None; boxes.len()];
         let mut eligible_crops = Vec::new();
@@ -835,7 +866,6 @@ impl PpocrEngine {
     pub fn recognize_text_in_boxes_image(
         &self,
         image: &DynamicImage,
-        gray: &GrayImage,
         boxes: &[crate::ocr::DetectedTextBox],
         scripts: &[PpocrScript],
         profile: PpocrProfile,
@@ -855,13 +885,8 @@ impl PpocrEngine {
         let height = image.height();
 
         let t_crops = Instant::now();
-        let (crops, dewarp_count) = crop_text_strips(
-            image,
-            gray,
-            boxes,
-            canonical_quadrant,
-            self.detector.pool_comp(),
-        );
+        let (crops, dewarp_count) =
+            crop_text_strips(image, boxes, canonical_quadrant, self.detector.pool_comp());
         let mean_crop_w: f32 =
             crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32;
         let mean_crop_h: f32 =
@@ -1157,12 +1182,12 @@ fn crop_dynamic(image: &DynamicImage, rect: &PpocrRect) -> DynamicImage {
 /// strip's reading direction.
 pub(crate) fn crop_text_strips(
     image: &DynamicImage,
-    gray: &GrayImage,
     boxes: &[crate::ocr::DetectedTextBox],
     canonical_quadrant: Option<crate::coords::Quadrant>,
     thickness_pad: f32,
 ) -> (Vec<DynamicImage>, usize) {
     let mut dewarp_count = 0usize;
+    let rgb = image.to_rgb8();
     let crops = boxes
         .iter()
         .map(|b| {
@@ -1174,8 +1199,10 @@ pub(crate) fn crop_text_strips(
                 };
             let dewarped = contour_pairs
                 .as_deref()
-                .and_then(|c| dewarp_contour_to_strip(gray, c, canonical_quadrant, thickness_pad))
-                .map(DynamicImage::ImageLuma8);
+                .and_then(|c| {
+                    dewarp_contour_to_strip_rgb(&rgb, c, canonical_quadrant, thickness_pad)
+                })
+                .map(DynamicImage::ImageRgb8);
             if let Some(dewarped) = dewarped {
                 dewarp_count += 1;
                 dewarped
@@ -3188,16 +3215,28 @@ pub fn dewarp_contour_to_strip_rgb_with_map(
     thickness_pad: f32,
 ) -> Option<(RgbImage, Vec<(f32, f32)>)> {
     let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;
+    Some(render_contour_strip_rgb_with_map(rgb, &warp))
+}
+
+/// Sample `warp`'s strip out of `rgb` and return, per strip pixel (row-major
+/// `y * width + x`), the source-image coordinate it sampled. `strip_source_coord`
+/// normalizes by `warp.width`/`warp.height`, so a caller may override those on the
+/// warp to render at a different resolution (e.g. the ink model's 48px height)
+/// and the map comes back at that resolution.
+fn render_contour_strip_rgb_with_map(
+    rgb: &RgbImage,
+    warp: &ContourStripWarp,
+) -> (RgbImage, Vec<(f32, f32)>) {
     let mut out = RgbImage::new(warp.width, warp.height);
     let mut map = Vec::with_capacity((warp.width * warp.height) as usize);
     for y in 0..warp.height {
         for x in 0..warp.width {
-            let (src_x, src_y) = strip_source_coord(&warp, x, y);
+            let (src_x, src_y) = strip_source_coord(warp, x, y);
             out.put_pixel(x, y, bilinear_rgb(rgb, src_x, src_y));
             map.push((src_x, src_y));
         }
     }
-    Some((out, map))
+    (out, map)
 }
 
 fn fit_quadratic(points: &[(f32, f32)]) -> Option<(f32, f32, f32)> {

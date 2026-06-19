@@ -136,6 +136,7 @@ pub fn mat_detections(
     rgba: &RgbaImage,
     boxes: &[DetectedTextBox],
     ink_masks: &[Option<GrayImage>],
+    src_maps: &[Option<Vec<(f32, f32)>>],
 ) -> Vec<MattedStrip> {
     let (w, h) = rgba.dimensions();
     let mut union_ink = vec![false; (w as usize) * (h as usize)];
@@ -145,7 +146,8 @@ pub fn mat_detections(
         let Some(Some(mask)) = ink_masks.get(idx) else {
             continue;
         };
-        fg[idx] = project_box_ink(rgba, b, mask, w, h, &mut union_ink);
+        let src_map = src_maps.get(idx).and_then(|m| m.as_deref());
+        fg[idx] = project_box_ink(rgba, b, mask, src_map, w, h, &mut union_ink);
     }
 
     boxes
@@ -164,12 +166,14 @@ pub fn union_ink_mask(
     rgba: &RgbaImage,
     boxes: &[DetectedTextBox],
     ink_masks: &[Option<GrayImage>],
+    src_maps: &[Option<Vec<(f32, f32)>>],
 ) -> Vec<bool> {
     let (w, h) = rgba.dimensions();
     let mut union = vec![false; (w as usize) * (h as usize)];
     for (idx, b) in boxes.iter().enumerate() {
         if let Some(Some(mask)) = ink_masks.get(idx) {
-            let _ = project_box_ink(rgba, b, mask, w, h, &mut union);
+            let src_map = src_maps.get(idx).and_then(|m| m.as_deref());
+            let _ = project_box_ink(rgba, b, mask, src_map, w, h, &mut union);
         }
     }
     union
@@ -187,10 +191,17 @@ fn project_box_ink(
     image: &RgbaImage,
     detected: &DetectedTextBox,
     ink_mask: &GrayImage,
+    src_map: Option<&[(f32, f32)]>,
     w: u32,
     h: u32,
     union_ink: &mut [bool],
 ) -> Option<u32> {
+    // Contour-dewarped strips carry a per-pixel source map (the strip is curl-straightened,
+    // so there is no single affine inverse). Scatter the matte back through it; the sparse
+    // hits a low-res strip leaves on large text are closed by the caller's fill dilation.
+    if let Some(map) = src_map {
+        return scatter_box_ink(image, ink_mask, map, w, h, union_ink);
+    }
     let o = detected.oriented_box;
     if o.width <= 1.0 || o.height <= 1.0 {
         return None;
@@ -252,6 +263,57 @@ fn project_box_ink(
         }
     }
 
+    if ink.len() < MIN_INK_PIXELS {
+        return None;
+    }
+    let bg_luma = if bg_count > 0 {
+        (bg_luma_sum / bg_count) as u8
+    } else {
+        255
+    };
+    Some(ink_core_argb(ink, bg_luma))
+}
+
+/// Scatter a contour-strip matte into the image-space `union_ink` via its forward
+/// source map (one `(x, y)` per matte texel), and derive the box's foreground ink
+/// colour the same way [`project_box_ink`] does. `src_map` is row-major over the
+/// matte's own `width × height`. The strip is 48px tall, so for source text taller
+/// than that the hits are sparse; the caller's fill dilation closes the gaps.
+fn scatter_box_ink(
+    image: &RgbaImage,
+    ink_mask: &GrayImage,
+    src_map: &[(f32, f32)],
+    w: u32,
+    h: u32,
+    union_ink: &mut [bool],
+) -> Option<u32> {
+    let mw = ink_mask.width();
+    let mh = ink_mask.height();
+    if src_map.len() != (mw * mh) as usize {
+        return None;
+    }
+    let w_us = w as usize;
+    let mut ink: Vec<Rgba<u8>> = Vec::new();
+    let mut bg_luma_sum: u64 = 0;
+    let mut bg_count: u64 = 0;
+    for my in 0..mh {
+        for mx in 0..mw {
+            let (sx, sy) = src_map[(my * mw + mx) as usize];
+            let pxi = sx.floor() as i32;
+            let pyi = sy.floor() as i32;
+            if pxi < 0 || pyi < 0 || pxi >= w as i32 || pyi >= h as i32 {
+                continue;
+            }
+            let pixel = *image.get_pixel(pxi as u32, pyi as u32);
+            if ink_mask.get_pixel(mx, my)[0] >= INK_ALPHA_CUT {
+                union_ink[(pyi as usize) * w_us + pxi as usize] = true;
+                ink.push(pixel);
+            } else {
+                bg_luma_sum += luma(pixel) as u64;
+                bg_count += 1;
+            }
+        }
+    }
     if ink.len() < MIN_INK_PIXELS {
         return None;
     }

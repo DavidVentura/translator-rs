@@ -66,7 +66,6 @@ fn main() {
 
     for img_path in images {
         let image = image::open(img_path).unwrap_or_else(|e| panic!("open {img_path}: {e}"));
-        let gray = image.to_luma8();
         let rgb = image.to_rgb8();
         let mut boxes = engine
             .detect_only_image(&image, PpocrProfile::Still)
@@ -105,14 +104,7 @@ fn main() {
 
         let scripts = vec![script; boxes.len()];
         let lines = engine
-            .recognize_text_in_boxes_image(
-                &image,
-                &gray,
-                &boxes,
-                &scripts,
-                PpocrProfile::Still,
-                None,
-            )
+            .recognize_text_in_boxes_image(&image, &boxes, &scripts, PpocrProfile::Still, None)
             .unwrap_or_else(|e| panic!("recognize: {e:?}"));
 
         let mut j = String::from("{\n");

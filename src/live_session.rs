@@ -1333,7 +1333,6 @@ pub fn estimate_canonical_via_rec(
         return None;
     }
     let rgb = oriented.rgb.as_ref()?;
-    let gray = &oriented.gray;
 
     // Pick top-K by det score, filtered for size + presence of contour.
     let mut sample_indices: Vec<(usize, f32)> = boxes
@@ -1420,7 +1419,6 @@ pub fn estimate_canonical_via_rec(
         let canon = slot.0;
         match engine.recognize_text_in_boxes_image(
             rgb,
-            gray,
             &samples,
             &scripts,
             PpocrProfile::Live,

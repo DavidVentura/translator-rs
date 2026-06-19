@@ -42,9 +42,6 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     // PPOCR needs display-orient gray (same coord frame as `rgb` and
     // detected boxes). `oriented.gray` is sensor-orient for the
     // tracker; we don't reuse it here.
-    let rgb8 = rgb.to_rgb8();
-    let gray_display = image::imageops::grayscale(&rgb8);
-
     let det_raw = ppocr
         .detect_only_image(rgb_det, PpocrProfile::Still)
         .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?;
@@ -60,12 +57,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let scripts = match source_selection {
         OcrSourceSelection::Auto => {
             let predictions = ppocr
-                .classify_text_boxes_image(
-                    rgb,
-                    &gray_display,
-                    &det_boxes,
-                    Some(crate::coords::Quadrant::R0),
-                )
+                .classify_text_boxes_image(rgb, &det_boxes, Some(crate::coords::Quadrant::R0))
                 .map_err(|e| {
                     TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
                 })?;
@@ -101,7 +93,6 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let lines = ppocr
         .recognize_text_in_boxes_image(
             rgb,
-            &gray_display,
             &det_boxes,
             &scripts,
             PpocrProfile::Still,
@@ -116,7 +107,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         let rgba = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
             .expect("rgba image from caller-owned bytes");
         let dynimg = image::DynamicImage::ImageRgba8(rgba);
-        let strips = ppocr.ink_strips(&dynimg, &det_boxes);
+        let strips = ppocr.ink_strips(&dynimg, &det_boxes, Some(crate::coords::Quadrant::R0));
         (strips, Some(dynimg.into_rgba8()))
     } else {
         (Vec::new(), None)
@@ -126,6 +117,10 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
         .iter()
         .map(|s| s.as_ref().map(|s| s.matte.clone()))
+        .collect();
+    let ink_src_maps: Vec<Option<Vec<(f32, f32)>>> = ink_strips
+        .iter()
+        .map(|s| s.as_ref().and_then(|s| s.src_map.clone()))
         .collect();
     let model_bold: Vec<Option<bool>> = ink_strips
         .iter()
@@ -167,9 +162,9 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     // replaces just the inked pixels with a reconstructed background instead of
     // flat-filling each line's rect. `None` when no ink model is installed →
     // flat-fill fallback.
-    let ink_union = ink_rgba
-        .as_ref()
-        .map(|rgba| crate::color_matting::union_ink_mask(rgba, &det_boxes, &ink_masks));
+    let ink_union = ink_rgba.as_ref().map(|rgba| {
+        crate::color_matting::union_ink_mask(rgba, &det_boxes, &ink_masks, &ink_src_maps)
+    });
 
     finalize_image_overlay(
         engine,
@@ -221,11 +216,8 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
     }
 }
 
-/// Pooled bold probability above which a line is rendered bold. ~0.65 puts thin-text
-/// false positives near zero (the acceptable failure is missing a bold, not emboldening
-/// thin text); the residual emboldening is on heavy-400 faces that read bold anyway.
 #[cfg(feature = "ppocr")]
-pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.65;
+pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.5;
 
 /// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent

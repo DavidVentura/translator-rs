@@ -53,7 +53,6 @@ fn main() {
     let iters: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(10);
 
     let image = image::open(&image_path).expect("open image");
-    let gray = image.to_luma8();
     eprintln!(
         "image: {} ({}x{})",
         image_path.display(),
@@ -86,7 +85,7 @@ fn main() {
         .expect("detect");
     let scripts = vec![PpocrScript::Latin; boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image(&image, &gray, &boxes, &scripts, PpocrProfile::Still, None)
+        .recognize_text_in_boxes_image(&image, &boxes, &scripts, PpocrProfile::Still, None)
         .expect("recognize");
     eprintln!(
         "warmup: boxes={} accepted={}",
@@ -128,14 +127,7 @@ fn main() {
         let scripts = vec![PpocrScript::Latin; boxes.len()];
         let t = Instant::now();
         let _lines = engine
-            .recognize_text_in_boxes_image(
-                &image,
-                &gray,
-                &boxes,
-                &scripts,
-                PpocrProfile::Still,
-                None,
-            )
+            .recognize_text_in_boxes_image(&image, &boxes, &scripts, PpocrProfile::Still, None)
             .expect("recognize");
         let r = t.elapsed().as_secs_f32() * 1000.0;
 

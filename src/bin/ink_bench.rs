@@ -45,7 +45,7 @@ fn main() {
 
     for r in 0..runs {
         let t = Instant::now();
-        let masks = engine.ink_masks(&image, &boxes);
+        let masks = engine.ink_masks(&image, &boxes, Some(translator::coords::Quadrant::R0));
         let n = masks.iter().filter(|m| m.is_some()).count();
         println!(
             "run {r}: {n} masks — ink_masks wall {:.1}ms",
