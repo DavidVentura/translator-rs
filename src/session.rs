@@ -317,14 +317,14 @@ impl TranslatorSession {
         )
     }
 
-    #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+    #[cfg(feature = "planar-tracker")]
     pub(crate) fn translate_mixed_texts_with_alignment(
         &self,
         inputs: &[String],
         forced_source_code: Option<&str>,
         target_code: &str,
         available_language_codes: &[LanguageCode],
-    ) -> Result<crate::routing::MixedAlignedTranslationResult, TranslatorError> {
+    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, TranslatorError> {
         let snap = self.snapshot();
         let mut engine = self.engine().lock().expect("engine lock poisoned");
         Translator::new(&mut engine, &snap).translate_mixed_texts_with_alignment(
@@ -481,25 +481,12 @@ impl TranslatorSession {
         ppocr.detect_only_image(rgb_det, crate::ppocr::PpocrProfile::Live)
     }
 
-    /// Per-box ink mattes for `boxes` against the oriented image's colour `rgb`
-    /// (the same frame matting samples from). 1:1 with `boxes`; entries are
-    /// `None` for boxes the model couldn't matte, and every entry is `None` when
-    /// no ink model is installed. `boxes` must already be in `rgb`'s coord space
-    /// (rec-scaled) so the masks register against the matting strips.
-    #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
-    pub(crate) fn ppocr_ink_masks(
-        &self,
-        rgb: &image::DynamicImage,
-        boxes: &[crate::ocr::DetectedTextBox],
-        canonical_quadrant: Option<crate::coords::Quadrant>,
-    ) -> Result<Vec<Option<image::GrayImage>>, TranslatorError> {
-        let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
-        Ok(ppocr.ink_masks(rgb, boxes, canonical_quadrant))
-    }
-
-    /// Like [`ppocr_ink_masks`] but keeps each strip's bold channel (ch1) so the live
-    /// path can decide typography weight from the model instead of a geometric heuristic.
+    /// Per-box ink strips for `boxes` against the oriented image's colour `rgb` (the same
+    /// frame matting samples from), keeping each strip's matte (ch0) and bold channel (ch1)
+    /// so the live path can decide typography weight from the model instead of a geometric
+    /// heuristic. 1:1 with `boxes`; entries are `None` for boxes the model couldn't matte,
+    /// and every entry is `None` when no ink model is installed. `boxes` must already be in
+    /// `rgb`'s coord space (rec-scaled) so the strips register against the matting strips.
     #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
     pub(crate) fn ppocr_ink_strips(
         &self,

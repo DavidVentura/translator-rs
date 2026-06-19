@@ -7,7 +7,7 @@ use crate::api::LanguageCode;
 use crate::bergamot::BergamotEngine;
 use crate::catalog::CatalogSnapshot;
 use crate::language_detect::detect_language_robust_code;
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+#[cfg(feature = "planar-tracker")]
 use crate::translate::{
     TranslationWithAlignment, execute_translation_plan_with_alignment, identity_char_alignments,
 };
@@ -213,18 +213,12 @@ pub(crate) fn translate_mixed_texts_in_snapshot(
     })
 }
 
-/// Like [`MixedTextTranslationResult`] but each translation carries the model's token
-/// alignments, so the live overlay can project per-word bold from the source onto the
-/// translated text. Internal (the FFI surface uses the alignment-free variant).
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
-pub(crate) struct MixedAlignedTranslationResult {
-    pub translations: Vec<TranslationWithAlignment>,
-    pub nothing_reason: Option<NothingReason>,
-}
-
-/// Alignment-returning [`translate_mixed_texts_in_snapshot`]. Passthrough inputs map onto
-/// themselves with identity char alignments; batched inputs run the plan with alignment.
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+/// Alignment-returning [`translate_mixed_texts_in_snapshot`]: each returned translation carries
+/// the model's token alignments so the live overlay can project per-word bold from the source
+/// onto the translated text. Passthrough inputs map onto themselves with identity char
+/// alignments; batched inputs run the plan with alignment. Internal (the FFI surface uses the
+/// alignment-free [`MixedTextTranslationResult`]).
+#[cfg(feature = "planar-tracker")]
 pub(crate) fn translate_mixed_texts_with_alignment_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
@@ -232,20 +226,13 @@ pub(crate) fn translate_mixed_texts_with_alignment_in_snapshot(
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[String],
-) -> Result<MixedAlignedTranslationResult, String> {
+) -> Result<Vec<TranslationWithAlignment>, String> {
     let routing_plan = plan_batch_text_translation(
         inputs,
         forced_source_code,
         target_code,
         available_language_codes,
     );
-
-    if routing_plan.batches.is_empty() && routing_plan.passthrough_texts.is_empty() {
-        return Ok(MixedAlignedTranslationResult {
-            translations: Vec::new(),
-            nothing_reason: routing_plan.nothing_reason,
-        });
-    }
 
     let mut translations = routing_plan
         .passthrough_texts
@@ -272,10 +259,7 @@ pub(crate) fn translate_mixed_texts_with_alignment_in_snapshot(
         )?);
     }
 
-    Ok(MixedAlignedTranslationResult {
-        translations,
-        nothing_reason: None,
-    })
+    Ok(translations)
 }
 
 #[cfg(test)]

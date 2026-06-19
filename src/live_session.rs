@@ -1216,7 +1216,7 @@ pub trait LiveTranslator {
         forced_source_code: Option<&str>,
         target_code: &str,
         available_language_codes: &[LanguageCode],
-    ) -> Result<crate::routing::MixedAlignedTranslationResult, String>;
+    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String>;
 }
 
 #[cfg(feature = "ppocr")]
@@ -1246,7 +1246,7 @@ impl LiveTranslator for &crate::session::TranslatorSession {
         forced_source_code: Option<&str>,
         target_code: &str,
         available_language_codes: &[LanguageCode],
-    ) -> Result<crate::routing::MixedAlignedTranslationResult, String> {
+    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
         (*self)
             .translate_mixed_texts_with_alignment(
                 inputs,
@@ -1270,19 +1270,15 @@ impl LiveTranslator for NoopTranslator {
         _forced: Option<&str>,
         _target: &str,
         _available: &[LanguageCode],
-    ) -> Result<crate::routing::MixedAlignedTranslationResult, String> {
-        let translations = inputs
+    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
+        Ok(inputs
             .iter()
             .map(|s| crate::translate::TranslationWithAlignment {
                 alignments: crate::translate::identity_char_alignments(s),
                 source_text: s.clone(),
                 translated_text: s.clone(),
             })
-            .collect();
-        Ok(crate::routing::MixedAlignedTranslationResult {
-            translations,
-            nothing_reason: None,
-        })
+            .collect())
     }
 }
 
@@ -2407,8 +2403,7 @@ impl LiveSession {
                         String,
                         crate::translate::TranslationWithAlignment,
                     > = match result {
-                        Ok(res) => res
-                            .translations
+                        Ok(translations) => translations
                             .into_iter()
                             .map(|t| (t.source_text.clone(), t))
                             .collect(),
