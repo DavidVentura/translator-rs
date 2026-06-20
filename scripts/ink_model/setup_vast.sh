@@ -45,9 +45,9 @@ apt-get install -y -qq \
 # Giga-bold / display-black faces: the stock font set tops out around ExtraBold, so real
 # poster/sign weights are under-trained and heavy condensed faces collapse. Most of these
 # declare OS/2 weight 400 despite rendering black, which the measured-stroke label handles
-# correctly. Anton + Archivo Black are deliberately NOT installed here — they stay held-out
-# probes (probe_font.py loads them by path). wget per-font with || true so a dead URL on the
-# CDN doesn't abort provisioning.
+# correctly. Archivo Black stays a held-out probe (probe_font.py loads it by path) for honest
+# display eval; Anton is now TRAINED (the condensed-grotesque header style — STRONGER/NOT COFFEE
+# — that the matte under-covered). wget per-font with || true so a dead URL doesn't abort.
 echo "== fetching giga-bold display faces =="
 GB=/usr/share/fonts/truetype/gigabold; mkdir -p "$GB"
 GF=https://github.com/google/fonts/raw/main
@@ -58,7 +58,11 @@ for f in \
   ofl/ultra/Ultra-Regular.ttf ofl/bungee/Bungee-Regular.ttf \
   ofl/passionone/PassionOne-Black.ttf ofl/bebasneue/BebasNeue-Regular.ttf \
   ofl/poppins/Poppins-Black.ttf ofl/lato/Lato-Black.ttf \
-  ofl/barlow/Barlow-Black.ttf apache/blackopsone/BlackOpsOne-Regular.ttf; do
+  ofl/barlow/Barlow-Black.ttf apache/blackopsone/BlackOpsOne-Regular.ttf \
+  ofl/anton/Anton-Regular.ttf ofl/staatliches/Staatliches-Regular.ttf \
+  ofl/oswald/static/Oswald-Bold.ttf ofl/oswald/static/Oswald-SemiBold.ttf \
+  ofl/fjallaone/FjallaOne-Regular.ttf ofl/khand/Khand-Bold.ttf \
+  ofl/squadaone/SquadaOne-Regular.ttf ofl/teko/static/Teko-Bold.ttf; do
   wget -q "$GF/$f" -O "$GB/$(basename "$f")" || true
 done
 fc-cache -f "$GB" >/dev/null 2>&1 || true

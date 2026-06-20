@@ -70,11 +70,29 @@ def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     return torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
 
 
-def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5, bold_asym_t0=0.15):
+# Confident-margin band: targets at/above CONF_BOLD_T are clearly bold, at/below CONF_NORM_T
+# clearly normal; the rest is left to pure regression. MARGIN_LOGIT = logit(0.75): the margin
+# pushes confident-bold logits above +M (prob >= 0.75) and confident-normal below -M (prob <=
+# 0.25), so the two clusters are repelled out of the [0.25,0.75] band. On the logistic targets
+# (gen_data) the confident bands hold most of the mass; on a linear ramp they'd hold only the
+# already-separated extremes, which is why this term is paired with the logistic calibration.
+MARGIN_CONF_BOLD_T = 0.75
+MARGIN_CONF_NORM_T = 0.25
+MARGIN_LOGIT = 1.0986
+
+# Asymmetric matte Tversky: penalise misses (FN, β) above spills (FP, α). The matting cost is
+# asymmetric — a missed-ink pixel leaves residual text the inpainter can't fill, an over-marked
+# pixel is benign edge spill the inpainter absorbs — so the matte should be biased toward recall.
+MATTE_TVERSKY_ALPHA = 0.3
+MATTE_TVERSKY_BETA = 0.7
+
+
+def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
+               bold_asym_t0=0.15, bold_margin=0.0, matte_tversky=0.0):
     """Matte BCE over the whole strip + asymmetric bold L1 *masked to ink*. `bold` is the
-    continuous per-pixel stroke-width target in [0,1] (gen_data `_font_stroke_ratio`,
-    LO..HI → 0..1), not a binary class: the head regresses how thick the ink is so the
-    runtime can threshold boldness wherever it wants.
+    continuous per-pixel stroke-width target in [0,1] (gen_data `_font_stroke_ratio` through
+    the logistic `_target_q`), not a binary class: the head regresses how thick the ink is so
+    the runtime can threshold boldness wherever it wants.
 
     The bold term is base L1 (keeps calibration everywhere) plus an extra penalty for
     *overshoot* (predicting bolder than truth) concentrated on *thin* ink (low target):
@@ -83,20 +101,38 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5, 
     `bold_asym_t0` is where the thinness gate fades to 0 (so genuine bold, target >= t0, is
     pure L1 — undisturbed). Undershoot (missing a bold) is never extra-penalised; it's the
     benign side of the asymmetric preference. Masking to ink keeps the empty background out.
+
+    `bold_margin` weights a logit-space confident-margin hinge: it lifts clearly-bold scores
+    toward the rail (L1 alone leaves them compressed below the saturated target) and pulls the
+    clearly-normal tail down, while leaving the ambiguous middle to regression. 0 disables it.
     `strip_w` (B,) is the per-strip legibility weight (illegible strips contribute zero);
-    None = all ones. Returns (total, matte, bold) for logging."""
+    None = all ones. Returns (total, matte, bold, margin) for logging."""
     matte_logit, bold_logit = logits[:, :1], logits[:, 1:]
     if strip_w is None:
         strip_w = torch.ones(logits.shape[0], device=logits.device)
     w = strip_w.view(-1, 1, 1, 1)
     bce_m = F.binary_cross_entropy_with_logits(matte_logit, cov, reduction="none")
     loss_matte = (bce_m * w).sum() / w.expand_as(bce_m).sum().clamp_min(1.0)
+    p_m = torch.sigmoid(matte_logit)
+    tp = (p_m * cov * w).sum()
+    fp = (p_m * (1.0 - cov) * w).sum()
+    fn = ((1.0 - p_m) * cov * w).sum()
+    loss_tversky = 1.0 - (tp + 1.0) / (tp + MATTE_TVERSKY_ALPHA * fp + MATTE_TVERSKY_BETA * fn + 1.0)
     ink = (cov > 0.5).float() * w
     err = torch.sigmoid(bold_logit) - bold
     thin_gate = torch.clamp(1.0 - bold / bold_asym_t0, min=0.0)
     pen = err.abs() + bold_asym * torch.relu(err) * thin_gate
     loss_bold = (pen * ink).sum() / ink.sum().clamp_min(1.0)
-    return loss_matte + bold_weight * loss_bold, loss_matte, loss_bold
+
+    conf_bold = (bold >= MARGIN_CONF_BOLD_T).float()
+    conf_norm = (bold <= MARGIN_CONF_NORM_T).float()
+    hinge = (conf_bold * torch.relu(MARGIN_LOGIT - bold_logit)
+             + conf_norm * torch.relu(bold_logit + MARGIN_LOGIT))
+    loss_margin = (hinge * ink).sum() / ink.sum().clamp_min(1.0)
+
+    total = (loss_matte + matte_tversky * loss_tversky
+             + bold_weight * loss_bold + bold_margin * loss_margin)
+    return total, loss_matte, loss_bold, loss_margin
 
 
 def main():
@@ -122,6 +158,10 @@ def main():
                     help="extra penalty on emboldening thin ink (overshoot on low-target); 0 = plain L1")
     ap.add_argument("--bold-asym-t0", type=float, default=0.15,
                     help="target above which the thin-overshoot penalty fades to 0 (bold left as pure L1)")
+    ap.add_argument("--bold-margin", type=float, default=0.0,
+                    help="weight on the confident-margin hinge (lifts clearly-bold scores to the rail); 0 = off")
+    ap.add_argument("--matte-tversky", type=float, default=0.0,
+                    help="weight on the recall-biased matte Tversky term (FN>FP); 0 = plain BCE")
     ap.add_argument("--bold-from", type=int, default=1, help="decoder stage feeding the bold head (1=full,2=½,3=¼)")
     ap.add_argument("--detach-bold", action="store_true", help="stop bold gradient into the trunk (matte-priority)")
     ap.add_argument("--gpu-degrade", action="store_true",
@@ -202,8 +242,9 @@ def main():
                 strip_w = gpu_degrade.legible_mask(img, cov, native_h).float()
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
-                                    bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0)
+            loss, _, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
+                                       bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
+                                       bold_margin=args.bold_margin, matte_tversky=args.matte_tversky)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -221,11 +262,12 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
-                vl, vm, vb = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight,
-                                        bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0)
+                vl, vm, vb, vg = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight,
+                                            bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
+                                            bold_margin=args.bold_margin, matte_tversky=args.matte_tversky)
             model.train()
             print(
-                f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f})",
+                f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f} margin {vg.item():.4f})",
                 flush=True,
             )
             state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,

@@ -125,22 +125,33 @@ def _font_weight(path: str) -> int | None:
         return None
 
 
-def _weight_pool(paths: tuple[str, ...], bold: bool) -> tuple[str, ...]:
-    """Fonts biased toward the run's intended weight: ≥550 for bold, ≤550 for regular.
-    The 400–700 middle is now *included* on both sides — the bold target is a measured
-    stroke width (`_font_stroke_ratio`), not a binary class, so medium/semibold is signal
-    along the continuum, not label noise. The bias only keeps heavy faces from being
-    swamped by the mostly-regular pool."""
-    cut = (lambda w: w >= 550) if bold else (lambda w: w <= 550)
-    out = tuple(p for p in paths if (w := _font_weight(p)) is not None and cut(w))
-    return out or paths  # never empty (a script with no match falls back)
+# Pool-selection cuts in MEASURED stroke-ratio space — NOT OS/2 usWeightClass, which lies
+# (giga-bold display faces declare 400 yet draw black, so they wrongly landed in the regular
+# pool and were never drawn in bold runs). This is the same measurement that produces the
+# label (_target_q), so the run's bold/regular intent now matches the font's real thickness —
+# and the heavy display tail rides in the bold pool on its own (no special-case oversampling).
+# The semibold middle sits in both pools (its mid label is honest either way).
+STROKE_BOLD_CUT = 0.085
+STROKE_REG_CUT = 0.115
+
+
+def _stroke_pool(paths: tuple[str, ...], script: str, bold: bool) -> tuple[str, ...]:
+    """Fonts biased toward the run's intended weight by *measured* stroke ratio: thick faces
+    for bold runs, thin for regular, the semibold middle in both. Never empty (falls back to
+    all). Measured (not OS/2) so declared-weight lies can't misfile a face."""
+    cut = (lambda r: r >= STROKE_BOLD_CUT) if bold else (lambda r: r <= STROKE_REG_CUT)
+    out = tuple(p for p in paths if cut(_font_stroke_ratio(p, script)))
+    return out or tuple(paths)
 
 
 @lru_cache(maxsize=16)
 def _weighted_fonts(script: str, bold: bool) -> tuple[str, ...]:
-    if script in SHAPED:
-        return _weight_pool(shaped_fonts(script), bold)
-    return _weight_pool(cjk_font_paths() if script == "cjk" else font_paths(), bold)
+    paths = (
+        shaped_fonts(script) if script in SHAPED
+        else cjk_font_paths() if script == "cjk"
+        else font_paths()
+    )
+    return _stroke_pool(tuple(paths), script, bold)
 
 
 # Connected/cursive scripts the Latin+CJK set misses: Arabic (cursive, RTL), the Indic
@@ -271,14 +282,18 @@ def _cjk_units(rng: random.Random, txt: str, is_bold: bool) -> list[tuple[str, b
 # flat over each run's ink. Measured from the rendered raster (distance transform), never
 # from font metadata — a 400-weight face that draws thick reads as thick. The measurement
 # is cached per (font, script) so the distance transform runs at most once per font in a
-# worker, never per training strip (per-strip it bottlenecks the dataloader). LO/HI bracket
-# the regular→bold stroke-ratio band and set where the inference threshold lands; calibrate
-# on the real font pool (gen_data --out dumps the per-strip mean as `bμ`).
-STROKE_RATIO_LO = 0.06
-STROKE_RATIO_HI = 0.16
+# worker, never per training strip (per-strip it bottlenecks the dataloader). The ratio→target
+# map is a logistic (see _target_q): its 0.5-crossing sits at the empirical valley between the
+# semibold (~0.088) and bold (~0.125) stroke-ratio modes, and K sets how hard confident weights
+# saturate. Calibrated on the font pool so regular p95 target ~0.2 and typical bold ~0.85, which
+# pulls the two clusters off the decision boundary (a linear LO..HI ramp left bold sitting at
+# ~0.65, smeared across 0.5). The model's ordering is already ~98% (eval_bold_sep); this only
+# moves where that ordering lands on the [0,1] axis.
+STROKE_RATIO_LO = 0.06  # stroke ratio assumed for a font whose raster can't be measured
+BOLD_RATIO_MID = 0.10   # ratio mapped to target 0.5 (valley between semibold and bold modes)
+BOLD_RATIO_K = 80.0     # logistic steepness; higher = harder saturation to the rails
 # Boundary in normalised target space where a strip/region counts as "should render bold".
-# LO/HI are calibrated so a nominal weight-700 Bold lands near 0.5, so both the eval
-# ground-truth split and the runtime decision threshold start from this value.
+# target >= 0.5 <=> stroke ratio >= BOLD_RATIO_MID, a real semibold/bold weight boundary.
 BOLD_GT_THRESHOLD = 0.5
 _REF_EM = 96
 _REF_LATIN = "Hxnodbpqgesa AOMW 2580"
@@ -315,10 +330,13 @@ def _font_stroke_ratio(path: str, script: str) -> float:
 
 
 def _target_q(ratio: float) -> int:
-    """Stroke ratio → 0..255 fill, where LO..HI maps to 0..255 (the [0,1] regression target
-    the bold head learns, quantised for an antialiased PIL draw)."""
-    t = (ratio - STROKE_RATIO_LO) / (STROKE_RATIO_HI - STROKE_RATIO_LO)
-    return round(255 * min(1.0, max(0.0, t)))
+    """Stroke ratio → 0..255 fill: a logistic centred at BOLD_RATIO_MID maps the [0,1]
+    regression target the bold head learns, quantised for an antialiased PIL draw. Logistic
+    (not a linear ramp) so confident regular/bold weights saturate near the rails and the
+    genuinely-ambiguous semibold band stays mid, instead of the whole bold cluster smearing
+    across the 0.5 threshold."""
+    t = 1.0 / (1.0 + np.exp(-BOLD_RATIO_K * (ratio - BOLD_RATIO_MID)))
+    return round(255 * float(t))
 
 
 def render_coverage(
@@ -421,11 +439,13 @@ def render_coverage(
         tot = mf(tot)
         fl = mf(fl) if outlined else tot
         # Thickening adds real stroke width, so the target must rise: grow the value region
-        # with the matte, then bump every ink pixel by the added width ((k-1) px / em) in
-        # normalised LO..HI units.
-        bump = (thick_k - 1) / (font_px * (STROKE_RATIO_HI - STROKE_RATIO_LO))
+        # with the matte, then raise it. Added half-width is (thick_k-1)/font_px of stroke
+        # ratio, which under the logistic target is a constant logit shift on the grown value.
+        shift = BOLD_RATIO_K * (thick_k - 1) / font_px
         grown = mf(bv)
-        bv = np.where(grown > 0, np.clip(grown + bump, 0.0, 1.0), 0.0).astype(np.float32)
+        gc = np.clip(grown, 1e-4, 1.0 - 1e-4)
+        shifted = 1.0 / (1.0 + np.exp(-(np.log(gc / (1.0 - gc)) + shift)))
+        bv = np.where(grown > 0, shifted, 0.0).astype(np.float32)
     if log is not None:
         log.update(
             font=last_font,
