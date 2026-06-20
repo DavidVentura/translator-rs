@@ -946,6 +946,7 @@ fn collect_translated_words(
     opts: &RenderOptions,
 ) -> Vec<PositionedWord> {
     let mut out = Vec::new();
+    let mut line_index = 0u32;
     for block in &prepared.blocks {
         if block.translated_text.trim().is_empty() {
             continue;
@@ -955,7 +956,14 @@ fn collect_translated_words(
             OverlayLayoutMode::VerticalBlockRect => layout_vertical(block, opts, cache, fonts),
         };
         if let Some(layout) = layout {
-            collect_block_words(&layout, &opts.language, cache, fonts, &mut out);
+            collect_block_words(
+                &layout,
+                &opts.language,
+                cache,
+                fonts,
+                &mut line_index,
+                &mut out,
+            );
         }
     }
     out
@@ -970,6 +978,7 @@ fn collect_block_words(
     language: &str,
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
+    line_index: &mut u32,
     out: &mut Vec<PositionedWord>,
 ) {
     for line in &layout.lines {
@@ -985,6 +994,8 @@ fn collect_block_words(
         if shaped.runs.is_empty() {
             continue;
         }
+        let li = *line_index;
+        *line_index += 1;
         let last = shaped.cum_em_at_byte.len() - 1;
         for (b0, b1) in selection_units(&line.text) {
             let x0 = shaped.cum_em_at_byte[b0.min(last)] * layout.size;
@@ -992,6 +1003,7 @@ fn collect_block_words(
             out.push(PositionedWord {
                 text: line.text[b0..b1].to_string(),
                 bounds: line.oriented.subspan(x0, x1),
+                line_index: li,
             });
         }
     }

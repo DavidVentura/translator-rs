@@ -227,39 +227,72 @@ fn firing_units_and_words(
     (units.len() == text_words.len()).then_some((units, text_words))
 }
 
-/// Per-word source boxes in image space, derived from a recognized line's CTC firings and its
-/// oriented box. Each firing's `at` is a fraction along the reading axis; a word spans from its
-/// first firing to the next word's first firing (the last reaches the box's far edge), mapped
-/// onto `oriented` via [`OrientedRect::subspan`] so adjacent boxes tile the line with no gaps.
-/// Empty when firings are absent or don't align 1:1 with the text.
+/// Word spans of `text` as `(char_start, char_end_exclusive, byte_start, byte_end)`: whitespace
+/// tokens for spaced scripts, each non-space glyph for CJK. Word segmentation comes from the
+/// recognized text itself, so every recognized line yields its words.
+fn text_word_spans(text: &str, is_cjk: bool) -> Vec<(usize, usize, usize, usize)> {
+    let mut out = Vec::new();
+    if is_cjk {
+        for (ci, (b, c)) in text.char_indices().enumerate() {
+            if !c.is_whitespace() {
+                out.push((ci, ci + 1, b, b + c.len_utf8()));
+            }
+        }
+        return out;
+    }
+    let mut word: Option<(usize, usize)> = None; // (char_start, byte_start)
+    let mut char_end = 0usize;
+    let mut byte_end = 0usize;
+    for (ci, (b, c)) in text.char_indices().enumerate() {
+        if c.is_whitespace() {
+            if let Some((cs, bs)) = word.take() {
+                out.push((cs, ci, bs, b));
+            }
+        } else if word.is_none() {
+            word = Some((ci, b));
+        }
+        char_end = ci + 1;
+        byte_end = b + c.len_utf8();
+    }
+    if let Some((cs, bs)) = word.take() {
+        out.push((cs, char_end, bs, byte_end));
+    }
+    out
+}
+
+/// Per-word source boxes in image space. Words are segmented from the recognized `text`, and
+/// each word's reading-axis span is read from the CTC `firings`, which are 1:1 with the text by
+/// construction (the recognizer's `text` is its decoded chars, and `ppocr` carries the firings
+/// through the same trim/normalize) — `firings[i].1` is the leading-edge fraction of char `i`,
+/// `1.0` is the far edge. Returns empty when no aligned firings are available (RTL lines, which
+/// carry none), since per-word positions can't be invented. Mapped onto `oriented` via
+/// [`OrientedRect::subspan`].
 pub fn firing_word_boxes(
     text: &str,
     firings: &[(char, f32)],
     is_cjk: bool,
     oriented: &crate::ocr::OrientedRect,
+    line_index: u32,
 ) -> Vec<crate::ocr::PositionedWord> {
-    if firings.is_empty() {
+    let n = text.chars().count();
+    if firings.len() != n || n == 0 {
         return Vec::new();
     }
-    let Some((units, text_words)) = firing_units_and_words(text, firings, is_cjk) else {
-        return Vec::new();
-    };
-    let w = oriented.width;
-    units
+    let char_edge: Vec<f32> = firings
         .iter()
-        .enumerate()
-        .map(|(k, &(s, _))| {
-            let lo = firings[s].1.clamp(0.0, 1.0);
-            let hi = if k + 1 < units.len() {
-                firings[units[k + 1].0].1.clamp(0.0, 1.0)
-            } else {
-                1.0
-            }
-            .max(lo);
-            let (bs, be) = text_words[k];
+        .map(|f| f.1.clamp(0.0, 1.0))
+        .chain(std::iter::once(1.0))
+        .collect();
+    let w = oriented.width;
+    text_word_spans(text, is_cjk)
+        .iter()
+        .map(|&(cs, ce, bs, be)| {
+            let x0 = char_edge[cs];
+            let x1 = char_edge[ce];
             crate::ocr::PositionedWord {
                 text: text[bs..be].to_string(),
-                bounds: oriented.subspan(lo * w, hi * w),
+                bounds: oriented.subspan(x0.min(x1) * w, x0.max(x1) * w),
+                line_index,
             }
         })
         .collect()
@@ -703,16 +736,16 @@ mod tests {
             height: 10.0,
             angle_radians: 0.0,
         };
-        // "aa bb": firings at fractions; first word 0.1..0.2, second 0.6..0.7.
+        // "aa bb": firings 1:1 with the 5 chars. char edges 0.1,0.2,0.45,0.6,0.7 and far edge 1.0.
         let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
-        let words = firing_word_boxes("aa bb", &firings, false, &oriented);
+        let words = firing_word_boxes("aa bb", &firings, false, &oriented, 0);
         assert_eq!(words.len(), 2);
         assert_eq!(words[0].text, "aa");
         assert_eq!(words[1].text, "bb");
-        // First word spans 0.1..0.6 (to the next word's start) → x 10..60, centre 35, width 50.
-        assert!((words[0].bounds.width - 50.0).abs() < 1e-3);
-        assert!((words[0].bounds.cx - 35.0).abs() < 1e-3);
-        // Last word spans 0.6..1.0 → x 60..100, centre 80, width 40.
+        // "aa" spans char edges 0.1..0.45 → x 10..45, centre 27.5, width 35.
+        assert!((words[0].bounds.width - 35.0).abs() < 1e-3);
+        assert!((words[0].bounds.cx - 27.5).abs() < 1e-3);
+        // "bb" spans 0.6..1.0 → x 60..100, centre 80, width 40.
         assert!((words[1].bounds.width - 40.0).abs() < 1e-3);
         assert!((words[1].bounds.cx - 80.0).abs() < 1e-3);
         // Height/baseline are inherited from the line box.
@@ -721,16 +754,18 @@ mod tests {
     }
 
     #[test]
-    fn firing_word_boxes_empty_when_counts_disagree() {
+    fn firing_word_boxes_empty_without_aligned_firings() {
         let oriented = crate::ocr::OrientedRect::axis_aligned(crate::ocr::Rect {
             left: 0,
             top: 0,
             right: 100,
             bottom: 10,
         });
-        // Two firing units but three whitespace words → no 1:1 alignment.
+        // Firings count != text chars (the RTL case carries none): no per-word positions to
+        // invent, so emit nothing rather than guessing.
+        assert!(firing_word_boxes("a b c", &[], false, &oriented, 0).is_empty());
         let firings = [('a', 0.1), (' ', 0.4), ('b', 0.7)];
-        assert!(firing_word_boxes("a b c", &firings, false, &oriented).is_empty());
+        assert!(firing_word_boxes("a b c", &firings, false, &oriented, 0).is_empty());
     }
 
     #[test]

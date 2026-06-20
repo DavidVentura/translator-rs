@@ -907,6 +907,7 @@ impl PpocrEngine {
             let chunks =
                 split_crop_on_whitespace_for_rec_width(crop, REC_WHITESPACE_SPLIT_MAX_WIDTH);
             split_count += chunks.len().saturating_sub(1);
+            let cw = crop.width().max(1) as f32;
             for chunk in chunks {
                 let idx = rec_chunks.len();
                 owner_chunks[owner].push(idx);
@@ -914,6 +915,8 @@ impl PpocrEngine {
                     owner,
                     image: chunk.image,
                     join_before: chunk.join_before,
+                    frac0: chunk.src_x0 as f32 / cw,
+                    frac1: chunk.src_x1 as f32 / cw,
                 });
             }
         }
@@ -1049,21 +1052,11 @@ impl PpocrEngine {
             // for a single contributing chunk (multi-chunk fractions are chunk-local) on a
             // non-RTL line (RTL reverses visual→logical, breaking the firing order). Edge
             // whitespace trimmed from `text` is fine: it never forms a word unit.
-            let firings: Vec<crate::ocr::CharFiring> =
-                if !text.is_empty() && !scripts[idx].is_rtl() && contrib_chunks.len() == 1 {
-                    results[contrib_chunks[0]]
-                        .as_ref()
-                        .expect("contributing chunk result populated")
-                        .chars
-                        .iter()
-                        .map(|c| crate::ocr::CharFiring {
-                            ch: c.ch as u32,
-                            at: c.at.0,
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let firings: Vec<crate::ocr::CharFiring> = if text.is_empty() || scripts[idx].is_rtl() {
+                Vec::new()
+            } else {
+                stitch_chunk_firings(&contrib_chunks, &rec_chunks, &results)
+            };
             lines.push(crate::ocr::RecognizedTextLine {
                 rect: boxes[idx].rect,
                 oriented_box: boxes[idx].oriented_box,
@@ -1288,6 +1281,8 @@ fn split_crop_on_whitespace_for_rec_width(
         return vec![SplitCrop {
             image: crop.clone(),
             join_before: "",
+            src_x0: 0,
+            src_x1: w,
         }];
     }
     let resized_w = resized_rec_width(crop);
@@ -1295,6 +1290,8 @@ fn split_crop_on_whitespace_for_rec_width(
         return vec![SplitCrop {
             image: crop.clone(),
             join_before: "",
+            src_x0: 0,
+            src_x1: w,
         }];
     }
 
@@ -1305,6 +1302,8 @@ fn split_crop_on_whitespace_for_rec_width(
         return vec![SplitCrop {
             image: crop.clone(),
             join_before: "",
+            src_x0: 0,
+            src_x1: w,
         }];
     }
 
@@ -1314,6 +1313,8 @@ fn split_crop_on_whitespace_for_rec_width(
         return vec![SplitCrop {
             image: crop.clone(),
             join_before: "",
+            src_x0: 0,
+            src_x1: w,
         }];
     }
 
@@ -1325,6 +1326,8 @@ fn split_crop_on_whitespace_for_rec_width(
         return vec![SplitCrop {
             image: crop.clone(),
             join_before: "",
+            src_x0: 0,
+            src_x1: w,
         }];
     }
 
@@ -1336,6 +1339,8 @@ fn split_crop_on_whitespace_for_rec_width(
         chunks.push(SplitCrop {
             image: crop.crop_imm(prev_x, 0, x - prev_x, h),
             join_before: if first { "" } else { " " },
+            src_x0: prev_x,
+            src_x1: x,
         });
         first = false;
         prev_x = x;
@@ -1344,6 +1349,8 @@ fn split_crop_on_whitespace_for_rec_width(
         chunks.push(SplitCrop {
             image: crop.crop_imm(prev_x, 0, w - prev_x, h),
             join_before: if first { "" } else { " " },
+            src_x0: prev_x,
+            src_x1: w,
         });
     }
     chunks
@@ -2121,15 +2128,64 @@ struct RecChar {
     at: StripFraction,
 }
 
+/// Assemble one line's CTC firings from its contributing chunks, staying 1:1 with the line text
+/// the same chunks build. Each chunk's chunk-local firing fraction is remapped onto the line's
+/// reading axis via its `[frac0, frac1)` span. Leading/trailing whitespace firings are dropped
+/// per chunk to mirror the `r.text.trim()` the text assembly applies (the recognizer emits a
+/// space class, so it pads line ends), and a whitespace firing is injected at each chunk
+/// boundary that contributed a `join_before` space. The per-script text normalize is
+/// count-preserving and never touches whitespace, so the result aligns exactly with the joined
+/// text. Caller gates out RTL lines (visual→logical reversal breaks firing order).
+fn stitch_chunk_firings(
+    contrib_chunks: &[usize],
+    rec_chunks: &[RecChunk],
+    results: &[Option<RecResult>],
+) -> Vec<crate::ocr::CharFiring> {
+    let mut out: Vec<crate::ocr::CharFiring> = Vec::new();
+    for &ci in contrib_chunks {
+        let chunk = &rec_chunks[ci];
+        let r = results[ci]
+            .as_ref()
+            .expect("contributing chunk result populated");
+        let first = r.chars.iter().position(|c| !c.ch.is_whitespace());
+        let last = r.chars.iter().rposition(|c| !c.ch.is_whitespace());
+        let (Some(first), Some(last)) = (first, last) else {
+            continue;
+        };
+        if !out.is_empty() && chunk.join_before == " " {
+            out.push(crate::ocr::CharFiring {
+                ch: ' ' as u32,
+                at: chunk.frac0,
+            });
+        }
+        let span = chunk.frac1 - chunk.frac0;
+        for c in &r.chars[first..=last] {
+            out.push(crate::ocr::CharFiring {
+                ch: c.ch as u32,
+                at: chunk.frac0 + c.at.0 * span,
+            });
+        }
+    }
+    out
+}
+
 struct RecChunk {
     owner: usize,
     image: DynamicImage,
     join_before: &'static str,
+    /// This chunk's column span within the owner crop, as fractions of the crop width. Lets the
+    /// per-chunk CTC firing fractions (local to the chunk strip) be remapped to line-global
+    /// fractions when stitching a multi-chunk line's firings.
+    frac0: f32,
+    frac1: f32,
 }
 
 struct SplitCrop {
     image: DynamicImage,
     join_before: &'static str,
+    /// Source column range `[src_x0, src_x1)` within the crop this was cut from.
+    src_x0: u32,
+    src_x1: u32,
 }
 
 impl PpocrRecognizer {

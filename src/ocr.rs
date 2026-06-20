@@ -310,6 +310,9 @@ pub struct PreparedTextBlock {
 pub struct PositionedWord {
     pub text: String,
     pub bounds: OrientedRect,
+    /// Index of the visual line this word belongs to, within its layer (source or translated).
+    /// Lets the UI group words back into lines for per-line selection highlighting.
+    pub line_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

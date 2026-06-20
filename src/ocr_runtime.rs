@@ -245,7 +245,13 @@ fn still_source_words(
                 .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
                 .collect();
             let is_cjk = scripts.get(i).copied() == Some(PpocrScript::Cj);
-            crate::text_metrics::firing_word_boxes(&line.text, &firings, is_cjk, &line.oriented_box)
+            crate::text_metrics::firing_word_boxes(
+                &line.text,
+                &firings,
+                is_cjk,
+                &line.oriented_box,
+                i as u32,
+            )
         })
         .collect()
 }
