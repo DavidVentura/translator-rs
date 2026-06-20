@@ -2353,6 +2353,8 @@ pub fn render_text_overlay_bitmap(
         extracted_text: String::new(),
         translated_text: String::new(),
         blocks,
+        source_words: Vec::new(),
+        translated_words: Vec::new(),
     };
     let opts = RenderOptions {
         language: items
@@ -2361,7 +2363,9 @@ pub fn render_text_overlay_bitmap(
             .unwrap_or_default(),
         min_font_size_px: 6.0,
     };
-    render_overlay(&prepared, fonts, &opts).ok()
+    render_overlay(&prepared, fonts, &opts)
+        .ok()
+        .map(|r| r.rgba_bytes)
 }
 
 /// Horizontal text inset (canonical pixels) within the live-overlay

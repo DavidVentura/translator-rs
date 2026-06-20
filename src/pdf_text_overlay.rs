@@ -611,6 +611,8 @@ mod tests {
                 extracted_text: String::new(),
                 translated_text: String::new(),
                 blocks: Vec::new(),
+                source_words: Vec::new(),
+                translated_words: Vec::new(),
             },
         }
     }

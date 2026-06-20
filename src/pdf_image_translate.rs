@@ -837,8 +837,9 @@ fn translate_one_xobject(
         language: target_code.to_string(),
         ..RenderOptions::default()
     };
-    let mut rendered =
-        render_overlay(&prepared, fonts, &opts).map_err(|e| SkipReason::Render(e.to_string()))?;
+    let mut rendered = render_overlay(&prepared, fonts, &opts)
+        .map_err(|e| SkipReason::Render(e.to_string()))?
+        .rgba_bytes;
 
     // Debug hook: when XOBJECT_DUMP_DIR is set, write each translated
     // bitmap as a PNG side-by-side with the source bitmap. Lets us

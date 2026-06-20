@@ -171,6 +171,11 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         })
         .collect();
 
+    // Per-word source boxes from the CTC firings, in recognition order. Built here while the
+    // recognized `lines` are still in hand (grouping below consumes them) and the translation
+    // hasn't run yet, so the boxes register against the original recognized text.
+    let source_words = still_source_words(&lines, &scripts);
+
     let blocks = still_ppocr_lines_to_blocks(
         &det_boxes,
         lines,
@@ -205,7 +210,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         crate::color_matting::union_ink_mask(rgba, &det_boxes, &ink_masks, &ink_src_maps)
     });
 
-    finalize_image_overlay(
+    let mut overlay = finalize_image_overlay(
         engine,
         snapshot,
         rgba_bytes,
@@ -217,7 +222,32 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         background_mode,
         reading_order,
         ink_union.as_deref(),
-    )
+    )?;
+    overlay.source_words = source_words;
+    Ok(overlay)
+}
+
+/// Flatten the recognized lines into per-word source boxes in image space, in recognition
+/// order. Each line's CTC firings drive the word split + positions (see
+/// [`crate::text_metrics::firing_word_boxes`]); CJK lines split per glyph.
+#[cfg(feature = "ppocr")]
+fn still_source_words(
+    lines: &[crate::ocr::RecognizedTextLine],
+    scripts: &[PpocrScript],
+) -> Vec<crate::ocr::PositionedWord> {
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(i, line)| {
+            let firings: Vec<(char, f32)> = line
+                .firings
+                .iter()
+                .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
+                .collect();
+            let is_cjk = scripts.get(i).copied() == Some(PpocrScript::Cj);
+            crate::text_metrics::firing_word_boxes(&line.text, &firings, is_cjk, &line.oriented_box)
+        })
+        .collect()
 }
 
 #[cfg(feature = "ppocr")]

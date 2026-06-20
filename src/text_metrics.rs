@@ -190,16 +190,16 @@ fn firing_word_units(firings: &[(char, f32)]) -> Vec<(usize, usize)> {
 /// `threshold`, the matching text word's byte range is emitted. Units map onto text words
 /// positionally; returns empty (caller falls back to a per-line estimate) if the firings
 /// are absent or the unit and word counts disagree.
-pub fn word_bold_ranges(
+/// Pair CTC firings with `text`'s words. Returns `(firing index ranges, text byte ranges)`,
+/// one entry each per word and positionally aligned, or `None` when the counts disagree (RTL
+/// or multi-chunk lines whose firings don't line up 1:1 with the text). For CJK each glyph is
+/// its own unit; for spaced scripts units come from the recognizer's space class / firing
+/// gaps. Shared by [`word_bold_ranges`] and [`firing_word_boxes`].
+fn firing_units_and_words(
     text: &str,
     firings: &[(char, f32)],
     is_cjk: bool,
-    profile: &BoldProfile,
-    threshold: f32,
-) -> Vec<(u32, u32)> {
-    if firings.is_empty() || profile.width() == 0 {
-        return Vec::new();
-    }
+) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
     let units: Vec<(usize, usize)> = if is_cjk {
         firings
             .iter()
@@ -224,9 +224,60 @@ pub fn word_bold_ranges(
             })
             .collect()
     };
-    if units.len() != text_words.len() {
+    (units.len() == text_words.len()).then_some((units, text_words))
+}
+
+/// Per-word source boxes in image space, derived from a recognized line's CTC firings and its
+/// oriented box. Each firing's `at` is a fraction along the reading axis; a word spans from its
+/// first firing to the next word's first firing (the last reaches the box's far edge), mapped
+/// onto `oriented` via [`OrientedRect::subspan`] so adjacent boxes tile the line with no gaps.
+/// Empty when firings are absent or don't align 1:1 with the text.
+pub fn firing_word_boxes(
+    text: &str,
+    firings: &[(char, f32)],
+    is_cjk: bool,
+    oriented: &crate::ocr::OrientedRect,
+) -> Vec<crate::ocr::PositionedWord> {
+    if firings.is_empty() {
         return Vec::new();
     }
+    let Some((units, text_words)) = firing_units_and_words(text, firings, is_cjk) else {
+        return Vec::new();
+    };
+    let w = oriented.width;
+    units
+        .iter()
+        .enumerate()
+        .map(|(k, &(s, _))| {
+            let lo = firings[s].1.clamp(0.0, 1.0);
+            let hi = if k + 1 < units.len() {
+                firings[units[k + 1].0].1.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+            .max(lo);
+            let (bs, be) = text_words[k];
+            crate::ocr::PositionedWord {
+                text: text[bs..be].to_string(),
+                bounds: oriented.subspan(lo * w, hi * w),
+            }
+        })
+        .collect()
+}
+
+pub fn word_bold_ranges(
+    text: &str,
+    firings: &[(char, f32)],
+    is_cjk: bool,
+    profile: &BoldProfile,
+    threshold: f32,
+) -> Vec<(u32, u32)> {
+    if firings.is_empty() || profile.width() == 0 {
+        return Vec::new();
+    }
+    let Some((units, text_words)) = firing_units_and_words(text, firings, is_cjk) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for (k, &(s, _)) in units.iter().enumerate() {
         let lo = firings[s].1.clamp(0.0, 1.0);
@@ -640,6 +691,46 @@ mod tests {
         let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
         let ranges = word_bold_ranges("aa bb", &firings, false, &profile, MODEL_BOLD_THRESHOLD);
         assert_eq!(ranges, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn firing_word_boxes_tile_a_horizontal_line() {
+        // Axis-aligned line box: 100 wide, centred at x=50, height 10, baseline at y=20.
+        let oriented = crate::ocr::OrientedRect {
+            cx: 50.0,
+            cy: 20.0,
+            width: 100.0,
+            height: 10.0,
+            angle_radians: 0.0,
+        };
+        // "aa bb": firings at fractions; first word 0.1..0.2, second 0.6..0.7.
+        let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
+        let words = firing_word_boxes("aa bb", &firings, false, &oriented);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "aa");
+        assert_eq!(words[1].text, "bb");
+        // First word spans 0.1..0.6 (to the next word's start) → x 10..60, centre 35, width 50.
+        assert!((words[0].bounds.width - 50.0).abs() < 1e-3);
+        assert!((words[0].bounds.cx - 35.0).abs() < 1e-3);
+        // Last word spans 0.6..1.0 → x 60..100, centre 80, width 40.
+        assert!((words[1].bounds.width - 40.0).abs() < 1e-3);
+        assert!((words[1].bounds.cx - 80.0).abs() < 1e-3);
+        // Height/baseline are inherited from the line box.
+        assert!((words[0].bounds.cy - 20.0).abs() < 1e-3);
+        assert!((words[0].bounds.height - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn firing_word_boxes_empty_when_counts_disagree() {
+        let oriented = crate::ocr::OrientedRect::axis_aligned(crate::ocr::Rect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 10,
+        });
+        // Two firing units but three whitespace words → no 1:1 alignment.
+        let firings = [('a', 0.1), (' ', 0.4), ('b', 0.7)];
+        assert!(firing_word_boxes("a b c", &firings, false, &oriented).is_empty());
     }
 
     #[test]

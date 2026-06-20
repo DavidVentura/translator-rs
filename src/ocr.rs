@@ -42,6 +42,24 @@ impl OrientedRect {
         }
     }
 
+    /// Sub-rectangle spanning `[x0, x1]` measured from this rect's left edge along its reading
+    /// direction, keeping full height and angle. `x0`/`x1` are in the same units as `width`
+    /// (image pixels along the baseline). Used to carve a single word's box out of a line's
+    /// oriented box given the word's start/end offset along the line.
+    pub fn subspan(&self, x0: f32, x1: f32) -> OrientedRect {
+        let cos = self.angle_radians.cos();
+        let sin = self.angle_radians.sin();
+        let half_w = self.width * 0.5;
+        let mid = (x0 + x1) * 0.5;
+        OrientedRect {
+            cx: self.cx - half_w * cos + mid * cos,
+            cy: self.cy - half_w * sin + mid * sin,
+            width: (x1 - x0).max(0.0),
+            height: self.height,
+            angle_radians: self.angle_radians,
+        }
+    }
+
     /// Axis-aligned bounding box of the oriented rect — the smallest `Rect` that contains all
     /// four corners. Useful for coarse hit-testing, sorting, and falling back to AABB-only
     /// downstream consumers.
@@ -283,6 +301,17 @@ pub struct PreparedTextBlock {
     pub bold_ranges: Vec<BoldRange>,
 }
 
+/// One selectable word with its position on the image, in image-pixel space. Emitted for
+/// both the recognized source text (positions derived from CTC firings) and the rendered
+/// translation (positions derived from the overlay layout), so the UI can hit-test a drag and
+/// copy either layer. `text` is the word's own substring; `bounds` is its oriented box.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PositionedWord {
+    pub text: String,
+    pub bounds: OrientedRect,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedImageOverlay {
@@ -292,6 +321,12 @@ pub struct PreparedImageOverlay {
     pub extracted_text: String,
     pub translated_text: String,
     pub blocks: Vec<PreparedTextBlock>,
+    /// Recognized source words with image-space boxes, in reading order. Drives drag-to-copy
+    /// of the original text. Empty until the source-word pass populates it.
+    pub source_words: Vec<PositionedWord>,
+    /// Rendered translation words with image-space boxes, in reading order. Drives drag-to-copy
+    /// of the translated text. Empty until the layout-word pass populates it.
+    pub translated_words: Vec<PositionedWord>,
 }
 
 /// Lightweight detection result — what the PaddlePaddle detector produces before
@@ -2310,6 +2345,8 @@ pub fn prepare_overlay_image(
             .join("\n"),
         translated_text: translated_blocks.join("\n"),
         blocks: prepared_blocks,
+        source_words: Vec::new(),
+        translated_words: Vec::new(),
     })
 }
 
@@ -2542,6 +2579,42 @@ mod tests {
         group_vertical_lines_into_paragraphs, prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
+
+    #[test]
+    fn subspan_horizontal_carves_a_sub_rect() {
+        // 100-wide box centred at x=50 (left edge x=0), height 10 at y=20.
+        let line = OrientedRect {
+            cx: 50.0,
+            cy: 20.0,
+            width: 100.0,
+            height: 10.0,
+            angle_radians: 0.0,
+        };
+        let w = line.subspan(10.0, 30.0);
+        assert!((w.cx - 20.0).abs() < 1e-3); // centre of [10,30]
+        assert!((w.cy - 20.0).abs() < 1e-3);
+        assert!((w.width - 20.0).abs() < 1e-3);
+        assert!((w.height - 10.0).abs() < 1e-3);
+        assert_eq!(w.angle_radians, 0.0);
+    }
+
+    #[test]
+    fn subspan_vertical_carves_along_reading_axis() {
+        // 90°-rotated line: reading axis runs down +y. Left edge at the box top.
+        let line = OrientedRect {
+            cx: 50.0,
+            cy: 50.0,
+            width: 100.0,
+            height: 8.0,
+            angle_radians: std::f32::consts::FRAC_PI_2,
+        };
+        // A unit at reading-offset [0,20] sits near the top; centre at offset 10.
+        let w = line.subspan(0.0, 20.0);
+        // Reading axis is +y, so the sub-rect advances in y, not x.
+        assert!((w.cx - 50.0).abs() < 1e-3);
+        assert!((w.cy - (0.0 + 10.0)).abs() < 1e-3); // top edge (cy-half_w=0) + 10
+        assert!((w.width - 20.0).abs() < 1e-3);
+    }
 
     /// A vertical text column the way the ppocr still path delivers it: AABB
     /// around the column, tight box with `width` along the (vertical) reading

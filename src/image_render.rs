@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::font_provider::{FontHandle, FontProvider, FontRequest};
-use crate::ocr::{OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock};
+use crate::ocr::{
+    OrientedRect, OverlayLayoutMode, PositionedWord, PreparedImageOverlay, PreparedTextBlock,
+};
 use crate::script::Script;
 use crate::text_shape::{self, DirRun, ShapedGlyph, segment_runs};
 
@@ -62,14 +64,24 @@ impl std::fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
-/// Rasterize translated text onto `prepared.rgba_bytes` and return the new
-/// buffer. The input buffer is treated as 4-byte little-endian ARGB pixels
-/// (i.e. the same layout `crate::ocr` produces).
+/// The rendered overlay plus the per-word boxes of the drawn translation. `rgba_bytes` is the
+/// new ARGB buffer (same dimensions as the input); `translated_words` are the selectable word
+/// boxes in image space, in reading order, for drag-to-copy of the translated text.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RenderedOverlay {
+    pub rgba_bytes: Vec<u8>,
+    pub translated_words: Vec<PositionedWord>,
+}
+
+/// Rasterize translated text onto `prepared.rgba_bytes` and return the new buffer together with
+/// the drawn translation's per-word boxes. The input buffer is treated as 4-byte little-endian
+/// ARGB pixels (i.e. the same layout `crate::ocr` produces).
 pub fn render_overlay(
     prepared: &PreparedImageOverlay,
     fonts: &dyn FontProvider,
     opts: &RenderOptions,
-) -> Result<Vec<u8>, RenderError> {
+) -> Result<RenderedOverlay, RenderError> {
     let expected = prepared.width as usize * prepared.height as usize * 4;
     if prepared.rgba_bytes.len() != expected {
         return Err(RenderError::InvalidImage(format!(
@@ -100,7 +112,11 @@ pub fn render_overlay(
         }
     }
 
-    Ok(canvas)
+    let translated_words = collect_translated_words(prepared, &mut cache, fonts, opts);
+    Ok(RenderedOverlay {
+        rgba_bytes: canvas,
+        translated_words,
+    })
 }
 
 /// `(font_id, glyph_id, size_px)` — the dense key for the CPU glyph atlas and the
@@ -653,26 +669,30 @@ impl LineShape {
     }
 }
 
-fn render_per_line(
-    sink: &mut GlyphSink<'_>,
-    block: &PreparedTextBlock,
-    cache: &mut FontCache,
-    fonts: &dyn FontProvider,
-    opts: &RenderOptions,
-) {
-    // The block's lines are pre-broken by the OCR side. Treat the block's
-    // translated text as a single string that we re-flow across that many
-    // line slots, fitting widths.
-    let translated = block.translated_text.trim();
-    if translated.is_empty() {
-        return;
-    }
+/// One laid-out line ready to draw or carve: its text, its oriented box in image space, and the
+/// foreground colour. Both block layouts (`layout_per_line`, `layout_vertical`) produce these;
+/// `render_*` draws them and `collect_block_words` carves per-word boxes from them, so drawing
+/// and word extraction consume one layout decision and can't diverge.
+struct LaidLine {
+    text: String,
+    oriented: OrientedRect,
+    foreground_argb: u32,
+}
 
-    let language = opts.language.clone();
-    // Per-word bold ranges, rebased onto the trimmed `translated` string (block.bold_ranges
-    // index the untrimmed translated text). A whole-bold block is one `[0, len)` range.
+/// The fitted layout of one block: chosen font size, whether the block draws bold, and its
+/// laid-out lines.
+struct BlockLayout {
+    size: f32,
+    bold: bool,
+    lines: Vec<LaidLine>,
+}
+
+/// Block bold spans rebased onto the trimmed translated string (`block.bold_ranges` index the
+/// untrimmed text). A whole-bold block is one `[0, len)` span.
+fn block_bold_spans(block: &PreparedTextBlock) -> Vec<(usize, usize)> {
+    let translated = block.translated_text.trim();
     let trim_lead = block.translated_text.len() - block.translated_text.trim_start().len();
-    let bold_spans: Vec<(usize, usize)> = block
+    block
         .bold_ranges
         .iter()
         .filter_map(|r| {
@@ -682,55 +702,170 @@ fn render_per_line(
                 .min(translated.len());
             (s < e).then_some((s, e))
         })
-        .collect();
-    // Break/size shaping uses one weight; pick bold when any run is bold (conservative —
-    // bold is wider, so lines won't overflow when the real runs are mixed).
-    let bold = !bold_spans.is_empty();
+        .collect()
+}
+
+/// Horizontal layout: re-flow the block's translated text across its OCR-provided per-line
+/// boxes, shrinking the font until every line fits its box width.
+fn layout_per_line(
+    block: &PreparedTextBlock,
+    opts: &RenderOptions,
+    cache: &mut FontCache,
+    fonts: &dyn FontProvider,
+) -> Option<BlockLayout> {
+    let translated = block.translated_text.trim();
+    if translated.is_empty() {
+        return None;
+    }
+    let language = &opts.language;
+    // Break/size shaping uses one weight; pick bold when any run is bold (conservative — bold is
+    // wider, so lines won't overflow when the real runs are mixed).
+    let bold = !block_bold_spans(block).is_empty();
     let mut size = block
         .layout_hints
         .suggested_font_size_px
         .max(opts.min_font_size_px);
 
-    // Helper to shape the whole translated string for a given font size.
-    // Shaping is size-independent (we shape once at upem and scale), so we
-    // can reuse this across the size-shrink loop.
+    // Shaping is size-independent (we shape once at upem and scale), so we reuse this across the
+    // size-shrink loop.
     let shaped_full = {
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-            c.chain_for(script, bold, false, false, &language, fonts)
+            c.chain_for(script, bold, false, false, language, fonts)
                 .to_vec()
         };
         let mut chain_fn = chain_fn;
         shape_line(translated, &mut chain_fn, cache)
     };
-
     if shaped_full.runs.is_empty() {
-        return;
+        return None;
     }
 
-    // Greedy break: try to assign words from `translated` to each block
-    // line such that each line's shaped width fits its target box. If any
-    // line overflows, shrink size by 1 and retry. We use the oriented_box's width
-    // (reading-direction extent) rather than the AABB width — for tilted text the
-    // AABB is wider than the actual line and would let us pack more glyphs than fit.
+    // Greedy break: assign words from `translated` to each block line so each line's shaped
+    // width fits its target box. If any line overflows, shrink size by 1 and retry. We use the
+    // oriented_box's width (reading-direction extent) rather than the AABB width — for tilted
+    // text the AABB is wider than the actual line and would let us pack more glyphs than fit.
     let target_widths: Vec<f32> = block.lines.iter().map(|l| l.oriented_box.width).collect();
-
-    let lines_text: Option<Vec<String>> = loop {
+    let lines_text = loop {
         match break_into_lines(translated, &shaped_full, size, &target_widths) {
-            Some(v) => break Some(v),
+            Some(v) => break v,
             None if size > opts.min_font_size_px => {
                 size -= 1.0;
                 continue;
             }
-            None => break None,
+            None => return None,
         }
     };
 
-    let Some(lines_text) = lines_text else {
-        return;
+    let lines = lines_text
+        .into_iter()
+        .zip(block.lines.iter())
+        .map(|(text, pl)| LaidLine {
+            text,
+            oriented: pl.oriented_box,
+            foreground_argb: pl.foreground_argb,
+        })
+        .collect();
+    Some(BlockLayout { size, bold, lines })
+}
+
+/// Vertical CJK layout: wrap the translated text into top-to-bottom columns within the block
+/// rect, shrinking the font until the columns fit; columns advance right-to-left. A column's
+/// reading-axis extent is never read downstream — drawing derives its origin from the box and
+/// carving places words by shaped advance — so the column box spans the full block height `bh`;
+/// only its left-edge anchor at the block top and its cross-axis thickness `line_h` matter.
+fn layout_vertical(
+    block: &PreparedTextBlock,
+    opts: &RenderOptions,
+    cache: &mut FontCache,
+    fonts: &dyn FontProvider,
+) -> Option<BlockLayout> {
+    let translated = block.translated_text.trim();
+    if translated.is_empty() {
+        return None;
+    }
+    let language = &opts.language;
+    // Vertical CJK keeps one weight per block (no per-glyph runs); bold if any run is bold.
+    let bold = !block.bold_ranges.is_empty();
+    let mut size = block
+        .layout_hints
+        .suggested_font_size_px
+        .max(opts.min_font_size_px);
+
+    let bw = block
+        .bounding_box
+        .right
+        .saturating_sub(block.bounding_box.left) as f32;
+    let bh = block
+        .bounding_box
+        .bottom
+        .saturating_sub(block.bounding_box.top) as f32;
+    if bw <= 0.0 || bh <= 0.0 {
+        return None;
+    }
+
+    let lines_text = loop {
+        let candidate = wrap_into_block(translated, bh, size);
+        let line_h = estimate_line_height(translated, size, language, bold, cache, fonts);
+        if line_h <= 0.0 {
+            return None;
+        }
+        let max_lines = (bw / line_h).floor() as usize;
+        if candidate.len() <= max_lines.max(1) && all_lines_fit(&candidate, bh, size) {
+            break candidate;
+        }
+        if size <= opts.min_font_size_px {
+            return None;
+        }
+        size -= 1.0;
     };
 
+    let line_h = estimate_line_height(translated, size, language, bold, cache, fonts);
+    // Baseline offset within the transposed rect; in image space it advances leftward from the
+    // block's right edge. 0.8 leaves the same ascender room the horizontal layout reserves below
+    // the top edge.
+    let mut baseline_offset = line_h * 0.8;
+    let right = block.bounding_box.right as f32;
+    let top = block.bounding_box.top as f32;
+    let lines = lines_text
+        .into_iter()
+        .map(|text| {
+            let oriented = OrientedRect {
+                cx: right - baseline_offset,
+                cy: top + bh / 2.0,
+                width: bh,
+                height: line_h,
+                angle_radians: std::f32::consts::FRAC_PI_2,
+            };
+            baseline_offset += line_h;
+            LaidLine {
+                text,
+                oriented,
+                foreground_argb: block.foreground_argb,
+            }
+        })
+        .collect();
+    Some(BlockLayout { size, bold, lines })
+}
+
+fn render_per_line(
+    sink: &mut GlyphSink<'_>,
+    block: &PreparedTextBlock,
+    cache: &mut FontCache,
+    fonts: &dyn FontProvider,
+    opts: &RenderOptions,
+) {
+    let Some(layout) = layout_per_line(block, opts, cache, fonts) else {
+        return;
+    };
+    let translated = block.translated_text.trim();
+    let bold_spans = block_bold_spans(block);
+    let bold = layout.bold;
+    let size = layout.size;
+    let language = opts.language.clone();
+
     let mut span_cursor = 0usize;
-    for (line_text, prepared_line) in lines_text.iter().zip(block.lines.iter()) {
+    for line in &layout.lines {
+        let line_text = &line.text;
         if line_text.trim().is_empty() {
             continue;
         }
@@ -760,7 +895,7 @@ fn render_per_line(
         // so the PDF erase-replace path is unchanged. For oversized rects (the live
         // overlay path inflates `oriented.height` to leave halo room) the glyph is
         // centred instead of top-aligned.
-        let oriented = prepared_line.oriented_box;
+        let oriented = line.oriented;
         let cos = oriented.angle_radians.cos();
         let sin = oriented.angle_radians.sin();
         let half_w = oriented.width * 0.5;
@@ -792,11 +927,72 @@ fn render_per_line(
                 cos,
                 sin,
                 size,
-                prepared_line.foreground_argb,
+                line.foreground_argb,
             );
             let w = seg_shape.width_px(size);
             origin_x += cos * w;
             origin_y += sin * w;
+        }
+    }
+}
+
+/// Per-word boxes of the rendered translation, in reading order, in image-pixel space. Re-runs
+/// the same per-mode layout the drawing used, then carves the laid-out lines via
+/// `collect_block_words`. Drives drag-to-copy of the translated text.
+fn collect_translated_words(
+    prepared: &PreparedImageOverlay,
+    cache: &mut FontCache,
+    fonts: &dyn FontProvider,
+    opts: &RenderOptions,
+) -> Vec<PositionedWord> {
+    let mut out = Vec::new();
+    for block in &prepared.blocks {
+        if block.translated_text.trim().is_empty() {
+            continue;
+        }
+        let layout = match block.layout_hints.layout_mode {
+            OverlayLayoutMode::PerLine => layout_per_line(block, opts, cache, fonts),
+            OverlayLayoutMode::VerticalBlockRect => layout_vertical(block, opts, cache, fonts),
+        };
+        if let Some(layout) = layout {
+            collect_block_words(&layout, &opts.language, cache, fonts, &mut out);
+        }
+    }
+    out
+}
+
+/// Carve each laid-out line into selectable units (`selection_units`) and map each unit's shaped
+/// x-span onto the line's oriented box via `OrientedRect::subspan`. Mode-agnostic: works for both
+/// horizontal lines and vertical columns, since each `LaidLine` already carries its image-space
+/// box and reading direction.
+fn collect_block_words(
+    layout: &BlockLayout,
+    language: &str,
+    cache: &mut FontCache,
+    fonts: &dyn FontProvider,
+    out: &mut Vec<PositionedWord>,
+) {
+    for line in &layout.lines {
+        if line.text.trim().is_empty() {
+            continue;
+        }
+        let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
+            c.chain_for(script, layout.bold, false, false, language, fonts)
+                .to_vec()
+        };
+        let mut chain_fn = chain_fn;
+        let shaped = shape_line(&line.text, &mut chain_fn, cache);
+        if shaped.runs.is_empty() {
+            continue;
+        }
+        let last = shaped.cum_em_at_byte.len() - 1;
+        for (b0, b1) in selection_units(&line.text) {
+            let x0 = shaped.cum_em_at_byte[b0.min(last)] * layout.size;
+            let x1 = shaped.cum_em_at_byte[b1.min(last)] * layout.size;
+            out.push(PositionedWord {
+                text: line.text[b0..b1].to_string(),
+                bounds: line.oriented.subspan(x0, x1),
+            });
         }
     }
 }
@@ -977,6 +1173,26 @@ fn break_opportunities(text: &str) -> Vec<BreakOpp> {
     opps
 }
 
+/// Byte ranges of the individually selectable units in `text`, delimited by the same break
+/// opportunities the wrapper uses: whitespace-separated tokens for spaced scripts, and
+/// kinsoku-grouped characters for CJK (so trailing punctuation stays attached to its
+/// character). Used to carve a rendered line into per-word boxes for drag-to-copy.
+pub(crate) fn selection_units(text: &str) -> Vec<(usize, usize)> {
+    let opps = break_opportunities(text);
+    let mut units = Vec::new();
+    let mut start = 0usize;
+    for opp in &opps {
+        if opp.prefix_end > start {
+            units.push((start, opp.prefix_end));
+        }
+        start = opp.next_start;
+    }
+    if start < text.len() {
+        units.push((start, text.len()));
+    }
+    units
+}
+
 /// Split `text` into per-line slices that fit within `target_widths` at the
 /// chosen `font_size`. Returns `None` if the text doesn't fit even greedily
 /// at the given size. Break candidates come from `break_opportunities`, so
@@ -1073,79 +1289,39 @@ fn render_vertical_block_rect(
     fonts: &dyn FontProvider,
     opts: &RenderOptions,
 ) {
-    let translated = block.translated_text.trim();
-    if translated.is_empty() {
+    let Some(layout) = layout_vertical(block, opts, cache, fonts) else {
         return;
-    }
-    let language = opts.language.clone();
-    // Vertical CJK keeps one weight per block (no per-glyph runs); bold if any run is bold.
-    let bold = !block.bold_ranges.is_empty();
-    let mut size = block
-        .layout_hints
-        .suggested_font_size_px
-        .max(opts.min_font_size_px);
-
-    let bw = block
-        .bounding_box
-        .right
-        .saturating_sub(block.bounding_box.left) as f32;
-    let bh = block
-        .bounding_box
-        .bottom
-        .saturating_sub(block.bounding_box.top) as f32;
-    if bw <= 0.0 || bh <= 0.0 {
-        return;
-    }
-
-    let lines = loop {
-        let candidate = wrap_into_block(translated, bh, size);
-        let line_h = estimate_line_height(translated, size, &language, bold, cache, fonts);
-        if line_h <= 0.0 {
-            return;
-        }
-        let max_lines = (bw / line_h).floor() as usize;
-        if candidate.len() <= max_lines.max(1) && all_lines_fit(&candidate, bh, size) {
-            break candidate;
-        }
-        if size <= opts.min_font_size_px {
-            return;
-        }
-        size -= 1.0;
     };
-
-    let line_h = estimate_line_height(translated, size, &language, bold, cache, fonts);
-    // Baseline offset within the transposed rect; in image space it advances
-    // leftward from the block's right edge. 0.8 leaves the same ascender room
-    // the horizontal block layout reserves below the top edge.
-    let mut baseline_offset = line_h * 0.8;
-    for line_text in lines {
-        if line_text.trim().is_empty() {
-            baseline_offset += line_h;
+    let language = opts.language.clone();
+    for line in &layout.lines {
+        if line.text.trim().is_empty() {
             continue;
         }
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-            c.chain_for(script, bold, false, false, &language, fonts)
+            c.chain_for(script, layout.bold, false, false, &language, fonts)
                 .to_vec()
         };
         let mut chain_fn = chain_fn;
-        let line_shape = shape_line(&line_text, &mut chain_fn, cache);
+        let line_shape = shape_line(&line.text, &mut chain_fn, cache);
         if line_shape.runs.is_empty() {
-            baseline_offset += line_h;
             continue;
         }
-        // Reading direction is image +y: rotation (cos, sin) = (0, 1).
+        // Origin at the column's reading-axis start (its top edge), derived from the box. Reading
+        // direction is image +y (90° rotation): (cos, sin) = (0, 1).
+        let cos = line.oriented.angle_radians.cos();
+        let sin = line.oriented.angle_radians.sin();
+        let half_w = line.oriented.width * 0.5;
         draw_shaped_line(
             sink,
             &line_shape,
             cache,
-            block.bounding_box.right as f32 - baseline_offset,
-            block.bounding_box.top as f32,
-            0.0,
-            1.0,
-            size,
-            block.foreground_argb,
+            line.oriented.cx - half_w * cos,
+            line.oriented.cy - half_w * sin,
+            cos,
+            sin,
+            layout.size,
+            line.foreground_argb,
         );
-        baseline_offset += line_h;
     }
 }
 
@@ -1596,5 +1772,34 @@ mod break_tests {
     fn hangul_has_no_inter_character_breaks() {
         // Korean rides whitespace only; no breaks inside a spaceless run.
         assert_eq!(breaks("한국어"), vec![]);
+    }
+
+    fn units<'a>(text: &'a str) -> Vec<&'a str> {
+        selection_units(text)
+            .into_iter()
+            .map(|(s, e)| &text[s..e])
+            .collect()
+    }
+
+    #[test]
+    fn selection_units_split_latin_on_whitespace() {
+        assert_eq!(units("the cat sat"), vec!["the", "cat", "sat"]);
+        assert_eq!(units("a  b"), vec!["a", "b"]); // collapsed space run
+    }
+
+    #[test]
+    fn selection_units_split_cjk_per_character() {
+        assert_eq!(units("日本語"), vec!["日", "本", "語"]);
+    }
+
+    #[test]
+    fn selection_units_keep_kinsoku_punctuation_attached() {
+        // 。 may not start a line, so it stays with the preceding character.
+        assert_eq!(units("日本。"), vec!["日", "本。"]);
+    }
+
+    #[test]
+    fn selection_units_split_mixed_latin_cjk() {
+        assert_eq!(units("AB日本"), vec!["AB", "日", "本"]);
     }
 }
