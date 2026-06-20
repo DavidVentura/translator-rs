@@ -715,7 +715,7 @@ fn render_per_line(
     let target_widths: Vec<f32> = block.lines.iter().map(|l| l.oriented_box.width).collect();
 
     let lines_text: Option<Vec<String>> = loop {
-        match break_into_lines_by_words(translated, &shaped_full, size, &target_widths) {
+        match break_into_lines(translated, &shaped_full, size, &target_widths) {
             Some(v) => break Some(v),
             None if size > opts.min_font_size_px => {
                 size -= 1.0;
@@ -821,9 +821,167 @@ fn split_line_by_bold(
     segs
 }
 
+/// A place where a line may break. `prefix_end` is the byte offset (exclusive)
+/// of the content that stays on the current line; `next_start` is where the
+/// following line resumes — equal to `prefix_end` for a mid-text CJK break,
+/// past the consumed whitespace for a space break.
+struct BreakOpp {
+    prefix_end: usize,
+    next_start: usize,
+}
+
+/// Characters not allowed to follow each other across a CJK line break:
+/// `is_cjk_breakable` marks the ideographs/kana between which a break may fall.
+/// Hangul is deliberately excluded — Korean has spaces and breaks like a spaced
+/// language, so it rides the whitespace opportunities below.
+fn is_cjk_breakable(c: char) -> bool {
+    let cp = c as u32;
+    (0x3040..=0x309F).contains(&cp)        // Hiragana
+        || (0x30A0..=0x30FF).contains(&cp) // Katakana
+        || (0x3400..=0x4DBF).contains(&cp) // CJK Unified Ext A
+        || (0x4E00..=0x9FFF).contains(&cp) // CJK Unified
+        || (0xF900..=0xFAFF).contains(&cp) // CJK Compatibility Ideographs
+        || (0xFF66..=0xFF9D).contains(&cp) // Halfwidth Katakana
+}
+
+/// Kinsoku: characters prohibited at the start of a line, so a break must not
+/// fall immediately before them (closing brackets, trailing punctuation, small
+/// kana, sound/iteration marks).
+fn no_break_before(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']'
+            | '}'
+            | '）'
+            | '］'
+            | '｝'
+            | '」'
+            | '』'
+            | '】'
+            | '〉'
+            | '》'
+            | '〕'
+            | '〗'
+            | '｣'
+            | '、'
+            | '。'
+            | '，'
+            | '．'
+            | '：'
+            | '；'
+            | '？'
+            | '！'
+            | '・'
+            | '…'
+            | '‥'
+            | '､'
+            | '｡'
+            | '”'
+            | '’'
+            | 'ー'
+            | 'ゝ'
+            | 'ゞ'
+            | '々'
+            | '〆'
+            | 'ぁ'
+            | 'ぃ'
+            | 'ぅ'
+            | 'ぇ'
+            | 'ぉ'
+            | 'っ'
+            | 'ゃ'
+            | 'ゅ'
+            | 'ょ'
+            | 'ゎ'
+            | 'ァ'
+            | 'ィ'
+            | 'ゥ'
+            | 'ェ'
+            | 'ォ'
+            | 'ッ'
+            | 'ャ'
+            | 'ュ'
+            | 'ョ'
+            | 'ヮ'
+            | 'ヵ'
+            | 'ヶ'
+    )
+}
+
+/// Kinsoku: characters prohibited at the end of a line, so a break must not
+/// fall immediately after them (opening brackets and quotes).
+fn no_break_after(c: char) -> bool {
+    matches!(
+        c,
+        '(' | '['
+            | '{'
+            | '（'
+            | '［'
+            | '｛'
+            | '「'
+            | '『'
+            | '【'
+            | '〈'
+            | '《'
+            | '〔'
+            | '〖'
+            | '｢'
+            | '“'
+            | '‘'
+    )
+}
+
+fn cjk_break_allowed(before: char, after: char) -> bool {
+    if !(is_cjk_breakable(before) || is_cjk_breakable(after)) {
+        return false;
+    }
+    !no_break_after(before) && !no_break_before(after)
+}
+
+/// Enumerate the byte offsets at which `text` may wrap: at runs of spaces (which
+/// the break consumes) and between adjacent characters where at least one side
+/// is CJK and kinsoku permits it. Returned in ascending `prefix_end` order, so a
+/// greedy fitter can stop at the first opportunity that overflows.
+fn break_opportunities(text: &str) -> Vec<BreakOpp> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut opps: Vec<BreakOpp> = Vec::new();
+    for i in 0..chars.len() {
+        let (b, ch) = chars[i];
+        if ch == ' ' {
+            if i > 0 && chars[i - 1].1 == ' ' {
+                continue; // covered by the run's first space
+            }
+            let mut next = b + ch.len_utf8();
+            while next < text.len() && text.as_bytes()[next] == b' ' {
+                next += 1;
+            }
+            opps.push(BreakOpp {
+                prefix_end: b,
+                next_start: next,
+            });
+            continue;
+        }
+        let Some(&(boundary, next_ch)) = chars.get(i + 1) else {
+            continue;
+        };
+        if next_ch == ' ' {
+            continue; // the space itself is the opportunity
+        }
+        if cjk_break_allowed(ch, next_ch) {
+            opps.push(BreakOpp {
+                prefix_end: boundary,
+                next_start: boundary,
+            });
+        }
+    }
+    opps
+}
+
 /// Split `text` into per-line slices that fit within `target_widths` at the
 /// chosen `font_size`. Returns `None` if the text doesn't fit even greedily
-/// at the given size.
+/// at the given size. Break candidates come from `break_opportunities`, so
+/// spaceless CJK wraps between characters under kinsoku while spaced scripts
+/// still break only at whitespace.
 ///
 /// Width measurement uses the shaped per-glyph advances (via
 /// `LineShape::cum_em_at_byte`) rather than an average-char-em
@@ -835,26 +993,13 @@ fn split_line_by_bold(
 /// made the breaker assign a prefix that "fit" the estimate but
 /// overflowed the rect when actually drawn, clipping the trailing
 /// glyph off-bitmap ("Ontwerpen Van" rendered as "Ontwerpen Va").
-fn break_into_lines_by_words(
+fn break_into_lines(
     text: &str,
     shaped: &LineShape,
     font_size: f32,
     target_widths: &[f32],
 ) -> Option<Vec<String>> {
     if target_widths.is_empty() {
-        return None;
-    }
-    if text.chars().all(|c| !c.is_whitespace()) {
-        // No spaces — single-line languages or one big run. Fits only if
-        // the full shaped width fits the first line.
-        let w = shaped.width_px(font_size);
-        if w <= target_widths[0] {
-            let mut out: Vec<String> = vec![text.to_string()];
-            for _ in 1..target_widths.len() {
-                out.push(String::new());
-            }
-            return Some(out);
-        }
         return None;
     }
 
@@ -868,52 +1013,46 @@ fn break_into_lines_by_words(
         (shaped.cum_em_at_byte[hi] - shaped.cum_em_at_byte[lo]) * font_size
     };
 
+    let opps = break_opportunities(text);
+
     let mut out: Vec<String> = Vec::with_capacity(target_widths.len());
     let mut cursor = 0;
-    let bytes_text = text;
     for (idx, &target_w) in target_widths.iter().enumerate() {
         let is_last = idx + 1 == target_widths.len();
-        if cursor >= bytes_text.len() {
+        if cursor >= text.len() {
             out.push(String::new());
             continue;
         }
-        if measure_bytes(cursor, bytes_text.len()) <= target_w {
-            out.push(bytes_text[cursor..].to_string());
-            cursor = bytes_text.len();
+        if measure_bytes(cursor, text.len()) <= target_w {
+            out.push(text[cursor..].to_string());
+            cursor = text.len();
             continue;
         }
         if is_last {
             return None;
         }
 
-        // Walk word boundaries (spaces) to find the largest prefix that fits.
-        let remainder = &bytes_text[cursor..];
-        let mut last_good_end: Option<usize> = None;
-        for (off, ch) in remainder.char_indices() {
-            if ch == ' ' {
-                // Width of cursor..(cursor + off) — i.e. up to but not
-                // including this space. The trailing space gets eaten by
-                // the cursor advance below.
-                if measure_bytes(cursor, cursor + off) <= target_w {
-                    last_good_end = Some(off);
-                } else {
-                    break;
-                }
+        // Largest break opportunity past the cursor whose prefix still fits.
+        let mut chosen: Option<&BreakOpp> = None;
+        for opp in opps.iter() {
+            if opp.prefix_end <= cursor {
+                continue;
+            }
+            if measure_bytes(cursor, opp.prefix_end) <= target_w {
+                chosen = Some(opp);
+            } else {
+                break;
             }
         }
 
-        let Some(end) = last_good_end else {
+        let Some(opp) = chosen else {
             return None;
         };
-        let assigned = &remainder[..end];
-        out.push(assigned.to_string());
-        cursor += end;
-        while cursor < bytes_text.len() && bytes_text.as_bytes()[cursor] == b' ' {
-            cursor += 1;
-        }
+        out.push(text[cursor..opp.prefix_end].to_string());
+        cursor = opp.next_start;
     }
 
-    if cursor < bytes_text.len() {
+    if cursor < text.len() {
         return None;
     }
     Some(out)
@@ -1038,32 +1177,49 @@ fn all_lines_fit(lines: &[String], width: f32, font_size: f32) -> bool {
 }
 
 fn wrap_into_block(text: &str, width: f32, font_size: f32) -> Vec<String> {
-    // Whitespace-greedy break against an avg-char-em estimate. Same caveat
-    // as PerLine: exact widths are realized when we re-shape each line for
-    // drawing.
+    // Greedy break against an avg-char-em estimate, using the same break
+    // opportunities as the horizontal path (spaces + CJK kinsoku boundaries).
+    // Same caveat as PerLine: exact widths are realized when we re-shape each
+    // line for drawing.
     let avg_char_em = 0.5;
     let max_chars = ((width / (font_size * avg_char_em)).floor() as usize).max(1);
+    let opps = break_opportunities(text);
+    let char_count = |s: usize, e: usize| text[s..e].chars().count();
+
     let mut out: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_chars = 0usize;
-    for word in text.split_whitespace() {
-        let wlen = word.chars().count();
-        let with_space = if current.is_empty() { wlen } else { wlen + 1 };
-        if current_chars + with_space <= max_chars || current.is_empty() {
-            if !current.is_empty() {
-                current.push(' ');
-                current_chars += 1;
-            }
-            current.push_str(word);
-            current_chars += wlen;
-        } else {
-            out.push(std::mem::take(&mut current));
-            current.push_str(word);
-            current_chars = wlen;
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        if char_count(cursor, text.len()) <= max_chars {
+            out.push(text[cursor..].to_string());
+            break;
         }
-    }
-    if !current.is_empty() {
-        out.push(current);
+        // Largest opportunity that fits; if none fits, force the first one past
+        // the cursor so an over-long run still makes progress (the line will be
+        // re-shaped and the font shrunk by the caller if it overflows).
+        let mut chosen: Option<&BreakOpp> = None;
+        for opp in opps.iter() {
+            if opp.prefix_end <= cursor {
+                continue;
+            }
+            if char_count(cursor, opp.prefix_end) <= max_chars {
+                chosen = Some(opp);
+            } else if chosen.is_some() {
+                break;
+            } else {
+                chosen = Some(opp);
+                break;
+            }
+        }
+        match chosen {
+            Some(opp) => {
+                out.push(text[cursor..opp.prefix_end].to_string());
+                cursor = opp.next_start;
+            }
+            None => {
+                out.push(text[cursor..].to_string());
+                break;
+            }
+        }
     }
     out
 }
@@ -1375,5 +1531,70 @@ fn blit_mask(
             let out_a = a + dst_a * inv;
             canvas[buf_idx + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
+    }
+}
+
+#[cfg(test)]
+mod break_tests {
+    use super::*;
+
+    fn breaks(text: &str) -> Vec<(usize, usize)> {
+        break_opportunities(text)
+            .iter()
+            .map(|o| (o.prefix_end, o.next_start))
+            .collect()
+    }
+
+    #[test]
+    fn spaced_text_breaks_only_at_spaces() {
+        // "ab cd" — one opportunity at the space (byte 2), resuming at byte 3.
+        assert_eq!(breaks("ab cd"), vec![(2, 3)]);
+        // No interior breaks inside a Latin/digit run.
+        assert_eq!(breaks("COVID-19"), vec![]);
+    }
+
+    #[test]
+    fn space_run_is_one_opportunity() {
+        // Two spaces collapse into a single break that consumes both.
+        assert_eq!(breaks("a  b"), vec![(1, 3)]);
+    }
+
+    #[test]
+    fn cjk_breaks_between_every_character() {
+        // 三 = 3 bytes each. Boundaries between consecutive ideographs.
+        assert_eq!(breaks("日本語"), vec![(3, 3), (6, 6)]);
+    }
+
+    #[test]
+    fn kinsoku_forbids_break_before_trailing_punctuation() {
+        // No break between 本 and 。 (。 may not start a line), break stays
+        // between 日 and 本.
+        let s = "日本。";
+        let nihon = "日".len();
+        assert_eq!(breaks(s), vec![(nihon, nihon)]);
+    }
+
+    #[test]
+    fn kinsoku_forbids_break_after_opening_bracket() {
+        // No break between 「 and 本 (「 may not end a line).
+        let s = "日「本";
+        let hi = "日".len();
+        let kagi = hi + "「".len();
+        // Break allowed 日|「? before='日'(cjk), after='「' -> 「 is no_break_before? no.
+        // 「 has no_break_after=true, so 「|本 is forbidden. 日|「 allowed.
+        assert_eq!(breaks(s), vec![(hi, hi)]);
+        let _ = kagi;
+    }
+
+    #[test]
+    fn break_allowed_at_latin_cjk_boundary() {
+        // "A日" — break before the ideograph even though A is Latin.
+        assert_eq!(breaks("A日"), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn hangul_has_no_inter_character_breaks() {
+        // Korean rides whitespace only; no breaks inside a spaceless run.
+        assert_eq!(breaks("한국어"), vec![]);
     }
 }
