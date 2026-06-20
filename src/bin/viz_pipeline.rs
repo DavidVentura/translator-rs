@@ -905,7 +905,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         "  no ink model (pass --ink or put ink.mnn in the model dir); skipping"
                     );
                 } else {
-                    let strips = engine.ink_strips(&image, &boxes);
+                    let strips = engine.ink_strips(&image, &boxes, None);
                     let lines = recognize(engine, &image, &gray, &boxes, cli.script, true)
                         .map_err(|e| format!("recognize: {e:?}"))?;
                     let mut canvas = rgba.clone();
@@ -1086,7 +1086,15 @@ fn run(cli: Cli) -> Result<(), String> {
                         "  no ink model (pass --ink or put ink.mnn in the model dir); skipping"
                     );
                 } else {
-                    let masks = engine.ink_masks(&image, &boxes);
+                    let ink_strips = engine.ink_strips(&image, &boxes, None);
+                    let masks: Vec<_> = ink_strips
+                        .iter()
+                        .map(|s| s.as_ref().map(|s| s.matte.clone()))
+                        .collect();
+                    let src_maps: Vec<_> = ink_strips
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.src_map.clone()))
+                        .collect();
                     let mut n = 0usize;
                     for (i, m) in masks.iter().enumerate() {
                         let Some(mask) = m else { continue };
@@ -1106,12 +1114,47 @@ fn run(cli: Cli) -> Result<(), String> {
                     // inpainted strip, so we can see whether a light fg is the
                     // colour algo or a bad/misregistered matte.
                     let rgba = image.to_rgba8();
-                    let strips = translator::color_matting::mat_detections(&rgba, &boxes, &masks);
+                    let strips =
+                        translator::color_matting::mat_detections(&rgba, &boxes, &masks, &src_maps);
+                    // Label each box's fg with its recognised text (so STRONGER etc. are findable);
+                    // match recognised lines to boxes by rect-centre proximity.
+                    let rec_lines = recognize(engine, &image, &gray, &boxes, cli.script, true)
+                        .unwrap_or_default();
+                    let text_for = |bi: usize| -> String {
+                        if bi >= boxes.len() {
+                            return String::new();
+                        }
+                        let r = &boxes[bi].rect;
+                        let (bx, by) =
+                            ((r.left + r.right) as i64 / 2, (r.top + r.bottom) as i64 / 2);
+                        rec_lines
+                            .iter()
+                            .min_by_key(|l| {
+                                let lx = (l.rect.left + l.rect.right) as i64 / 2;
+                                let ly = (l.rect.top + l.rect.bottom) as i64 / 2;
+                                (lx - bx).pow(2) + (ly - by).pow(2)
+                            })
+                            .map(|l| l.text.trim().chars().take(24).collect())
+                            .unwrap_or_default()
+                    };
                     let fgdir = cli.out_dir.join("ink-fg");
                     fs::create_dir_all(&fgdir).map_err(|e| format!("mkdir: {e}"))?;
                     for s in &strips {
                         let [_, r, g, b] = s.fg_argb.to_be_bytes();
-                        println!("  box {:03}: fg=#{r:02x}{g:02x}{b:02x}", s.box_index);
+                        let mut bgl: Vec<u32> = s
+                            .strip_rgba
+                            .chunks_exact(4)
+                            .map(|p| {
+                                (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000
+                            })
+                            .collect();
+                        bgl.sort_unstable();
+                        let bg = bgl.get(bgl.len() / 2).copied().unwrap_or(255);
+                        println!(
+                            "  box {:03}: fg=#{r:02x}{g:02x}{b:02x} bg_luma={bg:3}  {:?}",
+                            s.box_index,
+                            text_for(s.box_index)
+                        );
                         image::RgbImage::from_pixel(160, 48, image::Rgb([r, g, b]))
                             .save(fgdir.join(format!("fg-{:03}.png", s.box_index)))
                             .ok();
@@ -1228,7 +1271,7 @@ fn recognize(
         })
         .collect();
     let scripts = vec![script; boxes.len()];
-    engine.recognize_text_in_boxes_image(image, gray, &boxes, &scripts, PpocrProfile::Still, None)
+    engine.recognize_text_in_boxes_image(image, &boxes, &scripts, PpocrProfile::Still, None)
 }
 
 fn draw_recognition(

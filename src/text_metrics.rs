@@ -32,9 +32,9 @@ use image::GrayImage;
 
 use crate::ocr::OrientedRect;
 
-/// Matte alpha at or above which a texel counts as ink. Matches the erase
-/// path's `INK_ALPHA_CUT` so band detection and erasure agree on what is ink.
-const INK_CUT: u16 = 40;
+/// Matte alpha at or above which a texel counts as ink. The single source of truth for
+/// "what is ink"; the erase path's `color_matting::INK_ALPHA_CUT` aliases it.
+pub(crate) const INK_CUT: u16 = 40;
 /// Fraction of the peak row-profile that marks a row as part of the line's
 /// vertical *support* (as opposed to inter-line gap or padding). Deliberately
 /// low: it only has to separate this line's ink from a neighbouring line that
@@ -54,20 +54,21 @@ const MIN_TILT_COLUMNS: usize = 8;
 /// with the rough angle, so a real residual is small; a larger fit is a
 /// degenerate matte, not a steeper line.
 const MAX_TILT_RADIANS: f32 = 0.26; // ~15°
-/// Stroke width is measured on the confident *core* of the ink — texels at or
-/// above this fraction of the line's own peak alpha. Relative (not a fixed cut)
-/// so a faint/low-confidence bold matte isn't penalised the way a fixed high
-/// threshold would; feathered edges, which matter proportionally less on a bold
-/// stroke, drop out either way. Floored at `INK_CUT` so a weak matte still has a
-/// core.
+/// The confident stroke *core*: texels at or above this fraction of the line's own peak
+/// alpha. Used for both stroke-width geometry and bold pooling (via `stroke_core_cut`) — the
+/// feather drops out either way, and gating bold on the core stops anti-aliased edge pixels
+/// (low, ambiguous bold values) from dragging the pooled mean down on thick display words.
 const STROKE_CORE_FRAC: f32 = 0.6;
 
-/// Matte alpha (0..255) above which a pixel counts as ink for bold pooling.
-pub(crate) const INK_BOLD_ALPHA_CUT: u8 = 40;
+/// Per-line core alpha cut from the line's peak matte alpha. One definition of "the stroke
+/// core" for stroke-width geometry and bold pooling, floored at `INK_CUT` for a near-empty matte.
+pub(crate) fn stroke_core_cut(peak_alpha: u8) -> u8 {
+    ((peak_alpha as f32 * STROKE_CORE_FRAC) as u8).max(INK_CUT as u8)
+}
 /// Need at least this many ink pixels to trust a pooled bold estimate.
 pub(crate) const INK_BOLD_MIN_PX: u64 = 30;
 /// Mean pooled bold (0..1) at or above which a word/line counts as bold.
-pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.5;
+pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.55;
 /// A firing gap wider than this multiple of the line's median character advance starts a
 /// new word — the fallback for recognizer models/charsets that under-emit the space class.
 /// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
@@ -94,12 +95,13 @@ impl BoldProfile {
             return None;
         }
         let (w, h) = matte.dimensions();
+        let core = stroke_core_cut(matte.iter().copied().max().unwrap_or(0));
         let mut psum = vec![0u64; w as usize + 1];
         let mut pcount = vec![0u64; w as usize + 1];
         for x in 0..w {
             let (mut s, mut c) = (0u64, 0u64);
             for y in 0..h {
-                if matte.get_pixel(x, y)[0] >= INK_BOLD_ALPHA_CUT {
+                if matte.get_pixel(x, y)[0] >= core {
                     s += bold.get_pixel(x, y)[0] as u64;
                     c += 1;
                 }
@@ -404,7 +406,7 @@ fn stroke_width_px(
         .flat_map(|y| (0..mw).map(move |x| data[y * mw + x]))
         .max()
         .unwrap_or(0);
-    let core = ((peak as f32 * STROKE_CORE_FRAC) as u8).max(INK_CUT as u8);
+    let core = stroke_core_cut(peak);
     let ink = |x: usize, y: usize| data[y * mw + x] >= core;
     let mut area: u32 = 0;
     let mut perimeter: u32 = 0;

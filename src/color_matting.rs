@@ -91,7 +91,7 @@ pub struct MattedStrip {
 /// erase). The model emits a soft 0..255 alpha; the fill mask is then
 /// grown by a height-proportional radius to catch the anti-aliased rim,
 /// so a low cut is enough without bleeding into the background.
-const INK_ALPHA_CUT: u8 = 40;
+const INK_ALPHA_CUT: u8 = crate::text_metrics::INK_CUT as u8;
 /// Fraction of a line's *peak* matte alpha above which a pixel counts as a
 /// confident stroke core for sampling the foreground ink colour. Relative (not
 /// an absolute cut) so it adapts to the matte strength: a faint line still keeps
@@ -111,6 +111,11 @@ const FG_MIN_CONTRAST: f32 = 3.5;
 /// model found essentially no ink in the box — return `None` and let the
 /// caller fall back to default-pill rendering.
 const MIN_INK_PIXELS: usize = 6;
+/// Luma distance from the ink colour below which a "background" pixel is rejected as a
+/// matte-missed stroke (same colour as the ink). Wide enough to drop missed strokes and the
+/// dark feather, narrower than any readable ink↔background contrast so it never eats real
+/// background. See [`fg_from_samples`].
+const INK_LUMA_MARGIN: i32 = 64;
 /// Side of the square tiles the background field is reconstructed on, in
 /// strip pixels. Each tile takes the median of its non-ink pixels; the
 /// grid is then bilinearly upsampled, so this trades smoothness (larger)
@@ -237,8 +242,7 @@ fn project_box_ink(
 
     let w_us = w as usize;
     let mut ink: Vec<Rgba<u8>> = Vec::new();
-    let mut bg_luma_sum: u64 = 0;
-    let mut bg_count: u64 = 0;
+    let mut bg_lumas: Vec<u8> = Vec::new();
     for py in y0..y1 {
         for px in x0..x1 {
             let dx = px as f32 + 0.5 - o.cx;
@@ -257,21 +261,12 @@ fn project_box_ink(
                 union_ink[(py as usize) * w_us + px as usize] = true;
                 ink.push(pixel);
             } else {
-                bg_luma_sum += luma(pixel) as u64;
-                bg_count += 1;
+                bg_lumas.push(luma(pixel));
             }
         }
     }
 
-    if ink.len() < MIN_INK_PIXELS {
-        return None;
-    }
-    let bg_luma = if bg_count > 0 {
-        (bg_luma_sum / bg_count) as u8
-    } else {
-        255
-    };
-    Some(ink_core_argb(ink, bg_luma))
+    fg_from_samples(ink, bg_lumas)
 }
 
 /// Scatter a contour-strip matte into the image-space `union_ink` via its forward
@@ -294,8 +289,7 @@ fn scatter_box_ink(
     }
     let w_us = w as usize;
     let mut ink: Vec<Rgba<u8>> = Vec::new();
-    let mut bg_luma_sum: u64 = 0;
-    let mut bg_count: u64 = 0;
+    let mut bg_lumas: Vec<u8> = Vec::new();
     for my in 0..mh {
         for mx in 0..mw {
             let (sx, sy) = src_map[(my * mw + mx) as usize];
@@ -309,19 +303,41 @@ fn scatter_box_ink(
                 union_ink[(pyi as usize) * w_us + pxi as usize] = true;
                 ink.push(pixel);
             } else {
-                bg_luma_sum += luma(pixel) as u64;
-                bg_count += 1;
+                bg_lumas.push(luma(pixel));
             }
         }
     }
+    fg_from_samples(ink, bg_lumas)
+}
+
+/// Reduce a box's gathered ink pixels + background lumas to a foreground colour. The three
+/// matting paths (`project_box_ink`, `scatter_box_ink`, `ocr::matte_erase_oriented`) gather
+/// pixels in different coordinate systems but share this reduction, so the median + polarity
+/// can't drift apart between them. `bg_luma` is the **median** background — robust to an
+/// under-marking matte that dumps missed strokes into `bg_lumas`, where a mean would drift
+/// toward the ink colour and flip the fg/bg polarity. `None` when there's too little ink.
+pub(crate) fn fg_from_samples(ink: Vec<Rgba<u8>>, bg_lumas: Vec<u8>) -> Option<u32> {
     if ink.len() < MIN_INK_PIXELS {
         return None;
     }
-    let bg_luma = if bg_count > 0 {
-        (bg_luma_sum / bg_count) as u8
-    } else {
-        255
-    };
+    // Ink luma centre, to drop background samples that match the ink colour. A matte that
+    // under-marks the strokes leaves the missed (ink-coloured) pixels in the background set,
+    // and on an ink-dominated box they out-vote the real background and flip the polarity.
+    // Cleaning by colour keeps the true between-stroke background — gradient and all — unlike
+    // retreating to a margin, which samples a different location/surface than the text sits on.
+    let mut ink_l: Vec<u8> = ink.iter().map(|&p| luma(p)).collect();
+    ink_l.sort_unstable();
+    let ink_luma = ink_l[ink_l.len() / 2] as i32;
+    let mut bg: Vec<u8> = bg_lumas
+        .iter()
+        .copied()
+        .filter(|&l| (l as i32 - ink_luma).abs() > INK_LUMA_MARGIN)
+        .collect();
+    if bg.len() < MIN_INK_PIXELS {
+        bg = bg_lumas; // all background matched the ink colour (degenerate/low-contrast): keep all
+    }
+    bg.sort_unstable();
+    let bg_luma = bg.get(bg.len() / 2).copied().unwrap_or(255);
     Some(ink_core_argb(ink, bg_luma))
 }
 
@@ -331,21 +347,26 @@ fn scatter_box_ink(
 /// cluster of source pixels — the dark stroke centre plus its lighter
 /// anti-aliased edges — and the median lands between them, washing the colour
 /// toward the page (low-contrast lines render near-invisible). Sorting by luma
-/// and keeping the extreme fraction on the ink side recovers the true ink. The
-/// direction comes from `bg_luma` so it works for dark-on-light and light-on-dark
-/// alike. Shared by the live (`project_box_ink`) and still
+/// and keeping the extreme fraction on the ink side recovers the true ink. Polarity
+/// is the ink extreme *farther* from `bg_luma`, which works for dark-on-light and
+/// light-on-dark alike and is robust to a matte that mixed background pixels into the
+/// ink set — those sit near `bg_luma`, so they lose the farther-extreme test to the real
+/// strokes (the matte-median-vs-bg test instead inverted on heavy display type, where the
+/// matte under-marks the strokes). Shared by the live (`project_box_ink`) and still
 /// (`ocr::matte_erase_oriented`) paths so both colour text identically.
 /// `ink` must be non-empty.
 pub(crate) fn ink_core_argb(mut ink: Vec<Rgba<u8>>, bg_luma: u8) -> u32 {
     ink.sort_by_key(|&p| luma(p));
-    let ink_is_dark = luma(ink[ink.len() / 2]) < bg_luma;
     let k = ((ink.len() as f32 * FG_INK_FRACTION).ceil() as usize).clamp(1, ink.len());
-    let core = if ink_is_dark {
-        &ink[..k]
+    let dark = median_color(&ink[..k]);
+    let light = median_color(&ink[ink.len() - k..]);
+    let dist = |c: Rgba<u8>| (luma(c) as i32 - bg_luma as i32).abs();
+    let core = if dist(dark) >= dist(light) {
+        dark
     } else {
-        &ink[ink.len() - k..]
+        light
     };
-    enforce_contrast(rgba_to_argb(median_color(core)), bg_luma, FG_MIN_CONTRAST)
+    enforce_contrast(rgba_to_argb(core), bg_luma, FG_MIN_CONTRAST)
 }
 
 /// sRGB channel (0..1) → linear light.

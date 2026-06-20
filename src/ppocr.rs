@@ -57,7 +57,7 @@ const DET_MIN_AREA: u32 = 64;
 /// `tight·(1 + ratio) + 2·DET_BOX_BORDER` at 0.8 puts the inflated box at ~1.1–1.25× the ink —
 /// enough margin to erase the antialiasing fringe without swallowing neighboring lines the way
 /// upstream's ratio did (~1.75× the ink).
-const DET_UNCLIP_RATIO: f32 = 1.0;
+const DET_UNCLIP_RATIO: f32 = 1.5;
 const DET_BOX_BORDER: u32 = 4;
 const LIVE_REC_DROP_SCORE: f32 = 0.65;
 const LIVE_DET_BOX_MIN_SCORE: f32 = 0.68;
@@ -279,9 +279,11 @@ impl InkStrip {
     /// (legacy matte-only model) or too little ink to be reliable.
     pub fn pooled_bold(&self) -> Option<f32> {
         let bold = self.bold.as_ref()?;
+        let core =
+            crate::text_metrics::stroke_core_cut(self.matte.iter().copied().max().unwrap_or(0));
         let (mut sum, mut n) = (0u64, 0u64);
         for (m, b) in self.matte.iter().zip(bold.iter()) {
-            if *m >= crate::text_metrics::INK_BOLD_ALPHA_CUT {
+            if *m >= core {
                 sum += *b as u64;
                 n += 1;
             }
