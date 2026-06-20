@@ -327,27 +327,32 @@ pub(crate) fn fg_from_samples(ink: Vec<Rgba<u8>>, bg_lumas: Vec<u8>) -> Option<u
     if ink.len() < MIN_INK_PIXELS {
         return None;
     }
-    // Ink luma centre, to drop background samples that match the ink colour. A matte that
-    // under-marks the strokes leaves the missed (ink-coloured) pixels in the background set,
-    // and on an ink-dominated box they out-vote the real background and flip the polarity.
-    // Cleaning by colour keeps the true between-stroke background — gradient and all — unlike
-    // retreating to a margin, which samples a different location/surface than the text sits on.
-    let n_bg_raw = bg_lumas.len();
+    // Drop background samples that match the *ink core* colour — the matte-missed strokes that
+    // leak into the background set and, on an ink-dominated box, out-vote the real background and
+    // flip the polarity. The clean reference must be the confident stroke colour (the luma core),
+    // NOT the full-ink median: when the matte over-marks it pulls bright gap pixels into the ink
+    // set and drags the median to mid-gray, so cleaning around the median would delete the real
+    // background instead. The core sits on the actual strokes and doesn't overshoot. A rough
+    // background median orients which luma-extreme of the ink is the real core (the side farther
+    // from the page). Cleaning by colour keeps the true between-stroke background, gradient and all.
+    let mut raw = bg_lumas.clone();
+    raw.sort_unstable();
+    let rough_bg = raw[raw.len() / 2] as i32;
     let mut ink_l: Vec<u8> = ink.iter().map(|&p| luma(p)).collect();
     ink_l.sort_unstable();
-    let ink_luma = ink_l[ink_l.len() / 2] as i32;
+    let k = ((ink_l.len() as f32 * FG_INK_FRACTION).ceil() as usize).clamp(1, ink_l.len());
+    let dark_core = ink_l[(k / 2).min(ink_l.len() - 1)] as i32;
+    let light_core = ink_l[ink_l.len() - 1 - (k / 2).min(ink_l.len() - 1)] as i32;
+    let ink_core = if (dark_core - rough_bg).abs() >= (light_core - rough_bg).abs() {
+        dark_core
+    } else {
+        light_core
+    };
     let mut bg: Vec<u8> = bg_lumas
         .iter()
         .copied()
-        .filter(|&l| (l as i32 - ink_luma).abs() > INK_LUMA_MARGIN)
+        .filter(|&l| (l as i32 - ink_core).abs() > INK_LUMA_MARGIN)
         .collect();
-    // If the clean removed most of the background, `ink_luma` sits near the real background —
-    // a low-contrast line, or an over-marking matte that pulled light pixels into the ink set
-    // and inflated `ink_luma` to mid-gray. Cleaning there destroys the true background (leaving
-    // dark specks → a flipped, light foreground), so keep the raw background and median it.
-    if bg.len() < n_bg_raw / 2 {
-        bg = bg_lumas;
-    }
     bg.sort_unstable();
     let bg_luma = bg.get(bg.len() / 2).copied().unwrap_or(255);
     Some(ink_core_argb(ink, bg_luma))
