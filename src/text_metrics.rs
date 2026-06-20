@@ -39,14 +39,14 @@ pub const INK_CUT: u16 = 40;
 /// vertical *support* (as opposed to inter-line gap or padding). Deliberately
 /// low: it only has to separate this line's ink from a neighbouring line that
 /// bled into the box's padding (which shows as a *disjoint* run), not to find
-/// the x-height edge — that comes from the ink-mass percentiles below.
+/// the x-height edge — that comes from the modal top/bottom-of-ink rows.
 const SUPPORT_FRAC: f32 = 0.12;
-/// Ink-mass percentiles bounding the x-height band. Walking the cumulative row
-/// profile and cutting at these fractions of total ink is robust to a single
-/// dense row (e.g. the x-line where every lowercase top piles up) and to a
-/// shallow mid-band dip — both of which fragment a fraction-of-peak threshold.
-const MASS_LO: f32 = 0.10;
-const MASS_HI: f32 = 0.90;
+/// Minimum column span, as a fraction of the support height, for a column to vote
+/// in the span-coverage profile. Drops sliver columns — arch middles, round-glyph
+/// edge grazes, dots — that span only a fraction of the band; the knee where arch
+/// letters recover their true height sits at ~0.15, so this clears it with margin
+/// while staying well below the ~0.75 floor of a genuine x-height-only column.
+const MIN_SPAN_FRAC: f32 = 0.20;
 /// Minimum inked columns to attempt a baseline-tilt fit. Below this the slope
 /// is noise; report zero tilt and keep just the x-height.
 const MIN_TILT_COLUMNS: usize = 8;
@@ -68,7 +68,7 @@ pub(crate) fn stroke_core_cut(peak_alpha: u8) -> u8 {
 /// Need at least this many ink pixels to trust a pooled bold estimate.
 pub(crate) const INK_BOLD_MIN_PX: u64 = 30;
 /// Mean pooled bold (0..1) at or above which a word/line counts as bold.
-pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.55;
+pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.65;
 /// A firing gap wider than this multiple of the line's median character advance starts a
 /// new word — the fallback for recognizer models/charsets that under-emit the space class.
 /// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
@@ -420,20 +420,22 @@ pub fn measure_line(matte: &GrayImage, box_width: f32, box_height: f32) -> Optio
     }
 
     // Isolate the line's vertical support (drops neighbouring-line bleed, which
-    // sits in a disjoint run off-centre), then read the x-height band from the
-    // ink-mass distribution *within* that support.
+    // sits in a disjoint run off-centre).
     let (sup_top, sup_bottom) = central_band(&row_sum, peak as f32 * SUPPORT_FRAC, mh as usize)?;
-    let total: f64 = row_sum[sup_top..=sup_bottom]
-        .iter()
-        .map(|&s| s as f64)
-        .sum();
-    let lo = mass_row(&row_sum, sup_top, sup_bottom, total, MASS_LO);
-    let hi = mass_row(&row_sum, sup_top, sup_bottom, total, MASS_HI);
-    let mid = mass_row(&row_sum, sup_top, sup_bottom, total, 0.5);
+
+    // The x-height band is bounded by the half-maximum crossings of the column
+    // span-coverage profile. Caps/ascenders pile a shoulder above the x-line and
+    // descenders one below the baseline, but each is only a minority of columns so
+    // both shoulders sit well under half the peak — the half-max edge therefore
+    // tracks the dense x-height band regardless of the word's letter mix, where a
+    // column-top mode tips to the caps once they are a plurality (e.g. "MyAppList").
+    let span_cov = column_span_coverage(data, mw_us, mh as usize, sup_top, sup_bottom);
+    let (xheight_top, baseline_row) = band_edges(&span_cov, sup_top, sup_bottom);
 
     let rows_to_px = box_height / mh as f32;
-    let x_height = (hi - lo) * rows_to_px;
-    let centerline_offset = (mid - (mh as f32 - 1.0) * 0.5) * rows_to_px;
+    let x_height = (baseline_row - xheight_top).max(0.0) * rows_to_px;
+    let band_center = (xheight_top + baseline_row) * 0.5;
+    let centerline_offset = (band_center - (mh as f32 - 1.0) * 0.5) * rows_to_px;
 
     // Horizontal ink extent: the full span of inked columns within the support
     // band — the *full* span, not a percentile, since trimming would re-clip the
@@ -444,13 +446,7 @@ pub fn measure_line(matte: &GrayImage, box_width: f32, box_height: f32) -> Optio
     let ink_center_col = (col_left + col_right + 1) as f32 * 0.5;
     let center_u_offset = (ink_center_col - mw as f32 * 0.5) * cols_to_px;
 
-    let slope_rows_per_col = baseline_slope(
-        data,
-        mw_us,
-        mh as usize,
-        lo.floor() as usize,
-        hi.ceil() as usize,
-    );
+    let slope_rows_per_col = baseline_slope(data, mw_us, sup_top, sup_bottom);
     // Strip column step → image displacement along the reading axis; row step →
     // displacement across it. The tilt is the angle between the band's traced
     // direction and the strip's column axis.
@@ -546,28 +542,81 @@ fn ink_column_span(data: &[u8], mw: usize, sup_top: usize, sup_bottom: usize) ->
     }
 }
 
-/// Sub-row position where the cumulative ink mass over `[s, e]` first reaches
-/// `frac` of `total`, linearly interpolated within the crossing row. The
-/// integral form is what makes the x-height read robust to a single tall row.
-fn mass_row(row_sum: &[u32], s: usize, e: usize, total: f64, frac: f32) -> f32 {
-    if total <= 0.0 {
-        return s as f32;
-    }
-    let target = total * frac as f64;
-    let mut cum = 0.0f64;
-    for y in s..=e {
-        let r = row_sum[y] as f64;
-        if cum + r >= target {
-            let f = if r > 0.0 {
-                ((target - cum) / r) as f32
-            } else {
-                0.0
-            };
-            return y as f32 + f;
+/// Per-row count of columns whose inked span `[top, bottom]` covers the row. By
+/// filling each column from its first to its last inked row, interior holes — the
+/// bar of an `e`, the bowl of an `o` — are ignored, so a row of aligned horizontal
+/// strokes can't spike the profile and collapse the half-max band the way a raw
+/// alpha-sum or a per-row inked-column count does. The result is a clean top-hat:
+/// nearly every column spans the x-height band, dropping to the ascender/cap
+/// fraction above the x-line and the descender fraction below the baseline.
+///
+/// Columns whose span is under [`MIN_SPAN_FRAC`] of the support height are dropped
+/// first: these are slivers — the open middle of an `n`/`m`/`u` arch, the grazing
+/// left/right edges of an `o`, a stray dot or hyphen — that read a partial height
+/// and would drag the band short. Only full-height columns (stems, letter bodies)
+/// vote, so a word of pure arches still recovers its true x-height.
+fn column_span_coverage(
+    data: &[u8],
+    mw: usize,
+    mh: usize,
+    sup_top: usize,
+    sup_bottom: usize,
+) -> Vec<u32> {
+    let min_span = (MIN_SPAN_FRAC * (sup_bottom - sup_top + 1) as f32).ceil() as usize;
+    let mut cov = vec![0u32; mh];
+    for x in 0..mw {
+        let Some(top) = (sup_top..=sup_bottom).find(|&y| data[y * mw + x] as u16 >= INK_CUT) else {
+            continue;
+        };
+        let bottom = (sup_top..=sup_bottom)
+            .rev()
+            .find(|&y| data[y * mw + x] as u16 >= INK_CUT)
+            .expect("a column with a top has a bottom");
+        if bottom - top + 1 < min_span {
+            continue;
         }
-        cum += r;
+        for c in cov.iter_mut().take(bottom + 1).skip(top) {
+            *c += 1;
+        }
     }
-    e as f32
+    cov
+}
+
+/// The x-height line and baseline as the half-maximum crossings of a vertical
+/// `profile`, scanning outward from its peak row and linearly interpolating the
+/// crossing within the straddling row pair. A density level (not a column count
+/// or a cumulative-mass percentile), so the ascender/cap shoulder above the
+/// x-line and the descender shoulder below the baseline — each only a fraction of
+/// the columns, hence under half the peak — are stepped over rather than included.
+fn band_edges(profile: &[u32], sup_top: usize, sup_bottom: usize) -> (f32, f32) {
+    let peak_row = (sup_top..=sup_bottom)
+        .max_by_key(|&y| profile[y])
+        .expect("non-empty support");
+    let half = profile[peak_row] as f32 * 0.5;
+
+    let mut y = peak_row;
+    while y > sup_top && profile[y] as f32 >= half {
+        y -= 1;
+    }
+    let top = if profile[y] as f32 >= half {
+        sup_top as f32
+    } else {
+        let (a, b) = (profile[y] as f32, profile[y + 1] as f32);
+        y as f32 + (half - a) / (b - a)
+    };
+
+    let mut y = peak_row;
+    while y < sup_bottom && profile[y] as f32 >= half {
+        y += 1;
+    }
+    let bottom = if profile[y] as f32 >= half {
+        sup_bottom as f32
+    } else {
+        let (a, b) = (profile[y] as f32, profile[y - 1] as f32);
+        y as f32 - (half - a) / (b - a)
+    };
+
+    (top, bottom)
 }
 
 /// Pick the contiguous run of above-threshold rows that straddles the strip
@@ -604,121 +653,75 @@ fn central_band(row_sum: &[u32], threshold: f32, mh: usize) -> Option<(usize, us
     })
 }
 
-/// Fit the baseline slope (matte rows per column) by regressing each column's
-/// ink centroid against its column index, with two winsorizing passes so
-/// descenders/ascenders that overshoot can't drag the line. Each column's
-/// centroid comes from the inked run that overlaps the band centre — not a
-/// fixed global window — so a tilted line isn't clipped at the band edges, and
-/// a separate run from neighbouring-line bleed is left out. Returns 0 when too
-/// few columns carry ink to trust a slope.
-fn baseline_slope(data: &[u8], mw: usize, mh: usize, band_top: usize, band_bottom: usize) -> f32 {
-    let band_mid = (band_top + band_bottom) / 2;
+/// Fit the baseline slope (matte rows per column) by Theil–Sen regression of each
+/// column's bottom-of-ink row against its column index. The bottom edge is the
+/// typographic baseline, which caps, ascenders and x-height letters all share, so
+/// the fit is immune to the upward reach of tall glyphs that biases a centroid.
+/// The few descenders that survive into the support band push their columns low;
+/// Theil–Sen's median of pairwise slopes discards them — even clustered at one
+/// end of a word, as in "queue" — without picking a side or a trim threshold.
+/// Returns 0 when too few columns carry ink to trust a slope.
+fn baseline_slope(data: &[u8], mw: usize, support_top: usize, support_bottom: usize) -> f32 {
+    // Cap the pairwise work on very wide strips; striding columns barely moves a
+    // median-of-slopes fit.
+    let stride = (mw / 600).max(1);
     let mut xs: Vec<f32> = Vec::new();
     let mut ys: Vec<f32> = Vec::new();
-    for x in 0..mw {
-        if let Some(centroid) = column_band_centroid(data, mw, mh, x, band_mid) {
+    for x in (0..mw).step_by(stride) {
+        if let Some(bottom) = column_baseline_row(data, mw, x, support_top, support_bottom) {
             xs.push(x as f32);
-            ys.push(centroid);
+            ys.push(bottom);
         }
     }
     if xs.len() < MIN_TILT_COLUMNS {
         return 0.0;
     }
-
-    let mut keep = vec![true; xs.len()];
-    let mut slope = 0.0;
-    for _ in 0..2 {
-        let (m, b) = least_squares(&xs, &ys, &keep);
-        slope = m;
-        let mut resid: Vec<f32> = xs
-            .iter()
-            .zip(&ys)
-            .map(|(&x, &y)| (y - (m * x + b)).abs())
-            .collect();
-        let mut sorted = resid.clone();
-        sorted.sort_by(|a, c| a.partial_cmp(c).unwrap());
-        let mad = sorted[sorted.len() / 2].max(1e-3);
-        for (k, r) in resid.drain(..).enumerate() {
-            keep[k] = r <= 3.0 * mad;
-        }
-        if keep.iter().filter(|&&k| k).count() < MIN_TILT_COLUMNS {
-            break;
-        }
-    }
-    slope
+    theil_sen_slope(&xs, &ys)
 }
 
-/// Alpha-weighted centroid row of the column's inked run that contains (or sits
-/// nearest) `band_mid`. Scanning the column's own runs — rather than a fixed row
-/// window — means a tilted line's stroke is measured whole at every column, and
-/// a disjoint run from a neighbouring line is excluded.
-fn column_band_centroid(
+/// Median of all pairwise slopes (Theil–Sen). Robust to ~29% outliers regardless
+/// of whether they cluster at one end, so descender columns cannot lean the fit.
+fn theil_sen_slope(xs: &[f32], ys: &[f32]) -> f32 {
+    let n = xs.len();
+    let mut slopes: Vec<f32> = Vec::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = xs[j] - xs[i];
+            if dx.abs() < 1e-6 {
+                continue;
+            }
+            slopes.push((ys[j] - ys[i]) / dx);
+        }
+    }
+    if slopes.is_empty() {
+        return 0.0;
+    }
+    slopes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let m = slopes.len() / 2;
+    if slopes.len() % 2 == 1 {
+        slopes[m]
+    } else {
+        0.5 * (slopes[m - 1] + slopes[m])
+    }
+}
+
+/// Lowest inked row in the column, restricted to the line's support band. The
+/// support band drops a neighbouring line's bleed (a disjoint run outside the
+/// band) and the descenders too sparse to enter the support; taking the *lowest*
+/// row — not the run nearest the band centre — reads the true baseline through
+/// open/curved glyphs (c, s, e) whose column splits into a top arc and a separate
+/// bottom arc, where a nearest-run rule would wrongly latch onto the top arc.
+fn column_baseline_row(
     data: &[u8],
     mw: usize,
-    mh: usize,
     x: usize,
-    band_mid: usize,
+    support_top: usize,
+    support_bottom: usize,
 ) -> Option<f32> {
-    let mut best: Option<(usize, f32, f32)> = None; // (dist-to-mid, wsum, ysum)
-    let mut run_w: f32 = 0.0;
-    let mut run_y: f32 = 0.0;
-    let mut run_start: Option<usize> = None;
-    let flush =
-        |start: usize, end: usize, w: f32, ys: f32, best: &mut Option<(usize, f32, f32)>| {
-            let dist = if band_mid < start {
-                start - band_mid
-            } else if band_mid > end {
-                band_mid - end
-            } else {
-                0
-            };
-            if best.map_or(true, |(d, _, _)| dist < d) {
-                *best = Some((dist, w, ys));
-            }
-        };
-    for y in 0..mh {
-        let a = data[y * mw + x] as u16;
-        if a >= INK_CUT {
-            if run_start.is_none() {
-                run_start = Some(y);
-                run_w = 0.0;
-                run_y = 0.0;
-            }
-            run_w += a as f32;
-            run_y += a as f32 * y as f32;
-        } else if let Some(s) = run_start.take() {
-            flush(s, y - 1, run_w, run_y, &mut best);
-        }
-    }
-    if let Some(s) = run_start {
-        flush(s, mh - 1, run_w, run_y, &mut best);
-    }
-    best.and_then(|(_, w, ys)| (w > 0.0).then_some(ys / w))
-}
-
-/// Ordinary least-squares slope/intercept over the kept points.
-fn least_squares(xs: &[f32], ys: &[f32], keep: &[bool]) -> (f32, f32) {
-    let n = keep.iter().filter(|&&k| k).count() as f32;
-    if n < 2.0 {
-        return (0.0, 0.0);
-    }
-    let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
-    for ((&x, &y), &k) in xs.iter().zip(ys).zip(keep) {
-        if !k {
-            continue;
-        }
-        sx += x;
-        sy += y;
-        sxx += x * x;
-        sxy += x * y;
-    }
-    let denom = n * sxx - sx * sx;
-    if denom.abs() < 1e-6 {
-        return (0.0, sy / n);
-    }
-    let m = (n * sxy - sx * sy) / denom;
-    let b = (sy - m * sx) / n;
-    (m, b)
+    (support_top..=support_bottom)
+        .rev()
+        .find(|&y| data[y * mw + x] as u16 >= INK_CUT)
+        .map(|y| y as f32)
 }
 
 #[cfg(test)]
@@ -813,8 +816,8 @@ mod tests {
         let mh = 48;
         let m = tilted_band(mw, mh, 23.5, 0.0, 7.5);
         let r = measure_line(&m, mw as f32, mh as f32).unwrap();
-        // 16-row band; the 10–90% mass span is 0.8× of it ≈ 12.8.
-        assert!((r.x_height - 12.8).abs() <= 1.0, "x_height {}", r.x_height);
+        // Rows 16..=31 inked ⇒ baseline-to-x-line span of 15 rows.
+        assert!((r.x_height - 15.0).abs() <= 1.0, "x_height {}", r.x_height);
         assert!(
             r.baseline_angle_delta.abs() < 1e-3,
             "tilt {}",
@@ -849,9 +852,9 @@ mod tests {
         let mh = 48;
         let m = tilted_band(mw, mh, 23.5, 0.0, 7.5);
         // Box twice as tall as the matte → x-height doubles in image space
-        // (12.8 rows → 25.6px).
+        // (15 rows → 30px).
         let r = measure_line(&m, mw as f32, 2.0 * mh as f32).unwrap();
-        assert!((r.x_height - 25.6).abs() <= 2.0, "x_height {}", r.x_height);
+        assert!((r.x_height - 30.0).abs() <= 2.0, "x_height {}", r.x_height);
     }
 
     #[test]
@@ -888,8 +891,8 @@ mod tests {
             image::Luma([v])
         });
         let r = measure_line(&m, mw as f32, mh as f32).unwrap();
-        // 12-row central band; 10–90% mass span ≈ 9.6.
-        assert!((r.x_height - 9.6).abs() <= 1.0, "x_height {}", r.x_height);
+        // Central band rows 20..=31 ⇒ baseline-to-x-line span of 11 rows.
+        assert!((r.x_height - 11.0).abs() <= 1.0, "x_height {}", r.x_height);
     }
 
     #[test]
