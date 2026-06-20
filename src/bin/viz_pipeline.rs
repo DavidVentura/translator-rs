@@ -1110,10 +1110,143 @@ fn run(cli: Cli) -> Result<(), String> {
                     }
                     println!("  wrote {n}/{} ink masks", masks.len());
                     index.insert("ink_count".into(), serde_json::json!(n));
+
+                    // Three full-page overlays, each from the real prod constants/functions:
+                    //   raw   = the model's matte (every texel ≥ INK_CUT), no scatter loss
+                    //   core  = the FG_INK_FRACTION luma-extreme the colour picker samples
+                    //   erase = union_ink_mask (prod) + the per-box fill dilation the erase applies
+                    let rgba = image.to_rgba8();
+                    let (iw, ih) = (rgba.width(), rgba.height());
+                    let src_luma = |x: u32, y: u32| {
+                        let p = rgba.get_pixel(x, y).0;
+                        (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000
+                    };
+                    let cut = translator::text_metrics::INK_CUT as u8;
+                    let mut raw = vec![0u8; (iw * ih) as usize]; // image-space matte value
+                    let mut core = vec![false; (iw * ih) as usize];
+
+                    for (mask, sm) in masks.iter().zip(src_maps.iter()) {
+                        let (Some(mask), Some(sm)) = (mask, sm) else {
+                            continue;
+                        };
+                        let (mw, mh) = mask.dimensions();
+                        // dense sub-texel walk: bilinear src position so the 48px strip maps onto
+                        // the page with no scatter holes (this is for *visualising the model's matte*;
+                        // the erase below uses the real prod scatter instead).
+                        let src_at = |fx: f32, fy: f32| -> (f32, f32) {
+                            let x0 = (fx.floor() as u32).min(mw - 1);
+                            let y0 = (fy.floor() as u32).min(mh - 1);
+                            let x1 = (x0 + 1).min(mw - 1);
+                            let y1 = (y0 + 1).min(mh - 1);
+                            let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                            let g = |x: u32, y: u32| sm[(y * mw + x) as usize];
+                            let (a, b, c, d) = (g(x0, y0), g(x1, y0), g(x0, y1), g(x1, y1));
+                            let l = |p: f32, q: f32, t: f32| p + (q - p) * t;
+                            (
+                                l(l(a.0, b.0, tx), l(c.0, d.0, tx), ty),
+                                l(l(a.1, b.1, tx), l(c.1, d.1, tx), ty),
+                            )
+                        };
+                        let span = |f: fn((f32, f32)) -> f32| {
+                            sm.iter().map(|&p| f(p)).fold(f32::MIN, f32::max)
+                                - sm.iter().map(|&p| f(p)).fold(f32::MAX, f32::min)
+                        };
+                        let step = ((span(|p| p.0) / mw as f32)
+                            .max(span(|p| p.1) / mh as f32)
+                            .ceil() as u32)
+                            .clamp(1, 12);
+                        // collect this box's ink pixels (idx, luma) for the colour-core selection
+                        let mut ink_px: Vec<(usize, u8)> = Vec::new();
+                        for j in 0..mh * step {
+                            for i in 0..mw * step {
+                                let (fx, fy) = (i as f32 / step as f32, j as f32 / step as f32);
+                                let a = mask.get_pixel(fx as u32, fy as u32)[0];
+                                let (sx, sy) = src_at(fx, fy);
+                                if sx < 0.0 || sy < 0.0 || sx >= iw as f32 || sy >= ih as f32 {
+                                    continue;
+                                }
+                                let idx = (sy as u32 * iw + sx as u32) as usize;
+                                if a > raw[idx] {
+                                    raw[idx] = a;
+                                }
+                                if a >= cut {
+                                    ink_px.push((idx, src_luma(sx as u32, sy as u32) as u8));
+                                }
+                            }
+                        }
+                        if ink_px.is_empty() {
+                            continue;
+                        }
+                        // colour core: prod takes FG_INK_FRACTION on the ink side farther from bg.
+                        ink_px.sort_by_key(|&(_, l)| l);
+                        let med_ink = ink_px[ink_px.len() / 2].1;
+                        let k = ((ink_px.len() as f32 * translator::color_matting::FG_INK_FRACTION)
+                            .ceil() as usize)
+                            .clamp(1, ink_px.len());
+                        // box background luma (median over the box's non-ink-ish light pixels)
+                        let dark_side = (med_ink as u32) < 128;
+                        let chosen = if dark_side {
+                            &ink_px[..k]
+                        } else {
+                            &ink_px[ink_px.len() - k..]
+                        };
+                        for &(idx, _) in chosen {
+                            core[idx] = true;
+                        }
+                    }
+
+                    // erase mask: the exact prod still-path mask (union_ink_mask + fill dilation)
+                    let union =
+                        translator::color_matting::union_ink_mask(&rgba, &boxes, &masks, &src_maps);
+                    let mut erase = vec![false; (iw * ih) as usize];
+                    for b in &boxes {
+                        let fill_radius =
+                            translator::color_matting::fill_radius(b.oriented_box.height);
+                        let r = b.oriented_box.to_aabb();
+                        let (x0, y0) = (r.left.min(iw), r.top.min(ih));
+                        let (x1, y1) = (r.right.min(iw), r.bottom.min(ih));
+                        let (aw, ah) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+                        if aw == 0 || ah == 0 {
+                            continue;
+                        }
+                        let mut sub = vec![false; (aw * ah) as usize];
+                        for ly in 0..ah {
+                            for lx in 0..aw {
+                                sub[(ly * aw + lx) as usize] =
+                                    union[((y0 + ly) * iw + (x0 + lx)) as usize];
+                            }
+                        }
+                        let d = translator::color_matting::dilate(&sub, aw, ah, fill_radius);
+                        for ly in 0..ah {
+                            for lx in 0..aw {
+                                if d[(ly * aw + lx) as usize] {
+                                    erase[((y0 + ly) * iw + (x0 + lx)) as usize] = true;
+                                }
+                            }
+                        }
+                    }
+
+                    let paint = |name: &str, hit: &dyn Fn(usize) -> Option<f32>| {
+                        let mut ov = rgba.clone();
+                        for i in 0..(iw * ih) as usize {
+                            if let Some(a) = hit(i) {
+                                let p = ov.get_pixel_mut(i as u32 % iw, i as u32 / iw);
+                                p[0] = (p[0] as f32 * (1.0 - a) + 255.0 * a) as u8;
+                                p[1] = (p[1] as f32 * (1.0 - a)) as u8;
+                                p[2] = (p[2] as f32 * (1.0 - a)) as u8;
+                            }
+                        }
+                        let _ = ov.save(dir.join(name));
+                    };
+                    paint("ink-raw.png", &|i| {
+                        (raw[i] > 0).then_some(raw[i] as f32 / 255.0 * 0.8)
+                    });
+                    paint("ink-core.png", &|i| core[i].then_some(0.85));
+                    paint("ink-erase.png", &|i| erase[i].then_some(0.7));
+                    println!("  wrote ink-raw.png / ink-core.png / ink-erase.png");
                     // Per-box foreground colour the matting algo picks, plus the
                     // inpainted strip, so we can see whether a light fg is the
                     // colour algo or a bad/misregistered matte.
-                    let rgba = image.to_rgba8();
                     let strips =
                         translator::color_matting::mat_detections(&rgba, &boxes, &masks, &src_maps);
                     // Label each box's fg with its recognised text (so STRONGER etc. are findable);

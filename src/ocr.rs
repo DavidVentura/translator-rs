@@ -2221,8 +2221,12 @@ fn matte_erase_oriented(
 
     // Grow the fill set by a height-proportional radius so the original ink's
     // anti-aliased rim is replaced too (the matte edge sits just inside it).
-    let fill_radius = ((oriented.height * 0.06).round() as u32).clamp(1, 6);
-    let sub = dilate(&sub, aw, ah, fill_radius);
+    let sub = dilate(
+        &sub,
+        aw,
+        ah,
+        crate::color_matting::fill_radius(oriented.height),
+    );
     let bg: Vec<Rgb<u8>> = background_field(&pixels, &sub, aw, ah, BG_BLOCK);
 
     for ly in 0..ah {

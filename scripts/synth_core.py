@@ -177,12 +177,26 @@ def legible(img: np.ndarray, cov: np.ndarray, native_h: int) -> bool:
         return False
     text_rows = ink_mask.any(axis=1)
     bg_mask = (cov < 0.05) & text_rows[:, None]
-    if bg_mask.sum() < 30:
-        return False
+    if bg_mask.sum() >= 30:
+        bg_px = img[bg_mask]
+    else:
+        # Dense display text (~50% ink): clean cov<0.05 background is scarce because the
+        # tight inter-stroke gaps are antialiased. Sample the lowest-coverage pixels in the
+        # text band (the gaps/counters) as background instead, so high-coverage strips aren't
+        # wrongly rejected (and retried). Genuinely all-ink (no gaps) still fails.
+        band_cov = np.where(text_rows[:, None], cov, 2.0).ravel()
+        k = min(400, max(30, int(text_rows.sum()) * cov.shape[1] // 5))
+        k = min(k, band_cov.size - 1)
+        if k < 30:
+            return False
+        idx = np.argpartition(band_cov, k)[:k]
+        if band_cov[idx].max() >= 0.6:
+            return False
+        bg_px = img.reshape(-1, img.shape[-1])[idx]
     # Subsample before the median: a contrast gate doesn't need the exact median over
     # tens of thousands of pixels, and np.median's partition over the full native-res
     # ink/bg arrays was ~6% of total gen time (worse on the big signage strips).
-    ink_px, bg_px = img[ink_mask], img[bg_mask]
+    ink_px = img[ink_mask]
     if len(ink_px) > 400:
         ink_px = ink_px[:: len(ink_px) // 400]
     if len(bg_px) > 400:

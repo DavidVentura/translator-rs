@@ -34,7 +34,7 @@ use crate::ocr::OrientedRect;
 
 /// Matte alpha at or above which a texel counts as ink. The single source of truth for
 /// "what is ink"; the erase path's `color_matting::INK_ALPHA_CUT` aliases it.
-pub(crate) const INK_CUT: u16 = 40;
+pub const INK_CUT: u16 = 40;
 /// Fraction of the peak row-profile that marks a row as part of the line's
 /// vertical *support* (as opposed to inter-line gap or padding). Deliberately
 /// low: it only has to separate this line's ink from a neighbouring line that

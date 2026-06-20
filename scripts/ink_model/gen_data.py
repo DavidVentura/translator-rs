@@ -154,6 +154,43 @@ def _weighted_fonts(script: str, bold: bool) -> tuple[str, ...]:
     return _stroke_pool(tuple(paths), script, bold)
 
 
+# Fraction of strips drawn as a high-coverage condensed display header (env-gated, default 0
+# so the standard recipe is unchanged). Targets the out-of-distribution failure: real ultra-bold
+# condensed lettering is ~50% ink coverage, where the model over-marks the bright inter-letter
+# gaps; the standard gen tops out ~8% of strips above 0.40 coverage. The gap labels stay
+# background (cov = glyph coverage), so this teaches "dense ink, gaps still background".
+DISPLAY_HEAVY_FRAC = float(os.environ.get("INK_DISPLAY_HEAVY", "0"))
+STROKE_DISPLAY_CUT = 0.115
+
+
+@lru_cache(maxsize=1)
+def _display_fonts() -> tuple[str, ...]:
+    """Curated condensed/poster display faces — the ones `setup_vast.sh` fetches into the
+    `gigabold` dir (Anton, Oswald, BebasNeue, Staatliches, AlfaSlabOne, …). Restricted to that
+    known-good set rather than the measured-stroke tail of all system fonts: the tail pulled in
+    occasional faces that crash PIL at large display sizes (aborting a dataloader worker), and
+    the curated set is exactly the real-header style we want. Falls back to the measured tail
+    only if the gigabold dir is absent (local dev)."""
+    curated = tuple(p for p in font_paths() if "gigabold" in p)
+    if curated:
+        return curated
+    return tuple(p for p in font_paths() if _font_stroke_ratio(p, "latin") >= STROKE_DISPLAY_CUT) \
+        or _weighted_fonts("latin", True)
+
+
+def _display_text(rng: random.Random, width: int, font_px: int) -> str:
+    """Enough uppercase chars (the header style) to span the strip width at this em, so the
+    word fills its box like a real tight-cropped header instead of floating in background."""
+    n = max(3, int(width / (0.55 * font_px)) + rng.randint(0, 2))
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out, w = [], 0
+    while w < n:
+        run = rng.randint(3, 8)
+        out.append("".join(rng.choice(chars) for _ in range(min(run, n - w))))
+        w += run + 1
+    return " ".join(out)
+
+
 # Connected/cursive scripts the Latin+CJK set misses: Arabic (cursive, RTL), the Indic
 # scripts (Devanagari's shirorekha roof bar + conjuncts, Tamil's thick curved loops) and
 # Thai. (fc-list lang, consonant codepoint range) — sampling consonants avoids stray
@@ -368,18 +405,26 @@ def render_coverage(
     # 24 px box could otherwise draw an 11 px em (0.45·box) whose strokes are sub-pixel
     # for bold. The 0.45–0.95 box-hug spread stays (loose boxes are real; they just then
     # only occur at larger native heights).
-    font_px = rng.randint(max(20, int(height * 0.45)), max(21, int(height * 0.95)))
+    # Display-heavy mode: a single condensed bold latin word at near-full em with tight gaps,
+    # so the strip is ~50% ink (the STRONGER regime). Labels are still glyph-only coverage.
+    display = rng.random() < DISPLAY_HEAVY_FRAC
+    if display:
+        font_px = rng.randint(max(20, int(height * 0.80)), max(21, int(height * 0.95)))
+    else:
+        font_px = rng.randint(max(20, int(height * 0.45)), max(21, int(height * 0.95)))
     x = pad + rng.randint(-jitter, 2 * jitter)
     y0 = pad + rng.randint(-jitter, jitter)
     scripts, bold_runs, last_font = [], 0, "?"
     drew = False
-    for script, is_bold in _run_plan(rng):
-        text = _run_text(rng, script)
+    plan = [("latin", True)] if display else _run_plan(rng)
+    for script, is_bold in plan:
+        text = _display_text(rng, width, font_px) if display else _run_text(rng, script)
         units = _cjk_units(rng, text, is_bold) if script == "cjk" else [(text, is_bold)]
         for s, ub in units:
             if not s.strip():
                 continue
-            path, layout = _pick_font(rng, script, ub)
+            path = rng.choice(_display_fonts()) if display else None
+            path, layout = (path, ImageFont.Layout.BASIC) if path else _pick_font(rng, script, ub)
             try:
                 font = ImageFont.truetype(path, size=font_px, layout_engine=layout)
                 l, t, r, b = td.textbbox((0, 0), s, font=font)
@@ -397,8 +442,14 @@ def render_coverage(
             bvd.text((x, y), s, font=font, fill=_target_q(_font_stroke_ratio(path, script)))
             if ub:
                 bold_runs += 1
-            # CJK is set flush (no inter-unit gap); spaced scripts get a word gap.
-            gap = 0 if script == "cjk" else rng.randint(font_px // 6, font_px // 2)
+            # CJK is set flush (no inter-unit gap); spaced scripts get a word gap. Display mode
+            # packs tight (condensed headers have small inter-letter gaps) to keep coverage high.
+            if script == "cjk":
+                gap = 0
+            elif display:
+                gap = rng.randint(max(1, font_px // 12), max(2, font_px // 6))
+            else:
+                gap = rng.randint(font_px // 6, font_px // 2)
             x += int(td.textlength(s, font=font)) + gap
             drew, last_font = True, os.path.basename(path)
             scripts.append(script)

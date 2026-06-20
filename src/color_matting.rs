@@ -101,7 +101,7 @@ const INK_ALPHA_CUT: u8 = crate::text_metrics::INK_CUT as u8;
 /// distribution, used to estimate the foreground ink colour — i.e. sample the
 /// stroke cores (farthest from the page), not the washed median of the whole
 /// stroke.
-const FG_INK_FRACTION: f32 = 0.15;
+pub const FG_INK_FRACTION: f32 = 0.30;
 /// Minimum WCAG contrast ratio the translated ink is guaranteed against its
 /// reconstructed background. A floor, not a stretch: faithful colours above this
 /// pass through untouched; only genuinely low-contrast lines (device chrome,
@@ -121,6 +121,13 @@ const INK_LUMA_MARGIN: i32 = 64;
 /// grid is then bilinearly upsampled, so this trades smoothness (larger)
 /// against following tight background detail (smaller).
 pub(crate) const BG_BLOCK: u32 = 10;
+
+/// Pixels the matte ink mask is grown by before erasing, so the ink's anti-aliased rim (the
+/// matte edge sits just inside it) is replaced too. Height-proportional. Shared by the per-box
+/// erase (`ocr::matte_erase_oriented`) and any whole-page erase-mask consumer so they can't drift.
+pub fn fill_radius(oriented_height: f32) -> u32 {
+    ((oriented_height * 0.06).round() as u32).clamp(1, 6)
+}
 
 /// Compute matted strips for each detection from the ink model's per-box
 /// masks. `ink_masks` is 1:1 with `boxes` (the output of
@@ -652,7 +659,7 @@ pub(crate) fn background_field(
         .collect()
 }
 
-pub(crate) fn dilate(mask: &[bool], w: u32, h: u32, radius: u32) -> Vec<bool> {
+pub fn dilate(mask: &[bool], w: u32, h: u32, radius: u32) -> Vec<bool> {
     if radius == 0 {
         return mask.to_vec();
     }
