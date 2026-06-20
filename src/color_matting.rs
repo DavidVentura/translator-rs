@@ -332,6 +332,7 @@ pub(crate) fn fg_from_samples(ink: Vec<Rgba<u8>>, bg_lumas: Vec<u8>) -> Option<u
     // and on an ink-dominated box they out-vote the real background and flip the polarity.
     // Cleaning by colour keeps the true between-stroke background — gradient and all — unlike
     // retreating to a margin, which samples a different location/surface than the text sits on.
+    let n_bg_raw = bg_lumas.len();
     let mut ink_l: Vec<u8> = ink.iter().map(|&p| luma(p)).collect();
     ink_l.sort_unstable();
     let ink_luma = ink_l[ink_l.len() / 2] as i32;
@@ -340,12 +341,48 @@ pub(crate) fn fg_from_samples(ink: Vec<Rgba<u8>>, bg_lumas: Vec<u8>) -> Option<u
         .copied()
         .filter(|&l| (l as i32 - ink_luma).abs() > INK_LUMA_MARGIN)
         .collect();
-    if bg.len() < MIN_INK_PIXELS {
-        bg = bg_lumas; // all background matched the ink colour (degenerate/low-contrast): keep all
+    // If the clean removed most of the background, `ink_luma` sits near the real background —
+    // a low-contrast line, or an over-marking matte that pulled light pixels into the ink set
+    // and inflated `ink_luma` to mid-gray. Cleaning there destroys the true background (leaving
+    // dark specks → a flipped, light foreground), so keep the raw background and median it.
+    if bg.len() < n_bg_raw / 2 {
+        bg = bg_lumas;
     }
     bg.sort_unstable();
     let bg_luma = bg.get(bg.len() / 2).copied().unwrap_or(255);
     Some(ink_core_argb(ink, bg_luma))
+}
+
+/// Still-path foreground colour over a box AABB: gather ink + between-stroke/margin background
+/// from `pixels` (row-major, `aw`×`ah`) gated by `sub` (the ink mask), then reduce via
+/// [`fg_from_samples`]. Prefers the real between-stroke background; falls back to the AABB
+/// margin rows when the matte over-marks and leaves too few between-stroke pixels. Shared by
+/// `ocr::matte_erase_oriented` and the viz still-path dump so the decision is reproducible.
+pub fn still_fg_argb(pixels: &[Rgba<u8>], sub: &[bool], aw: u32, ah: u32) -> Option<u32> {
+    let near_ink = dilate(sub, aw, ah, 2);
+    let margin = (ah / 8).max(2);
+    let mut ink: Vec<Rgba<u8>> = Vec::new();
+    let mut bg_between: Vec<u8> = Vec::new();
+    let mut bg_margin: Vec<u8> = Vec::new();
+    for (i, (p, &m)) in pixels.iter().zip(sub.iter()).enumerate() {
+        if m {
+            ink.push(*p);
+            continue;
+        }
+        if !near_ink[i] {
+            bg_between.push(luma(*p));
+        }
+        let ly = (i as u32) / aw;
+        if ly < margin || ly >= ah - margin {
+            bg_margin.push(luma(*p));
+        }
+    }
+    let bg_lumas = if bg_between.len() >= 16 {
+        bg_between
+    } else {
+        bg_margin
+    };
+    fg_from_samples(ink, bg_lumas)
 }
 
 /// Foreground ink colour from a line's matte-gated source pixels: the ink-side

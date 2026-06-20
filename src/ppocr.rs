@@ -57,7 +57,7 @@ const DET_MIN_AREA: u32 = 64;
 /// `tight·(1 + ratio) + 2·DET_BOX_BORDER` at 0.8 puts the inflated box at ~1.1–1.25× the ink —
 /// enough margin to erase the antialiasing fringe without swallowing neighboring lines the way
 /// upstream's ratio did (~1.75× the ink).
-const DET_UNCLIP_RATIO: f32 = 1.5;
+const DET_UNCLIP_RATIO: f32 = 1.2;
 const DET_BOX_BORDER: u32 = 4;
 const LIVE_REC_DROP_SCORE: f32 = 0.65;
 const LIVE_DET_BOX_MIN_SCORE: f32 = 0.68;

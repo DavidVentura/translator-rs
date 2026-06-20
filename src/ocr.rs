@@ -2156,7 +2156,7 @@ fn matte_erase_oriented(
     oriented: OrientedRect,
     ink_mask: &[bool],
 ) -> Option<u32> {
-    use crate::color_matting::{BG_BLOCK, background_field, dilate, fg_from_samples, luma};
+    use crate::color_matting::{BG_BLOCK, background_field, dilate, still_fg_argb};
     use image::{Rgb, Rgba};
 
     let aabb = clamp_rect(oriented.to_aabb(), image.width, image.height)?;
@@ -2181,43 +2181,10 @@ fn matte_erase_oriented(
         }
     }
 
-    // Foreground colour: the ink-side luma extreme of the matte's ink pixels (the stroke
-    // cores), via the shared derivation so still and live colour text identically. The
-    // background that orients the polarity is the real between-stroke background (gradient
-    // and all) — the whole point of the ink model — but cleaned of two contaminants: pixels
-    // geometrically near a stroke (the AA feather) excluded here, and pixels matching the ink
-    // colour (strokes the matte under-marked) excluded in `fg_from_samples`. Both are needed:
-    // an under-marking matte leaves missed strokes in its "non-ink" set, and on an ink-heavy
-    // box they out-vote the real background and flip the polarity to the ink colour.
-    let near_ink = dilate(&sub, aw, ah, 2);
-    let margin = (ah / 8).max(2);
-    let mut ink: Vec<Rgba<u8>> = Vec::new();
-    let mut bg_between: Vec<u8> = Vec::new();
-    let mut bg_margin: Vec<u8> = Vec::new();
-    for (i, (p, &m)) in pixels.iter().zip(sub.iter()).enumerate() {
-        if m {
-            ink.push(*p);
-            continue;
-        }
-        if !near_ink[i] {
-            bg_between.push(luma(*p));
-        }
-        let ly = (i as u32) / aw;
-        if ly < margin || ly >= ah - margin {
-            bg_margin.push(luma(*p));
-        }
-    }
-    // Prefer the real between-stroke background (gradient and all); but when the matte
-    // OVER-marks — the box erases clean yet leaves almost no between-stroke pixels, the
-    // "invisible STRONGER" case — fall back to the AABB margin rows, which are page by
-    // construction (unclip/inflation padding). fg_from_samples then drops any ink-coloured
-    // pixel, covering under-marking. Both failure directions handled.
-    let bg_lumas = if bg_between.len() >= 16 {
-        bg_between
-    } else {
-        bg_margin
-    };
-    let fg = fg_from_samples(ink, bg_lumas);
+    // Foreground colour via the shared still-path derivation (between-stroke/margin background
+    // + fg_from_samples), so still and live colour text identically and the decision is
+    // reproducible outside the erase.
+    let fg = still_fg_argb(&pixels, &sub, aw, ah);
 
     // Grow the fill set by a height-proportional radius so the original ink's
     // anti-aliased rim is replaced too (the matte edge sits just inside it).
