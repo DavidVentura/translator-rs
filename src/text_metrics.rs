@@ -263,10 +263,10 @@ fn text_word_spans(text: &str, is_cjk: bool) -> Vec<(usize, usize, usize, usize)
 /// Per-word source boxes in image space. Words are segmented from the recognized `text`, and
 /// each word's reading-axis span is read from the CTC `firings`, which are 1:1 with the text by
 /// construction (the recognizer's `text` is its decoded chars, and `ppocr` carries the firings
-/// through the same trim/normalize) — `firings[i].1` is the leading-edge fraction of char `i`,
-/// `1.0` is the far edge. Returns empty when no aligned firings are available (RTL lines, which
-/// carry none), since per-word positions can't be invented. Mapped onto `oriented` via
-/// [`OrientedRect::subspan`].
+/// through the same trim/normalize). A firing sits near its glyph's *trailing* edge (peaky CTC
+/// biases `(t+0.5)/seq_len` ~one stride forward), so glyph `i` spans from the previous firing to
+/// its own — `char_edge[i]` is `firings[i-1]` (0 for the first glyph). Returns empty when no
+/// aligned firings are available (RTL lines, which carry none). Mapped via [`OrientedRect::subspan`].
 pub fn firing_word_boxes(
     text: &str,
     firings: &[(char, f32)],
@@ -278,20 +278,31 @@ pub fn firing_word_boxes(
     if firings.len() != n || n == 0 {
         return Vec::new();
     }
-    let char_edge: Vec<f32> = firings
-        .iter()
-        .map(|f| f.1.clamp(0.0, 1.0))
-        .chain(std::iter::once(1.0))
+    let char_edge: Vec<f32> = std::iter::once(0.0)
+        .chain(firings.iter().map(|f| f.1.clamp(0.0, 1.0)))
         .collect();
     let w = oriented.width;
-    text_word_spans(text, is_cjk)
+    let words = text_word_spans(text, is_cjk);
+    let last = words.len().saturating_sub(1);
+    words
         .iter()
-        .map(|&(cs, ce, bs, be)| {
-            let x0 = char_edge[cs];
-            let x1 = char_edge[ce];
+        .enumerate()
+        .map(|(wi, &(cs, ce, bs, be))| {
+            let lo = char_edge[cs].min(char_edge[ce]);
+            let hi = char_edge[cs].max(char_edge[ce]);
+            // A firing isn't guaranteed to land on any particular part of its glyph, so the span
+            // under/overshoots the visible word by up to ~a glyph. Pad with a fraction of an
+            // average glyph: a quarter on interior sides (so the inter-word space survives —
+            // neighbours' pads only meet halfway) and a half on the line's outer ends.
+            let glyph = (hi - lo) / (ce - cs).max(1) as f32;
+            let left_pad = glyph * if wi == 0 { 0.5 } else { 0.25 };
+            let right_pad = glyph * if wi == last { 0.5 } else { 0.25 };
             crate::ocr::PositionedWord {
                 text: text[bs..be].to_string(),
-                bounds: oriented.subspan(x0.min(x1) * w, x0.max(x1) * w),
+                bounds: oriented.subspan(
+                    ((lo - left_pad).max(0.0)) * w,
+                    ((hi + right_pad).min(1.0)) * w,
+                ),
                 line_index,
             }
         })
@@ -736,18 +747,19 @@ mod tests {
             height: 10.0,
             angle_radians: 0.0,
         };
-        // "aa bb": firings 1:1 with the 5 chars. char edges 0.1,0.2,0.45,0.6,0.7 and far edge 1.0.
+        // "aa bb": char edges 0,0.1,0.2,0.45,0.6,0.7. Each word pads ½ glyph on its outer end and
+        // ¼ glyph on its interior end.
         let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
         let words = firing_word_boxes("aa bb", &firings, false, &oriented, 0);
         assert_eq!(words.len(), 2);
         assert_eq!(words[0].text, "aa");
         assert_eq!(words[1].text, "bb");
-        // "aa" spans char edges 0.1..0.45 → x 10..45, centre 27.5, width 35.
-        assert!((words[0].bounds.width - 35.0).abs() < 1e-3);
-        assert!((words[0].bounds.cx - 27.5).abs() < 1e-3);
-        // "bb" spans 0.6..1.0 → x 60..100, centre 80, width 40.
-        assert!((words[1].bounds.width - 40.0).abs() < 1e-3);
-        assert!((words[1].bounds.cx - 80.0).abs() < 1e-3);
+        // "aa" edges 0..0.2, glyph 0.1: left ½ (clamped to 0), right ¼ → 0..0.225 → centre 11.25, width 22.5.
+        assert!((words[0].bounds.width - 22.5).abs() < 1e-3);
+        assert!((words[0].bounds.cx - 11.25).abs() < 1e-3);
+        // "bb" edges 0.45..0.7, glyph 0.125: left ¼, right ½ → 0.41875..0.7625 → centre 59.0625, width 34.375.
+        assert!((words[1].bounds.width - 34.375).abs() < 1e-3);
+        assert!((words[1].bounds.cx - 59.0625).abs() < 1e-3);
         // Height/baseline are inherited from the line box.
         assert!((words[0].bounds.cy - 20.0).abs() < 1e-3);
         assert!((words[0].bounds.height - 10.0).abs() < 1e-3);

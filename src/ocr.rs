@@ -315,6 +315,38 @@ pub struct PositionedWord {
     pub line_index: u32,
 }
 
+/// Reorder words into visual reading order: lines (grouped by `line_index`) sorted top-to-bottom
+/// by their cross-reading position, words within a line by reading position. The detection/block
+/// grouping order isn't visually monotonic, so callers (drag-to-select) get this so a contiguous
+/// range is contiguous on screen — keeping the ordering in the crate, not each consumer.
+pub fn order_words_visually(words: Vec<PositionedWord>) -> Vec<PositionedWord> {
+    fn cross(b: &OrientedRect) -> f32 {
+        -b.cx * b.angle_radians.sin() + b.cy * b.angle_radians.cos()
+    }
+    fn read(b: &OrientedRect) -> f32 {
+        b.cx * b.angle_radians.cos() + b.cy * b.angle_radians.sin()
+    }
+    let mut by_line: std::collections::HashMap<u32, Vec<PositionedWord>> =
+        std::collections::HashMap::new();
+    for w in words {
+        by_line.entry(w.line_index).or_default().push(w);
+    }
+    let mut lines: Vec<Vec<PositionedWord>> = by_line.into_values().collect();
+    for line in &mut lines {
+        line.sort_by(|a, b| {
+            read(&a.bounds)
+                .partial_cmp(&read(&b.bounds))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    lines.sort_by(|a, b| {
+        let ca = a.iter().map(|w| cross(&w.bounds)).fold(f32::MAX, f32::min);
+        let cb = b.iter().map(|w| cross(&w.bounds)).fold(f32::MAX, f32::min);
+        ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    lines.into_iter().flatten().collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedImageOverlay {
@@ -2582,6 +2614,31 @@ mod tests {
         group_vertical_lines_into_paragraphs, prepare_overlay_image,
     };
     use crate::{BackgroundMode, ReadingOrder};
+
+    #[test]
+    fn order_words_visually_sorts_top_down_then_reading_order() {
+        use super::{OrientedRect, PositionedWord, order_words_visually};
+        let mk = |text: &str, cx: f32, cy: f32, line: u32| PositionedWord {
+            text: text.to_string(),
+            bounds: OrientedRect {
+                cx,
+                cy,
+                width: 10.0,
+                height: 10.0,
+                angle_radians: 0.0,
+            },
+            line_index: line,
+        };
+        // Jumbled: bottom line's second word, top line's word, bottom line's first word.
+        let input = vec![
+            mk("b", 30.0, 100.0, 1),
+            mk("top", 10.0, 10.0, 0),
+            mk("a", 10.0, 100.0, 1),
+        ];
+        let out = order_words_visually(input);
+        let texts: Vec<&str> = out.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["top", "a", "b"]);
+    }
 
     #[test]
     fn subspan_horizontal_carves_a_sub_rect() {

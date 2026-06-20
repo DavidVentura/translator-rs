@@ -112,7 +112,9 @@ pub fn render_overlay(
         }
     }
 
-    let translated_words = collect_translated_words(prepared, &mut cache, fonts, opts);
+    let translated_words = crate::ocr::order_words_visually(collect_translated_words(
+        prepared, &mut cache, fonts, opts,
+    ));
     Ok(RenderedOverlay {
         rgba_bytes: canvas,
         translated_words,

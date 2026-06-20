@@ -44,6 +44,7 @@ fn main() {
                 75,
                 Some(ReadingOrder::LeftToRight),
                 BackgroundMode::AutoDetect,
+                None,
             );
             let _ = session.plan_download("en", Feature::Core, None);
             let _ = session.plan_download("en", Feature::Dictionary, None);

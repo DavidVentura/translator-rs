@@ -435,6 +435,8 @@ impl TranslatorSession {
         min_confidence: u32,
         reading_order: Option<ReadingOrder>,
         background_mode: BackgroundMode,
+        // Optional boxes from a prior `detect_image_boxes` call; when `Some`, detection is skipped.
+        detection: Option<Vec<crate::ocr::DetectedTextBox>>,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
         let tgt = LanguageCode::from(target_code);
@@ -453,6 +455,7 @@ impl TranslatorSession {
             min_confidence,
             background_mode,
             reading_order,
+            detection,
         )
         .map_err(|e| {
             if e.message.to_lowercase().contains("no text found") {
@@ -461,6 +464,28 @@ impl TranslatorSession {
                 e
             }
         })
+    }
+
+    /// Detect-only pass over a still RGBA image: returns the text boxes without recognizing or
+    /// translating them, for the UI to pill + animate. Feed the result back into
+    /// `translate_image_rgba` (as `detection`) so the detector runs only once.
+    #[cfg(feature = "ppocr")]
+    pub fn detect_image_boxes(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        max_image_size: u32,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        let snap = self.snapshot();
+        let ppocr = self.ppocr_engine(&snap)?;
+        crate::ocr_runtime::detect_image_boxes_ppocr(
+            &ppocr,
+            rgba_bytes,
+            width,
+            height,
+            max_image_size,
+        )
     }
 
     /// Live-OCR detect: takes a pre-built `OrientedImage` (the live pipeline's

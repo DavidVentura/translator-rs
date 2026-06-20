@@ -26,6 +26,9 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     min_confidence: u32,
     background_mode: BackgroundMode,
     reading_order: Option<ReadingOrder>,
+    // Detected boxes from a prior `detect_image_boxes_ppocr` pass; when `Some`, detection is
+    // skipped so the staged detect→translate path runs the detector only once.
+    detection: Option<Vec<DetectedTextBox>>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
     let full_rect = Rect {
         left: 0,
@@ -38,17 +41,20 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         OrientedImage::build_with_rgb(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
             .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
     let rgb = oriented.rgb.as_ref().expect("with_rgb path");
-    let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
-    // PPOCR needs display-orient gray (same coord frame as `rgb` and
-    // detected boxes). `oriented.gray` is sensor-orient for the
-    // tracker; we don't reuse it here.
-    let det_raw = ppocr
-        .detect_only_image(rgb_det, PpocrProfile::Still)
-        .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?;
-    let det_boxes: Vec<DetectedTextBox> = det_raw
-        .into_iter()
-        .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
-        .collect();
+    let det_boxes: Vec<DetectedTextBox> = match detection {
+        Some(boxes) => boxes,
+        None => {
+            // PPOCR needs display-orient gray (same coord frame as `rgb` and detected boxes).
+            // `oriented.gray` is sensor-orient for the tracker; we don't reuse it here.
+            let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
+            ppocr
+                .detect_only_image(rgb_det, PpocrProfile::Still)
+                .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
+                .into_iter()
+                .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
+                .collect()
+        }
+    };
 
     // Still images are display-oriented, so the canonical reading frame is R0.
     // Passing it explicitly (instead of None) pins the dewarp direction of
@@ -223,7 +229,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         reading_order,
         ink_union.as_deref(),
     )?;
-    overlay.source_words = source_words;
+    overlay.source_words = crate::ocr::order_words_visually(source_words);
     Ok(overlay)
 }
 
@@ -254,6 +260,36 @@ fn still_source_words(
             )
         })
         .collect()
+}
+
+/// Detect-only pass over a still image: builds the oriented image and runs the PPOCR detector,
+/// returning the text boxes in image-pixel space. The caller feeds these back into
+/// `translate_image_rgba_ppocr_in_snapshot` so recognition + translation skip a second detection.
+#[cfg(feature = "ppocr")]
+pub(crate) fn detect_image_boxes_ppocr(
+    ppocr: &PpocrEngine,
+    rgba_bytes: &[u8],
+    width: u32,
+    height: u32,
+    max_image_size: u32,
+) -> Result<Vec<DetectedTextBox>, TranslatorError> {
+    let full_rect = Rect {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let det_max_pixels = saturating_square(max_image_size);
+    let oriented =
+        OrientedImage::build_with_rgb(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
+            .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
+    let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
+    Ok(ppocr
+        .detect_only_image(rgb_det, PpocrProfile::Still)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
+        .into_iter()
+        .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
+        .collect())
 }
 
 #[cfg(feature = "ppocr")]

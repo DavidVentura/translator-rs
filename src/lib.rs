@@ -124,8 +124,8 @@ pub use catalog::{
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{
-    DetectedTextBox, OcrSourceSelection, OverlayColors, PreparedImageOverlay, ReadingOrder,
-    RecognizedTextLine, Rect, sample_overlay_colors,
+    DetectedTextBox, OcrSourceSelection, OrientedRect, OverlayColors, PreparedImageOverlay,
+    ReadingOrder, RecognizedTextLine, Rect, sample_overlay_colors,
 };
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
