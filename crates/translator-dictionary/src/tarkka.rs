@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use crate::CatalogSnapshot;
-use crate::api::{DictionaryCode, LanguageCode, TranslatorError};
+use translator_core::api::{DictionaryCode, LanguageCode, TranslatorError};
+use translator_core::catalog::CatalogSnapshot;
 
 pub use tarkka::WordWithTaggedEntries;
 use tarkka::reader::DictionaryReader;
@@ -59,7 +59,7 @@ fn dictionary_path(base_dir: &str, dictionary_code: &str) -> Option<String> {
     path.exists().then(|| path.to_string_lossy().into_owned())
 }
 
-pub(crate) fn lookup_dictionary_for_code(
+pub fn lookup_dictionary_for_code(
     base_dir: &str,
     cache: &mut DictionaryCache,
     dictionary_code: &DictionaryCode,
@@ -96,7 +96,7 @@ fn dictionary_path_for_language(
     dictionary_path(&snapshot.base_dir, &language.dictionary_code)
 }
 
-pub(crate) fn lookup_dictionary_in_snapshot(
+pub fn lookup_dictionary_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut DictionaryCache,
     language_code: &LanguageCode,
@@ -119,7 +119,7 @@ pub(crate) fn lookup_dictionary_in_snapshot(
     )
 }
 
-pub(crate) fn close_dictionary_in_snapshot(
+pub fn close_dictionary_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut DictionaryCache,
     language_code: &LanguageCode,

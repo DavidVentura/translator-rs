@@ -99,7 +99,7 @@ mod speech;
 mod styled;
 pub mod surface_map;
 #[cfg(feature = "dictionary")]
-pub mod tarkka;
+pub use translator_dictionary::tarkka;
 pub mod text_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod text_runs;
