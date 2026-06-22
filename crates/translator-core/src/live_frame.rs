@@ -564,17 +564,17 @@ pub struct LiveFrameState {
     /// Caller (Kotlin) MUST keep the backing ImageProxy alive until
     /// [`Self::materialize_owned`] or [`Self::clear_external`] runs.
     pub(crate) external_rgba: Option<ExternalRgba>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) rotation_degrees: i32,
+    pub width: u32,
+    pub height: u32,
+    pub rotation_degrees: i32,
     /// Cache for the OCR-side oriented image (visible-region crop,
     /// gray + rgb + rgb_det). Built by [`Self::ensure_oriented_with_rgb`].
-    pub(crate) cached: Option<OrientedImage>,
+    pub cached: Option<OrientedImage>,
     /// Cache for the tracker-side oriented image (full-display crop,
     /// gray-only). Built by [`Self::ensure_tracker_oriented`]. Kept
     /// separate so the OCR path can downscale aggressively for detect
     /// while the tracker keeps every feature.
-    pub(crate) cached_tracker: Option<OrientedImage>,
+    pub cached_tracker: Option<OrientedImage>,
     /// Set when the frame carries a pre-oriented gray buffer (GPU readback)
     /// and no RGBA: the per-frame tracker consumes `cached_tracker` directly,
     /// and acquire/refresh must be fed a separate RGBA frame via the pipeline's
@@ -598,7 +598,7 @@ impl LiveFrameState {
     /// acquire/refresh worker so the worker can read the bytes after
     /// the caller closes its `ImageProxy`. No-op when no external
     /// buffer is set.
-    pub(crate) fn materialize_owned(&mut self) {
+    pub fn materialize_owned(&mut self) {
         if let Some(ext) = self.external_rgba.take() {
             self.rgba.clear();
             self.rgba.reserve(ext.len);
@@ -615,7 +615,7 @@ impl LiveFrameState {
     /// Drop the external borrow without copying. Called by the
     /// pipeline when no async pipeline will run, so the camera buffer
     /// can be released right after `process_frame` returns.
-    pub(crate) fn clear_external(&mut self) {
+    pub fn clear_external(&mut self) {
         self.external_rgba = None;
     }
 
@@ -641,7 +641,7 @@ impl LiveFrameState {
     /// Build (or reuse) the OCR-side oriented image with rgb + rgb_det
     /// populated, sized to `display_crop`. Rebuild triggers: cache
     /// missing, crop changed, or cached entry is gray-only.
-    pub(crate) fn ensure_oriented_with_rgb(
+    pub fn ensure_oriented_with_rgb(
         &mut self,
         display_crop: Rect,
         det_max_pixels: u32,
@@ -667,10 +667,7 @@ impl LiveFrameState {
     /// Build (or reuse) the tracker-side gray-only oriented image
     /// sized to the full-display rect. Always full-display so the
     /// anchor includes every available feature.
-    pub(crate) fn ensure_tracker_oriented(
-        &mut self,
-        det_max_pixels: u32,
-    ) -> Result<(), TranslatorError> {
+    pub fn ensure_tracker_oriented(&mut self, det_max_pixels: u32) -> Result<(), TranslatorError> {
         let crop = self.full_display_rect();
         let needs_rebuild = match self.cached_tracker.as_ref() {
             Some(oi) => oi.display_crop != crop,
@@ -870,7 +867,7 @@ impl LiveFrame {
     /// Set the external-borrow pointer (no memcpy). The caller
     /// guarantees the memory at `src` stays valid for `len` bytes
     /// until the next frame action consumes or clears the borrow
-    /// (typically inside [`crate::live_tracker_pipeline::LiveTrackerPipeline::process_frame`]).
+    /// (typically inside `LiveTrackerPipeline::process_frame`).
     ///
     /// # Safety
     /// `src` must remain valid + readable for `len` bytes until the

@@ -6,12 +6,12 @@ pub mod bergamot;
 pub use translator_core::catalog;
 #[cfg(feature = "planar-tracker")]
 pub mod coarse_tracker;
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
-pub mod color_matting;
 #[cfg(feature = "doc-align")]
 pub use translator_align::doc_align;
 #[cfg(feature = "doc-align")]
 pub use translator_align::doc_align_refine;
+#[cfg(feature = "raster")]
+pub use translator_core::color_matting;
 pub use translator_core::coords;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_metrics;
@@ -34,8 +34,8 @@ pub mod image_render;
 pub mod klt;
 pub use translator_core::language;
 pub mod language_detect;
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
-pub mod live_frame;
+#[cfg(feature = "raster")]
+pub use translator_core::live_frame;
 #[cfg(feature = "gpu")]
 pub mod live_gpu_tick;
 #[cfg(feature = "planar-tracker")]
@@ -48,9 +48,9 @@ pub mod live_tracker_pipeline;
 pub mod live_worker;
 #[cfg(feature = "ppocr")]
 mod mnn_inference;
+pub use translator_core::ocr;
 #[cfg(feature = "mucab")]
 pub use translator_mucab::mucab;
-pub mod ocr;
 #[cfg(feature = "ppocr")]
 mod ocr_runtime;
 #[cfg(feature = "odt")]
@@ -96,9 +96,10 @@ pub use translator_core::settings;
 mod speech;
 mod styled;
 pub mod surface_map;
+#[cfg(feature = "raster")]
+pub use translator_core::text_metrics;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
-pub mod text_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod text_runs;
 #[cfg(any(feature = "pdf", feature = "image-render"))]

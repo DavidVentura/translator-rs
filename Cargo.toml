@@ -90,8 +90,9 @@ pdf-image-translate = [
     "dep:fax",
 ]
 doc-align = ["dep:translator-align", "dep:ndarray"]
-ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon"]
-planar-tracker = ["dep:image", "dep:imageproc", "image-render", "dep:rayon"]
+raster = ["translator-core/raster", "dep:image"]
+ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon", "raster"]
+planar-tracker = ["dep:image", "dep:imageproc", "image-render", "dep:rayon", "raster"]
 gpu = ["dep:glow", "planar-tracker"]
 surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
 viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]

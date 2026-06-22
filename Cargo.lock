@@ -2983,7 +2983,6 @@ dependencies = [
  "mnn-sys",
  "mupdf",
  "ndarray 0.16.1",
- "ort",
  "piper-rs",
  "rayon",
  "regex 1.12.3",
@@ -2992,9 +2991,10 @@ dependencies = [
  "serde_json",
  "slimt-sys",
  "subsetter",
- "tarkka",
  "toml 0.8.23",
+ "translator-align",
  "translator-core",
+ "translator-dictionary",
  "translator-mucab",
  "ttf-parser",
  "unicode-bidi",
@@ -3007,13 +3007,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "translator-align"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "ort",
+ "translator-core",
+]
+
+[[package]]
 name = "translator-core"
 version = "0.1.0"
 dependencies = [
+ "image",
+ "log",
  "serde",
  "serde_json",
  "unicode-script",
  "uniffi",
+]
+
+[[package]]
+name = "translator-dictionary"
+version = "0.1.0"
+dependencies = [
+ "tarkka",
+ "translator-core",
 ]
 
 [[package]]

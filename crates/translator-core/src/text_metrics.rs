@@ -62,17 +62,17 @@ const STROKE_CORE_FRAC: f32 = 0.6;
 
 /// Per-line core alpha cut from the line's peak matte alpha. One definition of "the stroke
 /// core" for stroke-width geometry and bold pooling, floored at `INK_CUT` for a near-empty matte.
-pub(crate) fn stroke_core_cut(peak_alpha: u8) -> u8 {
+pub fn stroke_core_cut(peak_alpha: u8) -> u8 {
     ((peak_alpha as f32 * STROKE_CORE_FRAC) as u8).max(INK_CUT as u8)
 }
 /// Need at least this many ink pixels to trust a pooled bold estimate.
-pub(crate) const INK_BOLD_MIN_PX: u64 = 30;
+pub const INK_BOLD_MIN_PX: u64 = 30;
 /// Mean pooled bold (0..1) at or above which a word/line counts as bold.
-pub(crate) const MODEL_BOLD_THRESHOLD: f32 = 0.65;
+pub const MODEL_BOLD_THRESHOLD: f32 = 0.65;
 /// A firing gap wider than this multiple of the line's median character advance starts a
 /// new word — the fallback for recognizer models/charsets that under-emit the space class.
 /// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
-pub(crate) const WORD_GAP_FACTOR: f32 = 1.8;
+pub const WORD_GAP_FACTOR: f32 = 1.8;
 
 /// Per-reading-axis-column reduction of an ink strip's bold channel: for each strip column,
 /// the matte-gated sum of the bold channel and the count of ink pixels, prefix-summed so any
@@ -121,7 +121,7 @@ impl BoldProfile {
     }
 
     /// Mean bold (0..1) over the whole strip's ink, or `None` when there is too little ink to
-    /// trust — the whole-line fallback weight, matching [`crate::ppocr::InkStrip::pooled_bold`].
+    /// trust — the whole-line fallback weight, matching `ppocr::InkStrip::pooled_bold`.
     pub fn whole_pooled_bold(&self) -> Option<f32> {
         let n = self.pcount[self.width as usize];
         (n >= INK_BOLD_MIN_PX).then(|| self.psum[self.width as usize] as f32 / n as f32 / 255.0)

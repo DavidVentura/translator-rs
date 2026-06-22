@@ -1705,7 +1705,7 @@ impl RasterImageMut {
         })
     }
 
-    #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+    #[cfg(feature = "raster")]
     fn as_image(&self) -> RasterImage<'_> {
         RasterImage {
             width: self.width,
@@ -2165,7 +2165,7 @@ fn erase_text_region(
     background_mode: crate::BackgroundMode,
     ink_mask: Option<&[bool]>,
 ) -> OverlayColors {
-    #[cfg(not(any(feature = "ppocr", feature = "planar-tracker")))]
+    #[cfg(not(feature = "raster"))]
     let _ = ink_mask;
     // The oriented rect carries the same DB-unclip + DET_BOX_BORDER inflation the AABB path
     // applies (see `oriented_rect_from_contour`), so it reliably covers ascenders/descenders
@@ -2193,7 +2193,7 @@ fn erase_text_region(
             // untouched) and colour the translated text with the real ink-median
             // foreground, the same derivation the live overlay uses. Lines the
             // model couldn't matte fall back to a flat white-on-black pill.
-            #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+            #[cfg(feature = "raster")]
             if let Some(mask) = ink_mask {
                 if let Some(fg) = matte_erase_oriented(image, oriented, mask) {
                     return OverlayColors {
@@ -2220,7 +2220,7 @@ fn erase_text_region(
 /// ink pixels to estimate). This is the same derivation
 /// [`crate::color_matting::mat_detections`] uses for the live overlay's
 /// `fg_argb`, so still and live colour text identically.
-#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
+#[cfg(feature = "raster")]
 fn matte_erase_oriented(
     image: &mut RasterImageMut,
     oriented: OrientedRect,
@@ -2613,7 +2613,8 @@ mod tests {
         TextLine, build_text_blocks, group_lines_into_paragraphs, group_live_lines_into_blocks,
         group_vertical_lines_into_paragraphs, prepare_overlay_image,
     };
-    use crate::{BackgroundMode, ReadingOrder};
+    use crate::BackgroundMode;
+    use crate::ocr::ReadingOrder;
 
     #[test]
     fn order_words_visually_sorts_top_down_then_reading_order() {
