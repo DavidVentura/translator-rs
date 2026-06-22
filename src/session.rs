@@ -41,12 +41,9 @@ use crate::api::VoiceName;
 #[cfg(feature = "tts")]
 use crate::catalog::{InstalledTtsPack, installed_tts_voices_for_language};
 #[cfg(feature = "tts")]
-use crate::speech::{
-    SpeechCache, available_tts_voices_in_snapshot, plan_speech_chunks_for_text_in_snapshot,
-    synthesize_pcm_in_snapshot, warm_tts_model_in_snapshot,
-};
-#[cfg(feature = "tts")]
 use crate::tts::{PcmAudio, SpeechChunk, TtsVoiceOption};
+#[cfg(feature = "tts")]
+use translator_tts::engine::TtsEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -67,7 +64,7 @@ pub struct TranslatorSession {
     /// single per-session flag unambiguously targets the active document.
     document_cancel: AtomicBool,
     #[cfg(feature = "tts")]
-    speech: Mutex<SpeechCache>,
+    tts: TtsEngine,
     #[cfg(feature = "dictionary")]
     dictionaries: Mutex<DictionaryCache>,
     #[cfg(feature = "doc-align")]
@@ -82,7 +79,7 @@ impl TranslatorSession {
             snapshot: RwLock::new(Arc::new(snapshot)),
             document_cancel: AtomicBool::new(false),
             #[cfg(feature = "tts")]
-            speech: Mutex::new(SpeechCache::new()),
+            tts: TtsEngine::new(),
             #[cfg(feature = "dictionary")]
             dictionaries: Mutex::new(DictionaryCache::new()),
             #[cfg(feature = "doc-align")]
@@ -720,7 +717,7 @@ impl TranslatorSession {
 
     #[cfg(feature = "tts")]
     fn clear_speech_cache(&self) {
-        self.speech.lock().expect("speech cache poisoned").clear();
+        self.tts.clear();
     }
 
     pub fn size_bytes(&self, language_code: &str, feature: Feature) -> u64 {
@@ -765,9 +762,8 @@ impl TranslatorSession {
         &self,
         language_code: &str,
     ) -> Result<Vec<TtsVoiceOption>, TranslatorError> {
-        let snap = self.snapshot();
-        let mut cache = self.speech.lock().expect("speech cache poisoned");
-        available_tts_voices_in_snapshot(&snap, &mut cache, &LanguageCode::from(language_code))
+        self.tts
+            .available_voices(&self.snapshot(), &LanguageCode::from(language_code))
     }
 
     #[cfg(feature = "tts")]
@@ -778,9 +774,8 @@ impl TranslatorSession {
 
     #[cfg(feature = "tts")]
     pub fn warm_tts_model(&self, language_code: &str) -> Result<(), TranslatorError> {
-        let snap = self.snapshot();
-        let mut cache = self.speech.lock().expect("speech cache poisoned");
-        warm_tts_model_in_snapshot(&snap, &mut cache, &LanguageCode::from(language_code))
+        self.tts
+            .warm_model(&self.snapshot(), &LanguageCode::from(language_code))
     }
 
     #[cfg(feature = "tts")]
@@ -790,11 +785,8 @@ impl TranslatorSession {
         text: &str,
         pack_id: Option<&str>,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
-        let snap = self.snapshot();
-        let mut cache = self.speech.lock().expect("speech cache poisoned");
-        plan_speech_chunks_for_text_in_snapshot(
-            &snap,
-            &mut cache,
+        self.tts.plan_speech_chunks(
+            &self.snapshot(),
             &LanguageCode::from(language_code),
             text,
             pack_id,
@@ -811,11 +803,8 @@ impl TranslatorSession {
         is_phonemes: bool,
         pack_id: Option<&str>,
     ) -> Result<PcmAudio, TranslatorError> {
-        let snap = self.snapshot();
-        let mut cache = self.speech.lock().expect("speech cache poisoned");
-        synthesize_pcm_in_snapshot(
-            &snap,
-            &mut cache,
+        self.tts.synthesize_pcm(
+            &self.snapshot(),
             &LanguageCode::from(language_code),
             text,
             speech_speed,
