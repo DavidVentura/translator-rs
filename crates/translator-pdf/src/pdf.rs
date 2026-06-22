@@ -3,8 +3,8 @@
 //! MuPDF provides the page geometry, text extraction, and optional debug
 //! rendering used by the PDF smoke tests.
 
+use crate::styled::TranslatedStyledBlock;
 use mupdf::{Colorspace, Document, Error as MupdfError, Matrix};
-use translator_translate::styled::TranslatedStyledBlock;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageDims {

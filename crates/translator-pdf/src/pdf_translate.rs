@@ -1,11 +1,11 @@
 //! Glue: extract → translate per page.
 
-use crate::session::TranslatorSession;
+use crate::pdf::PageTranslationResult;
+use crate::pdf::PdfError;
+use crate::pdf_text::extract_text;
 use translator_core::api::{LanguageCode, TranslatorError};
 use translator_core::settings::BackgroundMode;
-pub use translator_pdf::pdf::PageTranslationResult;
-use translator_pdf::pdf::PdfError;
-use translator_pdf::pdf_text::extract_text;
+use translator_translate::document_translator::DocumentTranslator;
 
 #[derive(Debug)]
 pub enum PdfTranslateError {
@@ -40,22 +40,22 @@ impl std::fmt::Display for PdfTranslateError {
 
 impl std::error::Error for PdfTranslateError {}
 
-/// Extract every page's text via mupdf, run each through the existing
-/// structured-translation path, and return per-page translated blocks.
+/// Extract every page's text via mupdf, run each through the structured
+/// translation path, and return per-page translated blocks.
 ///
 /// To also translate raster image XObjects embedded in the PDF, run
-/// [`crate::pdf_image_translate::translate_pdf_images_in_place`] on the
-/// input bytes first and pass the result here — image translation lives
-/// in the `pdf-image-translate` feature, not here.
+/// `pdf_image_translate::translate_pdf_images_in_place` on the input bytes
+/// first and pass the result here — image translation lives in the
+/// `image-translate` feature, not here.
 pub fn translate_pdf(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     pdf_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
     translate_pdf_with_progress(
-        session,
+        translator,
         pdf_bytes,
         forced_source_code,
         target_code,
@@ -68,17 +68,17 @@ pub fn translate_pdf(
 /// all pages' sentences across the worker pool). Progress is reported per
 /// sentence from worker threads via `on_progress` (cheap, non-blocking,
 /// thread-safe), mapped onto the page count. Cancellation is requested
-/// out-of-band via [`TranslatorSession::cancel_ongoing_work`] and surfaces as
+/// out-of-band via the host's `cancel_ongoing_work` and surfaces as
 /// [`PdfTranslateError::Cancelled`].
 pub fn translate_pdf_with_progress(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     pdf_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
     on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
-    session.begin_document_translation();
+    translator.begin_document_translation();
     let extracted = extract_text(pdf_bytes)?;
     if extracted.iter().all(|page| page.fragments.is_empty()) {
         return Err(PdfTranslateError::NoTextFound);
@@ -90,27 +90,32 @@ pub fn translate_pdf_with_progress(
         .iter()
         .map(|page| page.fragments.as_slice())
         .collect::<Vec<_>>();
+    let available_codes = available_language_codes
+        .iter()
+        .map(|code| code.as_str().to_string())
+        .collect::<Vec<_>>();
     let report = |done: usize, total: usize| {
         if total > 0 {
             on_progress(done as f32 / total as f32);
         }
     };
-    let translated = session
-        .translate_structured_fragments_batch_ctx(
-            &pages_fragments,
-            forced_source_code,
-            target_code,
-            available_language_codes,
-            BackgroundMode::BlackOnWhite,
-            &report,
-        )
-        .map_err(|error| {
-            if error.is_cancelled() {
-                PdfTranslateError::Cancelled
-            } else {
-                PdfTranslateError::Translator(error)
-            }
-        })?;
+    let translated = match crate::styled::translate_structured_fragments_batch_ctx(
+        translator,
+        &pages_fragments,
+        forced_source_code,
+        target_code,
+        &available_codes,
+        BackgroundMode::BlackOnWhite,
+        &report,
+    ) {
+        Ok(Some(translated)) => translated,
+        Ok(None) => return Err(PdfTranslateError::Cancelled),
+        Err(message) => {
+            return Err(PdfTranslateError::Translator(TranslatorError::translation(
+                message,
+            )));
+        }
+    };
 
     let results = extracted
         .into_iter()

@@ -30,8 +30,8 @@ use crate::pdf_resources::{
     prune_link_annotations, prune_unused_fonts,
 };
 use crate::pdf_surgery::{CapturedTextShow, rewrite_page_content};
+use crate::styled::TranslatedStyledBlock;
 use translator_core::ocr::Rect;
-use translator_translate::styled::TranslatedStyledBlock;
 
 /// PDF resource names for our font variants. All eight are PDF standard-14
 /// base fonts, so no embedding is needed.

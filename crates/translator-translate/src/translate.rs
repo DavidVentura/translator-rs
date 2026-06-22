@@ -4,11 +4,6 @@ use crate::bergamot::{BergamotEngine, ModelPaths, TranslateCtx};
 #[cfg(feature = "html")]
 use crate::html_translate;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
-use crate::styled::{
-    OverlayScreenshot, StructuredTranslationResult, StyledFragment,
-    translate_structured_fragments_batch_ctx_in_snapshot,
-    translate_structured_fragments_batch_in_snapshot, translate_structured_fragments_in_snapshot,
-};
 use translator_core::api::{LanguageCode, TranslatorError};
 use translator_core::catalog::CatalogSnapshot;
 
@@ -198,85 +193,6 @@ impl<'a> Translator<'a> {
             &available_language_codes,
         )
         .map_err(TranslatorError::translation)
-    }
-
-    pub fn translate_structured_fragments(
-        &mut self,
-        fragments: &[StyledFragment],
-        forced_source_code: Option<&LanguageCode>,
-        target_code: &LanguageCode,
-        available_language_codes: &[LanguageCode],
-        screenshot: Option<&OverlayScreenshot>,
-        background_mode: translator_core::settings::BackgroundMode,
-    ) -> Result<StructuredTranslationResult, TranslatorError> {
-        let available_language_codes = available_language_codes
-            .iter()
-            .map(|code| code.as_str().to_string())
-            .collect::<Vec<_>>();
-        translate_structured_fragments_in_snapshot(
-            self.engine,
-            self.snapshot,
-            fragments,
-            forced_source_code.map(LanguageCode::as_str),
-            target_code.as_str(),
-            &available_language_codes,
-            screenshot,
-            background_mode,
-        )
-        .map_err(TranslatorError::translation)
-    }
-
-    pub fn translate_structured_fragments_batch(
-        &mut self,
-        pages: &[&[StyledFragment]],
-        forced_source_code: Option<&LanguageCode>,
-        target_code: &LanguageCode,
-        available_language_codes: &[LanguageCode],
-        background_mode: translator_core::settings::BackgroundMode,
-    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
-        let available_language_codes = available_language_codes
-            .iter()
-            .map(|code| code.as_str().to_string())
-            .collect::<Vec<_>>();
-        translate_structured_fragments_batch_in_snapshot(
-            self.engine,
-            self.snapshot,
-            pages,
-            forced_source_code.map(LanguageCode::as_str),
-            target_code.as_str(),
-            &available_language_codes,
-            background_mode,
-        )
-        .map_err(TranslatorError::translation)
-    }
-
-    /// Cancellable, progress-reporting [`Self::translate_structured_fragments_batch`].
-    /// Errors with `TranslatorErrorKind::Cancelled` if cancelled mid-flight.
-    pub fn translate_structured_fragments_batch_ctx(
-        &mut self,
-        pages: &[&[StyledFragment]],
-        forced_source_code: Option<&LanguageCode>,
-        target_code: &LanguageCode,
-        available_language_codes: &[LanguageCode],
-        background_mode: translator_core::settings::BackgroundMode,
-        ctx: &TranslateCtx,
-    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
-        let available_language_codes = available_language_codes
-            .iter()
-            .map(|code| code.as_str().to_string())
-            .collect::<Vec<_>>();
-        translate_structured_fragments_batch_ctx_in_snapshot(
-            self.engine,
-            self.snapshot,
-            pages,
-            forced_source_code.map(LanguageCode::as_str),
-            target_code.as_str(),
-            &available_language_codes,
-            background_mode,
-            ctx,
-        )
-        .map_err(TranslatorError::translation)?
-        .ok_or_else(TranslatorError::cancelled)
     }
 
     /// Alignment translation for documents, with cancellation + per-sentence

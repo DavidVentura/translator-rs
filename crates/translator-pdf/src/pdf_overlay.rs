@@ -13,10 +13,10 @@ use crate::pdf_content::{
 use crate::pdf_font_embed::EmbeddedFont;
 use crate::pdf_surgery::CapturedTextShow;
 use crate::pdf_write::{BlockGeometry, BlockTypography, SampledBlockStyle};
+use crate::styled::{StyleSpan, TranslatedStyledBlock};
 use translator_core::ocr::Rect;
 use translator_render::font_metrics::FontMetrics;
 use translator_render::text_shape::{self, DirRun, segment_runs};
-use translator_translate::styled::{StyleSpan, TranslatedStyledBlock};
 
 /// Approximate average Helvetica glyph width as a fraction of font size.
 pub(crate) const HELVETICA_AVG_ADVANCE: f32 = 0.5;

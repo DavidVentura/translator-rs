@@ -19,21 +19,6 @@ fn main() {
             let _ = session.translate_text("en", "nl", "hello");
             let _ = session.translate_html_fragments("en", "nl", &texts);
             let _ = session.translate_mixed_texts(&texts, Some("en"), "nl", &languages);
-            let _ = session.translate_structured_fragments(
-                &[],
-                Some("en"),
-                "nl",
-                &languages,
-                None,
-                BackgroundMode::AutoDetect,
-            );
-            let _ = session.translate_structured_fragments_batch(
-                &[],
-                Some("en"),
-                "nl",
-                &languages,
-                BackgroundMode::AutoDetect,
-            );
             let _ = session.translate_image_rgba(
                 &[],
                 1,

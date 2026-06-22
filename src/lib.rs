@@ -52,6 +52,8 @@ pub use translator_live::live_worker;
 pub use translator_mucab::mucab;
 #[cfg(feature = "ppocr")]
 pub use translator_ocr::ocr_runtime;
+#[cfg(feature = "ppocr")]
+pub use translator_ocr::ppocr;
 #[cfg(feature = "pdf")]
 pub use translator_pdf::pdf;
 #[cfg(feature = "pdf")]
@@ -71,11 +73,11 @@ pub use translator_pdf::pdf_text;
 #[cfg(feature = "pdf")]
 pub use translator_pdf::pdf_text_overlay;
 #[cfg(feature = "pdf")]
-pub mod pdf_translate;
-#[cfg(feature = "ppocr")]
-pub use translator_ocr::ppocr;
+pub use translator_pdf::pdf_translate;
 #[cfg(feature = "pdf")]
 pub use translator_pdf::pdf_write;
+#[cfg(feature = "pdf")]
+pub use translator_pdf::styled;
 #[cfg(feature = "planar-tracker")]
 pub use translator_tracker::planar_engine;
 #[cfg(feature = "planar-tracker")]
@@ -104,7 +106,6 @@ pub use translator_render::text_runs;
 pub use translator_render::text_shape;
 #[cfg(feature = "planar-tracker")]
 pub use translator_tracker::surface_map;
-pub use translator_translate::styled;
 pub use translator_translate::translate;
 #[cfg(feature = "transliterate")]
 pub use translator_transliterate::transliterate;
@@ -129,8 +130,5 @@ pub use ocr::{
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
 pub use settings::BackgroundMode;
-pub use styled::{
-    OverlayScreenshot, StructuredTranslationResult, StyledFragment as StructuredStyledFragment,
-};
 pub use translate::{TokenAlignment, TranslationWithAlignment};
 pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};

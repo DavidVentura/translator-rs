@@ -16,7 +16,8 @@ use translator::pdf::{PageTransform, render_pages_for_debug};
 use translator::pdf_text::extract_text;
 use translator::pdf_translate::translate_pdf;
 use translator::pdf_write::write_translated_pdf;
-use translator::{FsPackInstallChecker, LanguageCode, StructuredStyledFragment, TranslatorSession};
+use translator::styled::StyledFragment;
+use translator::{FsPackInstallChecker, LanguageCode, TranslatorSession};
 
 const BITMAP_SIZE: u32 = 1024;
 
@@ -79,7 +80,7 @@ fn smoke_extract_text_fragments() {
 
 fn dump_text_fragments(
     rendered: &translator::pdf::RenderedPage,
-    fragments: &[StructuredStyledFragment],
+    fragments: &[StyledFragment],
     out: &Path,
 ) {
     let size = rendered.transform.bitmap_size;

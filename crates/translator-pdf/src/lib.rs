@@ -8,4 +8,6 @@ pub mod pdf_resources;
 pub mod pdf_surgery;
 pub mod pdf_text;
 pub mod pdf_text_overlay;
+pub mod pdf_translate;
 pub mod pdf_write;
+pub mod styled;

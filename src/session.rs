@@ -13,7 +13,6 @@ use crate::catalog::{
 };
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
-use crate::styled::{OverlayScreenshot, StructuredTranslationResult, StyledFragment};
 use crate::translate::TranslationWithAlignment;
 use crate::translate::Translator;
 
@@ -284,75 +283,6 @@ impl TranslatorSession {
             forced_source_code.map(LanguageCode::from).as_ref(),
             &LanguageCode::from(target_code),
             available_language_codes,
-        )
-    }
-
-    pub fn translate_structured_fragments(
-        &self,
-        fragments: &[StyledFragment],
-        forced_source_code: Option<&str>,
-        target_code: &str,
-        available_language_codes: &[LanguageCode],
-        screenshot: Option<&OverlayScreenshot>,
-        background_mode: BackgroundMode,
-    ) -> Result<StructuredTranslationResult, TranslatorError> {
-        let snap = self.snapshot();
-        let mut engine = self.engine().lock().expect("engine lock poisoned");
-        Translator::new(&mut engine, &snap).translate_structured_fragments(
-            fragments,
-            forced_source_code.map(LanguageCode::from).as_ref(),
-            &LanguageCode::from(target_code),
-            available_language_codes,
-            screenshot,
-            background_mode,
-        )
-    }
-
-    pub fn translate_structured_fragments_batch(
-        &self,
-        pages: &[&[StyledFragment]],
-        forced_source_code: Option<&str>,
-        target_code: &str,
-        available_language_codes: &[LanguageCode],
-        background_mode: BackgroundMode,
-    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
-        let snap = self.snapshot();
-        let mut engine = self.engine().lock().expect("engine lock poisoned");
-        Translator::new(&mut engine, &snap).translate_structured_fragments_batch(
-            pages,
-            forced_source_code.map(LanguageCode::from).as_ref(),
-            &LanguageCode::from(target_code),
-            available_language_codes,
-            background_mode,
-        )
-    }
-
-    /// Cancellable, progress-reporting [`Self::translate_structured_fragments_batch`].
-    /// `on_progress` is invoked from slimt worker threads with
-    /// `(sentences_done, sentences_total)`; cancellation via
-    /// [`Self::cancel_ongoing_work`].
-    pub fn translate_structured_fragments_batch_ctx(
-        &self,
-        pages: &[&[StyledFragment]],
-        forced_source_code: Option<&str>,
-        target_code: &str,
-        available_language_codes: &[LanguageCode],
-        background_mode: BackgroundMode,
-        on_progress: &(dyn Fn(usize, usize) + Sync),
-    ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
-        let ctx = TranslateCtx {
-            cancel: &self.document_cancel,
-            on_progress,
-        };
-        let snap = self.snapshot();
-        let mut engine = self.engine().lock().expect("engine lock poisoned");
-        Translator::new(&mut engine, &snap).translate_structured_fragments_batch_ctx(
-            pages,
-            forced_source_code.map(LanguageCode::from).as_ref(),
-            &LanguageCode::from(target_code),
-            available_language_codes,
-            background_mode,
-            &ctx,
         )
     }
 

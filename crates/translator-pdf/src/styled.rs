@@ -1,27 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::bergamot::BergamotEngine;
-use crate::language_detect::detect_language_robust_code;
-use crate::routing::NothingReason;
-use std::sync::atomic::AtomicBool;
 use translator_core::api::LanguageCode;
-use translator_core::catalog::CatalogSnapshot;
 use translator_core::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use translator_core::settings::BackgroundMode;
-
-use crate::bergamot::TranslateCtx;
-use crate::translate::{
-    TokenAlignment, execute_translation_plan_with_alignment,
-    execute_translation_plan_with_alignment_ctx, resolve_translation_plan_in_snapshot,
-};
+use translator_translate::document_translator::DocumentTranslator;
+use translator_translate::language_detect::detect_language_robust_code;
+use translator_translate::routing::NothingReason;
+use translator_translate::translate::TokenAlignment;
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TextStyle {
     pub text_color: Option<u32>,
     pub bg_color: Option<u32>,
     pub text_size: Option<f32>,
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub baseline_shift: Option<f32>,
     pub bold: bool,
     pub italic: bool,
@@ -51,7 +42,6 @@ impl TextStyle {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct StyledFragment {
     pub text: String,
     pub bounding_box: Rect,
@@ -64,12 +54,10 @@ pub struct StyledFragment {
     /// (LaTeX formulas) where mupdf's per-char font analysis says the line
     /// is drawn predominantly in CMSY/CMMI/CMEX. The PDF writer preserves
     /// the original glyph program for these fragments.
-    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub opaque: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct StyleSpan {
     pub start: u32,
     pub end: u32,
@@ -97,7 +85,6 @@ struct TranslatableBlock {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TranslatedStyledBlock {
     pub text: String,
     pub bounding_box: Rect,
@@ -108,12 +95,10 @@ pub struct TranslatedStyledBlock {
     /// Display-math (or otherwise pass-through) block. The writer preserves
     /// the original CMSY/CMMI/etc. text-show program instead of translating
     /// and redrawing the block with fallback fonts.
-    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub opaque: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct StructuredTranslationResult {
     pub blocks: Vec<TranslatedStyledBlock>,
     pub nothing_reason: Option<NothingReason>,
@@ -121,145 +106,26 @@ pub struct StructuredTranslationResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OverlayScreenshot {
     pub rgba_bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
 
-pub fn translate_structured_fragments_in_snapshot(
-    engine: &mut BergamotEngine,
-    snapshot: &CatalogSnapshot,
-    fragments: &[StyledFragment],
-    forced_source_code: Option<&str>,
-    target_code: &str,
-    available_language_codes: &[String],
-    screenshot: Option<&OverlayScreenshot>,
-    background_mode: BackgroundMode,
-) -> Result<StructuredTranslationResult, String> {
-    let available_codes = available_language_codes
-        .iter()
-        .map(|code| LanguageCode::from(code.as_str()))
-        .collect::<Vec<_>>();
-    let prepared = classify_page(fragments, forced_source_code, target_code, &available_codes);
-
-    let (blocks, source_code) = match prepared {
-        PageState::Empty(reason) => {
-            return Ok(StructuredTranslationResult {
-                blocks: Vec::new(),
-                nothing_reason: Some(reason),
-                error_message: None,
-            });
-        }
-        PageState::Identity(blocks) => {
-            return Ok(StructuredTranslationResult {
-                blocks: identity_translated_blocks(&blocks, screenshot, background_mode)?,
-                nothing_reason: None,
-                error_message: None,
-            });
-        }
-        PageState::Translate {
-            blocks,
-            source_code,
-        } => (blocks, source_code),
-    };
-
-    let segments = collect_block_segments(&blocks);
-    let texts = segments
-        .iter()
-        .map(|seg| seg.text.clone())
-        .collect::<Vec<_>>();
-
-    let target_code_lc = LanguageCode::from(target_code);
-    let Some(plan) = resolve_translation_plan_in_snapshot(
-        snapshot,
-        source_code.as_str(),
-        target_code_lc.as_str(),
-    ) else {
-        return Ok(StructuredTranslationResult {
-            blocks: Vec::new(),
-            nothing_reason: None,
-            error_message: Some(format!(
-                "Language pair {} -> {} not installed",
-                source_code.as_str(),
-                target_code_lc.as_str()
-            )),
-        });
-    };
-    let translations = execute_translation_plan_with_alignment(engine, &plan, &texts)?;
-
-    let block_translations = segments
-        .into_iter()
-        .zip(translations)
-        .map(|(seg, t)| BlockSegmentTranslation {
-            block_index: seg.block_index,
-            segment: seg.segment,
-            translated_text: t.translated_text,
-            alignments: t.alignments,
-            source_offset: seg.source_offset,
-            output_prefix: seg.output_prefix,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(StructuredTranslationResult {
-        blocks: assemble_translated_blocks(
-            &blocks,
-            &block_translations,
-            screenshot,
-            background_mode,
-        )?,
-        nothing_reason: None,
-        error_message: None,
-    })
-}
-
-/// Translate many pages worth of structured fragments in one go: every page's
-/// segments are bundled into a single bergamot call (per source language), so
-/// slimt's worker pool stays saturated even when individual pages are short.
-///
-/// Pages with mismatched outcomes (no translatable text, undetectable source,
-/// missing model pair, source==target) are still reported per-page, the same
-/// way the single-page entry does.
-pub fn translate_structured_fragments_batch_in_snapshot(
-    engine: &mut BergamotEngine,
-    snapshot: &CatalogSnapshot,
+/// Translate many pages of structured fragments: per-page source detection and
+/// block clustering happen here, then each source language's segments are
+/// translated through `translator` (the aligned primitive owns the bergamot
+/// call, cancellation and pair resolution), and the results are reassembled
+/// into styled blocks. `Ok(None)` means the run was cancelled; progress
+/// accumulates across the per-source-language batches in block units.
+pub fn translate_structured_fragments_batch_ctx(
+    translator: &dyn DocumentTranslator,
     pages: &[&[StyledFragment]],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[String],
     background_mode: BackgroundMode,
-) -> Result<Vec<StructuredTranslationResult>, String> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    let ctx = TranslateCtx {
-        cancel: &NEVER,
-        on_progress: &|_, _| {},
-    };
-    Ok(translate_structured_fragments_batch_ctx_in_snapshot(
-        engine,
-        snapshot,
-        pages,
-        forced_source_code,
-        target_code,
-        available_language_codes,
-        background_mode,
-        &ctx,
-    )?
-    .expect("uncancellable structured batch cannot return None"))
-}
-
-/// Cancellable, progress-reporting [`translate_structured_fragments_batch_in_snapshot`].
-/// `Ok(None)` means the run was cancelled. Progress accumulates across the
-/// per-source-language batches and is reported in sentence units.
-pub fn translate_structured_fragments_batch_ctx_in_snapshot(
-    engine: &mut BergamotEngine,
-    snapshot: &CatalogSnapshot,
-    pages: &[&[StyledFragment]],
-    forced_source_code: Option<&str>,
-    target_code: &str,
-    available_language_codes: &[String],
-    background_mode: BackgroundMode,
-    ctx: &TranslateCtx,
+    on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Option<Vec<StructuredTranslationResult>>, String> {
     let available_codes = available_language_codes
         .iter()
@@ -321,16 +187,9 @@ pub fn translate_structured_fragments_batch_ctx_in_snapshot(
     let total_blocks: usize = texts_by_source.values().map(Vec::len).sum();
     let mut blocks_done = 0usize;
 
+    let target_code_lc = LanguageCode::from(target_code);
     for (source_code_str, texts) in texts_by_source {
         let refs = refs_by_source.remove(&source_code_str).unwrap_or_default();
-        let Some(plan) =
-            resolve_translation_plan_in_snapshot(snapshot, &source_code_str, target_code)
-        else {
-            for r in &refs {
-                missing_pair_pages.insert(r.page_index);
-            }
-            continue;
-        };
         let batch_blocks = texts.len();
         let base = blocks_done;
         let batch_progress = |bytes_done: usize, bytes_total: usize| {
@@ -339,16 +198,25 @@ pub fn translate_structured_fragments_batch_ctx_in_snapshot(
             } else {
                 bytes_done * batch_blocks / bytes_total
             };
-            (ctx.on_progress)(base + filled, total_blocks);
+            on_progress(base + filled, total_blocks);
         };
-        let batch_ctx = TranslateCtx {
-            cancel: ctx.cancel,
-            on_progress: &batch_progress,
-        };
-        let Some(translated) =
-            execute_translation_plan_with_alignment_ctx(engine, &plan, &texts, &batch_ctx)?
-        else {
-            return Ok(None);
+        let translated = match translator.translate_texts_with_alignment_ctx(
+            &LanguageCode::from(source_code_str.as_str()),
+            &target_code_lc,
+            &texts,
+            &batch_progress,
+        ) {
+            Ok(Some(translated)) => translated,
+            // No model pair for this source — report those pages as missing,
+            // mirroring the old `resolve_translation_plan` None branch.
+            Ok(None) => {
+                for r in &refs {
+                    missing_pair_pages.insert(r.page_index);
+                }
+                continue;
+            }
+            Err(e) if e.is_cancelled() => return Ok(None),
+            Err(e) => return Err(e.message),
         };
         blocks_done += batch_blocks;
         for (r, t) in refs.into_iter().zip(translated) {

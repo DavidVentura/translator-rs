@@ -6,7 +6,6 @@ pub mod bergamot;
 pub mod language_detect;
 pub mod routing;
 pub mod sentence_split;
-pub mod styled;
 pub mod translate;
 
 #[cfg(feature = "dom-translate")]
