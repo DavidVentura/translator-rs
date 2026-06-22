@@ -27,8 +27,8 @@ use xml5ever::tendril::TendrilSink;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::document_translator::DocumentTranslator;
 use translator_core::api::{LanguageCode, TranslatorError};
+use translator_translate::document_translator::DocumentTranslator;
 use translator_translate::dom_translate::{
     Scope, apply_indexed, collect_and_index, collect_named_elements,
 };

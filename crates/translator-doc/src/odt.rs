@@ -10,8 +10,8 @@ use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::document_translator::DocumentTranslator;
 use translator_core::api::{LanguageCode, TranslatorError};
+use translator_translate::document_translator::DocumentTranslator;
 use translator_translate::language_detect::detect_language_robust_code;
 use translator_translate::translate::TranslationWithAlignment;
 

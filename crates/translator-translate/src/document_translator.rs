@@ -1,5 +1,5 @@
+use crate::translate::TranslationWithAlignment;
 use translator_core::api::{LanguageCode, TranslatorError};
-use translator_translate::translate::TranslationWithAlignment;
 
 /// The translation capability the document formats need from the host
 /// session: reset of the per-document cancel flag, plus the cancellable,

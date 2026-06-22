@@ -1,3 +1,4 @@
+pub mod document_translator;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 

@@ -16,7 +16,7 @@
 
 use std::num::NonZeroU32;
 
-use crate::document_translator::DocumentTranslator;
+use translator_translate::document_translator::DocumentTranslator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxtLayout {

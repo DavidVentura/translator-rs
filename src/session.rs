@@ -870,7 +870,7 @@ impl translator_pdf::pdf_image_translate::ImageTranslator for TranslatorSession 
     }
 }
 
-impl translator_doc::document_translator::DocumentTranslator for TranslatorSession {
+impl translator_translate::document_translator::DocumentTranslator for TranslatorSession {
     fn begin_document_translation(&self) {
         self.begin_document_translation();
     }
