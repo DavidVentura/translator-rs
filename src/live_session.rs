@@ -1229,7 +1229,9 @@ impl LiveRecognizer for &crate::session::TranslatorSession {
         canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<RecognizedTextLine>, String> {
         (*self)
+            .ocr()
             .recognize_in_oriented_image(
+                &(*self).snapshot(),
                 oriented,
                 boxes,
                 source_selection.clone(),
@@ -1237,6 +1239,40 @@ impl LiveRecognizer for &crate::session::TranslatorSession {
             )
             .map_err(|e| format!("{e:?}"))
     }
+}
+
+#[cfg(feature = "ppocr")]
+pub fn estimate_canonical_quadrant_with(
+    ocr: &translator_ocr::engine::OcrEngine,
+    snap: &crate::catalog::CatalogSnapshot,
+    oriented: &OrientedImage,
+    boxes: &[DetectedTextBox],
+) -> Result<Option<crate::coords::Quadrant>, crate::api::TranslatorError> {
+    let ppocr = ocr.engine(snap)?;
+    let rgb = oriented
+        .rgb
+        .as_ref()
+        .expect("estimate path requires build_with_rgb");
+    let gray_display = image::imageops::grayscale(&rgb.to_rgb8());
+    let scaled = oriented.rec_scaled_boxes(boxes);
+    Ok(estimate_canonical_quadrant(
+        &ppocr,
+        rgb,
+        &gray_display,
+        &scaled,
+    ))
+}
+
+#[cfg(feature = "ppocr")]
+pub fn estimate_canonical_via_rec_with(
+    ocr: &translator_ocr::engine::OcrEngine,
+    snap: &crate::catalog::CatalogSnapshot,
+    oriented: &OrientedImage,
+    boxes: &[DetectedTextBox],
+    script: crate::PpocrScript,
+) -> Result<Option<crate::coords::Quadrant>, crate::api::TranslatorError> {
+    let ppocr = ocr.engine(snap)?;
+    Ok(estimate_canonical_via_rec(&ppocr, oriented, boxes, script))
 }
 
 impl LiveTranslator for &crate::session::TranslatorSession {

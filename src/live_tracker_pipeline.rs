@@ -1534,7 +1534,8 @@ impl LiveTrackerPipeline {
             let rgb = oriented.rgb.as_ref().expect("with_rgb path");
             let ink_strips = self
                 .catalog
-                .ppocr_ink_strips(rgb, &scaled, canonical_quadrant)
+                .ocr()
+                .ink_strips(&self.catalog.snapshot(), rgb, &scaled, canonical_quadrant)
                 .unwrap_or_default();
             // Bold column profile per box from the model's ch1, parallel to `detected`;
             // pooled per word against CTC firings at rec time. `None` per box when the model
@@ -1744,7 +1745,11 @@ impl LiveTrackerPipeline {
                 };
             }
             let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
-            let raw = match self.catalog.detect_text_in_oriented_image(oriented) {
+            let raw = match self
+                .catalog
+                .ocr()
+                .detect_text_in_oriented_image(&self.catalog.snapshot(), oriented)
+            {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("[refresh] detect failed: {e:?}");
@@ -1973,7 +1978,8 @@ pub(crate) fn acquire_detect(
         .map_err(|_| "ensure_oriented failed")?;
     let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
     let raw = catalog
-        .detect_text_in_oriented_image(oriented)
+        .ocr()
+        .detect_text_in_oriented_image(&catalog.snapshot(), oriented)
         .map_err(|e| {
             log::warn!("detect failed: {e:?}");
             "detect failed"
@@ -2002,18 +2008,31 @@ pub(crate) fn acquire_orient(
     let forced_script = if is_auto_source {
         None
     } else {
-        catalog.ppocr_script_for_language_code(from_lang)
+        crate::ocr_runtime::recognizer_script_for_language(
+            &catalog.snapshot(),
+            &crate::LanguageCode::from(from_lang),
+        )
+        .ok()
     };
     let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
     let oriented = state.cached.as_ref().ok_or("oriented cache miss")?;
     Ok(if let Some(script) = forced_script {
-        catalog
-            .estimate_canonical_via_rec_in_oriented_image(oriented, detected, script)
-            .unwrap_or(None)
+        crate::live_session::estimate_canonical_via_rec_with(
+            catalog.ocr(),
+            &catalog.snapshot(),
+            oriented,
+            detected,
+            script,
+        )
+        .unwrap_or(None)
     } else {
-        catalog
-            .estimate_canonical_quadrant_in_oriented_image(oriented, detected)
-            .unwrap_or(None)
+        crate::live_session::estimate_canonical_quadrant_with(
+            catalog.ocr(),
+            &catalog.snapshot(),
+            oriented,
+            detected,
+        )
+        .unwrap_or(None)
     })
 }
 
