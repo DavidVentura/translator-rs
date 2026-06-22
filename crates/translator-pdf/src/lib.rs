@@ -1,6 +1,8 @@
 pub mod pdf;
 pub mod pdf_content;
 pub mod pdf_font_embed;
+#[cfg(feature = "image-translate")]
+pub mod pdf_image_translate;
 pub mod pdf_overlay;
 pub mod pdf_resources;
 pub mod pdf_surgery;

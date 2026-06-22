@@ -441,7 +441,7 @@ impl TranslatorSession {
         )
     }
 
-    #[cfg(feature = "ppocr")]
+    #[cfg(feature = "planar-tracker")]
     pub(crate) fn ocr(&self) -> &OcrEngine {
         &self.ocr
     }
@@ -839,6 +839,36 @@ impl translator_live::live_session::LiveOcrHost for TranslatorSession {
             .into_iter()
             .map(|row| LanguageCode::from(row.language.code.as_str()))
             .collect()
+    }
+}
+
+#[cfg(feature = "pdf-image-translate")]
+impl translator_pdf::pdf_image_translate::ImageTranslator for TranslatorSession {
+    fn translate_image_rgba(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        max_image_size: u32,
+        source_selection: OcrSourceSelection,
+        target_code: &str,
+        min_confidence: u32,
+        reading_order: Option<ReadingOrder>,
+        background_mode: BackgroundMode,
+        detection: Option<Vec<crate::ocr::DetectedTextBox>>,
+    ) -> Result<crate::ocr::PreparedImageOverlay, TranslatorError> {
+        self.translate_image_rgba(
+            rgba_bytes,
+            width,
+            height,
+            max_image_size,
+            source_selection,
+            target_code,
+            min_confidence,
+            reading_order,
+            background_mode,
+            detection,
+        )
     }
 }
 

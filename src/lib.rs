@@ -59,7 +59,7 @@ pub use translator_pdf::pdf_content;
 #[cfg(feature = "pdf")]
 pub use translator_pdf::pdf_font_embed;
 #[cfg(feature = "pdf-image-translate")]
-pub mod pdf_image_translate;
+pub use translator_pdf::pdf_image_translate;
 #[cfg(feature = "pdf")]
 pub use translator_pdf::pdf_overlay;
 #[cfg(feature = "pdf")]

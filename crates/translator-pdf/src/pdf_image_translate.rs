@@ -28,18 +28,40 @@ use std::thread;
 use log::{debug, info, trace, warn};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-use crate::session::TranslatorSession;
-use translator_core::api::{LanguageCode, TranslatorError};
-use translator_core::ocr::{PreparedImageOverlay, ReadingOrder};
-use translator_core::settings::BackgroundMode;
-use translator_pdf::pdf_content::PageGeometry;
-use translator_pdf::pdf_text::extract_text;
-use translator_pdf::pdf_text_overlay::{
+use crate::pdf_content::PageGeometry;
+use crate::pdf_text::extract_text;
+use crate::pdf_text_overlay::{
     OverlayPage, build_overlay_font_plan, build_page_overlay_stream, collect_used_embed_names,
     install_overlay_on_page,
 };
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::ocr::{
+    DetectedTextBox, OcrSourceSelection, PreparedImageOverlay, ReadingOrder,
+};
+use translator_core::settings::BackgroundMode;
 use translator_render::font_provider::FontProvider;
 use translator_render::image_render::{RenderOptions, render_overlay};
+
+/// OCR-and-translate a still RGBA image into a renderable overlay. The PDF
+/// image plumbing owns decode/placement/re-encode; this is the one capability
+/// it needs from the OCR/translate stack, supplied by the facade translator so
+/// this crate stays free of the OCR engine and catalog.
+pub trait ImageTranslator: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn translate_image_rgba(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        max_image_size: u32,
+        source_selection: OcrSourceSelection,
+        target_code: &str,
+        min_confidence: u32,
+        reading_order: Option<ReadingOrder>,
+        background_mode: BackgroundMode,
+        detection: Option<Vec<DetectedTextBox>>,
+    ) -> Result<PreparedImageOverlay, TranslatorError>;
+}
 
 /// Minimum total pixel area for an image to be considered worth OCR'ing.
 /// Roughly equivalent to "bigger than a 50×50 icon". Banner-shaped images
@@ -100,7 +122,7 @@ const XOBJECT_WORKERS: usize = 4;
 
 pub fn translate_pdf_images_in_place(
     pdf_bytes: &[u8],
-    session: &TranslatorSession,
+    translator: &dyn ImageTranslator,
     source_code: &str,
     target_code: &str,
     fonts: &(dyn FontProvider + Send + Sync),
@@ -183,7 +205,7 @@ pub fn translate_pdf_images_in_place(
                     let result = translate_one_xobject(
                         &worker_doc,
                         image_id,
-                        session,
+                        translator,
                         source_code,
                         target_code,
                         fonts,
@@ -773,7 +795,7 @@ impl std::fmt::Display for SkipReason {
 fn translate_one_xobject(
     doc: &Document,
     image_id: ObjectId,
-    session: &TranslatorSession,
+    translator: &dyn ImageTranslator,
     source_code: &str,
     target_code: &str,
     fonts: &(dyn FontProvider + Send + Sync),
@@ -806,7 +828,7 @@ fn translate_one_xobject(
         return Err(SkipReason::TooSmall);
     }
 
-    let prepared = session
+    let prepared = translator
         .translate_image_rgba(
             &rgba,
             width,
@@ -1516,7 +1538,7 @@ struct PageOcrResult {
 
 pub fn translate_pdf_pages_as_raster_in_place(
     pdf_bytes: &[u8],
-    session: &TranslatorSession,
+    translator: &dyn ImageTranslator,
     source_code: &str,
     target_code: &str,
     fonts: &(dyn FontProvider + Send + Sync),
@@ -1588,7 +1610,7 @@ pub fn translate_pdf_pages_as_raster_in_place(
                         break;
                     }
                     let result =
-                        ocr_page(&mupdf_doc, session, source_code, target_code, page_index)
+                        ocr_page(&mupdf_doc, translator, source_code, target_code, page_index)
                             .map_err(|reason| (page_index, reason));
                     if tx.send(result).is_err() {
                         break;
@@ -1721,7 +1743,7 @@ pub fn translate_pdf_pages_as_raster_in_place(
 /// performs all PDF mutation after worker collection.
 fn ocr_page(
     mupdf_doc: &mupdf::Document,
-    session: &TranslatorSession,
+    translator: &dyn ImageTranslator,
     source_code: &str,
     target_code: &str,
     page_index: usize,
@@ -1756,7 +1778,7 @@ fn ocr_page(
     let mut bgra = pixmap.samples().to_vec();
     swap_r_b(&mut bgra);
 
-    let prepared = session
+    let prepared = translator
         .translate_image_rgba(
             &bgra,
             width,

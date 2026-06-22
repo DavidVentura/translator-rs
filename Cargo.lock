@@ -2965,7 +2965,6 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "env_logger",
- "fax",
  "glow",
  "image",
  "imageproc",
@@ -3077,6 +3076,8 @@ dependencies = [
 name = "translator-pdf"
 version = "0.1.0"
 dependencies = [
+ "fax",
+ "image",
  "log",
  "lopdf",
  "mupdf",
