@@ -17,11 +17,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::font_provider::{FontHandle, FontProvider, FontRequest};
-use crate::ocr::{
+use crate::text_shape::{self, DirRun, ShapedGlyph, segment_runs};
+use translator_core::ocr::{
     OrientedRect, OverlayLayoutMode, PositionedWord, PreparedImageOverlay, PreparedTextBlock,
 };
-use crate::script::Script;
-use crate::text_shape::{self, DirRun, ShapedGlyph, segment_runs};
+use translator_core::script::Script;
 
 use rustybuzz::Face;
 use rustybuzz::ttf_parser;
@@ -118,7 +118,7 @@ pub fn render_overlay(
         }
     }
 
-    let translated_words = crate::ocr::order_words_visually(carver.words);
+    let translated_words = translator_core::ocr::order_words_visually(carver.words);
     Ok(RenderedOverlay {
         rgba_bytes: canvas,
         translated_words,
@@ -168,7 +168,7 @@ pub struct GlyphCollector {
 /// Route for glyph output from [`draw_shaped_line`]: either CPU-blit into a pixel
 /// canvas (existing paths — PDF, test) or collect instance + mask data for the GPU
 /// atlas compositor (screen overlay).
-pub(crate) enum GlyphSink<'a> {
+pub enum GlyphSink<'a> {
     Canvas {
         canvas: &'a mut [u8],
         width: u32,
@@ -180,7 +180,7 @@ pub(crate) enum GlyphSink<'a> {
 /// Collect glyph instances and upright mask data for the GPU atlas compositor.
 /// Blocks must be in canvas-texel coords (not tile-local); pen positions in the
 /// returned [`GlyphCollector`] are canvas-texel coordinates ready for the GPU.
-pub(crate) fn collect_overlay_glyphs(
+pub fn collect_overlay_glyphs(
     blocks: &[PreparedTextBlock],
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
@@ -262,7 +262,7 @@ struct GlyphMask {
 }
 
 #[derive(Default)]
-pub(crate) struct FontCache {
+pub struct FontCache {
     /// Parsed faces, keyed by handle. Each `Face` borrows the bytes held in
     /// `fonts`; declared first so it drops before the bytes it views. Caching the
     /// parsed face matters because `Face::from_slice` re-parses cmap + GSUB/GPOS,
@@ -290,7 +290,7 @@ impl FontCache {
     /// are font-file-keyed (provider-independent), so they persist — except the
     /// glyph atlas is dropped if it has grown past a cap, bounding memory over a
     /// long session (it re-warms on the next render).
-    pub(crate) fn clear_chains(&mut self) {
+    pub fn clear_chains(&mut self) {
         self.chains.clear();
         if self.glyphs.len() > GLYPH_ATLAS_CAP {
             self.glyphs.clear();
@@ -1815,7 +1815,7 @@ mod break_tests {
 #[cfg(test)]
 mod word_box_tests {
     use super::*;
-    use crate::ocr::{
+    use translator_core::ocr::{
         BoldRange, OrientedRect, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay,
         PreparedTextBlock, PreparedTextLine, Rect,
     };

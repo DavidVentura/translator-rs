@@ -68,18 +68,14 @@ pdf = [
     "dep:unicode-bidi",
     "dep:unicode-script",
     "translator-core/script-from-unicode",
+    "dep:translator-render",
 ]
 odt = ["dep:zip"]
 dom-translate = ["dep:markup5ever", "dep:markup5ever_rcdom"]
 html = ["dom-translate", "dep:html5ever"]
 epub = ["dom-translate", "dep:zip", "dep:xml5ever", "dep:ttf-parser"]
 image-render = [
-    "dep:ttf-parser",
-    "dep:rustybuzz",
-    "dep:unicode-bidi",
-    "dep:unicode-script",
-    "dep:unicode-linebreak",
-    "dep:zeno",
+    "dep:translator-render",
     "translator-core/script-from-unicode",
 ]
 pdf-image-translate = [
@@ -99,6 +95,7 @@ viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
 translator-core = { path = "crates/translator-core" }
+translator-render = { path = "crates/translator-render", optional = true }
 translator-raster = { path = "crates/translator-raster", optional = true }
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }

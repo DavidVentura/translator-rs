@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use crate::script::Script;
+use translator_core::script::Script;
 
 /// What the writer is asking for.
 ///

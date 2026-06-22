@@ -9,7 +9,7 @@
 //! `FontProvider` per run) and, eventually, the PDF overlay's mixed-run
 //! splitter.
 
-use crate::script::Script;
+use translator_core::script::Script;
 use unicode_script::UnicodeScript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

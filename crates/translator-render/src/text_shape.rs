@@ -11,8 +11,8 @@
 //! the PDF overlay feeds it the embedded target font. Both share this module so
 //! complex-script handling stays in one place.
 
-use crate::script::Script;
 use crate::text_runs::{ScriptRun, itemize};
+use translator_core::script::Script;
 
 use rustybuzz::{Direction, Face, UnicodeBuffer};
 use unicode_bidi::{BidiInfo, Level};

@@ -14,9 +14,9 @@ pub use translator_core::coords;
 #[cfg(feature = "raster")]
 pub use translator_raster::color_matting;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
-pub mod font_metrics;
+pub use translator_render::font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
-pub mod font_provider;
+pub use translator_render::font_provider;
 #[cfg(feature = "gpu")]
 pub mod gl_renderer;
 //#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
@@ -29,7 +29,7 @@ pub use translator_core::homography_ekf;
 #[cfg(feature = "html")]
 pub mod html_translate;
 #[cfg(feature = "image-render")]
-pub mod image_render;
+pub use translator_render::image_render;
 #[cfg(feature = "planar-tracker")]
 pub mod klt;
 pub use translator_core::language;
@@ -103,9 +103,9 @@ pub use translator_raster::overlay;
 #[cfg(feature = "raster")]
 pub use translator_raster::text_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
-pub mod text_runs;
+pub use translator_render::text_runs;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
-pub mod text_shape;
+pub use translator_render::text_shape;
 mod translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;
