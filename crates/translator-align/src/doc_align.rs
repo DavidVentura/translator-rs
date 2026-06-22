@@ -1,17 +1,14 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use ort::inputs;
-use ort::session::Session;
-use ort::value::Tensor;
+use mnn_sys::{ModuleEngine, NamedInput, NamedOutput, TensorData};
 
-use crate::inference::load_onnx_session;
+use crate::inference::{
+    HAS_OBJ_OUTPUT_NAME, MODEL_INPUT_NAME, POINTS_OUTPUT_NAME, load_doc_align_engine,
+};
 use translator_core::api::{TranslatorError, TranslatorErrorKind};
 
 const MODEL_INPUT_SIZE: usize = 256;
-const MODEL_INPUT_NAME: &str = "img";
-const POINTS_OUTPUT_NAME: &str = "points";
-const HAS_OBJ_OUTPUT_NAME: &str = "has_obj";
 
 const CONFIDENCE_THRESHOLD: f32 = 0.75;
 
@@ -67,14 +64,14 @@ pub struct WarpedImageRgba {
 }
 
 pub struct DocAligner {
-    session: Mutex<Session>,
+    engine: Mutex<ModuleEngine>,
 }
 
 impl DocAligner {
     pub fn load(model_path: &Path, intra_threads: usize) -> Result<Self, TranslatorError> {
-        let session = load_onnx_session(model_path, intra_threads)?;
+        let engine = load_doc_align_engine(model_path, intra_threads)?;
         Ok(Self {
-            session: Mutex::new(session),
+            engine: Mutex::new(engine),
         })
     }
 
@@ -116,24 +113,22 @@ impl DocAligner {
         }
 
         let tensor_buf = preprocess_to_planar_rgb(rgba, width, height);
-        let input = Tensor::from_array((
-            [1usize, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE],
-            tensor_buf.into_boxed_slice(),
-        ))
-        .map_err(|error| {
-            TranslatorError::new(
-                TranslatorErrorKind::Internal,
-                format!("failed to build doc-align input tensor: {error}"),
-            )
-        })?;
+        let input_shape = [1usize, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE];
 
         let (points, confidence) = {
-            let mut session = self
-                .session
+            let engine = self
+                .engine
                 .lock()
                 .expect("doc-align session mutex poisoned");
-            let outputs = session
-                .run(inputs![MODEL_INPUT_NAME => input])
+            let outputs = engine
+                .run_named_dynamic(
+                    &[NamedInput {
+                        name: MODEL_INPUT_NAME,
+                        data: TensorData::F32(&tensor_buf),
+                        shape: &input_shape,
+                    }],
+                    &[POINTS_OUTPUT_NAME, HAS_OBJ_OUTPUT_NAME],
+                )
                 .map_err(|error| {
                     TranslatorError::new(
                         TranslatorErrorKind::Internal,
@@ -141,22 +136,8 @@ impl DocAligner {
                     )
                 })?;
 
-            let (_, points) = outputs[POINTS_OUTPUT_NAME]
-                .try_extract_tensor::<f32>()
-                .map_err(|error| {
-                    TranslatorError::new(
-                        TranslatorErrorKind::Internal,
-                        format!("doc-align points output not f32: {error}"),
-                    )
-                })?;
-            let (_, has_obj) = outputs[HAS_OBJ_OUTPUT_NAME]
-                .try_extract_tensor::<f32>()
-                .map_err(|error| {
-                    TranslatorError::new(
-                        TranslatorErrorKind::Internal,
-                        format!("doc-align has_obj output not f32: {error}"),
-                    )
-                })?;
+            let points = output_data(&outputs, POINTS_OUTPUT_NAME)?;
+            let has_obj = output_data(&outputs, HAS_OBJ_OUTPUT_NAME)?;
             if points.len() < 8 || has_obj.is_empty() {
                 return Err(TranslatorError::new(
                     TranslatorErrorKind::Internal,
@@ -200,6 +181,19 @@ impl DocAligner {
             confidence,
         }))
     }
+}
+
+fn output_data<'a>(outputs: &'a [NamedOutput], name: &str) -> Result<&'a [f32], TranslatorError> {
+    outputs
+        .iter()
+        .find(|output| output.name == name)
+        .map(|output| output.data.as_slice())
+        .ok_or_else(|| {
+            TranslatorError::new(
+                TranslatorErrorKind::Internal,
+                format!("doc-align output `{name}` missing"),
+            )
+        })
 }
 
 /// Map `rgba` (width×height) into the model's planar RGB f32 tensor (3×256×256, /255). The

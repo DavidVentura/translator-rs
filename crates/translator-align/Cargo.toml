@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 translator-core = { path = "../translator-core" }
-ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
+mnn-sys = { git = "https://github.com/DavidVentura/mnn-sys" }
 log = "0.4"
 uniffi = { version = "0.29", optional = true, default-features = false }
 

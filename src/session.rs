@@ -12,6 +12,7 @@ use crate::catalog::{
     plan_support_download_by_kind, plan_tts_download, select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
+#[cfg(feature = "ppocr")]
 use crate::settings::BackgroundMode;
 use crate::translate::TranslationWithAlignment;
 use crate::translate::Translator;
