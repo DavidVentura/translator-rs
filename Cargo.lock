@@ -2981,7 +2981,6 @@ dependencies = [
  "markup5ever_rcdom",
  "minifb",
  "mnn-sys",
- "mucab",
  "mupdf",
  "ndarray 0.16.1",
  "ort",
@@ -2996,6 +2995,7 @@ dependencies = [
  "tarkka",
  "toml 0.8.23",
  "translator-core",
+ "translator-mucab",
  "ttf-parser",
  "unicode-bidi",
  "unicode-linebreak",
@@ -3014,6 +3014,13 @@ dependencies = [
  "serde_json",
  "unicode-script",
  "uniffi",
+]
+
+[[package]]
+name = "translator-mucab"
+version = "0.1.0"
+dependencies = [
+ "mucab",
 ]
 
 [[package]]

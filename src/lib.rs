@@ -51,7 +51,7 @@ pub mod live_worker;
 #[cfg(feature = "ppocr")]
 mod mnn_inference;
 #[cfg(feature = "mucab")]
-pub mod mucab;
+pub use translator_mucab::mucab;
 pub mod ocr;
 #[cfg(feature = "ppocr")]
 mod ocr_runtime;
