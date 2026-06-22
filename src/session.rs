@@ -19,10 +19,9 @@ use crate::translate::TranslationWithAlignment;
 use crate::translate::Translator;
 
 #[cfg(feature = "dictionary")]
-use crate::tarkka::{
-    DictionaryCache, WordWithTaggedEntries, close_dictionary_in_snapshot,
-    lookup_dictionary_in_snapshot,
-};
+use crate::tarkka::WordWithTaggedEntries;
+#[cfg(feature = "dictionary")]
+use translator_dictionary::engine::DictionaryEngine;
 
 #[cfg(feature = "doc-align")]
 use crate::doc_align::{DocumentDetection, DocumentQuad, WarpedImageRgba};
@@ -66,7 +65,7 @@ pub struct TranslatorSession {
     #[cfg(feature = "tts")]
     tts: TtsEngine,
     #[cfg(feature = "dictionary")]
-    dictionaries: Mutex<DictionaryCache>,
+    dictionary: DictionaryEngine,
     #[cfg(feature = "doc-align")]
     doc_align: DocAlignEngine,
     #[cfg(feature = "ppocr")]
@@ -81,7 +80,7 @@ impl TranslatorSession {
             #[cfg(feature = "tts")]
             tts: TtsEngine::new(),
             #[cfg(feature = "dictionary")]
-            dictionaries: Mutex::new(DictionaryCache::new()),
+            dictionary: DictionaryEngine::new(),
             #[cfg(feature = "doc-align")]
             doc_align: DocAlignEngine::new(),
             #[cfg(feature = "ppocr")]
@@ -692,8 +691,7 @@ impl TranslatorSession {
 
     #[cfg(feature = "dictionary")]
     fn close_dictionary(&self, snapshot: &CatalogSnapshot, language_code: &LanguageCode) {
-        let mut cache = self.dictionaries.lock().expect("dictionary cache poisoned");
-        close_dictionary_in_snapshot(snapshot, &mut cache, language_code);
+        self.dictionary.close(snapshot, language_code);
     }
 
     pub fn prepare_delete_superseded_tts(
@@ -752,9 +750,8 @@ impl TranslatorSession {
         language_code: &str,
         word: &str,
     ) -> Result<Option<WordWithTaggedEntries>, TranslatorError> {
-        let snap = self.snapshot();
-        let mut cache = self.dictionaries.lock().expect("dictionary cache poisoned");
-        lookup_dictionary_in_snapshot(&snap, &mut cache, &LanguageCode::from(language_code), word)
+        self.dictionary
+            .lookup(&self.snapshot(), &LanguageCode::from(language_code), word)
     }
 
     #[cfg(feature = "tts")]
