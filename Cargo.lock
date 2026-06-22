@@ -2970,7 +2970,6 @@ dependencies = [
  "image",
  "imageproc",
  "khronos-egl",
- "libc",
  "log",
  "lopdf",
  "markup5ever",
@@ -3050,6 +3049,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "imageproc",
+ "libc",
  "log",
  "mnn-sys",
  "rayon",

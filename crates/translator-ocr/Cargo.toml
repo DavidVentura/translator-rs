@@ -17,3 +17,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 imageproc = { version = "0.25", default-features = false }
 rayon = "1"
 log = "0.4"
+
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")))'.dependencies]
+libc = "0.2"
