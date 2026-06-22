@@ -6,19 +6,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use image::DynamicImage;
 use translator_core::api::{TranslatorError, TranslatorErrorKind};
 use translator_core::catalog::{
     CatalogSnapshot, FileRole, OcrPack, PackKind, PackRecord, PpocrScript,
 };
 use translator_core::coords::Quadrant;
-use translator_core::ocr::{DetectedTextBox, OcrSourceSelection, RecognizedTextLine};
+use translator_core::ocr::{DetectedTextBox, RecognizedTextLine};
 use translator_raster::live_frame::OrientedImage;
 
-use crate::ocr_runtime::{
-    ocr_source_for_lines, recognizer_script_for_language, route_ppocr_predictions,
-};
-use crate::ppocr::{InkStrip, PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
+use crate::ocr_runtime::route_ppocr_predictions;
+use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PpocrEngineKey {
@@ -171,88 +168,31 @@ impl OcrEngine {
         *cache = Some((key, Arc::clone(&engine)));
         Ok(engine)
     }
+}
 
-    /// Live-OCR detect over a pre-built [`OrientedImage`]. Boxes returned are in
-    /// detection-image coords; multiply by `oriented.det_to_full` to lift them
-    /// to the canonical box coord space.
-    pub fn detect_text_in_oriented_image(
-        &self,
-        snap: &CatalogSnapshot,
-        oriented: &OrientedImage,
-    ) -> Result<Vec<DetectedTextBox>, TranslatorError> {
-        let ppocr = self.engine(snap)?;
-        let rgb_det = oriented
-            .rgb_det
-            .as_ref()
-            .expect("detect path requires build_with_rgb");
-        ppocr.detect_only_image(rgb_det, PpocrProfile::Live)
-    }
-
-    /// Per-box ink strips for `boxes` against the oriented image's colour `rgb`,
-    /// keeping each strip's matte (ch0) and bold channel (ch1). 1:1 with
-    /// `boxes`; entries are `None` for boxes the model couldn't matte, and every
-    /// entry is `None` when no ink model is installed.
-    pub fn ink_strips(
-        &self,
-        snap: &CatalogSnapshot,
-        rgb: &DynamicImage,
-        boxes: &[DetectedTextBox],
-        canonical_quadrant: Option<Quadrant>,
-    ) -> Result<Vec<Option<InkStrip>>, TranslatorError> {
-        let ppocr = self.engine(snap)?;
-        Ok(ppocr.ink_strips(rgb, boxes, canonical_quadrant))
-    }
-
-    /// Live-OCR recognize over the same [`OrientedImage`] with caller-supplied
-    /// boxes in display-orient full-crop coords. `canonical_quadrant` is the
-    /// anchor's stored orientation (`None` for still / first-acquire paths).
-    pub fn recognize_in_oriented_image(
-        &self,
-        snap: &CatalogSnapshot,
-        oriented: &OrientedImage,
-        boxes: &[DetectedTextBox],
-        source_selection: OcrSourceSelection,
-        canonical_quadrant: Option<Quadrant>,
-    ) -> Result<Vec<RecognizedTextLine>, TranslatorError> {
-        let ppocr = self.engine(snap)?;
-        let rgb = oriented
-            .rgb
-            .as_ref()
-            .expect("recognize path requires build_with_rgb");
-        match source_selection {
-            OcrSourceSelection::Auto => {
-                let predictions =
-                    ppocr.classify_text_boxes_image(rgb, boxes, canonical_quadrant)?;
-                let scripts = route_ppocr_predictions(&ppocr, &predictions, boxes)?;
-                let mut lines = ppocr.recognize_text_in_boxes_image(
-                    rgb,
-                    boxes,
-                    &scripts,
-                    PpocrProfile::Live,
-                    canonical_quadrant,
-                )?;
-                let source = ocr_source_for_lines(snap, &lines, None);
-                if let Some(code) = source {
-                    let code = code.as_str().to_owned();
-                    for line in &mut lines {
-                        if !line.text.trim().is_empty() {
-                            line.source_code = Some(code.clone());
-                        }
-                    }
-                }
-                Ok(lines)
-            }
-            OcrSourceSelection::Specific { language_code } => {
-                let script = recognizer_script_for_language(snap, &language_code)?;
-                let scripts = vec![script; boxes.len()];
-                ppocr.recognize_text_in_boxes_image(
-                    rgb,
-                    boxes,
-                    &scripts,
-                    PpocrProfile::Live,
-                    canonical_quadrant,
-                )
-            }
+pub fn recognize_oriented(
+    ppocr: &PpocrEngine,
+    oriented: &OrientedImage,
+    boxes: &[DetectedTextBox],
+    script: Option<PpocrScript>,
+    canonical_quadrant: Option<Quadrant>,
+) -> Result<Vec<RecognizedTextLine>, TranslatorError> {
+    let rgb = oriented
+        .rgb
+        .as_ref()
+        .expect("recognize path requires build_with_rgb");
+    let scripts = match script {
+        None => {
+            let predictions = ppocr.classify_text_boxes_image(rgb, boxes, canonical_quadrant)?;
+            route_ppocr_predictions(ppocr, &predictions, boxes)?
         }
-    }
+        Some(script) => vec![script; boxes.len()],
+    };
+    ppocr.recognize_text_in_boxes_image(
+        rgb,
+        boxes,
+        &scripts,
+        PpocrProfile::Live,
+        canonical_quadrant,
+    )
 }

@@ -1535,7 +1535,8 @@ impl LiveTrackerPipeline {
             let ink_strips = self
                 .catalog
                 .ocr()
-                .ink_strips(&self.catalog.snapshot(), rgb, &scaled, canonical_quadrant)
+                .engine(&self.catalog.snapshot())
+                .map(|ppocr| ppocr.ink_strips(rgb, &scaled, canonical_quadrant))
                 .unwrap_or_default();
             // Bold column profile per box from the model's ch1, parallel to `detected`;
             // pooled per word against CTC firings at rec time. `None` per box when the model
@@ -1748,8 +1749,16 @@ impl LiveTrackerPipeline {
             let raw = match self
                 .catalog
                 .ocr()
-                .detect_text_in_oriented_image(&self.catalog.snapshot(), oriented)
-            {
+                .engine(&self.catalog.snapshot())
+                .and_then(|ppocr| {
+                    ppocr.detect_only_image(
+                        oriented
+                            .rgb_det
+                            .as_ref()
+                            .expect("detect path requires build_with_rgb"),
+                        crate::ppocr::PpocrProfile::Live,
+                    )
+                }) {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("[refresh] detect failed: {e:?}");
@@ -1979,7 +1988,16 @@ pub(crate) fn acquire_detect(
     let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
     let raw = catalog
         .ocr()
-        .detect_text_in_oriented_image(&catalog.snapshot(), oriented)
+        .engine(&catalog.snapshot())
+        .and_then(|ppocr| {
+            ppocr.detect_only_image(
+                oriented
+                    .rgb_det
+                    .as_ref()
+                    .expect("detect path requires build_with_rgb"),
+                crate::ppocr::PpocrProfile::Live,
+            )
+        })
         .map_err(|e| {
             log::warn!("detect failed: {e:?}");
             "detect failed"
@@ -2005,34 +2023,25 @@ pub(crate) fn acquire_orient(
     is_auto_source: bool,
     detected: &[DetectedTextBox],
 ) -> Result<Option<Quadrant>, &'static str> {
+    let snap = catalog.snapshot();
     let forced_script = if is_auto_source {
         None
     } else {
         crate::ocr_runtime::recognizer_script_for_language(
-            &catalog.snapshot(),
+            &snap,
             &crate::LanguageCode::from(from_lang),
         )
         .ok()
     };
+    let Ok(ppocr) = catalog.ocr().engine(&snap) else {
+        return Ok(None);
+    };
     let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
     let oriented = state.cached.as_ref().ok_or("oriented cache miss")?;
     Ok(if let Some(script) = forced_script {
-        crate::live_session::estimate_canonical_via_rec_with(
-            catalog.ocr(),
-            &catalog.snapshot(),
-            oriented,
-            detected,
-            script,
-        )
-        .unwrap_or(None)
+        crate::live_session::estimate_canonical_via_rec(&ppocr, oriented, detected, script)
     } else {
-        crate::live_session::estimate_canonical_quadrant_with(
-            catalog.ocr(),
-            &catalog.snapshot(),
-            oriented,
-            detected,
-        )
-        .unwrap_or(None)
+        crate::live_session::estimate_canonical_quadrant_with(&ppocr, oriented, detected)
     })
 }
 
