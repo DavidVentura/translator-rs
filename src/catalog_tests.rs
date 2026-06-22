@@ -112,6 +112,7 @@ fn translation_pack(
         PackKind::Translation(TranslationPack {
             from: from.to_string(),
             to: to.to_string(),
+            experimental: false,
         }),
         files,
         depends_on,

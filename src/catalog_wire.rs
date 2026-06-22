@@ -115,6 +115,8 @@ enum AssetPackWire {
     Translation {
         from: String,
         to: String,
+        #[serde(default)]
+        experimental: bool,
         #[serde(flatten)]
         common: PackCommonWire,
     },
@@ -259,11 +261,20 @@ fn parse_ocr_pack(engine: &str, role: Option<&str>, script: Option<&str>) -> Opt
 impl AssetPackWire {
     fn into_record(self, id: String) -> Option<PackRecord> {
         Some(match self {
-            AssetPackWire::Translation { from, to, common } => PackRecord {
+            AssetPackWire::Translation {
+                from,
+                to,
+                experimental,
+                common,
+            } => PackRecord {
                 id,
                 files: common.files.into_iter().map(Into::into).collect(),
                 depends_on: common.depends_on,
-                kind: PackKind::Translation(TranslationPack { from, to }),
+                kind: PackKind::Translation(TranslationPack {
+                    from,
+                    to,
+                    experimental,
+                }),
             },
             AssetPackWire::Ocr {
                 engine,

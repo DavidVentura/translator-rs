@@ -135,6 +135,7 @@ pub enum PackKind {
 pub struct TranslationPack {
     pub from: String,
     pub to: String,
+    pub experimental: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
