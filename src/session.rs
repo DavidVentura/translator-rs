@@ -3,8 +3,6 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::{BergamotEngine, TranslateCtx};
-#[cfg(feature = "ppocr")]
-use crate::catalog::PackKind;
 use crate::catalog::{
     CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
     LanguageOverview, PackInstallChecker, build_catalog_snapshot, build_language_overview,
@@ -28,16 +26,13 @@ use crate::tarkka::{
 
 #[cfg(feature = "doc-align")]
 use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
+#[cfg(feature = "ppocr")]
+use crate::engine::OcrEngine;
 use crate::ocr::PreparedImageOverlay;
 #[cfg(feature = "ppocr")]
 use crate::ocr::{OcrSourceSelection, ReadingOrder};
 #[cfg(feature = "ppocr")]
-use crate::ocr_runtime::{
-    ocr_source_for_lines, recognizer_script_for_language, route_ppocr_predictions,
-    translate_image_rgba_ppocr_in_snapshot,
-};
-#[cfg(feature = "ppocr")]
-use crate::ppocr::{PpocrEngine, PpocrRecognizerSpec};
+use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
 
 #[cfg(feature = "tts")]
 use crate::api::VoiceName;
@@ -76,7 +71,7 @@ pub struct TranslatorSession {
     #[cfg(feature = "doc-align")]
     doc_align: Mutex<DocAlignCache>,
     #[cfg(feature = "ppocr")]
-    ppocr: Mutex<PpocrCache>,
+    ocr: OcrEngine,
 }
 
 #[cfg(feature = "doc-align")]
@@ -86,34 +81,6 @@ struct DocAlignCache {
 
 #[cfg(feature = "doc-align")]
 impl DocAlignCache {
-    fn new() -> Self {
-        Self { state: None }
-    }
-}
-
-#[cfg(feature = "ppocr")]
-struct PpocrCache {
-    /// Cache key: (detector path, optional classifier path, sorted list of
-    /// installed recognizer (script, model, keys) tuples). One engine per
-    /// session is enough: detector + classifier load once, recognizers load
-    /// lazily per script via internal `OnceLock`. The key invalidates when
-    /// the installed pack set changes so a freshly-downloaded recognizer
-    /// gets picked up.
-    state: Option<(PpocrEngineKey, Arc<PpocrEngine>)>,
-}
-
-#[cfg(feature = "ppocr")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PpocrEngineKey {
-    detector_path: String,
-    classifier_path: Option<String>,
-    textline_orientation_path: Option<String>,
-    ink_path: Option<String>,
-    recognizers: Vec<(crate::catalog::PpocrScript, String, String)>,
-}
-
-#[cfg(feature = "ppocr")]
-impl PpocrCache {
     fn new() -> Self {
         Self { state: None }
     }
@@ -131,7 +98,7 @@ impl TranslatorSession {
             #[cfg(feature = "doc-align")]
             doc_align: Mutex::new(DocAlignCache::new()),
             #[cfg(feature = "ppocr")]
-            ppocr: Mutex::new(PpocrCache::new()),
+            ocr: OcrEngine::new(),
         }
     }
 
@@ -440,7 +407,7 @@ impl TranslatorSession {
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
         let tgt = LanguageCode::from(target_code);
-        let ppocr = self.ppocr_engine(&snap)?;
+        let ppocr = self.ocr.engine(&snap)?;
         log::info!("ocr engine: ppocr ({:?})", source_selection);
         translate_image_rgba_ppocr_in_snapshot(
             self.engine(),
@@ -478,7 +445,7 @@ impl TranslatorSession {
         max_image_size: u32,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
         let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
+        let ppocr = self.ocr.engine(&snap)?;
         crate::ocr_runtime::detect_image_boxes_ppocr(
             &ppocr,
             rgba_bytes,
@@ -497,13 +464,8 @@ impl TranslatorSession {
         &self,
         oriented: &crate::live_frame::OrientedImage,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
-        let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
-        let rgb_det = oriented
-            .rgb_det
-            .as_ref()
-            .expect("detect path requires build_with_rgb");
-        ppocr.detect_only_image(rgb_det, crate::ppocr::PpocrProfile::Live)
+        self.ocr
+            .detect_text_in_oriented_image(&self.snapshot(), oriented)
     }
 
     /// Per-box ink strips for `boxes` against the oriented image's colour `rgb` (the same
@@ -519,9 +481,8 @@ impl TranslatorSession {
         boxes: &[crate::ocr::DetectedTextBox],
         canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<Option<crate::ppocr::InkStrip>>, TranslatorError> {
-        let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
-        Ok(ppocr.ink_strips(rgb, boxes, canonical_quadrant))
+        self.ocr
+            .ink_strips(&self.snapshot(), rgb, boxes, canonical_quadrant)
     }
 
     /// Estimate the scene's reading-direction quadrant from a set of
@@ -537,7 +498,7 @@ impl TranslatorSession {
         boxes: &[crate::ocr::DetectedTextBox],
     ) -> Result<Option<crate::coords::Quadrant>, TranslatorError> {
         let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
+        let ppocr = self.ocr.engine(&snap)?;
         let rgb = oriented
             .rgb
             .as_ref()
@@ -576,7 +537,7 @@ impl TranslatorSession {
         script: crate::PpocrScript,
     ) -> Result<Option<crate::coords::Quadrant>, TranslatorError> {
         let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
+        let ppocr = self.ocr.engine(&snap)?;
         Ok(crate::live_session::estimate_canonical_via_rec(
             &ppocr, oriented, boxes, script,
         ))
@@ -610,50 +571,13 @@ impl TranslatorSession {
         source_selection: OcrSourceSelection,
         canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
-        use crate::ppocr::PpocrProfile;
-
-        let snap = self.snapshot();
-        let ppocr = self.ppocr_engine(&snap)?;
-        let rgb = oriented
-            .rgb
-            .as_ref()
-            .expect("recognize path requires build_with_rgb");
-        // PPOCR needs a gray buffer in the **same orientation** as
-        match source_selection {
-            OcrSourceSelection::Auto => {
-                let predictions =
-                    ppocr.classify_text_boxes_image(rgb, boxes, canonical_quadrant)?;
-                let scripts = route_ppocr_predictions(&ppocr, &predictions, boxes)?;
-                let mut lines = ppocr.recognize_text_in_boxes_image(
-                    rgb,
-                    boxes,
-                    &scripts,
-                    PpocrProfile::Live,
-                    canonical_quadrant,
-                )?;
-                let source = ocr_source_for_lines(&snap, &lines, None);
-                if let Some(code) = source {
-                    let code = code.as_str().to_owned();
-                    for line in &mut lines {
-                        if !line.text.trim().is_empty() {
-                            line.source_code = Some(code.clone());
-                        }
-                    }
-                }
-                Ok(lines)
-            }
-            OcrSourceSelection::Specific { language_code } => {
-                let script = recognizer_script_for_language(&snap, &language_code)?;
-                let scripts = vec![script; boxes.len()];
-                ppocr.recognize_text_in_boxes_image(
-                    rgb,
-                    boxes,
-                    &scripts,
-                    PpocrProfile::Live,
-                    canonical_quadrant,
-                )
-            }
-        }
+        self.ocr.recognize_in_oriented_image(
+            &self.snapshot(),
+            oriented,
+            boxes,
+            source_selection,
+            canonical_quadrant,
+        )
     }
 
     pub fn retranslate_prepared_overlay(
@@ -722,137 +646,6 @@ impl TranslatorSession {
         prepared.translated_text = translated_blocks.join("\n");
 
         Ok(prepared)
-    }
-
-    /// Build (or reuse) the session's PPOCR engine. One engine per session covers
-    /// detect / classify / recognize for every installed recognizer pack; the engine
-    /// loads each recognizer model lazily on first use. The cache key invalidates
-    /// only when the installed pack set changes (e.g. after a download), so day-to-day
-    /// switches between auto and forced source reuse the same loaded detector and
-    /// recognizers.
-    #[cfg(feature = "ppocr")]
-    fn ppocr_engine(&self, snap: &CatalogSnapshot) -> Result<Arc<PpocrEngine>, TranslatorError> {
-        use crate::api::TranslatorErrorKind;
-        use crate::catalog::{FileRole, OcrPack, PackRecord};
-
-        let catalog = &snap.catalog;
-        let pack_installed = |pack_id: &str| {
-            snap.pack_statuses
-                .get(pack_id)
-                .map(|s| s.installed)
-                .unwrap_or(false)
-        };
-
-        let (det_pack_id, det_pack) = catalog
-            .packs
-            .iter()
-            .find(|(_, pack)| matches!(&pack.kind, PackKind::Ocr(OcrPack::PpocrDetector)))
-            .ok_or_else(|| {
-                TranslatorError::new(
-                    TranslatorErrorKind::MissingAsset,
-                    "ppocr detector pack missing from catalog",
-                )
-            })?;
-        if !pack_installed(det_pack_id) {
-            return Err(TranslatorError::new(
-                TranslatorErrorKind::MissingAsset,
-                "ppocr detector pack is not installed",
-            ));
-        }
-
-        let base = std::path::Path::new(&snap.base_dir);
-        let best_present = |pack: &PackRecord, role: &str| {
-            pack.role_alternatives(role)
-                .into_iter()
-                .map(|f| base.join(&f.install_path))
-                .find(|path| path.exists())
-        };
-        let det_path = best_present(det_pack, FileRole::DETECTOR).ok_or_else(|| {
-            TranslatorError::missing_asset("ppocr detector pack has no detector model on disk")
-        })?;
-        let classifier_path = best_present(det_pack, FileRole::SCRIPT_CLASSIFIER);
-        let textline_orientation_path = best_present(det_pack, FileRole::TEXTLINE_ORIENTATION);
-
-        let mut specs = Vec::new();
-        for (pack_id, pack) in &catalog.packs {
-            if !pack_installed(pack_id) {
-                continue;
-            }
-            let PackKind::Ocr(OcrPack::PpocrRecognizer { script }) = &pack.kind else {
-                continue;
-            };
-            // A recognizer's charset must match its model, so alternates are
-            // paired by priority: take the best recognizer whose same-priority
-            // keys file is also on disk. A half-downloaded upgrade then falls
-            // back to the older complete pair instead of mixing generations.
-            let pair = pack
-                .role_alternatives(FileRole::RECOGNIZER)
-                .into_iter()
-                .find_map(|rec| {
-                    let model_path = base.join(&rec.install_path);
-                    if !model_path.exists() {
-                        return None;
-                    }
-                    let keys_path = pack
-                        .role_alternatives(FileRole::KEYS)
-                        .into_iter()
-                        .find(|keys| keys.priority == rec.priority)
-                        .map(|keys| base.join(&keys.install_path))
-                        .filter(|path| path.exists())?;
-                    Some((model_path, keys_path))
-                });
-            let Some((model_path, keys_path)) = pair else {
-                continue;
-            };
-            specs.push(PpocrRecognizerSpec {
-                script: *script,
-                model_path,
-                keys_path,
-            });
-        }
-        specs.sort_by_key(|s| s.script.as_slug());
-
-        // Optional ink-matte model. Resolved via the detector pack's declared install
-        // path (not det_path.parent() — det may be a different OCR version dir).
-        let ink_path = best_present(det_pack, FileRole::INK);
-
-        let key = PpocrEngineKey {
-            detector_path: det_path.to_string_lossy().into_owned(),
-            classifier_path: classifier_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            textline_orientation_path: textline_orientation_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            ink_path: ink_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            recognizers: specs
-                .iter()
-                .map(|s| {
-                    (
-                        s.script,
-                        s.model_path.to_string_lossy().into_owned(),
-                        s.keys_path.to_string_lossy().into_owned(),
-                    )
-                })
-                .collect(),
-        };
-
-        let mut cache = self.ppocr.lock().expect("ppocr cache poisoned");
-        if let Some((cached_key, engine)) = &cache.state {
-            if cached_key == &key {
-                return Ok(Arc::clone(engine));
-            }
-        }
-        let engine = Arc::new(PpocrEngine::load(
-            &det_path,
-            classifier_path.as_deref(),
-            textline_orientation_path.as_deref(),
-            specs,
-            4,
-            ink_path.as_deref(),
-        )?);
-        cache.state = Some((key, Arc::clone(&engine)));
-        Ok(engine)
     }
 
     pub fn plan_download(

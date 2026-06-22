@@ -49,6 +49,8 @@ pub use translator_core::ocr;
 #[cfg(feature = "mucab")]
 pub use translator_mucab::mucab;
 #[cfg(feature = "ppocr")]
+pub use translator_ocr::engine;
+#[cfg(feature = "ppocr")]
 pub use translator_ocr::ocr_runtime;
 #[cfg(feature = "odt")]
 pub mod odt;
