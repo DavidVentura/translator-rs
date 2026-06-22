@@ -2039,9 +2039,9 @@ pub(crate) fn acquire_orient(
     let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
     let oriented = state.cached.as_ref().ok_or("oriented cache miss")?;
     Ok(if let Some(script) = forced_script {
-        crate::live_session::estimate_canonical_via_rec(&ppocr, oriented, detected, script)
+        translator_ocr::orientation::estimate_canonical_via_rec(&ppocr, oriented, detected, script)
     } else {
-        crate::live_session::estimate_canonical_quadrant_with(&ppocr, oriented, detected)
+        translator_ocr::orientation::estimate_canonical_quadrant_with(&ppocr, oriented, detected)
     })
 }
 
