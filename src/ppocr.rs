@@ -2516,6 +2516,12 @@ const TILT_EDGE_OUTLIER_FRACTION: f32 = 0.20;
 /// rather than from a genuine baseline lean.
 const TILT_MIN_DEVIATION_FRACTION: f32 = 0.20;
 
+/// Extra vertical strip span reserved on the descender side, as a fraction of the
+/// text-band thickness. Covers descender tails that the p05–p95 band drops on long
+/// lines (rare descenders are excluded and the spine rides up to the ascenders).
+/// Shared by recognition and the ink matte so their geometries stay identical; the
+/// extra is whitespace recognition tolerates and background the matte ignores.
+const STRIP_DESCENDER_VPAD_FRAC: f32 = 0.4;
 /// Maximum PCA eigenvalue ratio (λ₂/λ₁) for the contour to have a trustworthy
 /// principal axis. Above it the cloud is too square (a lone glyph, "3%") for PCA
 /// to mean anything, so the dewarp aligns to the reading frame instead of a fluke
@@ -3186,7 +3192,7 @@ fn contour_strip_warp(
         .map(|&(u, v)| ((u - u_center) / u_half_span, u, v))
         .collect();
     let all_pts: Vec<(f32, f32)> = normalized.iter().map(|&(un, _, v)| (un, v)).collect();
-    let spine_fit = fit_quadratic(&all_pts)?;
+    let mut spine_fit = fit_quadratic(&all_pts)?;
 
     // 4. Text-band thickness from the spread of points about the spine. A robust
     //    5th–95th-percentile band ignores stray contour points and the odd
@@ -3199,7 +3205,16 @@ fn contour_strip_warp(
     residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let percentile = |p: f32| residuals[(((residuals.len() - 1) as f32) * p).round() as usize];
     let band_thickness = (percentile(0.95) - percentile(0.05)).max(1.0) + thickness_pad;
-    let global_thickness = band_thickness * 2.4;
+    // The p05–p95 band drops the rare descenders on a long line (they're <5% of the
+    // contour points) and the spine rides up toward the more common ascenders, so a
+    // symmetric 2.4x band clips descender tails — they never reach the strip, so the
+    // matte misses them and the erase leaves the un-matted tip as dots. Reserve a
+    // descender slice below: grow the span and push the centre down by half of it, so
+    // the ascender side (already covered) holds and the new room lands under the
+    // baseline. The text-band thickness used for `u_pad` stays the same.
+    let desc_extra = band_thickness * STRIP_DESCENDER_VPAD_FRAC;
+    let global_thickness = band_thickness * 2.4 + desc_extra;
+    spine_fit.2 += desc_extra * 0.5;
     let u_pad = band_thickness;
     let padded_u_min = u_min - u_pad;
     let padded_u_span = u_span + 2.0 * u_pad;
