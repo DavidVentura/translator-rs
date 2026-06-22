@@ -141,12 +141,17 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     // Absolute baseline angle per line, in image space, from the ink matte mapped
     // back through its strip's src_map. `None` without an ink model or src_map (the
     // oriented-box affine fallback), where the line keeps its detection angle.
-    let line_angles: Vec<Option<f32>> = ink_masks
+    let line_angles: Vec<Option<f32>> = det_boxes
         .iter()
-        .zip(ink_src_maps.iter())
-        .map(|(mask, src_map)| match (mask, src_map) {
-            (Some(matte), Some(src)) => crate::text_metrics::baseline_angle_source(matte, src),
-            _ => None,
+        .enumerate()
+        .map(|(i, _)| {
+            match (
+                ink_masks.get(i).and_then(|m| m.as_ref()),
+                ink_src_maps.get(i).and_then(|s| s.as_ref()),
+            ) {
+                (Some(matte), Some(src)) => crate::text_metrics::baseline_angle_source(matte, src),
+                _ => None,
+            }
         })
         .collect();
 
@@ -178,7 +183,8 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
                     .into_iter()
                     .map(|(start, end)| crate::ocr::BoldRange { start, end })
                     .collect()
-            } else if model_bold[i].unwrap_or(false) && !line.text.is_empty() {
+            } else if model_bold.get(i).copied().flatten().unwrap_or(false) && !line.text.is_empty()
+            {
                 vec![crate::ocr::BoldRange {
                     start: 0,
                     end: line.text.len() as u32,
