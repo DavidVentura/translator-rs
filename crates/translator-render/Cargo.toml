@@ -16,3 +16,7 @@ unicode-bidi = { version = "0.3", default-features = false, features = ["std", "
 unicode-script = { version = "0.5", default-features = false }
 unicode-linebreak = "0.1"
 zeno = { version = "0.3", default-features = false, features = ["std", "eval"] }
+uniffi = { version = "0.29", optional = true, default-features = false }
+
+[features]
+uniffi = ["dep:uniffi", "translator-core/uniffi"]

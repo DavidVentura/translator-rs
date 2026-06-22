@@ -3015,6 +3015,7 @@ dependencies = [
  "log",
  "ort",
  "translator-core",
+ "uniffi",
 ]
 
 [[package]]
@@ -3090,6 +3091,7 @@ dependencies = [
  "unicode-bidi",
  "unicode-linebreak",
  "unicode-script",
+ "uniffi",
  "zeno",
 ]
 
@@ -3102,7 +3104,6 @@ dependencies = [
  "rayon",
  "translator-core",
  "translator-render",
- "uniffi",
 ]
 
 [[package]]

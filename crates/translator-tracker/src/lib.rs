@@ -1,6 +1,3 @@
-#[cfg(feature = "uniffi")]
-uniffi::setup_scaffolding!();
-
 pub mod coarse_tracker;
 pub mod klt;
 pub mod planar_engine;

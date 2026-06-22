@@ -12,3 +12,7 @@ path = "src/lib.rs"
 translator-core = { path = "../translator-core" }
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 log = "0.4"
+uniffi = { version = "0.29", optional = true, default-features = false }
+
+[features]
+uniffi = ["dep:uniffi", "translator-core/uniffi"]
