@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::api::LanguageCode;
 use crate::bergamot::BergamotEngine;
-use crate::catalog::CatalogSnapshot;
 use crate::language_detect::detect_language_robust_code;
-use crate::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use crate::routing::NothingReason;
-use crate::settings::BackgroundMode;
 use std::sync::atomic::AtomicBool;
+use translator_core::api::LanguageCode;
+use translator_core::catalog::CatalogSnapshot;
+use translator_core::ocr::{OverlayColors, Rect, sample_overlay_colors};
+use translator_core::settings::BackgroundMode;
 
 use crate::bergamot::TranslateCtx;
 use crate::translate::{
@@ -128,7 +128,7 @@ pub struct OverlayScreenshot {
     pub height: u32,
 }
 
-pub(crate) fn translate_structured_fragments_in_snapshot(
+pub fn translate_structured_fragments_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     fragments: &[StyledFragment],
@@ -221,7 +221,7 @@ pub(crate) fn translate_structured_fragments_in_snapshot(
 /// Pages with mismatched outcomes (no translatable text, undetectable source,
 /// missing model pair, source==target) are still reported per-page, the same
 /// way the single-page entry does.
-pub(crate) fn translate_structured_fragments_batch_in_snapshot(
+pub fn translate_structured_fragments_batch_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     pages: &[&[StyledFragment]],
@@ -251,7 +251,7 @@ pub(crate) fn translate_structured_fragments_batch_in_snapshot(
 /// Cancellable, progress-reporting [`translate_structured_fragments_batch_in_snapshot`].
 /// `Ok(None)` means the run was cancelled. Progress accumulates across the
 /// per-source-language batches and is reported in sentence units.
-pub(crate) fn translate_structured_fragments_batch_ctx_in_snapshot(
+pub fn translate_structured_fragments_batch_ctx_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     pages: &[&[StyledFragment]],
@@ -1312,7 +1312,7 @@ fn resolve_block_colors(
     }
 
     if let Some(foreground_argb) = style_fg {
-        let luminance = super::ocr::luminance(foreground_argb);
+        let luminance = translator_core::ocr::luminance(foreground_argb);
         let background_argb = if luminance > 0.5 {
             0xFF00_0000
         } else {

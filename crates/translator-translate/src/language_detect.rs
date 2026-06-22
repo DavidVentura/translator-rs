@@ -1,5 +1,5 @@
-use crate::api::LanguageCode;
 use cld2::{Format, Hints, Reliable, detect_language_ext};
+use translator_core::api::LanguageCode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]

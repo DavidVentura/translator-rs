@@ -3,15 +3,14 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::api::LanguageCode;
 use crate::bergamot::BergamotEngine;
-use crate::catalog::CatalogSnapshot;
 use crate::language_detect::detect_language_robust_code;
-#[cfg(feature = "planar-tracker")]
 use crate::translate::{
-    TranslationWithAlignment, execute_translation_plan_with_alignment, identity_char_alignments,
+    TranslationWithAlignment, execute_translation_plan, execute_translation_plan_with_alignment,
+    identity_char_alignments, resolve_translation_plan_in_snapshot,
 };
-use crate::translate::{execute_translation_plan, resolve_translation_plan_in_snapshot};
+use translator_core::api::LanguageCode;
+use translator_core::catalog::CatalogSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -159,7 +158,7 @@ pub fn plan_batch_text_translation(
     }
 }
 
-pub(crate) fn translate_mixed_texts_in_snapshot(
+pub fn translate_mixed_texts_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     inputs: &[String],
@@ -218,8 +217,7 @@ pub(crate) fn translate_mixed_texts_in_snapshot(
 /// onto the translated text. Passthrough inputs map onto themselves with identity char
 /// alignments; batched inputs run the plan with alignment. Internal (the FFI surface uses the
 /// alignment-free [`MixedTextTranslationResult`]).
-#[cfg(feature = "planar-tracker")]
-pub(crate) fn translate_mixed_texts_with_alignment_in_snapshot(
+pub fn translate_mixed_texts_with_alignment_in_snapshot(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
     inputs: &[String],

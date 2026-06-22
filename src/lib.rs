@@ -2,8 +2,8 @@
 uniffi::setup_scaffolding!();
 
 pub use translator_core::api;
-pub mod bergamot;
 pub use translator_core::catalog;
+pub use translator_translate::bergamot;
 #[cfg(feature = "planar-tracker")]
 pub mod coarse_tracker;
 #[cfg(feature = "doc-align")]
@@ -19,23 +19,22 @@ pub use translator_render::font_metrics;
 pub use translator_render::font_provider;
 #[cfg(feature = "gpu")]
 pub mod gl_renderer;
-//#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 #[cfg(feature = "dom-translate")]
-mod dom_translate;
+pub use translator_translate::dom_translate;
 #[cfg(feature = "epub")]
 pub mod epub;
 pub use translator_core::homography;
 pub use translator_core::homography_ekf;
-#[cfg(feature = "html")]
-pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub use translator_render::image_render;
+#[cfg(feature = "html")]
+pub use translator_translate::html_translate;
 #[cfg(feature = "planar-tracker")]
 pub mod klt;
 pub use translator_core::language;
-pub mod language_detect;
 #[cfg(feature = "raster")]
 pub use translator_raster::live_frame;
+pub use translator_translate::language_detect;
 #[cfg(feature = "gpu")]
 pub mod live_gpu_tick;
 #[cfg(feature = "planar-tracker")]
@@ -83,18 +82,18 @@ pub mod planar_engine;
 pub mod planar_tracker;
 #[cfg(feature = "ppocr")]
 pub mod ppocr;
-mod routing;
+pub use translator_translate::routing;
 pub mod screen_monitor;
 #[cfg(feature = "gpu")]
 pub mod screen_monitor_gpu;
 pub use translator_core::script;
 pub use translator_core::script_normalize;
-mod sentence_split;
+pub use translator_translate::sentence_split;
 pub mod session;
 pub use translator_core::settings;
 #[cfg(feature = "tts")]
 mod speech;
-mod styled;
+pub use translator_translate::styled;
 pub mod surface_map;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
@@ -106,7 +105,7 @@ pub use translator_raster::text_metrics;
 pub use translator_render::text_runs;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub use translator_render::text_shape;
-mod translate;
+pub use translator_translate::translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;
 pub use translator_core::tts;

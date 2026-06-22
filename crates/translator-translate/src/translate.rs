@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::{BergamotEngine, ModelPaths, TranslateCtx};
-use crate::catalog::CatalogSnapshot;
 #[cfg(feature = "html")]
 use crate::html_translate;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
@@ -11,6 +9,8 @@ use crate::styled::{
     translate_structured_fragments_batch_ctx_in_snapshot,
     translate_structured_fragments_batch_in_snapshot, translate_structured_fragments_in_snapshot,
 };
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::catalog::CatalogSnapshot;
 
 pub struct Translator<'a> {
     engine: &'a mut BergamotEngine,
@@ -82,7 +82,7 @@ impl<'a> Translator<'a> {
         Ok(merged.join("\n"))
     }
 
-    pub(crate) fn translate_texts(
+    pub fn translate_texts(
         &mut self,
         from_code: &LanguageCode,
         to_code: &LanguageCode,
@@ -105,7 +105,7 @@ impl<'a> Translator<'a> {
 
     /// Cancellable, progress-reporting [`Self::translate_texts`]. Errors with
     /// `TranslatorErrorKind::Cancelled` if the run was cancelled mid-flight.
-    pub(crate) fn translate_texts_ctx(
+    pub fn translate_texts_ctx(
         &mut self,
         from_code: &LanguageCode,
         to_code: &LanguageCode,
@@ -178,8 +178,7 @@ impl<'a> Translator<'a> {
         .map_err(TranslatorError::translation)
     }
 
-    #[cfg(feature = "planar-tracker")]
-    pub(crate) fn translate_mixed_texts_with_alignment(
+    pub fn translate_mixed_texts_with_alignment(
         &mut self,
         inputs: &[String],
         forced_source_code: Option<&LanguageCode>,
@@ -208,7 +207,7 @@ impl<'a> Translator<'a> {
         target_code: &LanguageCode,
         available_language_codes: &[LanguageCode],
         screenshot: Option<&OverlayScreenshot>,
-        background_mode: crate::BackgroundMode,
+        background_mode: translator_core::settings::BackgroundMode,
     ) -> Result<StructuredTranslationResult, TranslatorError> {
         let available_language_codes = available_language_codes
             .iter()
@@ -233,7 +232,7 @@ impl<'a> Translator<'a> {
         forced_source_code: Option<&LanguageCode>,
         target_code: &LanguageCode,
         available_language_codes: &[LanguageCode],
-        background_mode: crate::BackgroundMode,
+        background_mode: translator_core::settings::BackgroundMode,
     ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
         let available_language_codes = available_language_codes
             .iter()
@@ -259,7 +258,7 @@ impl<'a> Translator<'a> {
         forced_source_code: Option<&LanguageCode>,
         target_code: &LanguageCode,
         available_language_codes: &[LanguageCode],
-        background_mode: crate::BackgroundMode,
+        background_mode: translator_core::settings::BackgroundMode,
         ctx: &TranslateCtx,
     ) -> Result<Vec<StructuredTranslationResult>, TranslatorError> {
         let available_language_codes = available_language_codes
@@ -283,13 +282,7 @@ impl<'a> Translator<'a> {
     /// Alignment translation for documents, with cancellation + per-sentence
     /// progress. `Ok(None)` means no translation plan (passthrough); a
     /// cancelled run errors with `TranslatorErrorKind::Cancelled`.
-    #[cfg(any(
-        feature = "odt",
-        feature = "epub",
-        feature = "ppocr",
-        feature = "planar-tracker"
-    ))]
-    pub(crate) fn translate_texts_with_alignment_ctx(
+    pub fn translate_texts_with_alignment_ctx(
         &mut self,
         from_code: &LanguageCode,
         to_code: &LanguageCode,
@@ -341,7 +334,7 @@ fn char_byte_offsets(s: &str) -> Vec<usize> {
 /// source range becomes the byte span covering every target token aligned to a source token
 /// it overlaps. Used to carry per-word bold from the OCR source text onto the translated
 /// text. Returns coalesced, sorted target byte ranges; empty when there are no alignments.
-pub(crate) fn remap_byte_ranges_through_alignment(
+pub fn remap_byte_ranges_through_alignment(
     src_ranges: &[(u32, u32)],
     twa: &TranslationWithAlignment,
 ) -> Vec<(u32, u32)> {
@@ -382,8 +375,7 @@ pub(crate) fn remap_byte_ranges_through_alignment(
 /// One-to-one character alignment for an untranslated passthrough (e.g. source
 /// language equals target): char `i` of the source maps to char `i` of the
 /// "translation". Used by the document translators when no model is run.
-#[cfg(any(feature = "odt", feature = "epub", feature = "planar-tracker"))]
-pub(crate) fn identity_char_alignments(text: &str) -> Vec<TokenAlignment> {
+pub fn identity_char_alignments(text: &str) -> Vec<TokenAlignment> {
     let count = text.chars().count() as u64;
     (0..count)
         .map(|idx| TokenAlignment {
@@ -396,7 +388,7 @@ pub(crate) fn identity_char_alignments(text: &str) -> Vec<TokenAlignment> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranslationStep {
+pub struct TranslationStep {
     pub from_code: String,
     pub to_code: String,
     pub cache_key: String,
@@ -404,7 +396,7 @@ pub(crate) struct TranslationStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct TranslationPlan {
+pub struct TranslationPlan {
     pub steps: Vec<TranslationStep>,
 }
 
@@ -412,7 +404,10 @@ fn absolute_install_path(base_dir: &str, install_path: &str) -> PathBuf {
     Path::new(base_dir).join(install_path)
 }
 
-fn build_model_paths(base_dir: &str, step: &crate::language::LanguageDirection) -> ModelPaths {
+fn build_model_paths(
+    base_dir: &str,
+    step: &translator_core::language::LanguageDirection,
+) -> ModelPaths {
     let src_vocab = absolute_install_path(base_dir, &step.src_vocab.path);
     let tgt_vocab = absolute_install_path(base_dir, &step.tgt_vocab.path);
     // Most catalog packs ship a single shared `vocab.*.spm` and the catalog
@@ -433,7 +428,7 @@ fn cache_key(from_code: &str, to_code: &str) -> String {
     format!("{from_code}-{to_code}")
 }
 
-pub(crate) fn resolve_translation_plan_in_snapshot(
+pub fn resolve_translation_plan_in_snapshot(
     snapshot: &CatalogSnapshot,
     from_code: &str,
     to_code: &str,
@@ -470,7 +465,7 @@ pub(crate) fn resolve_translation_plan_in_snapshot(
     Some(TranslationPlan { steps })
 }
 
-pub(crate) fn execute_translation_plan(
+pub fn execute_translation_plan(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     texts: &[String],
@@ -485,7 +480,7 @@ pub(crate) fn execute_translation_plan(
 
 /// Cancellable, progress-reporting [`execute_translation_plan`]. `Ok(None)`
 /// means the run was cancelled.
-pub(crate) fn execute_translation_plan_ctx(
+pub fn execute_translation_plan_ctx(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     texts: &[String],
@@ -501,7 +496,7 @@ pub(crate) fn execute_translation_plan_ctx(
     }
 }
 
-pub(crate) fn execute_translation_plan_with_alignment(
+pub fn execute_translation_plan_with_alignment(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     texts: &[String],
@@ -533,7 +528,7 @@ pub(crate) fn execute_translation_plan_with_alignment(
 
 /// Cancellable, progress-reporting [`execute_translation_plan_with_alignment`].
 /// `Ok(None)` means cancelled.
-pub(crate) fn execute_translation_plan_with_alignment_ctx(
+pub fn execute_translation_plan_with_alignment_ctx(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     texts: &[String],
@@ -558,7 +553,7 @@ pub(crate) fn execute_translation_plan_with_alignment_ctx(
 /// the same DOM nodes (no structural changes — `<p>` stays `<p>`, attributes
 /// pass through verbatim). This replaces slimt's old C++ HTML mode.
 #[cfg(feature = "html")]
-pub(crate) fn translate_html_via_dom(
+pub fn translate_html_via_dom(
     engine: &mut BergamotEngine,
     plan: &TranslationPlan,
     fragments: &[String],
@@ -569,7 +564,7 @@ pub(crate) fn translate_html_via_dom(
 }
 
 #[cfg(not(feature = "html"))]
-pub(crate) fn translate_html_via_dom(
+pub fn translate_html_via_dom(
     _engine: &mut BergamotEngine,
     _plan: &TranslationPlan,
     _fragments: &[String],

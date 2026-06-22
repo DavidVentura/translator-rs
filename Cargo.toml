@@ -54,7 +54,7 @@ required-features = ["ppocr"]
 [features]
 default = []
 translate-cli = ["dep:toml"]
-uniffi = ["dep:uniffi", "translator-core/uniffi"]
+uniffi = ["dep:uniffi", "translator-core/uniffi", "translator-translate/uniffi"]
 dictionary = ["dep:translator-dictionary"]
 mucab = ["dep:translator-mucab"]
 tts = ["dep:piper-rs"]
@@ -71,9 +71,9 @@ pdf = [
     "dep:translator-render",
 ]
 odt = ["dep:zip"]
-dom-translate = ["dep:markup5ever", "dep:markup5ever_rcdom"]
-html = ["dom-translate", "dep:html5ever"]
-epub = ["dom-translate", "dep:zip", "dep:xml5ever", "dep:ttf-parser"]
+dom-translate = ["translator-translate/dom-translate"]
+html = ["dom-translate", "translator-translate/html"]
+epub = ["dom-translate", "dep:markup5ever", "dep:markup5ever_rcdom", "dep:zip", "dep:xml5ever", "dep:ttf-parser"]
 image-render = [
     "dep:translator-render",
     "translator-core/script-from-unicode",
@@ -95,10 +95,9 @@ viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
 translator-core = { path = "crates/translator-core" }
+translator-translate = { path = "crates/translator-translate" }
 translator-render = { path = "crates/translator-render", optional = true }
 translator-raster = { path = "crates/translator-raster", optional = true }
-slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
-cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -132,7 +131,6 @@ ab_glyph = { version = "0.2", optional = true }
 env_logger = { version = "0.11", optional = true }
 
 zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
-html5ever = { version = "0.38", optional = true }
 markup5ever = { version = "0.38", optional = true }
 markup5ever_rcdom = { version = "0.38", optional = true }
 xml5ever = { version = "0.38", optional = true }

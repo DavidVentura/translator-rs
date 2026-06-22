@@ -130,7 +130,7 @@ fn is_inline(local_name: &str) -> bool {
 /// One contiguous run of text leaves whose nearest non-inline ancestor is the
 /// same. The flat `text` is what we send to slimt; `leaf_char_ends` lets us
 /// look up which leaf any source-text character belongs to.
-pub(crate) struct Scope {
+pub struct Scope {
     leaves: Vec<Handle>,
     text: String,
     /// `leaf_char_ends[i]` is the cumulative char count *after* leaf `i`,
@@ -144,7 +144,7 @@ pub(crate) struct Scope {
 /// each non-empty scope's text to `all_texts`, returning the scopes alongside
 /// their index into that flat list (`None` for whitespace-only scopes left
 /// untouched).
-pub(crate) fn collect_and_index(
+pub fn collect_and_index(
     dom: &RcDom,
     all_texts: &mut Vec<String>,
 ) -> (Vec<Scope>, Vec<Option<usize>>) {
@@ -164,7 +164,7 @@ pub(crate) fn collect_and_index(
 /// Write the translated text + alignments back onto each scope's DOM leaves in
 /// place. The DOM is mutated; the caller serialises it afterwards with the
 /// matching serialiser.
-pub(crate) fn apply_indexed(
+pub fn apply_indexed(
     scopes: &[Scope],
     translation_idx: &[Option<usize>],
     translations: &[TranslationWithAlignment],
@@ -182,7 +182,7 @@ pub(crate) fn apply_indexed(
 /// translated while the identifier, language code, dates and manifest are left
 /// untouched — the opposite default from [`collect_and_index`], which takes all
 /// prose text.
-pub(crate) fn collect_named_elements(
+pub fn collect_named_elements(
     dom: &RcDom,
     locals: &[&str],
     all_texts: &mut Vec<String>,
