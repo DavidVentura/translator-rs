@@ -56,9 +56,9 @@ default = []
 translate-cli = ["dep:toml"]
 uniffi = ["dep:uniffi", "translator-core/uniffi", "translator-translate/uniffi", "translator-tracker?/uniffi"]
 dictionary = ["dep:translator-dictionary"]
-mucab = ["dep:translator-mucab"]
+mucab = ["dep:translator-mucab", "translator-transliterate?/mucab"]
 tts = ["dep:piper-rs"]
-transliterate = ["dep:icu_locale_core", "dep:icu_experimental", "dep:unicode-script", "translator-core/script-from-unicode"]
+transliterate = ["dep:translator-transliterate"]
 pdf = [
     "dep:mupdf",
     "dep:lopdf",
@@ -107,9 +107,8 @@ toml = { version = "0.8", optional = true, default-features = false, features = 
 uniffi = { version = "0.29", optional = true, default-features = false }
 translator-dictionary = { path = "crates/translator-dictionary", optional = true }
 translator-mucab = { path = "crates/translator-mucab", optional = true }
+translator-transliterate = { path = "crates/translator-transliterate", optional = true }
 piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization", "mnn"] }
-icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
-icu_locale_core = { version = "2.2", optional = true }
 lopdf = { version = "0.40", optional = true, default-features = false }
 ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout", "variable-fonts"] }
 subsetter = { version = "0.2", optional = true, default-features = false }

@@ -92,6 +92,7 @@ pub mod session;
 pub use translator_core::settings;
 #[cfg(feature = "tts")]
 mod speech;
+pub use translator_core::tts;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
 #[cfg(feature = "raster")]
@@ -107,8 +108,7 @@ pub use translator_tracker::surface_map;
 pub use translator_translate::styled;
 pub use translator_translate::translate;
 #[cfg(feature = "transliterate")]
-pub mod transliterate;
-pub use translator_core::tts;
+pub use translator_transliterate::transliterate;
 pub mod txt;
 
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};

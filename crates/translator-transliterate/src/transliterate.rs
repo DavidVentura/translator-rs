@@ -2,7 +2,7 @@ use icu_experimental::transliterate::Transliterator;
 use icu_locale_core::Locale;
 use unicode_script::{Script, UnicodeScript};
 
-use crate::api::{LanguageCode, ScriptCode};
+use translator_core::api::{LanguageCode, ScriptCode};
 
 fn make_transliterator(source_script: &str) -> Option<Transliterator> {
     let locale_str = format!("und-Latn-t-und-{}", source_script.to_lowercase());
@@ -29,7 +29,7 @@ fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
 /// leave untouched (Latin, punctuation, marks). Scripts ICU has no transform
 /// for still fall back to pass-through via `transliterate` returning `None`.
 fn romanizable_source_code(script: Script) -> Option<String> {
-    use crate::script::Script as S;
+    use translator_core::script::Script as S;
     match S::from(script) {
         S::Latin | S::Common | S::Inherited | S::Other => None,
         // Both kana share the Japanese transform (katakana then hiragana).
@@ -168,7 +168,7 @@ fn preprocess_japanese(
     if dict_path.is_empty() {
         return None;
     }
-    crate::mucab::transliterate_with_path(dict_path, text, japanese_spaced).ok()
+    translator_mucab::mucab::transliterate_with_path(dict_path, text, japanese_spaced).ok()
 }
 
 #[cfg(not(feature = "mucab"))]
