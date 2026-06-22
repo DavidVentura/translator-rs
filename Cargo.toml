@@ -90,7 +90,7 @@ pdf-image-translate = [
     "dep:fax",
 ]
 doc-align = ["dep:translator-align", "dep:ndarray"]
-raster = ["translator-core/raster", "dep:image"]
+raster = ["dep:translator-raster", "dep:image"]
 ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon", "raster"]
 planar-tracker = ["dep:image", "dep:imageproc", "image-render", "dep:rayon", "raster"]
 gpu = ["dep:glow", "planar-tracker"]
@@ -99,6 +99,7 @@ viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
 translator-core = { path = "crates/translator-core" }
+translator-raster = { path = "crates/translator-raster", optional = true }
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"

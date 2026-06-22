@@ -44,7 +44,7 @@
 use image::imageops::FilterType;
 use image::{GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 
-use crate::ocr::DetectedTextBox;
+use translator_core::ocr::DetectedTextBox;
 
 /// Per-detection matting result, shared by the still-image and live-camera
 /// overlays. The `strip_rgba` is a rectified RGBA image — an opaque "pill": its

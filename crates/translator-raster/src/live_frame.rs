@@ -18,8 +18,8 @@
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
-use crate::api::{TranslatorError, TranslatorErrorKind};
-use crate::ocr::{DetectedTextBox, Rect};
+use translator_core::api::{TranslatorError, TranslatorErrorKind};
+use translator_core::ocr::{DetectedTextBox, Rect};
 /// A frame's cropped, rotated, and detection-ready derivatives.
 ///
 /// `gray` is always populated. `rgb` and `rgb_det` are `Some` iff this
@@ -945,14 +945,14 @@ mod tests {
                 right: 140,
                 bottom: 240,
             },
-            oriented_box: crate::ocr::OrientedRect {
+            oriented_box: translator_core::ocr::OrientedRect {
                 cx: 120.0,
                 cy: 220.0,
                 width: 40.0,
                 height: 40.0,
                 angle_radians: 0.0,
             },
-            tight_box: crate::ocr::OrientedRect {
+            tight_box: translator_core::ocr::OrientedRect {
                 cx: 120.0,
                 cy: 220.0,
                 width: 40.0,

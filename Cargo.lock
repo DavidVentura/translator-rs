@@ -2996,6 +2996,7 @@ dependencies = [
  "translator-core",
  "translator-dictionary",
  "translator-mucab",
+ "translator-raster",
  "ttf-parser",
  "unicode-bidi",
  "unicode-linebreak",
@@ -3019,7 +3020,6 @@ dependencies = [
 name = "translator-core"
 version = "0.1.0"
 dependencies = [
- "image",
  "log",
  "serde",
  "serde_json",
@@ -3040,6 +3040,15 @@ name = "translator-mucab"
 version = "0.1.0"
 dependencies = [
  "mucab",
+]
+
+[[package]]
+name = "translator-raster"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "translator-core",
 ]
 
 [[package]]

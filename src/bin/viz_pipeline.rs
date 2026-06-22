@@ -33,8 +33,9 @@ use translator::font_provider::{FontHandle, FontProvider, FontRequest};
 use translator::image_render::{RenderOptions, render_overlay};
 use translator::ocr::{
     DetectedTextBox, OrientedRect, PositionedWord, ReadingOrder, RecognizedTextLine, TextBlock,
-    TextLine, prepare_overlay_image,
+    TextLine,
 };
+use translator::overlay::prepare_overlay_image;
 use translator::ppocr::{
     PpocrEngine, PpocrProfile, PpocrRecognizerSpec, dewarp_contour_to_strip_rgb,
     dewarp_contour_to_strip_rgb_with_map,

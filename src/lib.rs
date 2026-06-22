@@ -10,9 +10,9 @@ pub mod coarse_tracker;
 pub use translator_align::doc_align;
 #[cfg(feature = "doc-align")]
 pub use translator_align::doc_align_refine;
-#[cfg(feature = "raster")]
-pub use translator_core::color_matting;
 pub use translator_core::coords;
+#[cfg(feature = "raster")]
+pub use translator_raster::color_matting;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
@@ -35,7 +35,7 @@ pub mod klt;
 pub use translator_core::language;
 pub mod language_detect;
 #[cfg(feature = "raster")]
-pub use translator_core::live_frame;
+pub use translator_raster::live_frame;
 #[cfg(feature = "gpu")]
 pub mod live_gpu_tick;
 #[cfg(feature = "planar-tracker")]
@@ -96,10 +96,12 @@ pub use translator_core::settings;
 mod speech;
 mod styled;
 pub mod surface_map;
-#[cfg(feature = "raster")]
-pub use translator_core::text_metrics;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
+#[cfg(feature = "raster")]
+pub use translator_raster::overlay;
+#[cfg(feature = "raster")]
+pub use translator_raster::text_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod text_runs;
 #[cfg(any(feature = "pdf", feature = "image-render"))]

@@ -30,7 +30,7 @@
 
 use image::GrayImage;
 
-use crate::ocr::OrientedRect;
+use translator_core::ocr::OrientedRect;
 
 /// Matte alpha at or above which a texel counts as ink. The single source of truth for
 /// "what is ink"; the erase path's `color_matting::INK_ALPHA_CUT` aliases it.
@@ -271,9 +271,9 @@ pub fn firing_word_boxes(
     text: &str,
     firings: &[(char, f32)],
     is_cjk: bool,
-    oriented: &crate::ocr::OrientedRect,
+    oriented: &translator_core::ocr::OrientedRect,
     line_index: u32,
-) -> Vec<crate::ocr::PositionedWord> {
+) -> Vec<translator_core::ocr::PositionedWord> {
     let n = text.chars().count();
     if firings.len() != n || n == 0 {
         return Vec::new();
@@ -297,7 +297,7 @@ pub fn firing_word_boxes(
             let glyph = (hi - lo) / (ce - cs).max(1) as f32;
             let left_pad = glyph * if wi == 0 { 0.5 } else { 0.25 };
             let right_pad = glyph * if wi == last { 0.5 } else { 0.25 };
-            crate::ocr::PositionedWord {
+            translator_core::ocr::PositionedWord {
                 text: text[bs..be].to_string(),
                 bounds: oriented.subspan(
                     ((lo - left_pad).max(0.0)) * w,
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn firing_word_boxes_tile_a_horizontal_line() {
         // Axis-aligned line box: 100 wide, centred at x=50, height 10, baseline at y=20.
-        let oriented = crate::ocr::OrientedRect {
+        let oriented = translator_core::ocr::OrientedRect {
             cx: 50.0,
             cy: 20.0,
             width: 100.0,
@@ -880,12 +880,13 @@ mod tests {
 
     #[test]
     fn firing_word_boxes_empty_without_aligned_firings() {
-        let oriented = crate::ocr::OrientedRect::axis_aligned(crate::ocr::Rect {
-            left: 0,
-            top: 0,
-            right: 100,
-            bottom: 10,
-        });
+        let oriented =
+            translator_core::ocr::OrientedRect::axis_aligned(translator_core::ocr::Rect {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 10,
+            });
         // Firings count != text chars (the RTL case carries none): no per-word positions to
         // invent, so emit nothing rather than guessing.
         assert!(firing_word_boxes("a b c", &[], false, &oriented, 0).is_empty());

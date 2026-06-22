@@ -1,7 +1,7 @@
 //! Image overlay renderer.
 //!
 //! Consumes a [`PreparedImageOverlay`] (text regions already erased + per-block
-//! layout instructions from [`crate::ocr::prepare_overlay_image`]) and renders
+//! layout instructions from `prepare_overlay_image`) and renders
 //! the translated text back into the raster, doing all the heavy lifting that
 //! used to live in callers (`ImagePainting.kt` on Android, `image_ocr.rs` on
 //! Linux): script itemization, BiDi resolution, per-run font selection from a
