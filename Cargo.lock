@@ -2988,6 +2988,7 @@ dependencies = [
  "translator-align",
  "translator-core",
  "translator-dictionary",
+ "translator-live",
  "translator-mucab",
  "translator-ocr",
  "translator-pdf",
@@ -3034,6 +3035,20 @@ version = "0.1.0"
 dependencies = [
  "tarkka",
  "translator-core",
+]
+
+[[package]]
+name = "translator-live"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "translator-core",
+ "translator-ocr",
+ "translator-raster",
+ "translator-render",
+ "translator-tracker",
+ "translator-translate",
 ]
 
 [[package]]

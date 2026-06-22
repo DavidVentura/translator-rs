@@ -89,7 +89,7 @@ pdf-image-translate = [
 doc-align = ["dep:translator-align", "dep:ndarray"]
 raster = ["dep:translator-raster", "dep:image"]
 ppocr = ["dep:translator-ocr", "raster"]
-planar-tracker = ["dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
+planar-tracker = ["dep:translator-live", "dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
 gpu = ["dep:glow", "planar-tracker"]
 surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
 viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
@@ -102,6 +102,7 @@ translator-pdf = { path = "crates/translator-pdf", optional = true }
 translator-tracker = { path = "crates/translator-tracker", optional = true }
 translator-raster = { path = "crates/translator-raster", optional = true }
 translator-ocr = { path = "crates/translator-ocr", optional = true }
+translator-live = { path = "crates/translator-live", optional = true }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

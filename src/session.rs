@@ -757,7 +757,7 @@ impl TranslatorSession {
 }
 
 #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
-impl crate::live_session::LiveRecognizer for TranslatorSession {
+impl translator_live::live_session::LiveRecognizer for TranslatorSession {
     fn recognize(
         &self,
         oriented: &crate::live_frame::OrientedImage,
@@ -797,7 +797,7 @@ impl crate::live_session::LiveRecognizer for TranslatorSession {
 }
 
 #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
-impl crate::live_session::LiveTranslator for TranslatorSession {
+impl translator_live::live_session::LiveTranslator for TranslatorSession {
     fn translate_mixed_texts_with_alignment(
         &self,
         inputs: &[String],
@@ -816,7 +816,7 @@ impl crate::live_session::LiveTranslator for TranslatorSession {
 }
 
 #[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
-impl crate::live_session::LiveOcrHost for TranslatorSession {
+impl translator_live::live_session::LiveOcrHost for TranslatorSession {
     fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String> {
         self.ocr()
             .engine(&self.snapshot())

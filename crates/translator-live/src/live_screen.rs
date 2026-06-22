@@ -17,16 +17,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::font_provider::FontProvider;
-use crate::live_frame::LiveFrame;
 use crate::live_session::{LiveOcrHost, LiveSession};
 use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate};
 use crate::live_worker::SlotWorker;
-use crate::ocr::{OrientedRect, Rect};
-use crate::screen_monitor::{
+use translator_core::ocr::{OrientedRect, Rect};
+use translator_ocr::orientation::dominant_axis_quadrant;
+use translator_raster::live_frame::LiveFrame;
+use translator_render::font_provider::FontProvider;
+use translator_tracker::screen_monitor::{
     FrameClassification, Lattice, MonitorConfig, Rgb, ScreenMonitor, channel_delta,
 };
-use translator_ocr::orientation::dominant_axis_quadrant;
 
 /// The one anchor the screen pipeline owns; everything composites against it.
 const SCREEN_ANCHOR_ID: u64 = 1;
@@ -834,7 +834,7 @@ impl LiveScreenPipeline {
     }
 
     /// Detector pixel budget — the JNI layer uses it to size the GPU det-gray
-    /// readback ([`crate::live_frame::aligned_det_dims`]).
+    /// readback ([`translator_raster::live_frame::aligned_det_dims`]).
     pub fn det_max_pixels(&self) -> u32 {
         self.config
             .lock()

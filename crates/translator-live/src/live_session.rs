@@ -17,12 +17,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::api::LanguageCode;
-use crate::color_matting::MattedStrip;
-use crate::homography::{invert, project};
-use crate::live_frame::OrientedImage;
-use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine};
-use crate::surface_map::{AddResult, SurfaceLineId, SurfaceLineObservation, SurfaceMap};
+use translator_core::api::LanguageCode;
+use translator_core::homography::{invert, project};
+use translator_core::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine};
+use translator_raster::color_matting::MattedStrip;
+use translator_raster::live_frame::OrientedImage;
+use translator_tracker::surface_map::{
+    AddResult, SurfaceLineId, SurfaceLineObservation, SurfaceMap,
+};
 
 /// Anchor identifier as the engine emits it. Mirrors
 /// `planar_engine::AnchorId` (u64) but kept here as a plain alias to
@@ -228,14 +230,17 @@ pub struct BlockSpec {
     /// the per-present draw-list build only offsets them by the
     /// block-origin → canvas-origin delta instead of re-shaping every
     /// frame. Empty for the camera path and for empty-text placeholders.
-    pub glyph_instances: Vec<crate::image_render::GlyphInstanceData>,
+    pub glyph_instances: Vec<translator_render::image_render::GlyphInstanceData>,
     /// Upright coverage masks for the unique glyphs referenced by
     /// `glyph_instances`. Block-local because they're shaped at upsert
     /// time; merged across blocks (deduped by key) at draw-list build.
-    pub glyph_masks: HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
+    pub glyph_masks: HashMap<
+        translator_render::image_render::GlyphKey,
+        translator_render::image_render::GlyphMaskData,
+    >,
     /// Bold byte ranges within `display_text` (per-word weight carried through translation).
     /// Empty = not bold; `[0, len)` = whole block bold.
-    pub bold_ranges: Vec<crate::ocr::BoldRange>,
+    pub bold_ranges: Vec<translator_core::ocr::BoldRange>,
 }
 
 /// Per-anchor live state. Each acquired anchor (engine
@@ -380,7 +385,7 @@ pub struct LiveSession {
     /// rasterized instead of rebuilding a per-call cache. Font-file-keyed, so it
     /// never goes stale (chain lookups are cleared per render). The screen renders
     /// under `screen_render_lock`, so this Mutex is effectively uncontended.
-    glyph_cache: Mutex<crate::image_render::FontCache>,
+    glyph_cache: Mutex<translator_render::image_render::FontCache>,
 }
 
 /// Default refresh cadence: fire `run_post_detect` every N tracked
@@ -407,7 +412,7 @@ impl LiveSession {
             overlay_oversample: AtomicU32::new(1.0_f32.to_bits()),
             overlay_bg: AtomicU32::new(0x1010_10C8),
             content_version: AtomicU64::new(0),
-            glyph_cache: Mutex::new(crate::image_render::FontCache::default()),
+            glyph_cache: Mutex::new(translator_render::image_render::FontCache::default()),
         }
     }
 
@@ -640,11 +645,11 @@ impl LiveSession {
             None => return false,
         };
         drop(states);
-        let curr_inv = match crate::homography::invert(current_h) {
+        let curr_inv = match translator_core::homography::invert(current_h) {
             Some(h) => h,
             None => return false,
         };
-        let lock_inv = match crate::homography::invert(&lock_h) {
+        let lock_inv = match translator_core::homography::invert(&lock_h) {
             Some(h) => h,
             None => return false,
         };
@@ -888,7 +893,7 @@ impl LiveSession {
         line_id: SurfaceLineId,
         source_text: &str,
         source_language: &str,
-        bold_ranges: &[crate::ocr::BoldRange],
+        bold_ranges: &[translator_core::ocr::BoldRange],
     ) {
         if let Ok(mut states) = self.anchor_states.lock() {
             if let Some(state) = states.get_mut(&anchor_id) {
@@ -940,8 +945,8 @@ impl LiveSession {
         source_text: String,
         translated_text: String,
         language: String,
-        bold_ranges: Vec<crate::ocr::BoldRange>,
-        font_provider: &dyn crate::font_provider::FontProvider,
+        bold_ranges: Vec<translator_core::ocr::BoldRange>,
+        font_provider: &dyn translator_render::font_provider::FontProvider,
     ) {
         if strips.is_empty() {
             return;
@@ -1017,10 +1022,13 @@ impl LiveSession {
     fn shape_block_glyphs(
         &self,
         spec: &BlockSpec,
-        font_provider: &dyn crate::font_provider::FontProvider,
+        font_provider: &dyn translator_render::font_provider::FontProvider,
     ) -> (
-        Vec<crate::image_render::GlyphInstanceData>,
-        HashMap<crate::image_render::GlyphKey, crate::image_render::GlyphMaskData>,
+        Vec<translator_render::image_render::GlyphInstanceData>,
+        HashMap<
+            translator_render::image_render::GlyphKey,
+            translator_render::image_render::GlyphMaskData,
+        >,
     ) {
         let os = self.overlay_oversample().max(1.0);
         let visuals = inflate_block_visuals(spec);
@@ -1032,12 +1040,12 @@ impl LiveSession {
         else {
             return (Vec::new(), HashMap::new());
         };
-        let opts = crate::image_render::RenderOptions {
+        let opts = translator_render::image_render::RenderOptions {
             language: spec.language.clone(),
             min_font_size_px: 6.0 * os,
         };
         let collector = with_glyph_cache(Some(&self.glyph_cache), |gc| {
-            crate::image_render::collect_overlay_glyphs(
+            translator_render::image_render::collect_overlay_glyphs(
                 std::slice::from_ref(&tb),
                 gc,
                 font_provider,
@@ -1202,7 +1210,7 @@ pub trait LiveRecognizer {
         oriented: &OrientedImage,
         boxes: &[DetectedTextBox],
         source_selection: &OcrSourceSelection,
-        canonical_quadrant: Option<crate::coords::Quadrant>,
+        canonical_quadrant: Option<translator_core::coords::Quadrant>,
     ) -> Result<Vec<RecognizedTextLine>, String>;
 }
 
@@ -1216,7 +1224,7 @@ pub trait LiveTranslator {
         forced_source_code: Option<&str>,
         target_code: &str,
         available_language_codes: &[LanguageCode],
-    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String>;
+    ) -> Result<Vec<translator_translate::translate::TranslationWithAlignment>, String>;
 }
 
 /// The OCR/translation capabilities the live pipeline needs from its host
@@ -1226,8 +1234,12 @@ pub trait LiveTranslator {
 /// `TranslatorSession` and supplied as a mock by tests, so the live
 /// pipeline holds this interface instead of the facade session type.
 pub trait LiveOcrHost: LiveRecognizer + LiveTranslator + Send + Sync {
-    fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String>;
-    fn orient_script(&self, from_lang: &str, is_auto_source: bool) -> Option<crate::PpocrScript>;
+    fn ppocr_engine(&self) -> Result<Arc<translator_ocr::ppocr::PpocrEngine>, String>;
+    fn orient_script(
+        &self,
+        from_lang: &str,
+        is_auto_source: bool,
+    ) -> Option<translator_core::catalog::PpocrScript>;
     fn available_language_codes(&self) -> Vec<LanguageCode>;
 }
 
@@ -1243,14 +1255,16 @@ impl LiveTranslator for NoopTranslator {
         _forced: Option<&str>,
         _target: &str,
         _available: &[LanguageCode],
-    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
+    ) -> Result<Vec<translator_translate::translate::TranslationWithAlignment>, String> {
         Ok(inputs
             .iter()
-            .map(|s| crate::translate::TranslationWithAlignment {
-                alignments: crate::translate::identity_char_alignments(s),
-                source_text: s.clone(),
-                translated_text: s.clone(),
-            })
+            .map(
+                |s| translator_translate::translate::TranslationWithAlignment {
+                    alignments: translator_translate::translate::identity_char_alignments(s),
+                    source_text: s.clone(),
+                    translated_text: s.clone(),
+                },
+            )
             .collect())
     }
 }
@@ -1278,7 +1292,7 @@ pub struct PostDetectInput<'a> {
     pub to_lang: &'a str,
     pub is_auto_source: bool,
     pub available_codes: &'a [LanguageCode],
-    pub font_provider: &'a dyn crate::font_provider::FontProvider,
+    pub font_provider: &'a dyn translator_render::font_provider::FontProvider,
     /// Per-detection matted strip (indexed parallel to `detections`).
     /// Empty falls back to the legacy pill for every strip.
     pub matted_strips: &'a [Option<MattedStrip>],
@@ -1286,12 +1300,12 @@ pub struct PostDetectInput<'a> {
     /// Re-fits each line's *grouping* box (x-height, ink width, centre, tilt)
     /// off the real ink; empty keeps the detection box. Does not touch the
     /// overlay footprint (`SurfaceLine.bbox`), only the merge decision.
-    pub line_metrics: &'a [Option<crate::text_metrics::LineMetrics>],
+    pub line_metrics: &'a [Option<translator_raster::text_metrics::LineMetrics>],
     /// Per-detection ink bold column profile (indexed parallel to `detections`). Pooled
     /// per word against each line's CTC firings to recover per-word bold; whole-strip
     /// pooled for the fallback. `None` per box when the model has no bold channel; empty
     /// falls back to not-bold.
-    pub bold_profiles: &'a [Option<crate::text_metrics::BoldProfile>],
+    pub bold_profiles: &'a [Option<translator_raster::text_metrics::BoldProfile>],
     /// Translate-block batch size. Production uses 4; sim may pick a
     /// smaller value to keep per-frame work bounded.
     pub rec_batch_size: usize,
@@ -1299,7 +1313,7 @@ pub struct PostDetectInput<'a> {
     /// when not running against a tracked anchor (still-image flow, or
     /// the orientation estimator has never produced consensus and there
     /// is no fallback yet).
-    pub canonical_quadrant: Option<crate::coords::Quadrant>,
+    pub canonical_quadrant: Option<translator_core::coords::Quadrant>,
 }
 
 /// Result of [`LiveSession::run_post_detect`].
@@ -1432,7 +1446,7 @@ impl LiveSession {
             source_code: String,
             /// Per-word bold ranges over `source_text` (trimmed), pooled from this run's ink
             /// bold profile + the line's CTC firings, or restored from the rec cache.
-            bold_ranges: Vec<crate::ocr::BoldRange>,
+            bold_ranges: Vec<translator_core::ocr::BoldRange>,
             rec_attempted: bool,
         }
         let mut entries: Vec<Entry> = input
@@ -1525,8 +1539,8 @@ impl LiveSession {
             // downstream, the overlay rects); `group_lines` are copies whose bbox is
             // the ink-refit box where available, fed only to the merge decision.
             let (snapshot_lines, group_lines): (
-                Vec<crate::surface_map::SurfaceLine>,
-                Vec<crate::surface_map::SurfaceLine>,
+                Vec<translator_tracker::surface_map::SurfaceLine>,
+                Vec<translator_tracker::surface_map::SurfaceLine>,
             ) = match states_guard {
                 Ok(ref s) => match s.get(&input.anchor_id) {
                     Some(state) => entries
@@ -1535,7 +1549,10 @@ impl LiveSession {
                         .filter_map(|(e, rb)| {
                             state.map.get(e.line_id).cloned().map(|sl| {
                                 let bbox = rb.clone().unwrap_or_else(|| sl.bbox.clone());
-                                let group = crate::surface_map::SurfaceLine { bbox, ..sl.clone() };
+                                let group = translator_tracker::surface_map::SurfaceLine {
+                                    bbox,
+                                    ..sl.clone()
+                                };
                                 (sl, group)
                             })
                         })
@@ -1548,7 +1565,7 @@ impl LiveSession {
                 &group_lines,
                 input
                     .canonical_quadrant
-                    .unwrap_or(crate::coords::Quadrant::R0),
+                    .unwrap_or(translator_core::coords::Quadrant::R0),
             );
             block_strip_indices = groups
                 .iter()
@@ -1757,11 +1774,11 @@ impl LiveSession {
                 // re-based onto it. Both walk the block's strips in the same order with the
                 // same non-empty filter and `\n` separator, so the bold offsets line up with
                 // the text the translator sees.
-                let block_built: Vec<(String, Vec<crate::ocr::BoldRange>)> = ready_blocks
+                let block_built: Vec<(String, Vec<translator_core::ocr::BoldRange>)> = ready_blocks
                     .iter()
                     .map(|&bi| {
                         let mut text = String::new();
-                        let mut bold: Vec<crate::ocr::BoldRange> = Vec::new();
+                        let mut bold: Vec<translator_core::ocr::BoldRange> = Vec::new();
                         for &i in &block_strip_indices[bi] {
                             let s = entries[i].source_text.as_str();
                             if s.is_empty() {
@@ -1773,16 +1790,16 @@ impl LiveSession {
                             let base = text.len() as u32;
                             text.push_str(s);
                             for r in &entries[i].bold_ranges {
-                                bold.push(crate::ocr::BoldRange {
+                                bold.push(translator_core::ocr::BoldRange {
                                     start: base + r.start,
                                     end: base + r.end,
                                 });
                             }
                         }
-                        (text, crate::ocr::merge_bold_ranges(bold))
+                        (text, translator_core::ocr::merge_bold_ranges(bold))
                     })
                     .collect();
-                let kept: Vec<(usize, String, Vec<crate::ocr::BoldRange>)> = ready_blocks
+                let kept: Vec<(usize, String, Vec<translator_core::ocr::BoldRange>)> = ready_blocks
                     .drain(..)
                     .zip(block_built)
                     .filter(|(_, (s, _))| !s.trim().is_empty())
@@ -1803,7 +1820,7 @@ impl LiveSession {
                     );
                     let by_src: std::collections::HashMap<
                         String,
-                        crate::translate::TranslationWithAlignment,
+                        translator_translate::translate::TranslationWithAlignment,
                     > = match result {
                         Ok(translations) => translations
                             .into_iter()
@@ -1880,11 +1897,14 @@ impl LiveSession {
                         // still path.
                         let src_ranges: Vec<(u32, u32)> =
                             src_bold.iter().map(|r| (r.start, r.end)).collect();
-                        let block_bold_ranges: Vec<crate::ocr::BoldRange> =
-                            crate::translate::remap_byte_ranges_through_alignment(&src_ranges, twa)
-                                .into_iter()
-                                .map(|(start, end)| crate::ocr::BoldRange { start, end })
-                                .collect();
+                        let block_bold_ranges: Vec<translator_core::ocr::BoldRange> =
+                            translator_translate::translate::remap_byte_ranges_through_alignment(
+                                &src_ranges,
+                                twa,
+                            )
+                            .into_iter()
+                            .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
+                            .collect();
                         self.ingest_translation(input.anchor_id, &line_ids, &translated);
                         self.upsert_block(
                             input.anchor_id,
@@ -2004,8 +2024,8 @@ impl LiveSession {
 fn entry_bold_ranges(
     source_text: &str,
     line: &RecognizedTextLine,
-    profile: Option<&Option<crate::text_metrics::BoldProfile>>,
-) -> Vec<crate::ocr::BoldRange> {
+    profile: Option<&Option<translator_raster::text_metrics::BoldProfile>>,
+) -> Vec<translator_core::ocr::BoldRange> {
     let Some(profile) = profile.and_then(|p| p.as_ref()) else {
         return Vec::new();
     };
@@ -2017,24 +2037,24 @@ fn entry_bold_ranges(
         .iter()
         .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
         .collect();
-    let word_ranges = crate::text_metrics::word_bold_ranges(
+    let word_ranges = translator_raster::text_metrics::word_bold_ranges(
         source_text,
         &firings,
-        crate::ocr::is_cjk_text(source_text),
+        translator_core::ocr::is_cjk_text(source_text),
         profile,
-        crate::text_metrics::MODEL_BOLD_THRESHOLD,
+        translator_raster::text_metrics::MODEL_BOLD_THRESHOLD,
     );
     if !word_ranges.is_empty() {
         return word_ranges
             .into_iter()
-            .map(|(start, end)| crate::ocr::BoldRange { start, end })
+            .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
             .collect();
     }
     let whole_bold = profile
         .whole_pooled_bold()
-        .is_some_and(|p| p >= crate::text_metrics::MODEL_BOLD_THRESHOLD);
+        .is_some_and(|p| p >= translator_raster::text_metrics::MODEL_BOLD_THRESHOLD);
     if whole_bold {
-        vec![crate::ocr::BoldRange {
+        vec![translator_core::ocr::BoldRange {
             start: 0,
             end: source_text.len() as u32,
         }]
@@ -2185,7 +2205,7 @@ pub struct DetectionOutcome {
     pub cached_source_language: String,
     /// Cached per-word bold ranges over `cached_source_text`, when `!needs_rec`. Empty
     /// otherwise.
-    pub cached_bold_ranges: Vec<crate::ocr::BoldRange>,
+    pub cached_bold_ranges: Vec<translator_core::ocr::BoldRange>,
 }
 
 impl DetectionOutcome {
@@ -2496,7 +2516,7 @@ pub struct OverlayDrawList {
     /// Matted background strips (textured quads) for boxes the ink model resolved;
     /// drawn in place of a pill for those boxes.
     pub strips: Vec<OverlayStrip>,
-    pub glyphs: crate::image_render::GlyphCollector,
+    pub glyphs: translator_render::image_render::GlyphCollector,
     /// Pill footprints (surface coords) for the movement monitor's mask.
     pub painted_pills: Vec<OrientedRect>,
 }
@@ -2591,7 +2611,7 @@ pub(crate) fn build_overlay_draw_list(
     // uses the same `canvas_geometry(block visuals)` origin, so adding the delta
     // reconstructs canvas-texel pen positions exactly — and merge the masks (deduped
     // by key) for the GPU atlas upload.
-    let mut glyphs = crate::image_render::GlyphCollector::default();
+    let mut glyphs = translator_render::image_render::GlyphCollector::default();
     for pb in &prepared {
         let Some((block_origin_x, block_origin_y, _, _)) = canvas_geometry(&pb.visuals, os) else {
             continue;
@@ -2601,7 +2621,7 @@ pub(crate) fn build_overlay_draw_list(
         for inst in &pb.spec.glyph_instances {
             glyphs
                 .instances
-                .push(crate::image_render::GlyphInstanceData {
+                .push(translator_render::image_render::GlyphInstanceData {
                     key: inst.key,
                     pen_x: inst.pen_x + dx,
                     pen_y: inst.pen_y + dy,
@@ -2632,12 +2652,12 @@ pub(crate) fn build_overlay_draw_list(
 /// fresh throwaway. Lets the screen reuse its glyph atlas across renders while the
 /// camera/sim stay on per-call caches.
 fn with_glyph_cache<R>(
-    glyph_cache: Option<&Mutex<crate::image_render::FontCache>>,
-    f: impl FnOnce(&mut crate::image_render::FontCache) -> R,
+    glyph_cache: Option<&Mutex<translator_render::image_render::FontCache>>,
+    f: impl FnOnce(&mut translator_render::image_render::FontCache) -> R,
 ) -> R {
     match glyph_cache {
         Some(m) => f(&mut m.lock().expect("glyph cache poisoned")),
-        None => f(&mut crate::image_render::FontCache::default()),
+        None => f(&mut translator_render::image_render::FontCache::default()),
     }
 }
 
@@ -2684,8 +2704,8 @@ fn build_block_text_block(
     os: f32,
     bitmap_w: u32,
     bitmap_h: u32,
-) -> Option<crate::ocr::PreparedTextBlock> {
-    use crate::ocr::{
+) -> Option<translator_core::ocr::PreparedTextBlock> {
+    use translator_core::ocr::{
         OverlayLayoutHints, OverlayLayoutMode, PreparedTextBlock, PreparedTextLine, Rect,
     };
     if spec.display_text.trim().is_empty() {
@@ -2715,7 +2735,9 @@ fn build_block_text_block(
                 cx: v.cx,
                 cy: v.cy,
                 width: (v.width
-                    - 2.0 * crate::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX * os)
+                    - 2.0
+                        * translator_tracker::planar_engine::OVERLAY_TEXT_HORIZONTAL_INSET_PX
+                        * os)
                     .max(1.0),
                 height: v.height,
                 angle_radians: v.angle_radians,
@@ -2763,7 +2785,7 @@ fn block_aabb_within_canvas(
     local: &[OrientedRect],
     canvas_w: u32,
     canvas_h: u32,
-) -> crate::ocr::Rect {
+) -> translator_core::ocr::Rect {
     let mut min_l = u32::MAX;
     let mut min_t = u32::MAX;
     let mut max_r: u32 = 0;
@@ -2783,7 +2805,7 @@ fn block_aabb_within_canvas(
             max_b = aabb.bottom;
         }
     }
-    crate::ocr::Rect {
+    translator_core::ocr::Rect {
         left: min_l.min(canvas_w.saturating_sub(1)),
         top: min_t.min(canvas_h.saturating_sub(1)),
         right: max_r.min(canvas_w),
@@ -2796,20 +2818,20 @@ fn block_aabb_within_canvas(
 /// variant kept for callers that don't track a scene canonical
 /// quadrant.
 pub fn group_surface_lines_into_blocks(
-    lines: &[crate::surface_map::SurfaceLine],
+    lines: &[translator_tracker::surface_map::SurfaceLine],
 ) -> Vec<Vec<usize>> {
-    group_surface_lines_into_blocks_in_quadrant(lines, crate::coords::Quadrant::R0)
+    group_surface_lines_into_blocks_in_quadrant(lines, translator_core::coords::Quadrant::R0)
 }
 
 /// Canonical-quadrant-aware variant: routes through
-/// `crate::ocr::group_live_lines_into_blocks_in_quadrant` so that scenes
+/// `translator_core::ocr::group_live_lines_into_blocks_in_quadrant` so that scenes
 /// captured with the camera rotated produce blocks in the page's actual
 /// reading order rather than image-y order.
 pub fn group_surface_lines_into_blocks_in_quadrant(
-    lines: &[crate::surface_map::SurfaceLine],
-    canonical_quadrant: crate::coords::Quadrant,
+    lines: &[translator_tracker::surface_map::SurfaceLine],
+    canonical_quadrant: translator_core::coords::Quadrant,
 ) -> Vec<Vec<usize>> {
-    use crate::ocr::TextLine;
+    use translator_core::ocr::TextLine;
     if lines.is_empty() {
         return Vec::new();
     }
@@ -2824,8 +2846,10 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
             bold_ranges: Vec::new(),
         })
         .collect();
-    let blocks =
-        crate::ocr::group_live_lines_into_blocks_in_quadrant(text_lines, canonical_quadrant);
+    let blocks = translator_core::ocr::group_live_lines_into_blocks_in_quadrant(
+        text_lines,
+        canonical_quadrant,
+    );
     blocks
         .into_iter()
         .map(|b| {
@@ -2845,7 +2869,7 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
 /// from any legacy `next_entry_id`-derived ids.
 pub fn stable_block_id(
     anchor_id: AnchorId,
-    sorted_line_ids: &[crate::surface_map::SurfaceLineId],
+    sorted_line_ids: &[translator_tracker::surface_map::SurfaceLineId],
 ) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in anchor_id.to_le_bytes() {

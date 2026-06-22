@@ -25,8 +25,6 @@
 //! frames don't trigger an acquire and the per-frame caller doesn't
 //! need to allocate / marshal a big struct.
 
-#![cfg(feature = "planar-tracker")]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,20 +32,20 @@ use std::sync::{Arc, Mutex};
 use crate::live_worker::SlotWorker;
 use std::time::{Duration, Instant};
 
-use crate::LanguageCode;
-use crate::api::TranslatorError;
-use crate::coarse_tracker::{CoarseTracker, Correction, Lifecycle};
-use crate::color_matting::MattedStrip;
-use crate::coords::Quadrant;
-use crate::font_provider::FontProvider;
-use crate::homography;
-use crate::live_frame::LiveFrame;
 use crate::live_session::{
     LiveOcrHost, LiveSession, PostDetectInput, PostDetectOutcome, h_view_to_surface_from,
     project_oriented_rect, viewport_surface_aabb,
 };
-use crate::ocr::{DetectedTextBox, OrientedRect, Rect};
-use crate::planar_engine::{EngineConfig, LivePlanarEngine};
+use translator_core::api::LanguageCode;
+use translator_core::api::TranslatorError;
+use translator_core::coords::Quadrant;
+use translator_core::homography;
+use translator_core::ocr::{DetectedTextBox, OrientedRect, Rect};
+use translator_raster::color_matting::MattedStrip;
+use translator_raster::live_frame::LiveFrame;
+use translator_render::font_provider::FontProvider;
+use translator_tracker::coarse_tracker::{CoarseTracker, Correction, Lifecycle};
+use translator_tracker::planar_engine::{EngineConfig, LivePlanarEngine};
 
 /// Tracker state surfaced to the caller. Mirrors the engine command
 /// shape but flattened for FFI.
@@ -273,7 +271,7 @@ struct TrackerRequest {
 /// (det-coord refinement_h + root-coord seeds + lifecycle) plus its sub-step
 /// timings. The pipeline scales `refinement_h` by `det_to_full` before applying.
 type TrackerComputeResult =
-    Result<(Correction, crate::planar_engine::StepTimings), TranslatorError>;
+    Result<(Correction, translator_tracker::planar_engine::StepTimings), TranslatorError>;
 
 /// Long-lived worker thread that runs `engine.relocalize` asynchronously
 /// (async-H step 3). The present thread no longer blocks on it: it
@@ -556,11 +554,11 @@ pub struct LiveTrackerPipeline {
     /// the anchor's detections), consumed by `run_post_detect` to re-fit each
     /// line's grouping box. Lives alongside `matted_strips` because both are
     /// produced from the same per-frame ink mattes.
-    line_metrics: Mutex<HashMap<u64, Vec<Option<crate::text_metrics::LineMetrics>>>>,
+    line_metrics: Mutex<HashMap<u64, Vec<Option<translator_raster::text_metrics::LineMetrics>>>>,
     /// Per-anchor per-box ink bold column profiles, indexed parallel to the anchor's
     /// detections. Pooled per word against CTC firings in `run_post_detect`. `None` per box
     /// when the model has no bold channel; populated alongside `line_metrics`.
-    bold_profiles: Mutex<HashMap<u64, Vec<Option<crate::text_metrics::BoldProfile>>>>,
+    bold_profiles: Mutex<HashMap<u64, Vec<Option<translator_raster::text_metrics::BoldProfile>>>>,
     generation: AtomicU64,
     config: Mutex<PipelineConfig>,
     host: Arc<dyn LiveOcrHost>,
@@ -834,9 +832,15 @@ impl LiveTrackerPipeline {
             }
             Some(Err(e)) => {
                 log::warn!("engine relocalize failed: {e:?}");
-                (None, crate::planar_engine::StepTimings::default())
+                (
+                    None,
+                    translator_tracker::planar_engine::StepTimings::default(),
+                )
             }
-            None => (None, crate::planar_engine::StepTimings::default()),
+            None => (
+                None,
+                translator_tracker::planar_engine::StepTimings::default(),
+            ),
         };
 
         // Track on the post-apply state. KLT picks up whatever seeds the
@@ -1539,10 +1543,11 @@ impl LiveTrackerPipeline {
             // Bold column profile per box from the model's ch1, parallel to `detected`;
             // pooled per word against CTC firings at rec time. `None` per box when the model
             // has no bold channel.
-            let bold_profiles: Vec<Option<crate::text_metrics::BoldProfile>> = ink_strips
-                .iter()
-                .map(|s| s.as_ref().and_then(|s| s.bold_profile()))
-                .collect();
+            let bold_profiles: Vec<Option<translator_raster::text_metrics::BoldProfile>> =
+                ink_strips
+                    .iter()
+                    .map(|s| s.as_ref().and_then(|s| s.bold_profile()))
+                    .collect();
             let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
                 .iter()
                 .map(|s| s.as_ref().map(|s| s.matte.clone()))
@@ -1554,12 +1559,12 @@ impl LiveTrackerPipeline {
             // Text-metrics off the same mattes. Measured against the *canonical*
             // box dims (not the rec-scaled `scaled`), so the recovered x-height /
             // width / offsets come out in canonical coords like `detected`.
-            let metrics: Vec<Option<crate::text_metrics::LineMetrics>> = detected
+            let metrics: Vec<Option<translator_raster::text_metrics::LineMetrics>> = detected
                 .iter()
                 .enumerate()
                 .map(|(i, d)| {
                     let mask = ink_masks.get(i)?.as_ref()?;
-                    crate::text_metrics::measure_line(
+                    translator_raster::text_metrics::measure_line(
                         mask,
                         d.oriented_box.width,
                         d.oriented_box.height,
@@ -1572,7 +1577,7 @@ impl LiveTrackerPipeline {
             if let Ok(mut store) = self.bold_profiles.lock() {
                 store.insert(anchor_id, bold_profiles);
             }
-            let strips = crate::color_matting::mat_detections(
+            let strips = translator_raster::color_matting::mat_detections(
                 &rgb.to_rgba8(),
                 &scaled,
                 &ink_masks,
@@ -1620,12 +1625,12 @@ impl LiveTrackerPipeline {
             Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
             Err(_) => Vec::new(),
         };
-        let line_metrics: Vec<Option<crate::text_metrics::LineMetrics>> =
+        let line_metrics: Vec<Option<translator_raster::text_metrics::LineMetrics>> =
             match self.line_metrics.lock() {
                 Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
                 Err(_) => Vec::new(),
             };
-        let bold_profiles: Vec<Option<crate::text_metrics::BoldProfile>> =
+        let bold_profiles: Vec<Option<translator_raster::text_metrics::BoldProfile>> =
             match self.bold_profiles.lock() {
                 Ok(g) => g.get(&anchor_id).cloned().unwrap_or_default(),
                 Err(_) => Vec::new(),
@@ -1751,7 +1756,7 @@ impl LiveTrackerPipeline {
                             .rgb_det
                             .as_ref()
                             .expect("detect path requires build_with_rgb"),
-                        crate::ppocr::PpocrProfile::Live,
+                        translator_ocr::ppocr::PpocrProfile::Live,
                     )
                     .map_err(|e| format!("{e:?}"))
             }) {
@@ -1889,7 +1894,7 @@ impl LiveTrackerPipeline {
 
 fn poisoned() -> TranslatorError {
     TranslatorError::new(
-        crate::api::TranslatorErrorKind::Internal,
+        translator_core::api::TranslatorErrorKind::Internal,
         "live pipeline mutex poisoned",
     )
 }
@@ -1986,7 +1991,7 @@ pub(crate) fn acquire_detect(
                         .rgb_det
                         .as_ref()
                         .expect("detect path requires build_with_rgb"),
-                    crate::ppocr::PpocrProfile::Live,
+                    translator_ocr::ppocr::PpocrProfile::Live,
                 )
                 .map_err(|e| format!("{e:?}"))
         })
@@ -2047,8 +2052,8 @@ pub(crate) fn acquire_rec_translate(
     anchor_id: u64,
     canonical_quadrant: Option<Quadrant>,
     matted_strips: &[Option<MattedStrip>],
-    line_metrics: &[Option<crate::text_metrics::LineMetrics>],
-    bold_profiles: &[Option<crate::text_metrics::BoldProfile>],
+    line_metrics: &[Option<translator_raster::text_metrics::LineMetrics>],
+    bold_profiles: &[Option<translator_raster::text_metrics::BoldProfile>],
     cancel: &dyn Fn() -> bool,
 ) -> Result<PostDetectOutcome, &'static str> {
     let available_codes: Vec<LanguageCode> = host.available_language_codes();
@@ -2136,10 +2141,10 @@ fn scale_detected_box(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font_provider::{FontHandle, FontProvider, FontRequest};
-    use crate::live_frame::LiveFrame;
-    use crate::ocr::Rect;
     use std::time::Duration;
+    use translator_core::ocr::Rect;
+    use translator_raster::live_frame::LiveFrame;
+    use translator_render::font_provider::{FontHandle, FontProvider, FontRequest};
 
     struct NoFonts;
     impl FontProvider for NoFonts {
@@ -2156,11 +2161,11 @@ mod tests {
     impl crate::live_session::LiveRecognizer for MockHost {
         fn recognize(
             &self,
-            _oriented: &crate::live_frame::OrientedImage,
+            _oriented: &translator_raster::live_frame::OrientedImage,
             _boxes: &[DetectedTextBox],
-            _source_selection: &crate::ocr::OcrSourceSelection,
+            _source_selection: &translator_core::ocr::OcrSourceSelection,
             _canonical_quadrant: Option<Quadrant>,
-        ) -> Result<Vec<crate::ocr::RecognizedTextLine>, String> {
+        ) -> Result<Vec<translator_core::ocr::RecognizedTextLine>, String> {
             Ok(Vec::new())
         }
     }
@@ -2171,19 +2176,20 @@ mod tests {
             _forced_source_code: Option<&str>,
             _target_code: &str,
             _available_language_codes: &[LanguageCode],
-        ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
+        ) -> Result<Vec<translator_translate::translate::TranslationWithAlignment>, String>
+        {
             Ok(Vec::new())
         }
     }
     impl crate::live_session::LiveOcrHost for MockHost {
-        fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String> {
+        fn ppocr_engine(&self) -> Result<Arc<translator_ocr::ppocr::PpocrEngine>, String> {
             Err("mock host has no engine".into())
         }
         fn orient_script(
             &self,
             _from_lang: &str,
             _is_auto_source: bool,
-        ) -> Option<crate::PpocrScript> {
+        ) -> Option<translator_core::catalog::PpocrScript> {
             None
         }
         fn available_language_codes(&self) -> Vec<LanguageCode> {
