@@ -87,7 +87,7 @@ pdf-image-translate = [
 ]
 doc-align = ["dep:translator-align", "dep:ndarray"]
 raster = ["dep:translator-raster", "dep:image"]
-ppocr = ["dep:mnn-sys", "dep:image", "dep:imageproc", "dep:ndarray", "dep:rayon", "raster"]
+ppocr = ["dep:translator-ocr", "raster"]
 planar-tracker = ["dep:image", "dep:imageproc", "image-render", "dep:rayon", "raster"]
 gpu = ["dep:glow", "planar-tracker"]
 surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
@@ -98,6 +98,7 @@ translator-core = { path = "crates/translator-core" }
 translator-translate = { path = "crates/translator-translate" }
 translator-render = { path = "crates/translator-render", optional = true }
 translator-raster = { path = "crates/translator-raster", optional = true }
+translator-ocr = { path = "crates/translator-ocr", optional = true }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -106,8 +107,6 @@ uniffi = { version = "0.29", optional = true, default-features = false }
 translator-dictionary = { path = "crates/translator-dictionary", optional = true }
 translator-mucab = { path = "crates/translator-mucab", optional = true }
 piper-rs = { git = "https://github.com/DavidVentura/piper-rs", optional = true, features = ["japanese", "fst-normalization", "mnn"] }
-# mnn-sys = { path = "../mnn-sys", optional = true }
-mnn-sys = { git = "https://github.com/DavidVentura/mnn-sys", optional = true }
 icu_experimental = { version = "0.4", features = ["compiled_data"], optional = true }
 icu_locale_core = { version = "2.2", optional = true }
 lopdf = { version = "0.40", optional = true, default-features = false }

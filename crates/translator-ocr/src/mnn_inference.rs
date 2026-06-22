@@ -2,7 +2,7 @@ use std::path::Path;
 
 use mnn_sys::{InferenceConfig, InferenceEngine, MemoryMode, PrecisionMode};
 
-use crate::api::{TranslatorError, TranslatorErrorKind};
+use translator_core::api::{TranslatorError, TranslatorErrorKind};
 
 pub(crate) struct MnnSession {
     engine: InferenceEngine,

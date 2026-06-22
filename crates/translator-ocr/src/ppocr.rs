@@ -11,9 +11,9 @@ use imageproc::point::Point;
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
-use crate::api::{TranslatorError, TranslatorErrorKind};
-use crate::catalog::PpocrScript;
 use crate::mnn_inference::MnnSession;
+use translator_core::api::{TranslatorError, TranslatorErrorKind};
+use translator_core::catalog::PpocrScript;
 
 const REC_TARGET_HEIGHT: u32 = 48;
 const REC_WIDTH_BUCKET: usize = 32;
@@ -279,8 +279,9 @@ impl InkStrip {
     /// (legacy matte-only model) or too little ink to be reliable.
     pub fn pooled_bold(&self) -> Option<f32> {
         let bold = self.bold.as_ref()?;
-        let core =
-            crate::text_metrics::stroke_core_cut(self.matte.iter().copied().max().unwrap_or(0));
+        let core = translator_raster::text_metrics::stroke_core_cut(
+            self.matte.iter().copied().max().unwrap_or(0),
+        );
         let (mut sum, mut n) = (0u64, 0u64);
         for (m, b) in self.matte.iter().zip(bold.iter()) {
             if *m >= core {
@@ -288,14 +289,15 @@ impl InkStrip {
                 n += 1;
             }
         }
-        (n >= crate::text_metrics::INK_BOLD_MIN_PX).then(|| sum as f32 / n as f32 / 255.0)
+        (n >= translator_raster::text_metrics::INK_BOLD_MIN_PX)
+            .then(|| sum as f32 / n as f32 / 255.0)
     }
 
     /// Reduce the strip's bold + matte channels to a per-reading-axis-column
-    /// [`crate::text_metrics::BoldProfile`]. `None` when there is no bold channel (legacy
+    /// [`translator_raster::text_metrics::BoldProfile`]. `None` when there is no bold channel (legacy
     /// matte-only model).
-    pub fn bold_profile(&self) -> Option<crate::text_metrics::BoldProfile> {
-        crate::text_metrics::BoldProfile::from_strip(self.bold.as_ref()?, &self.matte)
+    pub fn bold_profile(&self) -> Option<translator_raster::text_metrics::BoldProfile> {
+        translator_raster::text_metrics::BoldProfile::from_strip(self.bold.as_ref()?, &self.matte)
     }
 }
 
@@ -410,8 +412,8 @@ impl PpocrEngine {
     pub fn ink_masks(
         &self,
         image: &DynamicImage,
-        boxes: &[crate::ocr::DetectedTextBox],
-        canonical_quadrant: Option<crate::coords::Quadrant>,
+        boxes: &[translator_core::ocr::DetectedTextBox],
+        canonical_quadrant: Option<translator_core::coords::Quadrant>,
     ) -> Vec<Option<GrayImage>> {
         self.ink_strips(image, boxes, canonical_quadrant)
             .into_iter()
@@ -424,8 +426,8 @@ impl PpocrEngine {
     pub fn ink_strips(
         &self,
         image: &DynamicImage,
-        boxes: &[crate::ocr::DetectedTextBox],
-        canonical_quadrant: Option<crate::coords::Quadrant>,
+        boxes: &[translator_core::ocr::DetectedTextBox],
+        canonical_quadrant: Option<translator_core::coords::Quadrant>,
     ) -> Vec<Option<InkStrip>> {
         let Some(ink) = &self.ink else {
             return boxes.iter().map(|_| None).collect();
@@ -647,7 +649,7 @@ impl PpocrEngine {
         &self,
         image: &DynamicImage,
         profile: PpocrProfile,
-    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+    ) -> Result<Vec<translator_core::ocr::DetectedTextBox>, TranslatorError> {
         self.detect_only_image_with_thresholds(image, profile.thresholds())
     }
 
@@ -655,7 +657,7 @@ impl PpocrEngine {
         &self,
         image: &DynamicImage,
         thresholds: PpocrThresholds,
-    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+    ) -> Result<Vec<translator_core::ocr::DetectedTextBox>, TranslatorError> {
         let width = image.width();
         let height = image.height();
         let boxes = self.detector.detect_with_thresholds(image, thresholds)?;
@@ -669,7 +671,7 @@ impl PpocrEngine {
         // smoothly across the frame, so a short continuation line inherits its neighborhood's
         // lean rather than a global average dominated by far-away lines.
         struct Detected {
-            aabb: crate::ocr::Rect,
+            aabb: translator_core::ocr::Rect,
             contour: Option<Vec<(f32, f32)>>,
             score: f32,
             tilt: TiltEstimate,
@@ -680,7 +682,7 @@ impl PpocrEngine {
             .into_iter()
             .map(|tb| {
                 let expanded = expand_box(&tb.rect, DET_BOX_BORDER, width, height);
-                let aabb = crate::ocr::Rect {
+                let aabb = translator_core::ocr::Rect {
                     left: expanded.left,
                     top: expanded.top,
                     right: expanded.right,
@@ -713,7 +715,7 @@ impl PpocrEngine {
             .collect();
         let field = fit_tilt_field(&votes);
 
-        let out: Vec<crate::ocr::DetectedTextBox> = detected
+        let out: Vec<translator_core::ocr::DetectedTextBox> = detected
             .into_iter()
             .map(|d| {
                 let consensus = field.as_ref().map(|f| {
@@ -730,7 +732,7 @@ impl PpocrEngine {
                 let (oriented, tight) = match contour_boxes {
                     Some(ContourBoxes { tight, inflated }) => (inflated, tight),
                     None => {
-                        let aligned = crate::ocr::OrientedRect::axis_aligned(d.aabb);
+                        let aligned = translator_core::ocr::OrientedRect::axis_aligned(d.aabb);
                         (aligned, aligned)
                     }
                 };
@@ -746,7 +748,7 @@ impl PpocrEngine {
                         v
                     })
                     .unwrap_or_default();
-                crate::ocr::DetectedTextBox {
+                translator_core::ocr::DetectedTextBox {
                     rect: d.aabb,
                     oriented_box: oriented,
                     tight_box: tight,
@@ -770,8 +772,8 @@ impl PpocrEngine {
     pub fn classify_text_boxes_image(
         &self,
         image: &DynamicImage,
-        boxes: &[crate::ocr::DetectedTextBox],
-        canonical_quadrant: Option<crate::coords::Quadrant>,
+        boxes: &[translator_core::ocr::DetectedTextBox],
+        canonical_quadrant: Option<translator_core::coords::Quadrant>,
     ) -> Result<Vec<Option<PpocrScriptPrediction>>, TranslatorError> {
         let Some(classifier) = &self.classifier else {
             return Err(TranslatorError::new(
@@ -870,11 +872,11 @@ impl PpocrEngine {
     pub fn recognize_text_in_boxes_image(
         &self,
         image: &DynamicImage,
-        boxes: &[crate::ocr::DetectedTextBox],
+        boxes: &[translator_core::ocr::DetectedTextBox],
         scripts: &[PpocrScript],
         profile: PpocrProfile,
-        canonical_quadrant: Option<crate::coords::Quadrant>,
-    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, TranslatorError> {
+        canonical_quadrant: Option<translator_core::coords::Quadrant>,
+    ) -> Result<Vec<translator_core::ocr::RecognizedTextLine>, TranslatorError> {
         if boxes.is_empty() {
             return Ok(Vec::new());
         }
@@ -1052,12 +1054,13 @@ impl PpocrEngine {
             // for a single contributing chunk (multi-chunk fractions are chunk-local) on a
             // non-RTL line (RTL reverses visual→logical, breaking the firing order). Edge
             // whitespace trimmed from `text` is fine: it never forms a word unit.
-            let firings: Vec<crate::ocr::CharFiring> = if text.is_empty() || scripts[idx].is_rtl() {
-                Vec::new()
-            } else {
-                stitch_chunk_firings(&contrib_chunks, &rec_chunks, &results)
-            };
-            lines.push(crate::ocr::RecognizedTextLine {
+            let firings: Vec<translator_core::ocr::CharFiring> =
+                if text.is_empty() || scripts[idx].is_rtl() {
+                    Vec::new()
+                } else {
+                    stitch_chunk_firings(&contrib_chunks, &rec_chunks, &results)
+                };
+            lines.push(translator_core::ocr::RecognizedTextLine {
                 rect: boxes[idx].rect,
                 oriented_box: boxes[idx].oriented_box,
                 text,
@@ -1110,7 +1113,7 @@ fn log_text_preview(text: &str) -> String {
 fn normalize_rec_text_for_script(script: PpocrScript, text: String) -> String {
     match script {
         PpocrScript::Cyrillic | PpocrScript::Eslav => {
-            crate::script_normalize::repair_cyrillic_word_mixing(&text)
+            translator_core::script_normalize::repair_cyrillic_word_mixing(&text)
         }
         _ => text,
     }
@@ -1168,7 +1171,7 @@ mod rtl_reverse_tests {
 }
 
 fn pulc_strip_eligible(
-    box_: &crate::ocr::DetectedTextBox,
+    box_: &translator_core::ocr::DetectedTextBox,
     crop: &DynamicImage,
     image_area: f32,
 ) -> bool {
@@ -1201,8 +1204,8 @@ fn crop_dynamic(image: &DynamicImage, rect: &PpocrRect) -> DynamicImage {
 /// strip's reading direction.
 pub(crate) fn crop_text_strips(
     image: &DynamicImage,
-    boxes: &[crate::ocr::DetectedTextBox],
-    canonical_quadrant: Option<crate::coords::Quadrant>,
+    boxes: &[translator_core::ocr::DetectedTextBox],
+    canonical_quadrant: Option<translator_core::coords::Quadrant>,
     thickness_pad: f32,
 ) -> (Vec<DynamicImage>, usize) {
     let mut dewarp_count = 0usize;
@@ -1253,8 +1256,8 @@ pub(crate) fn crop_text_strips(
     (crops, dewarp_count)
 }
 
-fn rotate_strip_ccw(image: DynamicImage, by: crate::coords::Quadrant) -> DynamicImage {
-    use crate::coords::Quadrant;
+fn rotate_strip_ccw(image: DynamicImage, by: translator_core::coords::Quadrant) -> DynamicImage {
+    use translator_core::coords::Quadrant;
     match by {
         Quadrant::R0 => image,
         // image crate's rotate90/180/270 are clockwise. CCW 90° == CW 270°.
@@ -2140,8 +2143,8 @@ fn stitch_chunk_firings(
     contrib_chunks: &[usize],
     rec_chunks: &[RecChunk],
     results: &[Option<RecResult>],
-) -> Vec<crate::ocr::CharFiring> {
-    let mut out: Vec<crate::ocr::CharFiring> = Vec::new();
+) -> Vec<translator_core::ocr::CharFiring> {
+    let mut out: Vec<translator_core::ocr::CharFiring> = Vec::new();
     for &ci in contrib_chunks {
         let chunk = &rec_chunks[ci];
         let r = results[ci]
@@ -2153,14 +2156,14 @@ fn stitch_chunk_firings(
             continue;
         };
         if !out.is_empty() && chunk.join_before == " " {
-            out.push(crate::ocr::CharFiring {
+            out.push(translator_core::ocr::CharFiring {
                 ch: ' ' as u32,
                 at: chunk.frac0,
             });
         }
         let span = chunk.frac1 - chunk.frac0;
         for c in &r.chars[first..=last] {
-            out.push(crate::ocr::CharFiring {
+            out.push(translator_core::ocr::CharFiring {
                 ch: c.ch as u32,
                 at: chunk.frac0 + c.at.0 * span,
             });
@@ -2368,7 +2371,7 @@ fn decode_ctc(
     }
 }
 
-use crate::text_metrics::WORD_GAP_FACTOR;
+use translator_raster::text_metrics::WORD_GAP_FACTOR;
 
 /// Median strip-advance between consecutive decoded characters. Robust to the few large
 /// inter-word gaps, which are high outliers the median ignores. Returns 1.0 for fewer than
@@ -2485,10 +2488,10 @@ struct ContourBoxes {
     /// kernel — no ascender/descender padding, no unclip inflation. Used for layout heuristics
     /// (paragraph grouping, line-height clustering) where character whitespace would skew the
     /// metric.
-    tight: crate::ocr::OrientedRect,
+    tight: translator_core::ocr::OrientedRect,
     /// `tight` inflated by `unclip + DET_BOX_BORDER`, matching the AABB pipeline. Used for
     /// erase/render so the box covers actual ink including ascenders/descenders.
-    inflated: crate::ocr::OrientedRect,
+    inflated: translator_core::ocr::OrientedRect,
 }
 
 /// Number of x-bins used to extract the top and bottom edge profile from a contour. 16 is
@@ -2949,7 +2952,7 @@ fn build_oriented_boxes(
     // it by ~(stride - 1) px total (pooling pulls the threshold crossing
     // inward), which downstream consumers — live block merging, render
     // geometry — read as genuinely thinner lines. Restore the deficit.
-    let tight = crate::ocr::OrientedRect {
+    let tight = translator_core::ocr::OrientedRect {
         cx,
         cy,
         width: final_width + pool_comp_px,
@@ -2965,7 +2968,7 @@ fn build_oriented_boxes(
     let thickness = final_width.min(final_height);
     let expand_dist = (DET_UNCLIP_RATIO * thickness / 2.0).max(1.0);
     let pad = expand_dist + DET_BOX_BORDER as f32 + pool_comp_px;
-    let inflated = crate::ocr::OrientedRect {
+    let inflated = translator_core::ocr::OrientedRect {
         cx,
         cy,
         width: final_width + 2.0 * pad,
@@ -3098,7 +3101,7 @@ struct ContourStripWarp {
 /// share identical geometry and differ only in how they sample source pixels.
 fn contour_strip_warp(
     contour: &[(f32, f32)],
-    canonical_quadrant: Option<crate::coords::Quadrant>,
+    canonical_quadrant: Option<translator_core::coords::Quadrant>,
     thickness_pad: f32,
 ) -> Option<ContourStripWarp> {
     if contour.len() < 8 {
@@ -3257,7 +3260,7 @@ fn strip_source_coord(w: &ContourStripWarp, sx: u32, sy: u32) -> (f32, f32) {
 pub fn dewarp_contour_to_strip(
     gray: &GrayImage,
     contour: &[(f32, f32)],
-    canonical_quadrant: Option<crate::coords::Quadrant>,
+    canonical_quadrant: Option<translator_core::coords::Quadrant>,
     thickness_pad: f32,
 ) -> Option<GrayImage> {
     let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;
@@ -3285,7 +3288,7 @@ pub fn dewarp_contour_to_strip(
 /// in `color_matting`, so a mask produced here registers 1:1 against that strip.
 pub fn dewarp_oriented_to_strip_rgb(
     rgb: &RgbImage,
-    oriented: &crate::ocr::OrientedRect,
+    oriented: &translator_core::ocr::OrientedRect,
     out_w: u32,
     out_h: u32,
 ) -> RgbImage {
@@ -3311,7 +3314,7 @@ pub fn dewarp_oriented_to_strip_rgb(
 pub fn dewarp_contour_to_strip_rgb(
     rgb: &RgbImage,
     contour: &[(f32, f32)],
-    canonical_quadrant: Option<crate::coords::Quadrant>,
+    canonical_quadrant: Option<translator_core::coords::Quadrant>,
     thickness_pad: f32,
 ) -> Option<RgbImage> {
     let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;
@@ -3331,7 +3334,7 @@ pub fn dewarp_contour_to_strip_rgb(
 pub fn dewarp_contour_to_strip_rgb_with_map(
     rgb: &RgbImage,
     contour: &[(f32, f32)],
-    canonical_quadrant: Option<crate::coords::Quadrant>,
+    canonical_quadrant: Option<translator_core::coords::Quadrant>,
     thickness_pad: f32,
 ) -> Option<(RgbImage, Vec<(f32, f32)>)> {
     let warp = contour_strip_warp(contour, canonical_quadrant, thickness_pad)?;

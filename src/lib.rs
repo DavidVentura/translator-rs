@@ -45,13 +45,11 @@ pub mod live_session;
 pub mod live_tracker_pipeline;
 #[cfg(feature = "planar-tracker")]
 pub mod live_worker;
-#[cfg(feature = "ppocr")]
-mod mnn_inference;
 pub use translator_core::ocr;
 #[cfg(feature = "mucab")]
 pub use translator_mucab::mucab;
 #[cfg(feature = "ppocr")]
-mod ocr_runtime;
+pub use translator_ocr::ocr_runtime;
 #[cfg(feature = "odt")]
 pub mod odt;
 #[cfg(feature = "pdf")]
@@ -81,7 +79,7 @@ pub mod planar_engine;
 #[cfg(feature = "planar-tracker")]
 pub mod planar_tracker;
 #[cfg(feature = "ppocr")]
-pub mod ppocr;
+pub use translator_ocr::ppocr;
 pub use translator_translate::routing;
 pub mod screen_monitor;
 #[cfg(feature = "gpu")]

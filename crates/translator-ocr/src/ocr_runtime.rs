@@ -1,20 +1,22 @@
 use std::sync::Mutex;
 
-use crate::api::{LanguageCode, TranslatorError};
-use crate::bergamot::BergamotEngine;
-use crate::catalog::CatalogSnapshot;
-use crate::catalog::{OcrPack, PackKind, PpocrScript};
-use crate::language_detect::detect_language_robust_code;
-use crate::live_frame::OrientedImage;
-use crate::ocr::{DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine};
-use crate::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock};
-use crate::overlay::prepare_overlay_image;
 use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
-use crate::settings::BackgroundMode;
-use crate::text_metrics::{LineMetrics, measure_line};
-use crate::translate::Translator;
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::catalog::CatalogSnapshot;
+use translator_core::catalog::{OcrPack, PackKind, PpocrScript};
+use translator_core::ocr::{
+    DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine,
+};
+use translator_core::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock};
+use translator_core::settings::BackgroundMode;
+use translator_raster::live_frame::OrientedImage;
+use translator_raster::overlay::prepare_overlay_image;
+use translator_raster::text_metrics::{LineMetrics, measure_line};
+use translator_translate::bergamot::BergamotEngine;
+use translator_translate::language_detect::detect_language_robust_code;
+use translator_translate::translate::Translator;
 
-pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
+pub fn translate_image_rgba_ppocr_in_snapshot(
     engine: &Mutex<BergamotEngine>,
     ppocr: &PpocrEngine,
     snapshot: &CatalogSnapshot,
@@ -64,7 +66,11 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let scripts = match source_selection {
         OcrSourceSelection::Auto => {
             let predictions = ppocr
-                .classify_text_boxes_image(rgb, &det_boxes, Some(crate::coords::Quadrant::R0))
+                .classify_text_boxes_image(
+                    rgb,
+                    &det_boxes,
+                    Some(translator_core::coords::Quadrant::R0),
+                )
                 .map_err(|e| {
                     TranslatorError::ocr(format!("ppocr script classification failed: {e}"))
                 })?;
@@ -83,11 +89,12 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     let reading_order = reading_order.unwrap_or_else(|| {
         let cj_boxes = scripts.iter().filter(|s| **s == PpocrScript::Cj).count();
         let cjk_dominant = cj_boxes * 2 >= scripts.len() && !scripts.is_empty();
-        let resolved = if cjk_dominant && crate::ocr::detected_lines_read_vertically(&det_boxes) {
-            ReadingOrder::TopToBottomRightToLeft
-        } else {
-            ReadingOrder::LeftToRight
-        };
+        let resolved =
+            if cjk_dominant && translator_core::ocr::detected_lines_read_vertically(&det_boxes) {
+                ReadingOrder::TopToBottomRightToLeft
+            } else {
+                ReadingOrder::LeftToRight
+            };
         log::info!(
             "ppocr auto reading order: {} cj boxes of {} → {:?}",
             cj_boxes,
@@ -103,7 +110,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
             &det_boxes,
             &scripts,
             PpocrProfile::Still,
-            Some(crate::coords::Quadrant::R0),
+            Some(translator_core::coords::Quadrant::R0),
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
@@ -114,7 +121,11 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         let rgba = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
             .expect("rgba image from caller-owned bytes");
         let dynimg = image::DynamicImage::ImageRgba8(rgba);
-        let strips = ppocr.ink_strips(&dynimg, &det_boxes, Some(crate::coords::Quadrant::R0));
+        let strips = ppocr.ink_strips(
+            &dynimg,
+            &det_boxes,
+            Some(translator_core::coords::Quadrant::R0),
+        );
         (strips, Some(dynimg.into_rgba8()))
     } else {
         (Vec::new(), None)
@@ -134,7 +145,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         .map(|s| {
             s.as_ref()
                 .and_then(|s| s.pooled_bold())
-                .map(|p| p >= crate::text_metrics::MODEL_BOLD_THRESHOLD)
+                .map(|p| p >= translator_raster::text_metrics::MODEL_BOLD_THRESHOLD)
         })
         .collect();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
@@ -150,7 +161,9 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
                 ink_masks.get(i).and_then(|m| m.as_ref()),
                 ink_src_maps.get(i).and_then(|s| s.as_ref()),
             ) {
-                (Some(matte), Some(src)) => crate::text_metrics::baseline_angle_source(matte, src),
+                (Some(matte), Some(src)) => {
+                    translator_raster::text_metrics::baseline_angle_source(matte, src)
+                }
                 _ => None,
             }
         })
@@ -159,7 +172,7 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     // Per-word bold from the ink bold channel + the line's CTC firings. Falls back to a
     // whole-line range when the model pooled bold but firings weren't usable (RTL,
     // multi-chunk), and to nothing when neither fired.
-    let line_bold_ranges: Vec<Vec<crate::ocr::BoldRange>> = lines
+    let line_bold_ranges: Vec<Vec<translator_core::ocr::BoldRange>> = lines
         .iter()
         .enumerate()
         .map(|(i, line)| {
@@ -170,23 +183,23 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
                 .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
                 .collect();
             let word_ranges = match strip.and_then(|s| s.bold_profile()) {
-                Some(profile) => crate::text_metrics::word_bold_ranges(
+                Some(profile) => translator_raster::text_metrics::word_bold_ranges(
                     &line.text,
                     &firings,
                     scripts[i] == PpocrScript::Cj,
                     &profile,
-                    crate::text_metrics::MODEL_BOLD_THRESHOLD,
+                    translator_raster::text_metrics::MODEL_BOLD_THRESHOLD,
                 ),
                 None => Vec::new(),
             };
             if !word_ranges.is_empty() {
                 word_ranges
                     .into_iter()
-                    .map(|(start, end)| crate::ocr::BoldRange { start, end })
+                    .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
                     .collect()
             } else if model_bold.get(i).copied().flatten().unwrap_or(false) && !line.text.is_empty()
             {
-                vec![crate::ocr::BoldRange {
+                vec![translator_core::ocr::BoldRange {
                     start: 0,
                     end: line.text.len() as u32,
                 }]
@@ -233,7 +246,12 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
     // flat-filling each line's rect. `None` when no ink model is installed →
     // flat-fill fallback.
     let ink_union = ink_rgba.as_ref().map(|rgba| {
-        crate::color_matting::union_ink_mask(rgba, &det_boxes, &ink_masks, &ink_src_maps)
+        translator_raster::color_matting::union_ink_mask(
+            rgba,
+            &det_boxes,
+            &ink_masks,
+            &ink_src_maps,
+        )
     });
 
     let mut overlay = finalize_image_overlay(
@@ -249,18 +267,17 @@ pub(crate) fn translate_image_rgba_ppocr_in_snapshot(
         reading_order,
         ink_union.as_deref(),
     )?;
-    overlay.source_words = crate::ocr::order_words_visually(source_words);
+    overlay.source_words = translator_core::ocr::order_words_visually(source_words);
     Ok(overlay)
 }
 
 /// Flatten the recognized lines into per-word source boxes in image space, in recognition
 /// order. Each line's CTC firings drive the word split + positions (see
-/// [`crate::text_metrics::firing_word_boxes`]); CJK lines split per glyph.
-#[cfg(feature = "ppocr")]
+/// [`translator_raster::text_metrics::firing_word_boxes`]); CJK lines split per glyph.
 fn still_source_words(
-    lines: &[crate::ocr::RecognizedTextLine],
+    lines: &[translator_core::ocr::RecognizedTextLine],
     scripts: &[PpocrScript],
-) -> Vec<crate::ocr::PositionedWord> {
+) -> Vec<translator_core::ocr::PositionedWord> {
     lines
         .iter()
         .enumerate()
@@ -271,7 +288,7 @@ fn still_source_words(
                 .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
                 .collect();
             let is_cjk = scripts.get(i).copied() == Some(PpocrScript::Cj);
-            crate::text_metrics::firing_word_boxes(
+            translator_raster::text_metrics::firing_word_boxes(
                 &line.text,
                 &firings,
                 is_cjk,
@@ -285,8 +302,7 @@ fn still_source_words(
 /// Detect-only pass over a still image: builds the oriented image and runs the PPOCR detector,
 /// returning the text boxes in image-pixel space. The caller feeds these back into
 /// `translate_image_rgba_ppocr_in_snapshot` so recognition + translation skip a second detection.
-#[cfg(feature = "ppocr")]
-pub(crate) fn detect_image_boxes_ppocr(
+pub fn detect_image_boxes_ppocr(
     ppocr: &PpocrEngine,
     rgba_bytes: &[u8],
     width: u32,
@@ -312,13 +328,11 @@ pub(crate) fn detect_image_boxes_ppocr(
         .collect())
 }
 
-#[cfg(feature = "ppocr")]
 fn saturating_square(side: u32) -> u32 {
     let n = (side as u64).saturating_mul(side as u64);
     n.min(u32::MAX as u64) as u32
 }
 
-#[cfg(feature = "ppocr")]
 fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) -> DetectedTextBox {
     let left = ((b.rect.left as f32) * scale).max(0.0) as u32;
     let top = ((b.rect.top as f32) * scale).max(0.0) as u32;
@@ -351,13 +365,11 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
 /// frame, the line is treated as co-aligned and snapped to the reading frame, so
 /// co-aligned lines share one angle instead of each carrying sub-visible jitter.
 /// ~2.3°; a line genuinely rotated more than this keeps its own measured angle.
-#[cfg(feature = "ppocr")]
 const SUBVISIBLE_TILT: f32 = 0.04;
 
 /// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent
 /// ink band); the caller then keeps the box's own tight height and angle.
-#[cfg(feature = "ppocr")]
 fn box_line_metrics(
     boxes: &[DetectedTextBox],
     masks: &[Option<image::GrayImage>],
@@ -380,13 +392,12 @@ fn box_line_metrics(
 /// centre snaps to the band centreline, and its angle is corrected by the recovered
 /// baseline tilt — so grouping keys size *and* spacing on the real ink, not the
 /// detection box. The render `oriented_box` gets the same tilt correction.
-#[cfg(feature = "ppocr")]
 fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
     line_angles: &[Option<f32>],
-    line_bold_ranges: &[Vec<crate::ocr::BoldRange>],
+    line_bold_ranges: &[Vec<translator_core::ocr::BoldRange>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -444,10 +455,13 @@ fn still_ppocr_lines_to_blocks(
         .collect();
     match reading_order {
         ReadingOrder::LeftToRight => {
-            crate::ocr::group_lines_into_paragraphs(text_lines, Default::default())
+            translator_core::ocr::group_lines_into_paragraphs(text_lines, Default::default())
         }
         ReadingOrder::TopToBottomRightToLeft => {
-            crate::ocr::group_vertical_lines_into_paragraphs(text_lines, Default::default())
+            translator_core::ocr::group_vertical_lines_into_paragraphs(
+                text_lines,
+                Default::default(),
+            )
         }
     }
 }
@@ -455,7 +469,6 @@ fn still_ppocr_lines_to_blocks(
 /// Map a PULC script class to the best installed PPOCR recognizer script. Tries the
 /// specialist first (Eslav for Cyrillic), then a general fallback. Returns `None`
 /// when nothing applicable is installed.
-#[cfg(feature = "ppocr")]
 fn ppocr_script_for_class(ppocr: &PpocrEngine, class: PpocrScriptClass) -> Option<PpocrScript> {
     let candidates: &[PpocrScript] = match class {
         PpocrScriptClass::Arabic => &[PpocrScript::Arabic],
@@ -475,8 +488,7 @@ fn ppocr_script_for_class(ppocr: &PpocrEngine, class: PpocrScriptClass) -> Optio
     candidates.iter().find(|s| installed.contains(s)).copied()
 }
 
-#[cfg(feature = "ppocr")]
-pub(crate) fn recognizer_script_for_language(
+pub fn recognizer_script_for_language(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Result<PpocrScript, TranslatorError> {
@@ -500,11 +512,8 @@ pub(crate) fn recognizer_script_for_language(
     }
 }
 
-#[cfg(feature = "ppocr")]
 const PPOCR_ROUTE_DOMINANT_MIN_RATIO: f32 = 0.55;
-#[cfg(feature = "ppocr")]
 const PPOCR_ROUTE_MINOR_KEEP_RATIO: f32 = 0.20;
-#[cfg(feature = "ppocr")]
 const PPOCR_ROUTE_SMOOTH_MIN_CLASSIFIED: usize = 8;
 
 /// Resolve per-strip PULC predictions into per-strip PPOCR recognizer scripts. Strips
@@ -512,8 +521,7 @@ const PPOCR_ROUTE_SMOOTH_MIN_CLASSIFIED: usize = 8;
 /// scripts below `PPOCR_ROUTE_MINOR_KEEP_RATIO` are folded into the dominant; Latin
 /// strips in an otherwise single non-Latin batch fold into that non-Latin script
 /// (PPOCR's non-Latin recognizers can handle Latin glyphs but not vice versa).
-#[cfg(feature = "ppocr")]
-pub(crate) fn route_ppocr_predictions(
+pub fn route_ppocr_predictions(
     ppocr: &PpocrEngine,
     predictions: &[Option<PpocrScriptPrediction>],
     boxes: &[DetectedTextBox],
@@ -602,7 +610,6 @@ pub(crate) fn route_ppocr_predictions(
         .collect())
 }
 
-#[cfg(feature = "ppocr")]
 fn dominant_script(scripts: &[PpocrScript]) -> Option<PpocrScript> {
     scripts
         .iter()
@@ -618,7 +625,6 @@ fn dominant_script(scripts: &[PpocrScript]) -> Option<PpocrScript> {
         .map(|(script, _)| script)
 }
 
-#[cfg(feature = "ppocr")]
 fn smooth_dominant_routes(routed: &mut [Option<PpocrScript>], classified: &[PpocrScript]) {
     if classified.len() < PPOCR_ROUTE_SMOOTH_MIN_CLASSIFIED {
         return;
@@ -668,7 +674,6 @@ fn smooth_dominant_routes(routed: &mut [Option<PpocrScript>], classified: &[Ppoc
 /// target (otherwise returns `None`). Used both still-mode (where the caller turns
 /// `None` into a `MissingAsset`) and live-mode (where the caller keeps `None` so the
 /// frame renders as untranslated text).
-#[cfg(feature = "ppocr")]
 fn ocr_source_from_text(
     snapshot: &CatalogSnapshot,
     text: &str,
@@ -688,8 +693,7 @@ fn ocr_source_from_text(
     Some(detected)
 }
 
-#[cfg(feature = "ppocr")]
-pub(crate) fn ocr_source_for_lines(
+pub fn ocr_source_for_lines(
     snapshot: &CatalogSnapshot,
     lines: &[RecognizedTextLine],
     target_code: Option<&LanguageCode>,
@@ -752,7 +756,7 @@ fn finalize_image_overlay(
     result
 }
 
-type BlockBold = Vec<crate::ocr::BoldRange>;
+type BlockBold = Vec<translator_core::ocr::BoldRange>;
 
 fn translate_block_texts(
     engine: &mut BergamotEngine,
@@ -788,7 +792,7 @@ fn translate_block_texts(
         .collect::<Vec<_>>();
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let on_progress = |_: usize, _: usize| {};
-    let ctx = crate::bergamot::TranslateCtx {
+    let ctx = translator_translate::bergamot::TranslateCtx {
         cancel: &cancel,
         on_progress: &on_progress,
     };
@@ -808,10 +812,13 @@ fn translate_block_texts(
                 let src_ranges: Vec<(u32, u32)> =
                     sources[bi].1.iter().map(|r| (r.start, r.end)).collect();
                 target_bold[bi] =
-                    crate::translate::remap_byte_ranges_through_alignment(&src_ranges, twa)
-                        .into_iter()
-                        .map(|(start, end)| crate::ocr::BoldRange { start, end })
-                        .collect();
+                    translator_translate::translate::remap_byte_ranges_through_alignment(
+                        &src_ranges,
+                        twa,
+                    )
+                    .into_iter()
+                    .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
+                    .collect();
                 translated_blocks[bi] = twa.translated_text.clone();
             }
         }
