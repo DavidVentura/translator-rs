@@ -2964,13 +2964,9 @@ name = "translator"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
- "cld2",
  "env_logger",
  "fax",
  "glow",
- "html5ever",
- "icu_experimental",
- "icu_locale_core",
  "image",
  "imageproc",
  "khronos-egl",
@@ -2980,7 +2976,6 @@ dependencies = [
  "markup5ever",
  "markup5ever_rcdom",
  "minifb",
- "mnn-sys",
  "mupdf",
  "ndarray 0.16.1",
  "piper-rs",
@@ -2989,14 +2984,20 @@ dependencies = [
  "rustybuzz",
  "serde",
  "serde_json",
- "slimt-sys",
  "subsetter",
  "toml 0.8.23",
  "translator-align",
  "translator-core",
  "translator-dictionary",
  "translator-mucab",
+ "translator-ocr",
+ "translator-pdf",
  "translator-raster",
+ "translator-render",
+ "translator-tracker",
+ "translator-translate",
+ "translator-transliterate",
+ "translator-tts",
  "ttf-parser",
  "unicode-bidi",
  "unicode-linebreak",
@@ -3043,12 +3044,103 @@ dependencies = [
 ]
 
 [[package]]
+name = "translator-ocr"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "imageproc",
+ "log",
+ "mnn-sys",
+ "rayon",
+ "translator-core",
+ "translator-raster",
+ "translator-translate",
+]
+
+[[package]]
+name = "translator-pdf"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "lopdf",
+ "mupdf",
+ "rustybuzz",
+ "subsetter",
+ "translator-core",
+ "translator-render",
+ "translator-translate",
+]
+
+[[package]]
 name = "translator-raster"
 version = "0.1.0"
 dependencies = [
  "image",
  "log",
  "translator-core",
+]
+
+[[package]]
+name = "translator-render"
+version = "0.1.0"
+dependencies = [
+ "rustybuzz",
+ "translator-core",
+ "ttf-parser",
+ "unicode-bidi",
+ "unicode-linebreak",
+ "unicode-script",
+ "zeno",
+]
+
+[[package]]
+name = "translator-tracker"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "rayon",
+ "translator-core",
+ "translator-render",
+ "uniffi",
+]
+
+[[package]]
+name = "translator-translate"
+version = "0.1.0"
+dependencies = [
+ "cld2",
+ "html5ever",
+ "log",
+ "markup5ever",
+ "markup5ever_rcdom",
+ "regex 1.12.3",
+ "serde",
+ "serde_json",
+ "slimt-sys",
+ "translator-core",
+ "uniffi",
+]
+
+[[package]]
+name = "translator-transliterate"
+version = "0.1.0"
+dependencies = [
+ "icu_experimental",
+ "icu_locale_core",
+ "translator-core",
+ "translator-mucab",
+ "unicode-script",
+]
+
+[[package]]
+name = "translator-tts"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "piper-rs",
+ "translator-core",
+ "translator-transliterate",
 ]
 
 [[package]]

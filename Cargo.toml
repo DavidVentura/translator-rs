@@ -69,6 +69,7 @@ pdf = [
     "dep:unicode-script",
     "translator-core/script-from-unicode",
     "dep:translator-render",
+    "dep:translator-pdf",
 ]
 odt = ["dep:zip"]
 dom-translate = ["translator-translate/dom-translate"]
@@ -97,6 +98,7 @@ viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 translator-core = { path = "crates/translator-core" }
 translator-translate = { path = "crates/translator-translate" }
 translator-render = { path = "crates/translator-render", optional = true }
+translator-pdf = { path = "crates/translator-pdf", optional = true }
 translator-tracker = { path = "crates/translator-tracker", optional = true }
 translator-raster = { path = "crates/translator-raster", optional = true }
 translator-ocr = { path = "crates/translator-ocr", optional = true }

@@ -30,13 +30,15 @@ use std::collections::{HashMap, HashSet};
 use log::warn;
 use lopdf::{Document, ObjectId};
 
-use crate::font_metrics::FontMetrics;
-use crate::font_provider::{FontHandle, FontProvider, FontRequest};
-use crate::ocr::{OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine};
 use crate::pdf_content::{ContentStreamBuilder, Matrix, PageGeometry, UserRect};
 use crate::pdf_font_embed::{EmbeddedFont, embed_font};
 use crate::pdf_resources::{append_content_stream, attach_embedded_fonts_to_page};
-use crate::script::Script;
+use translator_core::ocr::{
+    OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine,
+};
+use translator_core::script::Script;
+use translator_render::font_metrics::FontMetrics;
+use translator_render::font_provider::{FontHandle, FontProvider, FontRequest};
 
 /// Approximate average advance for the Helvetica fallback (em fraction).
 const HELVETICA_AVG_ADVANCE: f32 = 0.5;
@@ -68,7 +70,7 @@ const OVERHANG_TOLERANCE: f32 = 1.05;
 /// One page's complete OCR-derived translation plan, ready to be turned
 /// into an overlay content stream. Workers in the page-raster pass build
 /// these (no lopdf state touched) and hand them to the main thread.
-pub(crate) struct OverlayPage {
+pub struct OverlayPage {
     pub page_index: usize,
     pub geom: PageGeometry,
     pub dpi: f32,
@@ -77,7 +79,7 @@ pub(crate) struct OverlayPage {
 
 /// Per-pass font dedup. Mirrors `pdf_write::FontPlan` but is local to one
 /// run of the page-raster overlay pass.
-pub(crate) struct OverlayFontPlan {
+pub struct OverlayFontPlan {
     pub metrics: HashMap<(FontRequest, FontHandle), FontMetrics>,
     pub embeds: HashMap<(FontRequest, FontHandle), EmbeddedFont>,
     pub primary_handle: Option<FontHandle>,
@@ -88,7 +90,7 @@ pub(crate) struct OverlayFontPlan {
 /// the union per `(FontRequest, FontHandle)`, parse each unique font
 /// once with the union, embed each unique font once. The overlay path
 /// only needs one variant (regular) since we don't recover bold/italic.
-pub(crate) fn build_overlay_font_plan(
+pub fn build_overlay_font_plan(
     doc: &mut Document,
     overlays: &[OverlayPage],
     target_language: &str,
@@ -160,7 +162,7 @@ pub(crate) fn build_overlay_font_plan(
 ///
 /// All coordinates are in PDF user space, derived from the raster pixel
 /// space via `page_geom_for_overlay`.
-pub(crate) fn build_page_overlay_stream(page: &OverlayPage, plan: &OverlayFontPlan) -> Vec<u8> {
+pub fn build_page_overlay_stream(page: &OverlayPage, plan: &OverlayFontPlan) -> Vec<u8> {
     let mut builder = ContentStreamBuilder::new();
     builder.save_state();
 
@@ -199,7 +201,7 @@ pub(crate) fn build_page_overlay_stream(page: &OverlayPage, plan: &OverlayFontPl
 
 /// Attach the overlay's embedded fonts to the page's `/Resources/Font`
 /// dict and append the overlay stream to its `/Contents` array.
-pub(crate) fn install_overlay_on_page(
+pub fn install_overlay_on_page(
     doc: &mut Document,
     page_id: ObjectId,
     overlay_stream: Vec<u8>,
@@ -429,14 +431,14 @@ fn emit_filled_rect(builder: &mut ContentStreamBuilder, rect: UserRect, rgb: (f3
 
 /// Convert a Tesseract pixel-space rect to a PDF user-space rect.
 /// Pixels are top-left origin; user space is bottom-left.
-fn pixel_rect_to_user(rect: crate::ocr::Rect, page: &OverlayPage) -> UserRect {
+fn pixel_rect_to_user(rect: translator_core::ocr::Rect, page: &OverlayPage) -> UserRect {
     let scale = 72.0 / page.dpi;
     let display_left = rect.left as f32 * scale;
     let display_top = rect.top as f32 * scale;
     let display_right = rect.right as f32 * scale;
     let display_bottom = rect.bottom as f32 * scale;
 
-    let display_rect = crate::ocr::Rect {
+    let display_rect = translator_core::ocr::Rect {
         left: display_left.floor().max(0.0) as u32,
         top: display_top.floor().max(0.0) as u32,
         right: display_right.ceil().max(0.0) as u32,
@@ -578,7 +580,7 @@ fn wrap_to_width(text: &str, font_size: f32, max_width: f32, metrics: &FontMetri
 /// when attaching the page's `/Font` resources. We attach every embed
 /// regardless (fallback to one font), but this list lets the caller
 /// avoid attaching fonts that no page uses.
-pub(crate) fn collect_used_embed_names(plan: &OverlayFontPlan) -> HashSet<Vec<u8>> {
+pub fn collect_used_embed_names(plan: &OverlayFontPlan) -> HashSet<Vec<u8>> {
     plan.embeds
         .values()
         .map(|e| e.resource_name.clone())
@@ -599,7 +601,7 @@ mod tests {
         }
     }
 
-    fn dummy_page(_rect: crate::ocr::Rect) -> OverlayPage {
+    fn dummy_page(_rect: translator_core::ocr::Rect) -> OverlayPage {
         OverlayPage {
             page_index: 0,
             geom: dummy_geom(),
@@ -619,10 +621,10 @@ mod tests {
 
     #[test]
     fn pixel_to_user_unrotated_origin_topleft_to_bottomleft() {
-        let page = dummy_page(crate::ocr::Rect::default());
+        let page = dummy_page(translator_core::ocr::Rect::default());
         // A pixel rect at (0,0) → (200,100) at 200 dpi is 1in × 0.5in.
         let user = pixel_rect_to_user(
-            crate::ocr::Rect {
+            translator_core::ocr::Rect {
                 left: 0,
                 top: 0,
                 right: 200,

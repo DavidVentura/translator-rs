@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use lopdf::{Document, ObjectId};
 
-use crate::Rect;
+use crate::pdf::PageTranslationResult;
 use crate::pdf::PdfError;
 use crate::pdf_content::{BoldItalic, FontStyleFlags, Matrix, PageGeometry, UserRect};
 use crate::pdf_overlay::{
@@ -30,8 +30,8 @@ use crate::pdf_resources::{
     prune_link_annotations, prune_unused_fonts,
 };
 use crate::pdf_surgery::{CapturedTextShow, rewrite_page_content};
-use crate::pdf_translate::PageTranslationResult;
-use crate::styled::TranslatedStyledBlock;
+use translator_core::ocr::Rect;
+use translator_translate::styled::TranslatedStyledBlock;
 
 /// PDF resource names for our font variants. All eight are PDF standard-14
 /// base fonts, so no embedding is needed.
@@ -202,15 +202,15 @@ struct PageWork<'a> {
 }
 
 type FontKey = (
-    crate::font_provider::FontRequest,
-    crate::font_provider::FontHandle,
+    translator_render::font_provider::FontRequest,
+    translator_render::font_provider::FontHandle,
 );
 
 /// Document-wide font resolution: each unique `(FontRequest, FontHandle)`
 /// has a parsed [`FontMetrics`] (covering the union of texts that need it)
 /// and an embedded subset already added to the [`Document`].
 struct FontPlan {
-    metrics: HashMap<FontKey, crate::font_metrics::FontMetrics>,
+    metrics: HashMap<FontKey, translator_render::font_metrics::FontMetrics>,
     embeds: HashMap<FontKey, crate::pdf_font_embed::EmbeddedFont>,
 }
 
@@ -218,12 +218,12 @@ struct FontPlan {
 /// appending the translated text in the same bbox positions.
 ///
 /// `fonts` is consulted for non-Standard-14 scripts and for accurate wrap
-/// metrics. Pass [`crate::font_provider::NoFontProvider`] (or `&|_| None`) to
+/// metrics. Pass [`translator_render::font_provider::NoFontProvider`] (or `&|_| None`) to
 /// keep the current Standard-14-only behavior.
 pub fn write_translated_pdf(
     original_pdf_bytes: &[u8],
     translations: &[PageTranslationResult],
-    fonts: &dyn crate::font_provider::FontProvider,
+    fonts: &dyn translator_render::font_provider::FontProvider,
 ) -> Result<Vec<u8>, PdfWriteError> {
     let mut doc = Document::load_mem(original_pdf_bytes)?;
 
@@ -345,11 +345,13 @@ fn run_surgery<'a>(
 ///
 /// `source_rects` are left untouched so removal of original Tjs still
 /// covers every glyph.
-fn clamp_block_bounds_to_columns(blocks: &[TranslatedStyledBlock]) -> Vec<crate::Rect> {
+fn clamp_block_bounds_to_columns(
+    blocks: &[TranslatedStyledBlock],
+) -> Vec<translator_core::ocr::Rect> {
     /// Extra breathing room (display-space points) we shave off the
     /// clipped right edge so columns don't merely touch.
     const COLUMN_MARGIN: u32 = 2;
-    let mut out: Vec<crate::Rect> = blocks.iter().map(|b| b.bounding_box).collect();
+    let mut out: Vec<translator_core::ocr::Rect> = blocks.iter().map(|b| b.bounding_box).collect();
     for i in 0..blocks.len() {
         let me = blocks[i].bounding_box;
         let mut new_right = me.right;
@@ -398,14 +400,14 @@ fn clamp_block_bounds_to_columns(blocks: &[TranslatedStyledBlock]) -> Vec<crate:
 fn build_font_plan(
     doc: &mut Document,
     works: &[PageWork<'_>],
-    fonts: &dyn crate::font_provider::FontProvider,
+    fonts: &dyn translator_render::font_provider::FontProvider,
 ) -> FontPlan {
-    use crate::font_provider::FontRequest;
+    use translator_render::font_provider::FontRequest;
 
     // Pass 2: union of texts per (req, handle).
     let mut union_text: HashMap<FontKey, String> = HashMap::new();
     for work in works {
-        let script = crate::script::Script::from_bcp47(&work.translation.target_language);
+        let script = translator_core::script::Script::from_bcp47(&work.translation.target_language);
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
             for variant in block_variants(block, style) {
                 let req = FontRequest {
@@ -426,10 +428,11 @@ fn build_font_plan(
     }
 
     // Pass 3: parse each unique font once with its union text.
-    let mut metrics: HashMap<FontKey, crate::font_metrics::FontMetrics> = HashMap::new();
+    let mut metrics: HashMap<FontKey, translator_render::font_metrics::FontMetrics> =
+        HashMap::new();
     for (key, text) in &union_text {
         let (_req, handle) = key;
-        match crate::font_metrics::FontMetrics::from_file_for_text(
+        match translator_render::font_metrics::FontMetrics::from_file_for_text(
             &handle.path,
             handle.ttc_index,
             text,
@@ -468,23 +471,25 @@ fn emit_pages(
     doc: &mut Document,
     works: &[PageWork<'_>],
     plan: &FontPlan,
-    fonts: &dyn crate::font_provider::FontProvider,
+    fonts: &dyn translator_render::font_provider::FontProvider,
     installed_font_names: &mut HashSet<Vec<u8>>,
 ) -> Result<(), PdfWriteError> {
-    use crate::font_provider::FontRequest;
+    use translator_render::font_provider::FontRequest;
 
-    let helvetica_fallback = crate::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
-    let courier_fallback = crate::font_metrics::FontMetrics::approx(COURIER_AVG_ADVANCE);
+    let helvetica_fallback =
+        translator_render::font_metrics::FontMetrics::approx(HELVETICA_AVG_ADVANCE);
+    let courier_fallback =
+        translator_render::font_metrics::FontMetrics::approx(COURIER_AVG_ADVANCE);
 
     for work in works {
         let mut block_resources: Vec<BlockResources> =
             Vec::with_capacity(work.translation.blocks.len());
-        let script = crate::script::Script::from_bcp47(&work.translation.target_language);
+        let script = translator_core::script::Script::from_bcp47(&work.translation.target_language);
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
             let mut by_flags: HashMap<
                 BoldItalic,
                 (
-                    crate::font_metrics::FontMetrics,
+                    translator_render::font_metrics::FontMetrics,
                     Option<crate::pdf_font_embed::EmbeddedFont>,
                 ),
             > = HashMap::new();
@@ -571,7 +576,8 @@ mod tests {
 
     #[test]
     fn empty_translations_does_not_touch_pdf() {
-        let result = write_translated_pdf(b"", &[], &crate::font_provider::NoFontProvider);
+        let result =
+            write_translated_pdf(b"", &[], &translator_render::font_provider::NoFontProvider);
         assert!(result.is_err());
     }
 }

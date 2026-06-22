@@ -16,11 +16,11 @@ use std::io::Write as _;
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use crate::ocr::Rect;
 use crate::pdf::PageDims;
+use translator_core::ocr::Rect;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Matrix {
+pub struct Matrix {
     pub a: f32,
     pub b: f32,
     pub c: f32,
@@ -30,7 +30,7 @@ pub(crate) struct Matrix {
 }
 
 impl Matrix {
-    pub(crate) fn identity() -> Self {
+    pub fn identity() -> Self {
         Self {
             a: 1.0,
             b: 0.0,
@@ -41,7 +41,7 @@ impl Matrix {
         }
     }
 
-    pub(crate) fn translate(tx: f32, ty: f32) -> Self {
+    pub fn translate(tx: f32, ty: f32) -> Self {
         Self {
             a: 1.0,
             b: 0.0,
@@ -54,7 +54,7 @@ impl Matrix {
 
     /// PDF matrix multiplication: result transforms a point as
     /// `point -> other -> self`.
-    pub(crate) fn mul(self, other: Matrix) -> Matrix {
+    pub fn mul(self, other: Matrix) -> Matrix {
         Matrix {
             a: self.a * other.a + self.b * other.c,
             b: self.a * other.b + self.b * other.d,
@@ -65,14 +65,14 @@ impl Matrix {
         }
     }
 
-    pub(crate) fn transform_point(&self, x: f32, y: f32) -> (f32, f32) {
+    pub fn transform_point(&self, x: f32, y: f32) -> (f32, f32) {
         (
             self.a * x + self.c * y + self.e,
             self.b * x + self.d * y + self.f,
         )
     }
 
-    pub(crate) fn inverse(&self) -> Option<Matrix> {
+    pub fn inverse(&self) -> Option<Matrix> {
         let det = self.a * self.d - self.b * self.c;
         if det.abs() < 1e-9 {
             return None;
@@ -95,7 +95,7 @@ impl Matrix {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PageGeometry {
+pub struct PageGeometry {
     /// User-space width (independent of `/Rotate`; matches MediaBox x range).
     pub user_w: f32,
     /// User-space height (independent of `/Rotate`; matches MediaBox y range).
@@ -111,11 +111,7 @@ pub(crate) struct PageGeometry {
 }
 
 impl PageGeometry {
-    pub(crate) fn read(
-        doc: &Document,
-        page_id: ObjectId,
-        fallback_display: Option<PageDims>,
-    ) -> Self {
+    pub fn read(doc: &Document, page_id: ObjectId, fallback_display: Option<PageDims>) -> Self {
         let rotate = inherited_object(doc, page_id, b"Rotate")
             .and_then(|o| o.as_i64().ok())
             .unwrap_or(0);
@@ -159,7 +155,7 @@ impl PageGeometry {
 
     /// Convert a user-space point to display coords (top-left origin), matching
     /// MuPDF's stext line/char coordinates.
-    pub(crate) fn to_display(&self, user: (f32, f32)) -> (f32, f32) {
+    pub fn to_display(&self, user: (f32, f32)) -> (f32, f32) {
         let top = self.user_top();
         let right = self.user_right();
         match self.rotate {
@@ -173,7 +169,7 @@ impl PageGeometry {
 
     /// Convert a MuPDF stext bbox (display coords, top-left origin) to a PDF
     /// user-space rect honouring the effective `/Rotate`.
-    pub(crate) fn user_rect_from_display(&self, bbox: Rect) -> UserRect {
+    pub fn user_rect_from_display(&self, bbox: Rect) -> UserRect {
         let (l, t, r, b) = (
             bbox.left as f32,
             bbox.top as f32,
@@ -209,7 +205,7 @@ impl PageGeometry {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UserRect {
+pub struct UserRect {
     pub x0: f32,
     pub y0: f32,
     pub x1: f32,
@@ -250,7 +246,7 @@ fn media_box_dims(doc: &Document, obj: &Object) -> Option<(f32, f32, f32, f32)> 
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FontAdvance {
+pub struct FontAdvance {
     code_bytes: usize,
     default_width: f32,
     widths: HashMap<u16, f32>,
@@ -380,12 +376,12 @@ impl FontAdvance {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct FontAdvanceMap {
+pub struct FontAdvanceMap {
     by_resource: HashMap<Vec<u8>, FontAdvance>,
 }
 
 impl FontAdvanceMap {
-    pub(crate) fn from_page(doc: &Document, page_id: ObjectId) -> Self {
+    pub fn from_page(doc: &Document, page_id: ObjectId) -> Self {
         let mut by_resource = HashMap::new();
         if let Ok(fonts) = doc.get_page_fonts(page_id) {
             for (name, font) in fonts {
@@ -395,7 +391,7 @@ impl FontAdvanceMap {
         Self { by_resource }
     }
 
-    pub(crate) fn from_resources(doc: &Document, resources: &Dictionary) -> Self {
+    pub fn from_resources(doc: &Document, resources: &Dictionary) -> Self {
         let mut by_resource = HashMap::new();
         collect_font_advances_from_resources(doc, resources, &mut by_resource);
         Self { by_resource }
@@ -499,7 +495,7 @@ impl Default for GraphicsState {
 }
 
 #[derive(Debug)]
-pub(crate) struct ContentState {
+pub struct ContentState {
     stack: Vec<GraphicsState>,
     current: GraphicsState,
     in_text: bool,
@@ -513,7 +509,7 @@ pub(crate) struct ContentState {
 }
 
 impl ContentState {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             stack: Vec::new(),
             current: GraphicsState::default(),
@@ -528,13 +524,13 @@ impl ContentState {
         }
     }
 
-    pub(crate) fn with_ctm(ctm: Matrix) -> Self {
+    pub fn with_ctm(ctm: Matrix) -> Self {
         let mut state = Self::new();
         state.current.ctm = ctm;
         state
     }
 
-    pub(crate) fn apply_non_show_op(&mut self, op: &Operation) {
+    pub fn apply_non_show_op(&mut self, op: &Operation) {
         match op.operator.as_str() {
             "q" => self.stack.push(self.current.clone()),
             "Q" => {
@@ -657,7 +653,7 @@ impl ContentState {
     /// Calling this one method replaces the three-step
     /// `prepare_text_show_op` → query state → `advance_text` protocol so the
     /// sequencing can't be misordered.
-    pub(crate) fn process_text_show(
+    pub fn process_text_show(
         &mut self,
         op: &Operation,
         font_advances: &FontAdvanceMap,
@@ -673,40 +669,40 @@ impl ContentState {
         snapshot
     }
 
-    pub(crate) fn current_text_origin(&self) -> (f32, f32) {
+    pub fn current_text_origin(&self) -> (f32, f32) {
         let (tx, ty) = self.text_matrix.transform_point(0.0, 0.0);
         self.current.ctm.transform_point(tx, ty)
     }
 
-    pub(crate) fn combined_text_matrix(&self) -> Matrix {
+    pub fn combined_text_matrix(&self) -> Matrix {
         self.text_matrix.mul(self.current.ctm)
     }
 
-    pub(crate) fn current_ctm(&self) -> Matrix {
+    pub fn current_ctm(&self) -> Matrix {
         self.current.ctm
     }
 
-    pub(crate) fn font_resource(&self) -> &Option<Vec<u8>> {
+    pub fn font_resource(&self) -> &Option<Vec<u8>> {
         &self.current.font_resource
     }
 
-    pub(crate) fn font_size(&self) -> f32 {
+    pub fn font_size(&self) -> f32 {
         self.font_size
     }
 
-    pub(crate) fn horizontal_scaling(&self) -> f32 {
+    pub fn horizontal_scaling(&self) -> f32 {
         self.horizontal_scaling
     }
 
-    pub(crate) fn char_spacing(&self) -> f32 {
+    pub fn char_spacing(&self) -> f32 {
         self.char_spacing
     }
 
-    pub(crate) fn word_spacing(&self) -> f32 {
+    pub fn word_spacing(&self) -> f32 {
         self.word_spacing
     }
 
-    pub(crate) fn fill_rgb(&self) -> (f32, f32, f32) {
+    pub fn fill_rgb(&self) -> (f32, f32, f32) {
         self.current.fill_rgb
     }
 
@@ -718,13 +714,13 @@ impl ContentState {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ShowSnapshot {
+pub struct ShowSnapshot {
     pub origin: (f32, f32),
     pub combined: Matrix,
     pub advance: f32,
 }
 
-pub(crate) fn is_text_show_operator(operator: &str) -> bool {
+pub fn is_text_show_operator(operator: &str) -> bool {
     matches!(operator, "Tj" | "TJ" | "'" | "\"")
 }
 
@@ -787,7 +783,7 @@ fn resolve_array<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a [Object]>
     }
 }
 
-pub(crate) fn object_as_f32(obj: &Object) -> Option<f32> {
+pub fn object_as_f32(obj: &Object) -> Option<f32> {
     match obj {
         Object::Integer(i) => Some(*i as f32),
         Object::Real(r) => Some(*r),
@@ -795,7 +791,7 @@ pub(crate) fn object_as_f32(obj: &Object) -> Option<f32> {
     }
 }
 
-pub(crate) fn matrix_from_operands(operands: &[Object]) -> Option<Matrix> {
+pub fn matrix_from_operands(operands: &[Object]) -> Option<Matrix> {
     if operands.len() < 6 {
         return None;
     }
@@ -810,7 +806,7 @@ pub(crate) fn matrix_from_operands(operands: &[Object]) -> Option<Matrix> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub(crate) struct FontStyleFlags {
+pub struct FontStyleFlags {
     pub bold: bool,
     pub italic: bool,
     pub monospace: bool,
@@ -820,14 +816,14 @@ pub(crate) struct FontStyleFlags {
 /// across translation. Used as a hashmap key when grouping by intra-block
 /// style variant (monospace stays fixed for the whole block).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub(crate) struct BoldItalic {
+pub struct BoldItalic {
     pub bold: bool,
     pub italic: bool,
 }
 
 /// Read style flags from `/FontDescriptor /Flags`, OR'd with BaseFont-name
 /// pattern matching for producers that omit or under-set flags.
-pub(crate) fn font_flags(doc: &Document, font_dict: &Dictionary) -> FontStyleFlags {
+pub fn font_flags(doc: &Document, font_dict: &Dictionary) -> FontStyleFlags {
     let mut flags_int: Option<i64> = None;
     if let Ok(descriptor_ref) = font_dict.get(b"FontDescriptor") {
         let descriptor = match descriptor_ref {
@@ -858,7 +854,7 @@ pub(crate) fn font_flags(doc: &Document, font_dict: &Dictionary) -> FontStyleFla
     }
 }
 
-pub(crate) fn detect_from_name(base_font: &[u8]) -> FontStyleFlags {
+pub fn detect_from_name(base_font: &[u8]) -> FontStyleFlags {
     let name = match base_font.iter().position(|&b| b == b'+') {
         Some(idx) if idx == 6 => &base_font[idx + 1..],
         _ => base_font,
@@ -897,42 +893,42 @@ pub(crate) fn detect_from_name(base_font: &[u8]) -> FontStyleFlags {
 /// [`ContentState`] (the read-side interpreter): callers stay in PDF
 /// vocabulary instead of formatting raw bytes inline with layout math.
 #[derive(Debug, Default)]
-pub(crate) struct ContentStreamBuilder {
+pub struct ContentStreamBuilder {
     out: Vec<u8>,
 }
 
 impl ContentStreamBuilder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn save_state(&mut self) {
+    pub fn save_state(&mut self) {
         self.out.extend_from_slice(b"q\n");
     }
 
-    pub(crate) fn restore_state(&mut self) {
+    pub fn restore_state(&mut self) {
         self.out.extend_from_slice(b"Q\n");
     }
 
-    pub(crate) fn begin_text(&mut self) {
+    pub fn begin_text(&mut self) {
         self.out.extend_from_slice(b"BT\n");
     }
 
-    pub(crate) fn end_text(&mut self) {
+    pub fn end_text(&mut self) {
         self.out.extend_from_slice(b"ET\n\n");
     }
 
-    pub(crate) fn set_fill_rgb(&mut self, r: f32, g: f32, b: f32) {
+    pub fn set_fill_rgb(&mut self, r: f32, g: f32, b: f32) {
         let _ = writeln!(self.out, "{r:.3} {g:.3} {b:.3} rg");
     }
 
-    pub(crate) fn set_font(&mut self, resource_name: &[u8], size: f32) {
+    pub fn set_font(&mut self, resource_name: &[u8], size: f32) {
         self.out.push(b'/');
         self.out.extend_from_slice(resource_name);
         let _ = writeln!(self.out, " {size:.2} Tf");
     }
 
-    pub(crate) fn set_text_matrix(&mut self, m: Matrix) {
+    pub fn set_text_matrix(&mut self, m: Matrix) {
         let _ = writeln!(
             self.out,
             "{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm",
@@ -940,19 +936,19 @@ impl ContentStreamBuilder {
         );
     }
 
-    pub(crate) fn set_char_spacing(&mut self, spacing: f32) {
+    pub fn set_char_spacing(&mut self, spacing: f32) {
         let _ = writeln!(self.out, "{spacing:.4} Tc");
     }
 
-    pub(crate) fn set_word_spacing(&mut self, spacing: f32) {
+    pub fn set_word_spacing(&mut self, spacing: f32) {
         let _ = writeln!(self.out, "{spacing:.4} Tw");
     }
 
-    pub(crate) fn set_horizontal_scaling(&mut self, scaling: f32) {
+    pub fn set_horizontal_scaling(&mut self, scaling: f32) {
         let _ = writeln!(self.out, "{:.4} Tz", scaling * 100.0);
     }
 
-    pub(crate) fn push_operation(&mut self, op: &Operation) {
+    pub fn push_operation(&mut self, op: &Operation) {
         if let Ok(bytes) = (Content {
             operations: vec![op.clone()],
         })
@@ -967,7 +963,7 @@ impl ContentStreamBuilder {
 
     /// `<HHHH...>` Tj — draws hex-encoded glyph IDs (used with embedded
     /// Identity-H CID fonts).
-    pub(crate) fn show_hex_gids(&mut self, gids: impl IntoIterator<Item = u16>) {
+    pub fn show_hex_gids(&mut self, gids: impl IntoIterator<Item = u16>) {
         self.out.push(b'<');
         for gid in gids {
             let _ = write!(self.out, "{gid:04X}");
@@ -977,7 +973,7 @@ impl ContentStreamBuilder {
 
     /// `(...)` Tj — draws a literal-string glyph stream encoded as WinAnsi
     /// (CP1252). Codepoints with no WinAnsi mapping become `?`.
-    pub(crate) fn show_winansi(&mut self, text: &str) {
+    pub fn show_winansi(&mut self, text: &str) {
         self.out.push(b'(');
         for c in text.chars() {
             let byte = unicode_to_winansi(c);
@@ -995,14 +991,14 @@ impl ContentStreamBuilder {
         self.out.extend_from_slice(b") Tj\n");
     }
 
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
         self.out
     }
 }
 
 /// Map a Unicode codepoint to its WinAnsi (CP1252) byte, or `b'?'` if there
 /// is no WinAnsi codepoint for it.
-pub(crate) fn unicode_to_winansi(c: char) -> u8 {
+pub fn unicode_to_winansi(c: char) -> u8 {
     match c as u32 {
         0x00..=0x7F => c as u8,
         0x20AC => 0x80, // €

@@ -7,16 +7,16 @@
 
 use std::collections::HashMap;
 
-use crate::Rect;
-use crate::font_metrics::FontMetrics;
 use crate::pdf_content::{
     BoldItalic, ContentStreamBuilder, FontStyleFlags, Matrix, PageGeometry, UserRect,
 };
 use crate::pdf_font_embed::EmbeddedFont;
 use crate::pdf_surgery::CapturedTextShow;
 use crate::pdf_write::{BlockGeometry, BlockTypography, SampledBlockStyle};
-use crate::styled::{StyleSpan, TranslatedStyledBlock};
-use crate::text_shape::{self, DirRun, segment_runs};
+use translator_core::ocr::Rect;
+use translator_render::font_metrics::FontMetrics;
+use translator_render::text_shape::{self, DirRun, segment_runs};
+use translator_translate::styled::{StyleSpan, TranslatedStyledBlock};
 
 /// Approximate average Helvetica glyph width as a fraction of font size.
 pub(crate) const HELVETICA_AVG_ADVANCE: f32 = 0.5;
@@ -1222,7 +1222,6 @@ pub(crate) fn line_contains_rtl(text: &str) -> bool {
 /// in visual order, concatenated across BiDi runs. For single-font lines (the
 /// OCR overlay path) this is the whole-line equivalent of [`emit_line_shaped`].
 /// Returns `None` if the font can't be parsed for shaping.
-#[cfg_attr(not(feature = "pdf-image-translate"), allow(dead_code))]
 pub(crate) fn shape_line_to_gids(
     text: &str,
     metrics: &FontMetrics,
@@ -1408,7 +1407,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::font_metrics::{FontDescriptorInfo, FontFileKind, GlyphInfo};
+    use translator_render::font_metrics::{FontDescriptorInfo, FontFileKind, GlyphInfo};
 
     /// Body bytes between `(` and `) Tj\n` from a single show_winansi call.
     fn encode_helper(text: &str) -> Vec<u8> {
@@ -1805,7 +1804,7 @@ mod tests {
             user_y_min: 0.0,
             rotate: 90,
         };
-        let user_rect = geom.user_rect_from_display(crate::ocr::Rect {
+        let user_rect = geom.user_rect_from_display(translator_core::ocr::Rect {
             left: 20,
             top: 121,
             right: 53,

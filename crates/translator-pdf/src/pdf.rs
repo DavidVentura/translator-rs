@@ -4,6 +4,7 @@
 //! rendering used by the PDF smoke tests.
 
 use mupdf::{Colorspace, Document, Error as MupdfError, Matrix};
+use translator_translate::styled::TranslatedStyledBlock;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageDims {
@@ -139,6 +140,18 @@ fn letterbox_rgba(
         canvas[dst_offset..dst_offset + len].copy_from_slice(&src[src_offset..src_offset + len]);
     }
     canvas
+}
+
+#[derive(Debug, Clone)]
+pub struct PageTranslationResult {
+    pub page_index: usize,
+    pub page: PageDims,
+    pub blocks: Vec<TranslatedStyledBlock>,
+    pub error: Option<String>,
+    /// BCP-47 tag of the language the blocks were translated **into**.
+    /// The PDF writer hands this to its [`FontProvider`] when picking a
+    /// font for the script.
+    pub target_language: String,
 }
 
 #[cfg(test)]

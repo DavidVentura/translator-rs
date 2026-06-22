@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-use crate::font_metrics::{FontFileKind, FontMetrics, UsedGlyph};
+use translator_render::font_metrics::{FontFileKind, FontMetrics, UsedGlyph};
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedFont {
@@ -196,7 +196,7 @@ pub fn embed_font(doc: &mut Document, metrics: &FontMetrics, slot: usize) -> Opt
 
 /// PDF `/FontDescriptor` `Flags` bitfield (PDF spec table 122).
 /// Bit indices are 1-based, so bit n sets `1 << (n-1)`.
-fn font_flags(d: &crate::font_metrics::FontDescriptorInfo) -> u32 {
+fn font_flags(d: &translator_render::font_metrics::FontDescriptorInfo) -> u32 {
     let mut f = 0u32;
     if d.monospace {
         f |= 1 << 0; // FixedPitch

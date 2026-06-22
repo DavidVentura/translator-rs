@@ -28,18 +28,18 @@ use std::thread;
 use log::{debug, info, trace, warn};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-use crate::api::{LanguageCode, TranslatorError};
-use crate::font_provider::FontProvider;
-use crate::image_render::{RenderOptions, render_overlay};
-use crate::ocr::{PreparedImageOverlay, ReadingOrder};
-use crate::pdf_content::PageGeometry;
-use crate::pdf_text::extract_text;
-use crate::pdf_text_overlay::{
+use crate::session::TranslatorSession;
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::ocr::{PreparedImageOverlay, ReadingOrder};
+use translator_core::settings::BackgroundMode;
+use translator_pdf::pdf_content::PageGeometry;
+use translator_pdf::pdf_text::extract_text;
+use translator_pdf::pdf_text_overlay::{
     OverlayPage, build_overlay_font_plan, build_page_overlay_stream, collect_used_embed_names,
     install_overlay_on_page,
 };
-use crate::session::TranslatorSession;
-use crate::settings::BackgroundMode;
+use translator_render::font_provider::FontProvider;
+use translator_render::image_render::{RenderOptions, render_overlay};
 
 /// Minimum total pixel area for an image to be considered worth OCR'ing.
 /// Roughly equivalent to "bigger than a 50×50 icon". Banner-shaped images
@@ -812,7 +812,7 @@ fn translate_one_xobject(
             width,
             height,
             u32::MAX,
-            crate::ocr::OcrSourceSelection::specific(LanguageCode::from(source_code)),
+            translator_core::ocr::OcrSourceSelection::specific(LanguageCode::from(source_code)),
             target_code,
             DEFAULT_MIN_CONFIDENCE,
             Some(ReadingOrder::LeftToRight),
@@ -1762,7 +1762,7 @@ fn ocr_page(
             width,
             height,
             u32::MAX,
-            crate::ocr::OcrSourceSelection::specific(LanguageCode::from(source_code)),
+            translator_core::ocr::OcrSourceSelection::specific(LanguageCode::from(source_code)),
             target_code,
             DEFAULT_MIN_CONFIDENCE,
             Some(ReadingOrder::LeftToRight),

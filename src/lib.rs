@@ -53,29 +53,29 @@ pub use translator_ocr::ocr_runtime;
 #[cfg(feature = "odt")]
 pub mod odt;
 #[cfg(feature = "pdf")]
-pub mod pdf;
+pub use translator_pdf::pdf;
 #[cfg(feature = "pdf")]
-mod pdf_content;
+pub use translator_pdf::pdf_content;
 #[cfg(feature = "pdf")]
-pub mod pdf_font_embed;
+pub use translator_pdf::pdf_font_embed;
 #[cfg(feature = "pdf-image-translate")]
 pub mod pdf_image_translate;
 #[cfg(feature = "pdf")]
-mod pdf_overlay;
+pub use translator_pdf::pdf_overlay;
 #[cfg(feature = "pdf")]
-mod pdf_resources;
+pub use translator_pdf::pdf_resources;
 #[cfg(feature = "pdf")]
-mod pdf_surgery;
+pub use translator_pdf::pdf_surgery;
 #[cfg(feature = "pdf")]
-pub mod pdf_text;
-#[cfg(feature = "pdf-image-translate")]
-mod pdf_text_overlay;
+pub use translator_pdf::pdf_text;
+#[cfg(feature = "pdf")]
+pub use translator_pdf::pdf_text_overlay;
 #[cfg(feature = "pdf")]
 pub mod pdf_translate;
-#[cfg(feature = "pdf")]
-pub mod pdf_write;
 #[cfg(feature = "ppocr")]
 pub use translator_ocr::ppocr;
+#[cfg(feature = "pdf")]
+pub use translator_pdf::pdf_write;
 #[cfg(feature = "planar-tracker")]
 pub use translator_tracker::planar_engine;
 #[cfg(feature = "planar-tracker")]

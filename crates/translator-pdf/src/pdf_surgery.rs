@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use crate::Rect;
 use crate::pdf_content::{
     ContentState, FontAdvanceMap, FontStyleFlags, Matrix, PageGeometry, UserRect, font_flags,
     is_text_show_operator, matrix_from_operands,
 };
 use crate::pdf_write::{BlockGeometry, BlockTypography, PdfWriteError, SampledBlockStyle};
+use translator_core::ocr::Rect;
 
 /// Minimum vertical separation floor (in PDF points) between two Tj samples
 /// for them to be treated as belonging to distinct lines. The effective

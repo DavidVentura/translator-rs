@@ -1,23 +1,11 @@
 //! Glue: extract → translate per page.
 
-use crate::api::{LanguageCode, TranslatorError};
-use crate::pdf::{PageDims, PdfError};
-use crate::pdf_text::extract_text;
 use crate::session::TranslatorSession;
-use crate::settings::BackgroundMode;
-use crate::styled::TranslatedStyledBlock;
-
-#[derive(Debug, Clone)]
-pub struct PageTranslationResult {
-    pub page_index: usize,
-    pub page: PageDims,
-    pub blocks: Vec<TranslatedStyledBlock>,
-    pub error: Option<String>,
-    /// BCP-47 tag of the language the blocks were translated **into**.
-    /// The PDF writer hands this to its [`FontProvider`] when picking a
-    /// font for the script.
-    pub target_language: String,
-}
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::settings::BackgroundMode;
+pub use translator_pdf::pdf::PageTranslationResult;
+use translator_pdf::pdf::PdfError;
+use translator_pdf::pdf_text::extract_text;
 
 #[derive(Debug)]
 pub enum PdfTranslateError {

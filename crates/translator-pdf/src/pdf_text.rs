@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use mupdf::text_page::TextBlockType;
 use mupdf::{Document, Page, TextCharFlags, TextPageFlags};
 
-use crate::ocr::Rect;
 use crate::pdf::{PageDims, PdfError};
-use crate::styled::{StyledFragment, TextStyle};
+use translator_core::ocr::Rect;
+use translator_translate::styled::{StyledFragment, TextStyle};
 
 #[derive(Debug, Clone)]
 pub struct PageTextFragments {
