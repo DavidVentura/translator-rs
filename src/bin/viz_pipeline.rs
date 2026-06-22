@@ -28,13 +28,18 @@ use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 use imageproc::point::Point;
 use imageproc::rect::Rect as IpRect;
 
-use translator::PpocrScript;
 use translator::doc_align::{DocAligner, DocumentPoint, DocumentQuad, suggested_output_dims, warp};
-use translator::ocr::{DetectedTextBox, OrientedRect, RecognizedTextLine};
+use translator::font_provider::{FontHandle, FontProvider, FontRequest};
+use translator::image_render::{RenderOptions, render_overlay};
+use translator::ocr::{
+    DetectedTextBox, OrientedRect, PositionedWord, ReadingOrder, RecognizedTextLine, TextBlock,
+    TextLine, prepare_overlay_image,
+};
 use translator::ppocr::{
     PpocrEngine, PpocrProfile, PpocrRecognizerSpec, dewarp_contour_to_strip_rgb,
     dewarp_contour_to_strip_rgb_with_map,
 };
+use translator::{BackgroundMode, PpocrScript};
 
 const REC_TARGET_HEIGHT: u32 = 48;
 
@@ -78,12 +83,13 @@ enum Stage {
     Deskewed,
     Ink,
     CharFirings,
+    Rewrite,
     Dewarp,
     Corners,
 }
 
 impl Stage {
-    const ALL: [Stage; 16] = [
+    const ALL: [Stage; 17] = [
         Stage::Input,
         Stage::Heatmap,
         Stage::Boxes,
@@ -98,6 +104,7 @@ impl Stage {
         Stage::Deskewed,
         Stage::Ink,
         Stage::CharFirings,
+        Stage::Rewrite,
         Stage::Dewarp,
         Stage::Corners,
     ];
@@ -118,6 +125,7 @@ impl Stage {
             Stage::Deskewed => "deskewed",
             Stage::Ink => "ink",
             Stage::CharFirings => "char-firings",
+            Stage::Rewrite => "rewrite",
             Stage::Dewarp => "dewarp",
             Stage::Corners => "corners",
         }
@@ -150,6 +158,9 @@ impl Stage {
             Stage::Ink => "per-box ink matte (alpha) from the optional ink model",
             Stage::CharFirings => {
                 "per-box straightened strips with a vertical line at each CTC character firing X"
+            }
+            Stage::Rewrite => {
+                "real erase+render path (prepare_overlay_image → render_overlay), overlaying the per-word boxes reported to the app: render-layout words (red) vs CTC source words (green); needs ink model for the erase"
             }
             Stage::Dewarp => "full-page perspective correction (DocAligner)",
             Stage::Corners => "DocAligner proposed document quad overlay",
@@ -794,6 +805,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 | Stage::Squashed
                 | Stage::Deskewed
                 | Stage::CharFirings
+                | Stage::Rewrite
         )
     });
     let mut boxes: Vec<DetectedTextBox> = Vec::new();
@@ -1412,6 +1424,10 @@ fn run(cli: Cli) -> Result<(), String> {
                     save_png(&canvas, &dir.join(format!("box-{i:03}.png")))?;
                 }
             }
+            Stage::Rewrite => {
+                let engine = engine.as_ref().expect("engine for rewrite");
+                run_rewrite_stage(engine, &image, &gray, &boxes, &cli, &font)?;
+            }
             Stage::Dewarp | Stage::Corners => {
                 run_docaligner_stage(stage, &cli, &rgba, &font, t, engine.as_ref(), &mut index)?;
             }
@@ -1473,6 +1489,233 @@ fn draw_recognition(
         draw_text_in_oriented_box(&mut canvas, font, &b.oriented_box, label);
     }
     canvas
+}
+
+/// Hands the renderer one font for every request — the `--font` file. The real
+/// apps return a script-aware chain; the viz just needs a face covering the
+/// recognized script (override with `--font` for non-Latin scripts).
+struct VizFonts {
+    path: PathBuf,
+}
+
+impl FontProvider for VizFonts {
+    fn locate(&self, _request: &FontRequest) -> Vec<FontHandle> {
+        vec![FontHandle::from(self.path.clone())]
+    }
+}
+
+/// Run the real still erase+render path and overlay the per-word boxes the app
+/// receives. Each recognized line becomes one PerLine block whose translated
+/// text is the recognized text itself, so `render_overlay` lays glyphs where
+/// the app would draw the translation and its `translated_words` are the exact
+/// boxes drag-to-copy/tap hit-tests against (red). The CTC `source_words`,
+/// measured straight from recognizer firings, are drawn alongside as the
+/// accurate reference (green) so a mis-sized render-layout box is obvious.
+fn run_rewrite_stage(
+    engine: &PpocrEngine,
+    image: &DynamicImage,
+    gray: &GrayImage,
+    boxes: &[DetectedTextBox],
+    cli: &Cli,
+    font: &FontRef,
+) -> Result<(), String> {
+    let lines = recognize(engine, image, gray, boxes, cli.script, true)
+        .map_err(|e| format!("recognize: {e:?}"))?;
+    let is_cjk = cli.script == PpocrScript::Cj;
+
+    let source_words: Vec<PositionedWord> = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(i, line)| {
+            let firings: Vec<(char, f32)> = line
+                .firings
+                .iter()
+                .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
+                .collect();
+            translator::text_metrics::firing_word_boxes(
+                &line.text,
+                &firings,
+                is_cjk,
+                &line.oriented_box,
+                i as u32,
+            )
+        })
+        .collect();
+
+    // Per-box ink strips drive both the erase (union mask) and per-word bold, exactly as the
+    // still overlay path does — bold matters because bold runs render wider, and that's where the
+    // per-word box geometry is most easily wrong.
+    let strips = engine
+        .has_ink()
+        .then(|| engine.ink_strips(image, boxes, None));
+
+    // One PerLine block per recognized line; the recognized text is fed back as the "translated"
+    // text so we exercise the render path without translating. Per-word bold comes from the ink
+    // bold channel + CTC firings, with a whole-line fallback (mirrors the still pipeline).
+    let mut blocks: Vec<TextBlock> = Vec::new();
+    let mut translated: Vec<String> = Vec::new();
+    let mut bold_ranges: Vec<Vec<translator::ocr::BoldRange>> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.text.trim().is_empty() {
+            continue;
+        }
+        let strip = strips
+            .as_ref()
+            .and_then(|s| s.get(i))
+            .and_then(|s| s.as_ref());
+        let firings: Vec<(char, f32)> = line
+            .firings
+            .iter()
+            .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
+            .collect();
+        // 0.65 mirrors text_metrics::MODEL_BOLD_THRESHOLD (pub(crate), so not nameable here).
+        let word_ranges = match strip.and_then(|s| s.bold_profile()) {
+            Some(profile) => translator::text_metrics::word_bold_ranges(
+                &line.text, &firings, is_cjk, &profile, 0.65,
+            ),
+            None => Vec::new(),
+        };
+        let bold: Vec<translator::ocr::BoldRange> = if !word_ranges.is_empty() {
+            word_ranges
+                .into_iter()
+                .map(|(start, end)| translator::ocr::BoldRange { start, end })
+                .collect()
+        } else if strip
+            .and_then(|s| s.pooled_bold())
+            .map(|p| p >= 0.65)
+            .unwrap_or(false)
+        {
+            vec![translator::ocr::BoldRange {
+                start: 0,
+                end: line.text.len() as u32,
+            }]
+        } else {
+            Vec::new()
+        };
+        blocks.push(TextBlock {
+            lines: vec![TextLine {
+                text: line.text.clone(),
+                bounding_box: line.rect,
+                oriented_box: line.oriented_box,
+                tight_box: line.oriented_box,
+                word_rects: Vec::new(),
+                bold_ranges: bold.clone(),
+            }],
+        });
+        translated.push(line.text.clone());
+        bold_ranges.push(bold);
+    }
+
+    let rgba = image.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+
+    // Real ink-matte erase (union mask), exactly as the still overlay path uses.
+    let ink_mask: Option<Vec<bool>> = strips.as_ref().map(|strips| {
+        let masks: Vec<_> = strips
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.matte.clone()))
+            .collect();
+        let src_maps: Vec<_> = strips
+            .iter()
+            .map(|s| s.as_ref().and_then(|s| s.src_map.clone()))
+            .collect();
+        translator::color_matting::union_ink_mask(&rgba, boxes, &masks, &src_maps)
+    });
+
+    let prepared = prepare_overlay_image(
+        rgba.as_raw(),
+        w,
+        h,
+        &blocks,
+        &translated,
+        &bold_ranges,
+        BackgroundMode::AutoDetect,
+        ReadingOrder::LeftToRight,
+        ink_mask.as_deref(),
+    )
+    .map_err(|e| format!("prepare_overlay_image: {e}"))?;
+
+    let fonts = VizFonts {
+        path: cli.font.clone(),
+    };
+    let opts = RenderOptions {
+        language: cli.script.as_slug().to_string(),
+        min_font_size_px: 8.0,
+    };
+    let rendered =
+        render_overlay(&prepared, &fonts, &opts).map_err(|e| format!("render_overlay: {e}"))?;
+
+    let mut canvas = RgbaImage::from_raw(w, h, rendered.rgba_bytes.clone())
+        .ok_or_else(|| "rendered buffer size mismatch".to_string())?;
+    let t = line_thickness(&canvas);
+    draw_word_boxes(&mut canvas, &source_words, COLOR_FIRING_A, t.max(1), font);
+    draw_word_boxes(&mut canvas, &rendered.translated_words, COLOR_BOX, t, font);
+    save_png(&canvas, &cli.out_dir.join("rewrite.png"))?;
+
+    // The same render-layout boxes over just the erased background, so the box
+    // geometry is readable without the rendered glyphs sitting under it.
+    let mut erased = RgbaImage::from_raw(w, h, prepared.rgba_bytes.clone())
+        .ok_or_else(|| "erased buffer size mismatch".to_string())?;
+    draw_word_boxes(&mut erased, &rendered.translated_words, COLOR_BOX, t, font);
+    save_png(&erased, &cli.out_dir.join("rewrite-erased.png"))?;
+
+    let words_json = serde_json::json!({
+        "translated_words": words_to_json(&rendered.translated_words),
+        "source_words": words_to_json(&source_words),
+    });
+    fs::write(
+        cli.out_dir.join("rewrite_words.json"),
+        serde_json::to_string_pretty(&words_json).unwrap(),
+    )
+    .map_err(|e| format!("write rewrite_words.json: {e}"))?;
+    println!(
+        "  rewrite: {} render-layout words (red), {} CTC source words (green)",
+        rendered.translated_words.len(),
+        source_words.len()
+    );
+    Ok(())
+}
+
+fn words_to_json(words: &[PositionedWord]) -> Vec<serde_json::Value> {
+    words
+        .iter()
+        .map(|w| {
+            serde_json::json!({
+                "text": w.text,
+                "line_index": w.line_index,
+                "cx": w.bounds.cx,
+                "cy": w.bounds.cy,
+                "width": w.bounds.width,
+                "height": w.bounds.height,
+                "angle_deg": w.bounds.angle_radians.to_degrees(),
+            })
+        })
+        .collect()
+}
+
+/// Outline each word's oriented box, labelling its index at the leading corner
+/// so a box can be matched to its `rewrite_words.json` entry.
+fn draw_word_boxes(
+    img: &mut RgbaImage,
+    words: &[PositionedWord],
+    color: Rgba<u8>,
+    t: i32,
+    font: &FontRef,
+) {
+    for (i, w) in words.iter().enumerate() {
+        let corners = w.bounds.corners();
+        draw_closed_polyline(img, &corners, color, t);
+        let (lx, ly) = corners[0];
+        draw_text_mut(
+            img,
+            color,
+            lx as i32,
+            (ly as i32 - 14).max(0),
+            PxScale::from(13.0),
+            font,
+            &i.to_string(),
+        );
+    }
 }
 
 fn run_docaligner_stage(

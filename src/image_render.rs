@@ -92,6 +92,7 @@ pub fn render_overlay(
 
     let mut canvas = prepared.rgba_bytes.clone();
     let mut cache = FontCache::default();
+    let mut carver = WordCarver::default();
 
     for block in &prepared.blocks {
         if block.translated_text.trim().is_empty() {
@@ -104,17 +105,20 @@ pub fn render_overlay(
         };
         match block.layout_hints.layout_mode {
             OverlayLayoutMode::PerLine => {
-                render_per_line(&mut sink, block, &mut cache, fonts, opts)
+                render_per_line(&mut sink, block, &mut cache, fonts, opts, Some(&mut carver))
             }
-            OverlayLayoutMode::VerticalBlockRect => {
-                render_vertical_block_rect(&mut sink, block, &mut cache, fonts, opts)
-            }
+            OverlayLayoutMode::VerticalBlockRect => render_vertical_block_rect(
+                &mut sink,
+                block,
+                &mut cache,
+                fonts,
+                opts,
+                Some(&mut carver),
+            ),
         }
     }
 
-    let translated_words = crate::ocr::order_words_visually(collect_translated_words(
-        prepared, &mut cache, fonts, opts,
-    ));
+    let translated_words = crate::ocr::order_words_visually(carver.words);
     Ok(RenderedOverlay {
         rgba_bytes: canvas,
         translated_words,
@@ -190,9 +194,11 @@ pub(crate) fn collect_overlay_glyphs(
         }
         let mut sink = GlyphSink::Collect(&mut collector);
         match block.layout_hints.layout_mode {
-            OverlayLayoutMode::PerLine => render_per_line(&mut sink, block, cache, fonts, opts),
+            OverlayLayoutMode::PerLine => {
+                render_per_line(&mut sink, block, cache, fonts, opts, None)
+            }
             OverlayLayoutMode::VerticalBlockRect => {
-                render_vertical_block_rect(&mut sink, block, cache, fonts, opts)
+                render_vertical_block_rect(&mut sink, block, cache, fonts, opts, None)
             }
         }
     }
@@ -671,10 +677,10 @@ impl LineShape {
     }
 }
 
-/// One laid-out line ready to draw or carve: its text, its oriented box in image space, and the
-/// foreground colour. Both block layouts (`layout_per_line`, `layout_vertical`) produce these;
-/// `render_*` draws them and `collect_block_words` carves per-word boxes from them, so drawing
-/// and word extraction consume one layout decision and can't diverge.
+/// One laid-out line ready to draw: its text, its oriented box in image space, and the foreground
+/// colour. Both block layouts (`layout_per_line`, `layout_vertical`) produce these; the `render_*`
+/// functions draw each line and, in the same loop, carve its per-word boxes from the very glyph
+/// advances they just placed (see [`WordCarver`]), so drawing and word extraction can't diverge.
 struct LaidLine {
     text: String,
     oriented: OrientedRect,
@@ -849,12 +855,41 @@ fn layout_vertical(
     Some(BlockLayout { size, bold, lines })
 }
 
+/// Collects the per-word boxes a render pass emits, carrying the running visual-line index across
+/// blocks. `render_*` push into it as they draw each line, so the boxes are carved from the exact
+/// shaped glyphs that were drawn and can't drift from them. Optional: the GPU atlas path renders
+/// without needing word boxes and passes `None`.
+#[derive(Default)]
+struct WordCarver {
+    words: Vec<PositionedWord>,
+    line_index: u32,
+}
+
+impl WordCarver {
+    /// Carve `line_text` into selectable units and push each unit's box, mapping its reading-axis
+    /// span `[cum_px[b0], cum_px[b1]]` onto `oriented` via `subspan`. `cum_px` is the per-byte
+    /// reading-axis advance the draw loop just placed glyphs by, so a unit's box bounds its glyphs.
+    fn carve_line(&mut self, line_text: &str, oriented: &OrientedRect, cum_px: &[f32]) {
+        let li = self.line_index;
+        self.line_index += 1;
+        let last = cum_px.len() - 1;
+        for (b0, b1) in selection_units(line_text) {
+            self.words.push(PositionedWord {
+                text: line_text[b0..b1].to_string(),
+                bounds: oriented.subspan(cum_px[b0.min(last)], cum_px[b1.min(last)]),
+                line_index: li,
+            });
+        }
+    }
+}
+
 fn render_per_line(
     sink: &mut GlyphSink<'_>,
     block: &PreparedTextBlock,
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
     opts: &RenderOptions,
+    mut words: Option<&mut WordCarver>,
 ) {
     let Some(layout) = layout_per_line(block, opts, cache, fonts) else {
         return;
@@ -907,9 +942,14 @@ fn render_per_line(
         // perp_down direction (line-local +v) in image space is (-sin, cos).
         let mut origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
         let mut origin_y = oriented.cy - half_w * sin + v_from_center * cos;
-        // Draw each bold/regular run with its own font chain, advancing the baseline cursor
-        // by the run's width so mixed-weight lines (a bold lead-in, a bold term) render in
-        // the right faces instead of one weight for the whole block.
+        // Draw each bold/regular run with its own font chain, advancing the baseline cursor by the
+        // run's width so mixed-weight lines (a bold lead-in, a bold term) render in the right faces
+        // instead of one weight for the whole block. `cum_px[i]` records the reading-axis advance
+        // to byte `i` as glyphs are placed, so word carving reuses the same geometry (bold runs are
+        // wider than regular ones, and that difference must land in the boxes too).
+        let mut cum_px = vec![0.0f32; line_text.len() + 1];
+        let mut acc = 0.0f32;
+        let mut byte = 0usize;
         for (seg_text, seg_bold) in &segments {
             let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
                 c.chain_for(script, *seg_bold, false, false, &language, fonts)
@@ -917,7 +957,14 @@ fn render_per_line(
             };
             let mut chain_fn = chain_fn;
             let seg_shape = shape_line(seg_text, &mut chain_fn, cache);
+            let seg_len = seg_text.len();
             if seg_shape.runs.is_empty() {
+                // Nothing drawn and the pen doesn't move; pin this segment's bytes to the current
+                // advance so carving indices stay aligned across the rest of the line.
+                for sb in 0..=seg_len {
+                    cum_px[byte + sb] = acc;
+                }
+                byte += seg_len;
                 continue;
             }
             draw_shaped_line(
@@ -931,82 +978,18 @@ fn render_per_line(
                 size,
                 line.foreground_argb,
             );
+            let last = seg_shape.cum_em_at_byte.len() - 1;
+            for sb in 0..=seg_len {
+                cum_px[byte + sb] = acc + seg_shape.cum_em_at_byte[sb.min(last)] * size;
+            }
             let w = seg_shape.width_px(size);
+            acc += w;
+            byte += seg_len;
             origin_x += cos * w;
             origin_y += sin * w;
         }
-    }
-}
-
-/// Per-word boxes of the rendered translation, in reading order, in image-pixel space. Re-runs
-/// the same per-mode layout the drawing used, then carves the laid-out lines via
-/// `collect_block_words`. Drives drag-to-copy of the translated text.
-fn collect_translated_words(
-    prepared: &PreparedImageOverlay,
-    cache: &mut FontCache,
-    fonts: &dyn FontProvider,
-    opts: &RenderOptions,
-) -> Vec<PositionedWord> {
-    let mut out = Vec::new();
-    let mut line_index = 0u32;
-    for block in &prepared.blocks {
-        if block.translated_text.trim().is_empty() {
-            continue;
-        }
-        let layout = match block.layout_hints.layout_mode {
-            OverlayLayoutMode::PerLine => layout_per_line(block, opts, cache, fonts),
-            OverlayLayoutMode::VerticalBlockRect => layout_vertical(block, opts, cache, fonts),
-        };
-        if let Some(layout) = layout {
-            collect_block_words(
-                &layout,
-                &opts.language,
-                cache,
-                fonts,
-                &mut line_index,
-                &mut out,
-            );
-        }
-    }
-    out
-}
-
-/// Carve each laid-out line into selectable units (`selection_units`) and map each unit's shaped
-/// x-span onto the line's oriented box via `OrientedRect::subspan`. Mode-agnostic: works for both
-/// horizontal lines and vertical columns, since each `LaidLine` already carries its image-space
-/// box and reading direction.
-fn collect_block_words(
-    layout: &BlockLayout,
-    language: &str,
-    cache: &mut FontCache,
-    fonts: &dyn FontProvider,
-    line_index: &mut u32,
-    out: &mut Vec<PositionedWord>,
-) {
-    for line in &layout.lines {
-        if line.text.trim().is_empty() {
-            continue;
-        }
-        let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
-            c.chain_for(script, layout.bold, false, false, language, fonts)
-                .to_vec()
-        };
-        let mut chain_fn = chain_fn;
-        let shaped = shape_line(&line.text, &mut chain_fn, cache);
-        if shaped.runs.is_empty() {
-            continue;
-        }
-        let li = *line_index;
-        *line_index += 1;
-        let last = shaped.cum_em_at_byte.len() - 1;
-        for (b0, b1) in selection_units(&line.text) {
-            let x0 = shaped.cum_em_at_byte[b0.min(last)] * layout.size;
-            let x1 = shaped.cum_em_at_byte[b1.min(last)] * layout.size;
-            out.push(PositionedWord {
-                text: line.text[b0..b1].to_string(),
-                bounds: line.oriented.subspan(x0, x1),
-                line_index: li,
-            });
+        if let Some(carver) = words.as_deref_mut() {
+            carver.carve_line(line_text, &oriented, &cum_px);
         }
     }
 }
@@ -1302,6 +1285,7 @@ fn render_vertical_block_rect(
     cache: &mut FontCache,
     fonts: &dyn FontProvider,
     opts: &RenderOptions,
+    mut words: Option<&mut WordCarver>,
 ) {
     let Some(layout) = layout_vertical(block, opts, cache, fonts) else {
         return;
@@ -1311,6 +1295,8 @@ fn render_vertical_block_rect(
         if line.text.trim().is_empty() {
             continue;
         }
+        // The vertical path draws the whole column in the block weight (it doesn't split bold
+        // runs), so word carving shapes it the same way — one whole-line shape drives both.
         let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
             c.chain_for(script, layout.bold, false, false, &language, fonts)
                 .to_vec()
@@ -1336,6 +1322,14 @@ fn render_vertical_block_rect(
             layout.size,
             line.foreground_argb,
         );
+        if let Some(carver) = words.as_deref_mut() {
+            let cum_px: Vec<f32> = line_shape
+                .cum_em_at_byte
+                .iter()
+                .map(|em| em * layout.size)
+                .collect();
+            carver.carve_line(&line.text, &line.oriented, &cum_px);
+        }
     }
 }
 
@@ -1815,5 +1809,142 @@ mod break_tests {
     #[test]
     fn selection_units_split_mixed_latin_cjk() {
         assert_eq!(units("AB日本"), vec!["AB", "日", "本"]);
+    }
+}
+
+#[cfg(test)]
+mod word_box_tests {
+    use super::*;
+    use crate::ocr::{
+        BoldRange, OrientedRect, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay,
+        PreparedTextBlock, PreparedTextLine, Rect,
+    };
+
+    const REGULAR: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+    const BOLD: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+
+    struct WeightFonts;
+    impl FontProvider for WeightFonts {
+        fn locate(&self, req: &FontRequest) -> Vec<FontHandle> {
+            let path = if req.bold { BOLD } else { REGULAR };
+            vec![FontHandle::from(path)]
+        }
+    }
+
+    /// Per-column ink runs (white background, dark glyphs), segmented into words by gaps wider
+    /// than `gap`. Returns each word's `(left, right)` ink x-range.
+    fn ink_word_ranges(rgba: &[u8], w: u32, h: u32, gap: u32) -> Vec<(u32, u32)> {
+        let inked_col = |x: u32| -> bool {
+            (0..h).any(|y| {
+                let i = ((y * w + x) * 4) as usize;
+                let lum = rgba[i] as u32 + rgba[i + 1] as u32 + rgba[i + 2] as u32;
+                lum < 600 // < ~200 per channel
+            })
+        };
+        let mut runs = Vec::new();
+        let mut start: Option<u32> = None;
+        let mut empty = 0u32;
+        for x in 0..w {
+            if inked_col(x) {
+                if start.is_none() {
+                    start = Some(x);
+                }
+                empty = 0;
+            } else if let Some(s) = start {
+                empty += 1;
+                if empty >= gap {
+                    runs.push((s, x - empty));
+                    start = None;
+                }
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, w - 1));
+        }
+        runs
+    }
+
+    /// Regression for the per-word box drift on mixed-weight lines: a bold prefix used to widen the
+    /// whole-line shaping the boxes were carved from, sliding every later word's box right of its
+    /// drawn glyphs (the error grew along the line). Each word box must sit on its own ink.
+    #[test]
+    fn translated_word_boxes_track_glyphs_with_a_bold_prefix() {
+        if !std::path::Path::new(REGULAR).exists() || !std::path::Path::new(BOLD).exists() {
+            eprintln!("DejaVu fonts missing; skipping");
+            return;
+        }
+        let (w, h) = (1000u32, 80u32);
+        let text = "Aaaa bbbb cccc dddd";
+        // One horizontal line whose box starts at x=50 and the font fits without shrinking.
+        let oriented = OrientedRect {
+            cx: 500.0,
+            cy: 40.0,
+            width: 900.0,
+            height: 40.0,
+            angle_radians: 0.0,
+        };
+        let line = PreparedTextLine {
+            text: text.to_string(),
+            bounding_box: Rect {
+                left: 50,
+                top: 20,
+                right: 950,
+                bottom: 60,
+            },
+            oriented_box: oriented,
+            word_rects: Vec::new(),
+            background_argb: 0xFFFF_FFFF,
+            foreground_argb: 0xFF00_0000,
+        };
+        let block = PreparedTextBlock {
+            source_text: text.to_string(),
+            translated_text: text.to_string(),
+            bounding_box: line.bounding_box,
+            lines: vec![line],
+            layout_hints: OverlayLayoutHints {
+                layout_mode: OverlayLayoutMode::PerLine,
+                suggested_font_size_px: 40.0,
+            },
+            background_argb: 0xFFFF_FFFF,
+            foreground_argb: 0xFF00_0000,
+            // "Aaaa" (bytes 0..4) bold; the rest regular.
+            bold_ranges: vec![BoldRange { start: 0, end: 4 }],
+        };
+        let prepared = PreparedImageOverlay {
+            rgba_bytes: vec![0xFF; (w * h * 4) as usize], // opaque white
+            width: w,
+            height: h,
+            extracted_text: text.to_string(),
+            translated_text: text.to_string(),
+            blocks: vec![block],
+            source_words: Vec::new(),
+            translated_words: Vec::new(),
+        };
+
+        let rendered =
+            render_overlay(&prepared, &WeightFonts, &RenderOptions::default()).expect("render");
+        let ink = ink_word_ranges(&rendered.rgba_bytes, w, h, 8);
+        assert_eq!(
+            ink.len(),
+            4,
+            "expected 4 ink words, got {ink:?} (box widths {:?})",
+            rendered
+                .translated_words
+                .iter()
+                .map(|x| x.bounds.width)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rendered.translated_words.len(), 4);
+        for (word, (l, r)) in rendered.translated_words.iter().zip(ink.iter()) {
+            let ink_center = (*l as f32 + *r as f32) * 0.5;
+            let box_center = word.bounds.cx;
+            assert!(
+                (ink_center - box_center).abs() <= 6.0,
+                "word {:?} box center {:.1} drifted from ink center {:.1} (ink {l}..{r})",
+                word.text,
+                box_center,
+                ink_center,
+            );
+        }
     }
 }
