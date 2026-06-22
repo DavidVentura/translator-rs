@@ -756,7 +756,7 @@ impl TranslatorSession {
     }
 }
 
-#[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+#[cfg(feature = "planar-tracker")]
 impl translator_live::live_session::LiveRecognizer for TranslatorSession {
     fn recognize(
         &self,
@@ -796,7 +796,7 @@ impl translator_live::live_session::LiveRecognizer for TranslatorSession {
     }
 }
 
-#[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+#[cfg(feature = "planar-tracker")]
 impl translator_live::live_session::LiveTranslator for TranslatorSession {
     fn translate_mixed_texts_with_alignment(
         &self,
@@ -815,7 +815,7 @@ impl translator_live::live_session::LiveTranslator for TranslatorSession {
     }
 }
 
-#[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+#[cfg(feature = "planar-tracker")]
 impl translator_live::live_session::LiveOcrHost for TranslatorSession {
     fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String> {
         self.ocr()

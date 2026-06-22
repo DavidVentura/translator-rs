@@ -89,9 +89,9 @@ pdf-image-translate = [
 doc-align = ["dep:translator-align", "dep:ndarray"]
 raster = ["dep:translator-raster", "dep:image"]
 ppocr = ["dep:translator-ocr", "raster"]
-planar-tracker = ["dep:translator-live", "dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
+planar-tracker = ["ppocr", "dep:translator-live", "dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
 gpu = ["dep:glow", "planar-tracker"]
-surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
+surface-sim = ["planar-tracker", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
 viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
