@@ -3,7 +3,7 @@ use std::path::Path;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 
-use crate::api::{TranslatorError, TranslatorErrorKind};
+use translator_core::api::{TranslatorError, TranslatorErrorKind};
 
 pub(crate) fn load_onnx_session(
     model_path: &Path,

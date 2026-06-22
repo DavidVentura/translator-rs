@@ -1,0 +1,14 @@
+[package]
+name = "translator-align"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "translator_align"
+path = "src/lib.rs"
+
+[dependencies]
+translator-core = { path = "../translator-core" }
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
+log = "0.4"

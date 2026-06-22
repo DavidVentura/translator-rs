@@ -5,8 +5,8 @@ use ort::inputs;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::inference::load_onnx_session;
+use translator_core::api::{TranslatorError, TranslatorErrorKind};
 
 const MODEL_INPUT_SIZE: usize = 256;
 const MODEL_INPUT_NAME: &str = "img";

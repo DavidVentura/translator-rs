@@ -8,11 +8,11 @@ pub use translator_core::catalog;
 pub mod coarse_tracker;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod color_matting;
+#[cfg(feature = "doc-align")]
+pub use translator_align::doc_align;
+#[cfg(feature = "doc-align")]
+pub use translator_align::doc_align_refine;
 pub use translator_core::coords;
-#[cfg(feature = "doc-align")]
-pub mod doc_align;
-#[cfg(feature = "doc-align")]
-pub mod doc_align_refine;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub mod font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
@@ -30,8 +30,6 @@ pub use translator_core::homography_ekf;
 pub mod html_translate;
 #[cfg(feature = "image-render")]
 pub mod image_render;
-#[cfg(feature = "doc-align")]
-mod inference;
 #[cfg(feature = "planar-tracker")]
 pub mod klt;
 pub use translator_core::language;
