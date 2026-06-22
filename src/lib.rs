@@ -90,8 +90,6 @@ pub use translator_core::script_normalize;
 pub use translator_translate::sentence_split;
 pub mod session;
 pub use translator_core::settings;
-#[cfg(feature = "tts")]
-mod speech;
 pub use translator_core::tts;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
@@ -109,6 +107,8 @@ pub use translator_translate::styled;
 pub use translator_translate::translate;
 #[cfg(feature = "transliterate")]
 pub use translator_transliterate::transliterate;
+#[cfg(feature = "tts")]
+pub use translator_tts::speech;
 pub mod txt;
 
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};

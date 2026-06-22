@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::api::{LanguageCode, TranslatorError, VoiceName};
-use crate::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
-use crate::tts::{
-    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
-};
 use piper_rs::{
     Backend, BoundaryAfter, CoquiVitsModel, CotoviaVitsModel, KokoroMnnModel, KokoroModel,
     MmsModel, PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
+};
+use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
+use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
+use translator_core::tts::{
+    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
 };
 
 fn log_debug(message: impl AsRef<str>) {
@@ -342,7 +342,11 @@ fn resolve_speech_assets_for_pack(
     language_code: &LanguageCode,
     pack_id: Option<&str>,
 ) -> Option<ResolvedSpeechAssets> {
-    let files = crate::catalog::resolve_tts_voice_files_for_pack(snapshot, language_code, pack_id)?;
+    let files = translator_core::catalog::resolve_tts_voice_files_for_pack(
+        snapshot,
+        language_code,
+        pack_id,
+    )?;
     let support_data_root = support_data_root(snapshot, &files);
     let model_path = absolute_install_path(snapshot, &files.model_install_path);
     if !Path::new(&model_path).exists() {
@@ -371,10 +375,12 @@ fn piper_length_scale_for_speed(speech_speed: f32) -> f32 {
 /// natively render the source script (Cyrillic, CJK, …) keep the text intact.
 #[cfg(feature = "transliterate")]
 fn romanize_foreign_runs_for_voice(text: &str, language_code: &str) -> String {
-    if crate::script::Script::from_bcp47(language_code) != crate::script::Script::Latin {
+    if translator_core::script::Script::from_bcp47(language_code)
+        != translator_core::script::Script::Latin
+    {
         return text.to_owned();
     }
-    crate::transliterate::transliterate_mixed_to_latin(text)
+    translator_transliterate::transliterate::transliterate_mixed_to_latin(text)
 }
 
 #[cfg(not(feature = "transliterate"))]
@@ -389,7 +395,7 @@ fn missing_tts_asset(language_code: &LanguageCode) -> TranslatorError {
     ))
 }
 
-pub(crate) fn available_tts_voices_in_snapshot(
+pub fn available_tts_voices_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
@@ -407,7 +413,7 @@ pub(crate) fn available_tts_voices_in_snapshot(
     .map_err(TranslatorError::tts)
 }
 
-pub(crate) fn warm_tts_model_in_snapshot(
+pub fn warm_tts_model_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
@@ -415,7 +421,7 @@ pub(crate) fn warm_tts_model_in_snapshot(
     available_tts_voices_in_snapshot(snapshot, cache, language_code).map(|_| ())
 }
 
-pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
+pub fn plan_speech_chunks_for_text_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
@@ -436,7 +442,7 @@ pub(crate) fn plan_speech_chunks_for_text_in_snapshot(
     .map_err(TranslatorError::tts)
 }
 
-pub(crate) fn synthesize_pcm_in_snapshot(
+pub fn synthesize_pcm_in_snapshot(
     snapshot: &CatalogSnapshot,
     cache: &mut SpeechCache,
     language_code: &LanguageCode,
