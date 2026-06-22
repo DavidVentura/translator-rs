@@ -68,6 +68,7 @@ enum Stage {
     Heatmap,
     Boxes,
     OrientedBoxes,
+    Contours,
     BoxHeights,
     XHeight,
     RecognizeDeskew,
@@ -82,11 +83,12 @@ enum Stage {
 }
 
 impl Stage {
-    const ALL: [Stage; 15] = [
+    const ALL: [Stage; 16] = [
         Stage::Input,
         Stage::Heatmap,
         Stage::Boxes,
         Stage::OrientedBoxes,
+        Stage::Contours,
         Stage::BoxHeights,
         Stage::XHeight,
         Stage::RecognizeDeskew,
@@ -106,6 +108,7 @@ impl Stage {
             Stage::Heatmap => "heatmap",
             Stage::Boxes => "boxes",
             Stage::OrientedBoxes => "oriented-boxes",
+            Stage::Contours => "contours",
             Stage::BoxHeights => "box-heights",
             Stage::XHeight => "x-height",
             Stage::RecognizeDeskew => "recognize-deskew",
@@ -130,6 +133,9 @@ impl Stage {
             Stage::Heatmap => "detection probability map, colorized over the input",
             Stage::Boxes => "detected boxes (AABB), one color per box",
             Stage::OrientedBoxes => "detected boxes (tight oriented rect), one color per box",
+            Stage::Contours => {
+                "raw detection contour polygon per box, labeled with its PCA principal-axis angle"
+            }
             Stage::BoxHeights => {
                 "tight (green) vs unclip-inflated (magenta) rects, labeled tight→inflated height"
             }
@@ -779,6 +785,7 @@ fn run(cli: Cli) -> Result<(), String> {
             s,
             Stage::Boxes
                 | Stage::OrientedBoxes
+                | Stage::Contours
                 | Stage::BoxHeights
                 | Stage::XHeight
                 | Stage::RecognizeDeskew
@@ -838,6 +845,32 @@ fn run(cli: Cli) -> Result<(), String> {
                     draw_closed_polyline(&mut canvas, &b.tight_box.corners(), box_color(i), t);
                 }
                 save_png(&canvas, &cli.out_dir.join("oriented_boxes.png"))?;
+            }
+            Stage::Contours => {
+                let mut canvas = rgba.clone();
+                let scale = PxScale::from(20.0);
+                for (i, b) in boxes.iter().enumerate() {
+                    let pts = contour_points(&b.contour);
+                    if pts.len() < 2 {
+                        continue;
+                    }
+                    draw_closed_polyline(&mut canvas, &pts, box_color(i), t);
+                    let angle = translator::ppocr::contour_principal_axis_angle(&pts)
+                        .map(|a| a.to_degrees())
+                        .unwrap_or(0.0);
+                    let lx = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+                    let ly = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+                    draw_text_mut(
+                        &mut canvas,
+                        Rgba([255, 80, 0, 255]),
+                        lx as i32,
+                        (ly as i32 - 22).max(0),
+                        scale,
+                        &font,
+                        &format!("{angle:.1}deg"),
+                    );
+                }
+                save_png(&canvas, &cli.out_dir.join("contours.png"))?;
             }
             Stage::BoxHeights => {
                 let mut canvas = rgba.clone();
@@ -952,8 +985,21 @@ fn run(cli: Cli) -> Result<(), String> {
                         // the geometric fallback — matching the runtime decision.
                         let mp = model_bold_p[i];
                         let is_bold = mp.map(|p| p >= 0.65).unwrap_or(false);
-                        // Matte band in cyan: box re-fit to actual ink on both axes.
-                        let band = m.refit(b.tight_box);
+                        // Matte band in cyan: box re-fit to actual ink on both axes, at the
+                        // ink's absolute baseline angle (source space via src_map), snapped to
+                        // the detection reading frame when the lean is sub-visible — the same
+                        // angle the still pipeline now renders.
+                        let reading_angle = b.tight_box.angle_radians;
+                        let angle = strips
+                            .get(i)
+                            .and_then(|s| s.as_ref())
+                            .and_then(|s| {
+                                let sm = s.src_map.as_ref()?;
+                                translator::text_metrics::baseline_angle_source(&s.matte, sm)
+                            })
+                            .filter(|a| (a - reading_angle).abs() > 0.04)
+                            .unwrap_or(reading_angle);
+                        let band = m.refit(b.tight_box, angle);
                         draw_closed_polyline(
                             &mut canvas,
                             &band.corners(),

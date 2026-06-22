@@ -2106,7 +2106,9 @@ impl LiveSession {
             .enumerate()
             .map(|(i, d)| {
                 let m = input.line_metrics.get(i).copied().flatten()?;
-                let refined = m.refit(d.tight_box.clone());
+                // Keep the detection reading angle (the strip-frame baseline delta is the
+                // wrong frame to fold in); live then snaps to the canonical quadrant below.
+                let refined = m.refit(d.tight_box.clone(), d.tight_box.angle_radians);
                 let mut sb = match input.h_view_to_surface {
                     None => refined,
                     Some(h) => project_oriented_rect(&refined, &h).unwrap_or(refined),

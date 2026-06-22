@@ -2516,6 +2516,12 @@ const TILT_EDGE_OUTLIER_FRACTION: f32 = 0.20;
 /// rather than from a genuine baseline lean.
 const TILT_MIN_DEVIATION_FRACTION: f32 = 0.20;
 
+/// Maximum PCA eigenvalue ratio (λ₂/λ₁) for the contour to have a trustworthy
+/// principal axis. Above it the cloud is too square (a lone glyph, "3%") for PCA
+/// to mean anything, so the dewarp aligns to the reading frame instead of a fluke
+/// lean. ~0.12 ⇒ needs roughly a 2.5:1 aspect, which any real word clears.
+const STRIP_ELONG_MAX: f32 = 0.12;
+
 /// Per-contour tilt measurement. `angle` is what the box uses on its own (post agreement and
 /// sub-visibility gates: 0 when the contour is degenerate, content-asymmetric, or its tilt is
 /// below the visibility floor). `vote` is the reading-direction sample this contour contributes
@@ -3018,6 +3024,52 @@ pub fn contour_principal_axis_angle(contour: &[(f32, f32)]) -> Option<f32> {
     Some(uy.atan2(ux))
 }
 
+/// Mean, principal-axis unit vector (`ux >= 0` convention) and the two PCA
+/// eigenvalues (λ₁ ≥ λ₂) of a point set. The shared core of every contour-PCA in
+/// this module.
+fn pca_axis(pts: &[(f32, f32)]) -> Option<(f32, f32, f32, f32, f32, f32)> {
+    let n = pts.len() as f32;
+    if n < 3.0 {
+        return None;
+    }
+    let (mut mean_x, mut mean_y) = (0.0f32, 0.0f32);
+    for &(x, y) in pts {
+        mean_x += x;
+        mean_y += y;
+    }
+    mean_x /= n;
+    mean_y /= n;
+    let (mut cxx, mut cyy, mut cxy) = (0.0f32, 0.0f32, 0.0f32);
+    for &(x, y) in pts {
+        let (dx, dy) = (x - mean_x, y - mean_y);
+        cxx += dx * dx;
+        cyy += dy * dy;
+        cxy += dx * dy;
+    }
+    cxx /= n;
+    cyy /= n;
+    cxy /= n;
+    let trace = cxx + cyy;
+    let det = cxx * cyy - cxy * cxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let lambda1 = (trace + disc) * 0.5;
+    let lambda2 = (trace - disc) * 0.5;
+    let (ex, ey) = if cxy.abs() > 1e-6 {
+        (lambda1 - cyy, cxy)
+    } else if cxx >= cyy {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
+    let (mut ux, mut uy) = (ex / norm, ey / norm);
+    if ux < 0.0 {
+        ux = -ux;
+        uy = -uy;
+    }
+    Some((mean_x, mean_y, ux, uy, lambda1, lambda2))
+}
+
 struct ContourStripWarp {
     width: u32,
     height: u32,
@@ -3046,46 +3098,20 @@ fn contour_strip_warp(
     if contour.len() < 8 {
         return None;
     }
-    let n = contour.len() as f32;
-
     // 1. PCA on contour points -> principal axis (u) and perpendicular (v).
-    let mut mean_x = 0.0f32;
-    let mut mean_y = 0.0f32;
-    for &(x, y) in contour {
-        mean_x += x;
-        mean_y += y;
-    }
-    mean_x /= n;
-    mean_y /= n;
+    let (mut mean_x, mut mean_y, mut ux, mut uy, lambda1, lambda2) = pca_axis(contour)?;
 
-    let mut cxx = 0.0f32;
-    let mut cyy = 0.0f32;
-    let mut cxy = 0.0f32;
-    for &(x, y) in contour {
-        let dx = x - mean_x;
-        let dy = y - mean_y;
-        cxx += dx * dx;
-        cyy += dy * dy;
-        cxy += dx * dy;
+    // A short, near-square contour ("3%", a lone glyph) has no trustworthy axis —
+    // the eigenvalues are close and PCA latches onto noise, leaning the strip
+    // wildly. Fall back to the reading frame's own direction (canonical quadrant,
+    // else screen-horizontal).
+    if lambda2 / lambda1.max(1e-6) > STRIP_ELONG_MAX {
+        let theta = canonical_quadrant.map(|q| q.radians()).unwrap_or(0.0);
+        ux = theta.cos();
+        uy = theta.sin();
+        mean_x = contour.iter().map(|p| p.0).sum::<f32>() / contour.len() as f32;
+        mean_y = contour.iter().map(|p| p.1).sum::<f32>() / contour.len() as f32;
     }
-    cxx /= n;
-    cyy /= n;
-    cxy /= n;
-
-    let trace = cxx + cyy;
-    let det = cxx * cyy - cxy * cxy;
-    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
-    let lambda1 = (trace + disc) * 0.5;
-    let (ex, ey) = if cxy.abs() > 1e-6 {
-        (lambda1 - cyy, cxy)
-    } else if cxx >= cyy {
-        (1.0, 0.0)
-    } else {
-        (0.0, 1.0)
-    };
-    let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
-    let mut ux = ex / norm;
-    let mut uy = ey / norm;
     // PCA gives a sign-ambiguous principal axis; we have to pick which
     // way along it the strip's +x should point. Without a reference,
     // `ux >= 0` is the only deterministic choice — and it must stay
@@ -3122,7 +3148,7 @@ fn contour_strip_warp(
     let vx = -uy;
     let vy = ux;
 
-    // 2. Project contour into (u, v) frame.
+    // 2. Project contour into the final (u, v) frame.
     let projected: Vec<(f32, f32)> = contour
         .iter()
         .map(|&(x, y)| {
@@ -3643,34 +3669,21 @@ mod tests {
     }
 
     #[test]
-    fn phantom_lean_snaps_but_intentional_rotation_survives() {
-        // The scene is essentially horizontal.
+    fn committed_box_keeps_its_own_angle_against_the_scene() {
+        // A box that committed to a tilt is a breakaway: it keeps its measured angle
+        // regardless of the scene consensus. The commitment gates (top/bottom edge
+        // agreement plus a visible-deviation floor) already rejected the phantom and
+        // sub-visible leans upstream, so a committed angle is trusted and overriding
+        // it with the first-order field would only inflate the rect's height by
+        // width·tan(err). This holds for a small genuine lean and a large
+        // deliberate rotation alike — both must survive a flat scene.
         let scene = Some(0.0f32);
-        // A short word that picked up a spurious ~5° lean is in the phantom band → flattened.
-        let phantom = committed(5.0);
-        assert!(
-            resolve_box_angle(&phantom, scene).abs() < 1e-6,
-            "5° phantom lean should snap to the co-aligned scene",
-        );
-        // A deliberately rotated 35° label is past the break-away threshold → kept as measured.
-        let intentional = committed(35.0);
-        assert!(
-            (resolve_box_angle(&intentional, scene) - 35.0f32.to_radians()).abs() < 1e-6,
-            "intentional 35° rotation must not be dragged flat by a horizontal page",
-        );
-    }
-
-    #[test]
-    fn small_committed_lean_on_a_flat_page_snaps_to_the_scene() {
-        // Regression for "Storage": a visually-horizontal heading whose DB mask comes back as a
-        // slightly tilted parallelogram commits to a real ~2.6° lean (both edges slope the same
-        // way, so the disagreement guard never fires). On a page of flat body text the consensus
-        // is ~0°, and the box must adopt it rather than keep its own measurement noise.
-        let scene = Some(0.0f32);
-        let storage = committed(2.6);
-        assert!(
-            resolve_box_angle(&storage, scene).abs() < 1e-6,
-            "a sub-break-away lean against a flat scene should flatten to the consensus",
-        );
+        for deg in [2.6f32, 5.0, 35.0] {
+            let est = committed(deg);
+            assert!(
+                (resolve_box_angle(&est, scene) - deg.to_radians()).abs() < 1e-6,
+                "committed {deg}° must survive a flat scene",
+            );
+        }
     }
 }
