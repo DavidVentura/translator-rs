@@ -13,8 +13,10 @@
 use image::GrayImage;
 use rayon::prelude::*;
 
-use crate::homography::{fit_affine, fit_homography, fit_similarity, invert, mat3_mul, project};
 use crate::klt::{KltConfig, Pyramid, track_points};
+use translator_core::homography::{
+    fit_affine, fit_homography, fit_similarity, invert, mat3_mul, project,
+};
 
 /// Master toggle for per-frame tracker timing logs (target
 /// `planar_timing`). Flip to `false` to silence the per-frame
@@ -484,16 +486,16 @@ pub fn track_against_anchor_with_features(
         let descriptor_pairs = &pairs[n_klt..];
         r.descriptor_inliers = descriptor_pairs
             .iter()
-            .filter(
-                |&&(px, py, qx, qy)| match crate::homography::project(&r.homography, px, py) {
+            .filter(|&&(px, py, qx, qy)| {
+                match translator_core::homography::project(&r.homography, px, py) {
                     Some((px2, py2)) => {
                         let dx = px2 - qx;
                         let dy = py2 - qy;
                         dx * dx + dy * dy <= r_thresh_sq
                     }
                     None => false,
-                },
-            )
+                }
+            })
             .count();
         // Temporal-prior post-refit was tried here and reverted:
         // `homography::fit_homography_with_temporal_prior` with

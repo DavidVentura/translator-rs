@@ -14,23 +14,23 @@ use std::sync::Arc;
 use image::GrayImage;
 
 use crate::coarse_tracker::{Correction, Lifecycle};
-use crate::coords::Quadrant;
-use crate::homography::{invert, mat3_mul, project};
-use crate::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 use crate::planar_tracker::{
     FrameFeatures, SceneAnchor, TrackResult, TrackerConfig, build_anchor, build_anchor_in_regions,
     compute_frame_features, track_against_anchor_with_features,
 };
+use translator_core::coords::Quadrant;
+use translator_core::homography::{invert, mat3_mul, project};
+use translator_core::homography_ekf::{EKF_Q_DEFAULT, EKF_R_DEFAULT, HomographyEkf};
 
 #[cfg(feature = "image-render")]
-use crate::font_provider::FontProvider;
-#[cfg(feature = "image-render")]
-use crate::image_render::{RenderOptions, render_overlay};
-#[cfg(feature = "image-render")]
-use crate::ocr::{
+use translator_core::ocr::{
     OrientedRect, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock,
     PreparedTextLine, Rect,
 };
+#[cfg(feature = "image-render")]
+use translator_render::font_provider::FontProvider;
+#[cfg(feature = "image-render")]
+use translator_render::image_render::{RenderOptions, render_overlay};
 
 /// Stable identifier for a captured scene. Increases monotonically; we
 /// never reuse an id even after an anchor is evicted from the LRU
@@ -1159,9 +1159,9 @@ impl LivePlanarEngine {
                     // handoff once we're past ~1.35× to rebuild
                     // descriptors at the current scale before matching
                     // collapses.
-                    let scale = crate::coords::Homography::<
-                        crate::coords::AnchorSpace,
-                        crate::coords::TrackerSpace,
+                    let scale = translator_core::coords::Homography::<
+                        translator_core::coords::AnchorSpace,
+                        translator_core::coords::TrackerSpace,
                     >::from_raw(r.homography)
                     .approx_scale();
                     let scale_log = if scale > 0.0 { scale.ln().abs() } else { 0.0 };
@@ -1898,7 +1898,7 @@ impl LivePlanarEngine {
             .filter_map(|ov| {
                 let mut quad = [(0.0, 0.0); 4];
                 for (i, &(x, y)) in ov.quad.iter().enumerate() {
-                    let (px, py) = crate::homography::project(homography, x, y)?;
+                    let (px, py) = translator_core::homography::project(homography, x, y)?;
                     quad[i] = (px, py);
                 }
                 Some(OverlayProjection {
@@ -2390,7 +2390,7 @@ fn visible_keypoint_ratio(positions: &[(f32, f32)], h: &[f32; 9], view_w: u32, v
     let h_ = view_h as f32;
     let mut visible = 0usize;
     for &(x, y) in positions {
-        let Some((vx, vy)) = crate::homography::project(h, x, y) else {
+        let Some((vx, vy)) = translator_core::homography::project(h, x, y) else {
             continue;
         };
         if vx >= 0.0 && vx < w && vy >= 0.0 && vy < h_ {
@@ -2437,8 +2437,8 @@ fn homography_delta_is_sane(
     let ch = canonical_h as f32;
     let corners = [(0.0_f32, 0.0_f32), (cw, 0.0), (cw, ch), (0.0, ch)];
     for &(x, y) in &corners {
-        let pn = crate::homography::project(h_new, x, y);
-        let pp = crate::homography::project(h_prev, x, y);
+        let pn = translator_core::homography::project(h_new, x, y);
+        let pp = translator_core::homography::project(h_prev, x, y);
         match (pn, pp) {
             (Some(pn), Some(pp)) => {
                 let dx = pn.0 - pp.0;
@@ -2466,8 +2466,8 @@ fn approx_corner_delta(a: &[f32; 9], b: &[f32; 9]) -> f32 {
     let corners = [(0.0_f32, 0.0_f32), (W, 0.0), (W, W), (0.0, W)];
     let mut max_d = 0.0_f32;
     for &(x, y) in &corners {
-        let pa = crate::homography::project(a, x, y);
-        let pb = crate::homography::project(b, x, y);
+        let pa = translator_core::homography::project(a, x, y);
+        let pb = translator_core::homography::project(b, x, y);
         if let (Some(pa), Some(pb)) = (pa, pb) {
             let dx = pa.0 - pb.0;
             let dy = pa.1 - pb.1;
@@ -2529,7 +2529,7 @@ fn homography_is_sane(h: &[f32; 9], canonical_w: u32, canonical_h: u32) -> bool 
     let corners = [(0.0_f32, 0.0_f32), (cw, 0.0), (cw, ch), (0.0, ch)];
     let mut p = [(0.0f32, 0.0f32); 4];
     for (i, &(x, y)) in corners.iter().enumerate() {
-        match crate::homography::project(h, x, y) {
+        match translator_core::homography::project(h, x, y) {
             Some(q) if q.0.is_finite() && q.1.is_finite() => p[i] = q,
             _ => return false,
         }
@@ -2630,7 +2630,7 @@ pub fn fill_oriented_rect_blended(
     rgba: &mut [u8],
     w: u32,
     h: u32,
-    rect: &crate::ocr::OrientedRect,
+    rect: &translator_core::ocr::OrientedRect,
     color: [u8; 4],
 ) {
     if color[3] == 0 {
@@ -2699,7 +2699,7 @@ pub fn fill_oriented_rect_solid(
     rgba: &mut [u8],
     w: u32,
     h: u32,
-    rect: &crate::ocr::OrientedRect,
+    rect: &translator_core::ocr::OrientedRect,
     color: [u8; 4],
 ) {
     if color[3] == 0 {
@@ -2718,10 +2718,10 @@ pub fn clear_oriented_rect(
     rgba: &mut [u8],
     w: u32,
     h: u32,
-    rect: &crate::ocr::OrientedRect,
+    rect: &translator_core::ocr::OrientedRect,
     margin: f32,
 ) {
-    let grown = crate::ocr::OrientedRect {
+    let grown = translator_core::ocr::OrientedRect {
         width: rect.width + 2.0 * margin,
         height: rect.height + 2.0 * margin,
         ..*rect
@@ -2736,7 +2736,7 @@ fn fill_oriented_rect_solid_unguarded(
     rgba: &mut [u8],
     w: u32,
     h: u32,
-    rect: &crate::ocr::OrientedRect,
+    rect: &translator_core::ocr::OrientedRect,
     color: [u8; 4],
 ) {
     let hw = rect.width * 0.5;

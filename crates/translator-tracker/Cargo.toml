@@ -1,0 +1,21 @@
+[package]
+name = "translator-tracker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "translator_tracker"
+path = "src/lib.rs"
+
+[dependencies]
+translator-core = { path = "../translator-core" }
+translator-render = { path = "../translator-render", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rayon = "1"
+log = "0.4"
+uniffi = { version = "0.29", optional = true, default-features = false }
+
+[features]
+uniffi = ["dep:uniffi", "translator-core/uniffi"]
+image-render = ["dep:translator-render", "translator-core/script-from-unicode"]

@@ -16,7 +16,7 @@
 //! bootstrap), because the background can mimic ink's appearance but not its
 //! stability — see the three-layer mask in the spec.
 
-use crate::ocr::OrientedRect;
+use translator_core::ocr::OrientedRect;
 
 /// A point in the global sampling lattice, in canonical (overlay) coords.
 #[derive(Debug, Clone, Copy, PartialEq)]

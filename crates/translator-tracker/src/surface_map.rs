@@ -20,7 +20,7 @@
 //! surface coords before they reach this layer. See
 //! FUTURE_SURFACE_MAP.md for the broader design.
 
-use crate::ocr::OrientedRect;
+use translator_core::ocr::OrientedRect;
 
 /// Stable identifier of a line in the surface map. Assigned at
 /// creation, never reused.
@@ -48,7 +48,7 @@ pub struct SurfaceLine {
     /// Per-word bold byte ranges over `source_text` (trimmed), pooled from the ink bold
     /// channel + CTC firings at the last rec. Cached so lines that skip re-rec (held camera)
     /// keep their per-word weight instead of falling back to a whole-line estimate.
-    pub source_bold_ranges: Vec<crate::ocr::BoldRange>,
+    pub source_bold_ranges: Vec<translator_core::ocr::BoldRange>,
     /// BCP-47 source language tag (e.g. "nl", "en"), or empty when
     /// the source language wasn't recorded.
     pub source_language: String,
@@ -186,7 +186,7 @@ impl SurfaceMap {
         if rects.is_empty() {
             return;
         }
-        let targets: Vec<crate::ocr::Rect> = rects.iter().map(|r| r.to_aabb()).collect();
+        let targets: Vec<translator_core::ocr::Rect> = rects.iter().map(|r| r.to_aabb()).collect();
         self.lines.retain(|line| {
             let lb = line.bbox.to_aabb();
             !targets.iter().any(|t| {
@@ -432,7 +432,7 @@ fn merge_bbox(existing: &OrientedRect, obs: &OrientedRect, prev_count: u32) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ocr::OrientedRect;
+    use translator_core::ocr::OrientedRect;
 
     fn rect(cx: f32, cy: f32, w: f32, h: f32, angle_deg: f32) -> OrientedRect {
         OrientedRect {

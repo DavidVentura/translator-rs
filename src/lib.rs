@@ -1,15 +1,12 @@
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use translator_core::api;
-pub use translator_core::catalog;
-pub use translator_translate::bergamot;
-#[cfg(feature = "planar-tracker")]
-pub mod coarse_tracker;
 #[cfg(feature = "doc-align")]
 pub use translator_align::doc_align;
 #[cfg(feature = "doc-align")]
 pub use translator_align::doc_align_refine;
+pub use translator_core::api;
+pub use translator_core::catalog;
 pub use translator_core::coords;
 #[cfg(feature = "raster")]
 pub use translator_raster::color_matting;
@@ -17,6 +14,9 @@ pub use translator_raster::color_matting;
 pub use translator_render::font_metrics;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub use translator_render::font_provider;
+#[cfg(feature = "planar-tracker")]
+pub use translator_tracker::coarse_tracker;
+pub use translator_translate::bergamot;
 #[cfg(feature = "gpu")]
 pub mod gl_renderer;
 #[cfg(feature = "dom-translate")]
@@ -25,15 +25,15 @@ pub use translator_translate::dom_translate;
 pub mod epub;
 pub use translator_core::homography;
 pub use translator_core::homography_ekf;
-#[cfg(feature = "image-render")]
-pub use translator_render::image_render;
-#[cfg(feature = "html")]
-pub use translator_translate::html_translate;
-#[cfg(feature = "planar-tracker")]
-pub mod klt;
 pub use translator_core::language;
 #[cfg(feature = "raster")]
 pub use translator_raster::live_frame;
+#[cfg(feature = "image-render")]
+pub use translator_render::image_render;
+#[cfg(feature = "planar-tracker")]
+pub use translator_tracker::klt;
+#[cfg(feature = "html")]
+pub use translator_translate::html_translate;
 pub use translator_translate::language_detect;
 #[cfg(feature = "gpu")]
 pub mod live_gpu_tick;
@@ -74,14 +74,15 @@ mod pdf_text_overlay;
 pub mod pdf_translate;
 #[cfg(feature = "pdf")]
 pub mod pdf_write;
-#[cfg(feature = "planar-tracker")]
-pub mod planar_engine;
-#[cfg(feature = "planar-tracker")]
-pub mod planar_tracker;
 #[cfg(feature = "ppocr")]
 pub use translator_ocr::ppocr;
+#[cfg(feature = "planar-tracker")]
+pub use translator_tracker::planar_engine;
+#[cfg(feature = "planar-tracker")]
+pub use translator_tracker::planar_tracker;
+#[cfg(feature = "planar-tracker")]
+pub use translator_tracker::screen_monitor;
 pub use translator_translate::routing;
-pub mod screen_monitor;
 #[cfg(feature = "gpu")]
 pub mod screen_monitor_gpu;
 pub use translator_core::script;
@@ -91,8 +92,6 @@ pub mod session;
 pub use translator_core::settings;
 #[cfg(feature = "tts")]
 mod speech;
-pub use translator_translate::styled;
-pub mod surface_map;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
 #[cfg(feature = "raster")]
@@ -103,6 +102,9 @@ pub use translator_raster::text_metrics;
 pub use translator_render::text_runs;
 #[cfg(any(feature = "pdf", feature = "image-render"))]
 pub use translator_render::text_shape;
+#[cfg(feature = "planar-tracker")]
+pub use translator_tracker::surface_map;
+pub use translator_translate::styled;
 pub use translator_translate::translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;
