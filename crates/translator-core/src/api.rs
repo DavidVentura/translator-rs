@@ -190,29 +190,27 @@ impl TranslatorError {
         }
     }
 
-    pub(crate) fn translation(message: impl Into<String>) -> Self {
+    pub fn translation(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::Translation, message)
     }
 
-    pub(crate) fn ocr(message: impl Into<String>) -> Self {
+    pub fn ocr(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::Ocr, message)
     }
 
-    #[cfg(feature = "tts")]
-    pub(crate) fn tts(message: impl Into<String>) -> Self {
+    pub fn tts(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::Tts, message)
     }
 
-    #[cfg(feature = "dictionary")]
-    pub(crate) fn dictionary(message: impl Into<String>) -> Self {
+    pub fn dictionary(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::Dictionary, message)
     }
 
-    pub(crate) fn missing_asset(message: impl Into<String>) -> Self {
+    pub fn missing_asset(message: impl Into<String>) -> Self {
         Self::new(TranslatorErrorKind::MissingAsset, message)
     }
 
-    pub(crate) fn cancelled() -> Self {
+    pub fn cancelled() -> Self {
         Self::new(TranslatorErrorKind::Cancelled, "cancelled")
     }
 

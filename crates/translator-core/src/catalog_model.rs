@@ -342,7 +342,7 @@ pub struct LanguageCatalog {
     pub dictionary_version: i32,
     pub sources: CatalogSourcesV2,
     pub(crate) languages: HashMap<String, LanguageInfo>,
-    pub(crate) packs: HashMap<String, PackRecord>,
+    pub packs: HashMap<String, PackRecord>,
     pub(crate) translation_pack_ids: HashMap<(String, String), String>,
     pub(crate) dictionary_pack_ids_by_code: HashMap<String, String>,
     pub(crate) root_pack_ids_by_language_feature: HashMap<(String, LanguageFeature), Vec<String>>,
@@ -610,7 +610,7 @@ impl LanguageCatalog {
             .sum()
     }
 
-    pub(crate) fn translation_pack_id(&self, from: &str, to: &str) -> Option<String> {
+    pub fn translation_pack_id(&self, from: &str, to: &str) -> Option<String> {
         self.translation_pack_ids
             .get(&(from.to_string(), to.to_string()))
             .cloned()

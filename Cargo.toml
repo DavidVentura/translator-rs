@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[workspace]
+members = ["crates/*"]
+
 [lib]
 name = "translator"
 path = "src/lib.rs"
@@ -51,11 +54,11 @@ required-features = ["ppocr"]
 [features]
 default = []
 translate-cli = ["dep:toml"]
-uniffi = ["dep:uniffi"]
+uniffi = ["dep:uniffi", "translator-core/uniffi"]
 dictionary = ["dep:tarkka"]
 mucab = ["dep:mucab"]
 tts = ["dep:piper-rs"]
-transliterate = ["dep:icu_locale_core", "dep:icu_experimental", "dep:unicode-script"]
+transliterate = ["dep:icu_locale_core", "dep:icu_experimental", "dep:unicode-script", "translator-core/script-from-unicode"]
 pdf = [
     "dep:mupdf",
     "dep:lopdf",
@@ -64,6 +67,7 @@ pdf = [
     "dep:rustybuzz",
     "dep:unicode-bidi",
     "dep:unicode-script",
+    "translator-core/script-from-unicode",
 ]
 odt = ["dep:zip"]
 dom-translate = ["dep:markup5ever", "dep:markup5ever_rcdom"]
@@ -76,6 +80,7 @@ image-render = [
     "dep:unicode-script",
     "dep:unicode-linebreak",
     "dep:zeno",
+    "translator-core/script-from-unicode",
 ]
 pdf-image-translate = [
     "pdf",
@@ -92,6 +97,7 @@ surface-sim = ["planar-tracker", "ppocr", "dep:minifb", "dep:ab_glyph", "dep:env
 viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 
 [dependencies]
+translator-core = { path = "crates/translator-core" }
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"

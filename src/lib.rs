@@ -1,15 +1,14 @@
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub mod api;
+pub use translator_core::api;
 pub mod bergamot;
-pub mod catalog;
+pub use translator_core::catalog;
 #[cfg(feature = "planar-tracker")]
 pub mod coarse_tracker;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod color_matting;
-//#[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
-pub mod coords;
+pub use translator_core::coords;
 #[cfg(feature = "doc-align")]
 pub mod doc_align;
 #[cfg(feature = "doc-align")]
@@ -25,8 +24,8 @@ pub mod gl_renderer;
 mod dom_translate;
 #[cfg(feature = "epub")]
 pub mod epub;
-pub mod homography;
-pub mod homography_ekf;
+pub use translator_core::homography;
+pub use translator_core::homography_ekf;
 #[cfg(feature = "html")]
 pub mod html_translate;
 #[cfg(feature = "image-render")]
@@ -35,7 +34,7 @@ pub mod image_render;
 mod inference;
 #[cfg(feature = "planar-tracker")]
 pub mod klt;
-pub mod language;
+pub use translator_core::language;
 pub mod language_detect;
 #[cfg(any(feature = "ppocr", feature = "planar-tracker"))]
 pub mod live_frame;
@@ -90,11 +89,11 @@ mod routing;
 pub mod screen_monitor;
 #[cfg(feature = "gpu")]
 pub mod screen_monitor_gpu;
-pub mod script;
-pub mod script_normalize;
+pub use translator_core::script;
+pub use translator_core::script_normalize;
 mod sentence_split;
 pub mod session;
-pub mod settings;
+pub use translator_core::settings;
 #[cfg(feature = "tts")]
 mod speech;
 mod styled;
@@ -109,7 +108,7 @@ pub mod text_shape;
 mod translate;
 #[cfg(feature = "transliterate")]
 pub mod transliterate;
-pub mod tts;
+pub use translator_core::tts;
 pub mod txt;
 
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};

@@ -2995,6 +2995,7 @@ dependencies = [
  "subsetter",
  "tarkka",
  "toml 0.8.23",
+ "translator-core",
  "ttf-parser",
  "unicode-bidi",
  "unicode-linebreak",
@@ -3003,6 +3004,16 @@ dependencies = [
  "xml5ever",
  "zeno",
  "zip",
+]
+
+[[package]]
+name = "translator-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-script",
+ "uniffi",
 ]
 
 [[package]]
