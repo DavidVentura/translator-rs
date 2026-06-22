@@ -19,14 +19,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::font_provider::FontProvider;
 use crate::live_frame::LiveFrame;
-use crate::live_session::LiveSession;
+use crate::live_session::{LiveOcrHost, LiveSession};
 use crate::live_tracker_pipeline::{acquire_detect, acquire_rec_translate};
 use crate::live_worker::SlotWorker;
 use crate::ocr::{OrientedRect, Rect};
 use crate::screen_monitor::{
     FrameClassification, Lattice, MonitorConfig, Rgb, ScreenMonitor, channel_delta,
 };
-use crate::session::TranslatorSession;
 use translator_ocr::orientation::dominant_axis_quadrant;
 
 /// The one anchor the screen pipeline owns; everything composites against it.
@@ -328,7 +327,7 @@ fn reconcile_boxes(
 }
 
 pub struct LiveScreenPipeline {
-    catalog: Arc<TranslatorSession>,
+    host: Arc<dyn LiveOcrHost>,
     session: Arc<LiveSession>,
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     config: Mutex<ScreenConfig>,
@@ -343,7 +342,7 @@ pub struct LiveScreenPipeline {
 
 impl LiveScreenPipeline {
     pub fn new(
-        catalog: Arc<TranslatorSession>,
+        host: Arc<dyn LiveOcrHost>,
         font_provider: Arc<dyn FontProvider + Send + Sync>,
     ) -> Arc<Self> {
         let session = Arc::new(LiveSession::new());
@@ -352,7 +351,7 @@ impl LiveScreenPipeline {
         // double-dim into unreadable mush. Camera keeps the translucent default.
         session.set_overlay_bg([0x00, 0x00, 0x00, 0xFF]);
         let pipeline = Arc::new(Self {
-            catalog,
+            host,
             session,
             font_provider,
             config: Mutex::new(ScreenConfig::default()),
@@ -972,7 +971,7 @@ impl LiveScreenPipeline {
             .flat_map(|(_, _, strips)| strips)
             .collect();
         let t_det = std::time::Instant::now();
-        let detected = match acquire_detect(&self.catalog, &frame, crop, cfg.det_max_pixels) {
+        let detected = match acquire_detect(&*self.host, &frame, crop, cfg.det_max_pixels) {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("[screen] detect failed: {e}");
@@ -1032,7 +1031,7 @@ impl LiveScreenPipeline {
         let quadrant = Some(dominant_axis_quadrant(&detected));
         let t_rec = std::time::Instant::now();
         let rec_result = acquire_rec_translate(
-            &self.catalog,
+            &*self.host,
             &self.session,
             &*self.font_provider,
             &frame,

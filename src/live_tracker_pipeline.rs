@@ -43,12 +43,11 @@ use crate::font_provider::FontProvider;
 use crate::homography;
 use crate::live_frame::LiveFrame;
 use crate::live_session::{
-    LiveSession, PostDetectInput, PostDetectOutcome, h_view_to_surface_from, project_oriented_rect,
-    viewport_surface_aabb,
+    LiveOcrHost, LiveSession, PostDetectInput, PostDetectOutcome, h_view_to_surface_from,
+    project_oriented_rect, viewport_surface_aabb,
 };
 use crate::ocr::{DetectedTextBox, OrientedRect, Rect};
 use crate::planar_engine::{EngineConfig, LivePlanarEngine};
-use crate::session::TranslatorSession;
 
 /// Tracker state surfaced to the caller. Mirrors the engine command
 /// shape but flattened for FFI.
@@ -564,7 +563,7 @@ pub struct LiveTrackerPipeline {
     bold_profiles: Mutex<HashMap<u64, Vec<Option<crate::text_metrics::BoldProfile>>>>,
     generation: AtomicU64,
     config: Mutex<PipelineConfig>,
-    catalog: Arc<TranslatorSession>,
+    host: Arc<dyn LiveOcrHost>,
     font_provider: Arc<dyn FontProvider + Send + Sync>,
     last_telemetry: Mutex<Option<AcquireTelemetry>>,
     acquire_backoff: Mutex<AcquireBackoff>,
@@ -581,7 +580,7 @@ impl LiveTrackerPipeline {
     /// lazily spawned on the first frame so callers that build a
     /// pipeline but never feed frames don't pay for it.
     pub fn new(
-        catalog: Arc<TranslatorSession>,
+        host: Arc<dyn LiveOcrHost>,
         font_provider: Arc<dyn FontProvider + Send + Sync>,
     ) -> Arc<Self> {
         let engine_cfg = rescaled_engine_config();
@@ -601,7 +600,7 @@ impl LiveTrackerPipeline {
             bold_profiles: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             config: Mutex::new(PipelineConfig::default()),
-            catalog,
+            host,
             font_provider,
             last_telemetry: Mutex::new(None),
             acquire_backoff: Mutex::new(AcquireBackoff::default()),
@@ -1387,7 +1386,7 @@ impl LiveTrackerPipeline {
         display_crop: Rect,
         cfg: &PipelineConfig,
     ) -> Result<Vec<DetectedTextBox>, &'static str> {
-        acquire_detect(&self.catalog, frame, display_crop, cfg.det_max_pixels)
+        acquire_detect(&*self.host, frame, display_crop, cfg.det_max_pixels)
     }
 
     /// Stage 2: register the anchor and flip the engine to Locked.
@@ -1488,7 +1487,7 @@ impl LiveTrackerPipeline {
         detected: &[DetectedTextBox],
     ) -> Result<Option<Quadrant>, &'static str> {
         acquire_orient(
-            &self.catalog,
+            &*self.host,
             frame,
             &cfg.from_lang,
             cfg.is_auto_source,
@@ -1533,9 +1532,8 @@ impl LiveTrackerPipeline {
             let scaled = oriented.rec_scaled_boxes(detected);
             let rgb = oriented.rgb.as_ref().expect("with_rgb path");
             let ink_strips = self
-                .catalog
-                .ocr()
-                .engine(&self.catalog.snapshot())
+                .host
+                .ppocr_engine()
                 .map(|ppocr| ppocr.ink_strips(rgb, &scaled, canonical_quadrant))
                 .unwrap_or_default();
             // Bold column profile per box from the model's ch1, parallel to `detected`;
@@ -1639,7 +1637,7 @@ impl LiveTrackerPipeline {
             .and_then(|e| e.canonical_rotation_for(anchor_id));
         let cancel = || self.generation.load(Ordering::SeqCst) != generation;
         acquire_rec_translate(
-            &self.catalog,
+            &*self.host,
             &self.session,
             &*self.font_provider,
             frame,
@@ -1746,22 +1744,20 @@ impl LiveTrackerPipeline {
                 };
             }
             let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
-            let raw = match self
-                .catalog
-                .ocr()
-                .engine(&self.catalog.snapshot())
-                .and_then(|ppocr| {
-                    ppocr.detect_only_image(
+            let raw = match self.host.ppocr_engine().and_then(|ppocr| {
+                ppocr
+                    .detect_only_image(
                         oriented
                             .rgb_det
                             .as_ref()
                             .expect("detect path requires build_with_rgb"),
                         crate::ppocr::PpocrProfile::Live,
                     )
-                }) {
+                    .map_err(|e| format!("{e:?}"))
+            }) {
                 Ok(r) => r,
                 Err(e) => {
-                    log::warn!("[refresh] detect failed: {e:?}");
+                    log::warn!("[refresh] detect failed: {e}");
                     return AcquireTelemetry {
                         error: Some("detect failed".into()),
                         is_refresh: true,
@@ -1794,12 +1790,7 @@ impl LiveTrackerPipeline {
             };
         }
 
-        let available_codes: Vec<LanguageCode> = self
-            .catalog
-            .language_rows()
-            .into_iter()
-            .map(|row| LanguageCode::from(row.language.code.as_str()))
-            .collect();
+        let available_codes: Vec<LanguageCode> = self.host.available_language_codes();
 
         let state = match frame.state().lock() {
             Ok(s) => s,
@@ -1829,7 +1820,7 @@ impl LiveTrackerPipeline {
         let h_view_to_sensor = view_to_sensor_h(&oriented.sensor_crop);
         let h_view_to_surface_composed =
             homography::mat3_mul(&h_sensor_view_to_surface, &h_view_to_sensor);
-        let session_ref: &TranslatorSession = &self.catalog;
+        let host: &dyn LiveOcrHost = &*self.host;
         self.session.clear_anchor_state_for_relock(anchor_id);
         let canonical_quadrant = self
             .engine
@@ -1853,8 +1844,8 @@ impl LiveTrackerPipeline {
                 rec_batch_size: cfg.rec_batch_size,
                 canonical_quadrant,
             },
-            &session_ref,
-            &session_ref,
+            host,
+            host,
             &cancel,
         );
         drop(state);
@@ -1976,7 +1967,7 @@ fn view_to_sensor_h(crop: &Rect) -> [f32; 9] {
 /// return boxes in full-resolution pixel coords. (Body of
 /// `LiveTrackerPipeline::acquire_stage_detect`.)
 pub(crate) fn acquire_detect(
-    catalog: &TranslatorSession,
+    host: &dyn LiveOcrHost,
     frame: &Arc<LiveFrame>,
     display_crop: Rect,
     det_max_pixels: u32,
@@ -1986,20 +1977,21 @@ pub(crate) fn acquire_detect(
         .ensure_oriented_with_rgb(display_crop, det_max_pixels)
         .map_err(|_| "ensure_oriented failed")?;
     let oriented = state.cached.as_ref().expect("ensure_oriented filled cache");
-    let raw = catalog
-        .ocr()
-        .engine(&catalog.snapshot())
+    let raw = host
+        .ppocr_engine()
         .and_then(|ppocr| {
-            ppocr.detect_only_image(
-                oriented
-                    .rgb_det
-                    .as_ref()
-                    .expect("detect path requires build_with_rgb"),
-                crate::ppocr::PpocrProfile::Live,
-            )
+            ppocr
+                .detect_only_image(
+                    oriented
+                        .rgb_det
+                        .as_ref()
+                        .expect("detect path requires build_with_rgb"),
+                    crate::ppocr::PpocrProfile::Live,
+                )
+                .map_err(|e| format!("{e:?}"))
         })
         .map_err(|e| {
-            log::warn!("detect failed: {e:?}");
+            log::warn!("detect failed: {e}");
             "detect failed"
         })?;
     let (sx, sy) = oriented.det_to_full;
@@ -2017,23 +2009,14 @@ pub(crate) fn acquire_detect(
 /// Estimate the canonical reading-direction quadrant. (Body of
 /// `LiveTrackerPipeline::acquire_stage_orient`.) `None` = no consensus.
 pub(crate) fn acquire_orient(
-    catalog: &TranslatorSession,
+    host: &dyn LiveOcrHost,
     frame: &Arc<LiveFrame>,
     from_lang: &str,
     is_auto_source: bool,
     detected: &[DetectedTextBox],
 ) -> Result<Option<Quadrant>, &'static str> {
-    let snap = catalog.snapshot();
-    let forced_script = if is_auto_source {
-        None
-    } else {
-        crate::ocr_runtime::recognizer_script_for_language(
-            &snap,
-            &crate::LanguageCode::from(from_lang),
-        )
-        .ok()
-    };
-    let Ok(ppocr) = catalog.ocr().engine(&snap) else {
+    let forced_script = host.orient_script(from_lang, is_auto_source);
+    let Ok(ppocr) = host.ppocr_engine() else {
         return Ok(None);
     };
     let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
@@ -2051,7 +2034,7 @@ pub(crate) fn acquire_orient(
 /// quadrant lookup — pass `canonical_quadrant` directly.)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn acquire_rec_translate(
-    catalog: &TranslatorSession,
+    host: &dyn LiveOcrHost,
     session: &LiveSession,
     font_provider: &dyn FontProvider,
     frame: &Arc<LiveFrame>,
@@ -2068,12 +2051,7 @@ pub(crate) fn acquire_rec_translate(
     bold_profiles: &[Option<crate::text_metrics::BoldProfile>],
     cancel: &dyn Fn() -> bool,
 ) -> Result<PostDetectOutcome, &'static str> {
-    let available_codes: Vec<LanguageCode> = catalog
-        .language_rows()
-        .into_iter()
-        .map(|row| LanguageCode::from(row.language.code.as_str()))
-        .collect();
-    let session_ref: &TranslatorSession = catalog;
+    let available_codes: Vec<LanguageCode> = host.available_language_codes();
     let state = frame.state().lock().map_err(|_| "frame.state poisoned")?;
     let oriented = state
         .cached
@@ -2098,8 +2076,8 @@ pub(crate) fn acquire_rec_translate(
             rec_batch_size,
             canonical_quadrant,
         },
-        &session_ref,
-        &session_ref,
+        host,
+        host,
         cancel,
     );
     drop(state);
@@ -2158,11 +2136,9 @@ fn scale_detected_box(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CatalogSnapshot, CatalogSourcesV2, LanguageCatalog};
     use crate::font_provider::{FontHandle, FontProvider, FontRequest};
     use crate::live_frame::LiveFrame;
     use crate::ocr::Rect;
-    use std::collections::HashMap;
     use std::time::Duration;
 
     struct NoFonts;
@@ -2172,33 +2148,47 @@ mod tests {
         }
     }
 
-    /// Minimal catalog-less session. The per-frame tracker path never reads
-    /// the catalog (only async acquire/refresh do), and the test runs in
-    /// `Suppressed` mode which dispatches neither, so an empty snapshot is
-    /// enough to stand the pipeline up.
-    fn empty_session() -> Arc<TranslatorSession> {
-        let catalog = LanguageCatalog {
-            format_version: 0,
-            generated_at: 0,
-            dictionary_version: 0,
-            sources: CatalogSourcesV2 {
-                language_index_version: 0,
-                language_index_updated_at: 0,
-                dictionary_index_version: 0,
-                dictionary_index_updated_at: 0,
-            },
-            languages: HashMap::new(),
-            packs: HashMap::new(),
-            translation_pack_ids: HashMap::new(),
-            dictionary_pack_ids_by_code: HashMap::new(),
-            root_pack_ids_by_language_feature: HashMap::new(),
-        };
-        Arc::new(TranslatorSession::from_snapshot(CatalogSnapshot {
-            catalog,
-            base_dir: String::new(),
-            pack_statuses: HashMap::new(),
-            availability_by_code: HashMap::new(),
-        }))
+    /// Host that never resolves an engine. The per-frame tracker path never
+    /// touches the host (only async acquire/refresh do), and the test runs in
+    /// `Suppressed` mode which dispatches neither, so the mock is enough to
+    /// stand the pipeline up.
+    struct MockHost;
+    impl crate::live_session::LiveRecognizer for MockHost {
+        fn recognize(
+            &self,
+            _oriented: &crate::live_frame::OrientedImage,
+            _boxes: &[DetectedTextBox],
+            _source_selection: &crate::ocr::OcrSourceSelection,
+            _canonical_quadrant: Option<Quadrant>,
+        ) -> Result<Vec<crate::ocr::RecognizedTextLine>, String> {
+            Ok(Vec::new())
+        }
+    }
+    impl crate::live_session::LiveTranslator for MockHost {
+        fn translate_mixed_texts_with_alignment(
+            &self,
+            _inputs: &[String],
+            _forced_source_code: Option<&str>,
+            _target_code: &str,
+            _available_language_codes: &[LanguageCode],
+        ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
+            Ok(Vec::new())
+        }
+    }
+    impl crate::live_session::LiveOcrHost for MockHost {
+        fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String> {
+            Err("mock host has no engine".into())
+        }
+        fn orient_script(
+            &self,
+            _from_lang: &str,
+            _is_auto_source: bool,
+        ) -> Option<crate::PpocrScript> {
+            None
+        }
+        fn available_language_codes(&self) -> Vec<LanguageCode> {
+            Vec::new()
+        }
     }
 
     /// Drives a few frames through the real pipeline and then drops it, all
@@ -2211,13 +2201,13 @@ mod tests {
     ///     `Weak`/channel lifecycle hangs the drop).
     /// Either failure manifests as the deadline elapsing — a deterministic
     /// `panic`, not a silently hung suite. `Suppressed` mode keeps the
-    /// engine cleared each frame, so the result is a deterministic `Idle`
-    /// with a full-frame camera-only composite and no async dispatch.
+    /// engine cleared each frame, so the verdict is a deterministic `Lost`
+    /// with no composed homography and no async dispatch.
     #[test]
     fn process_frame_rendezvous_and_clean_shutdown() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let pipeline = LiveTrackerPipeline::new(empty_session(), Arc::new(NoFonts));
+            let pipeline = LiveTrackerPipeline::new(Arc::new(MockHost), Arc::new(NoFonts));
             pipeline.set_target_mode(TargetMode::Suppressed);
 
             let (w, h) = (128u32, 96u32);
@@ -2242,7 +2232,7 @@ mod tests {
                 let r = pipeline
                     .process_frame(&frame, crop, w, h, (i + 1) * 1_000_000)
                     .expect("process_frame ok");
-                assert_eq!(r.state, PlanarTrackerState::Idle);
+                assert_eq!(r.state, PlanarTrackerState::Lost);
                 assert!(r.compose_h.is_none());
                 assert!(!r.started_acquire && !r.started_refresh);
             }

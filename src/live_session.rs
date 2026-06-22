@@ -14,8 +14,8 @@
 //! themselves. See FUTURE_SURFACE_MAP.md for the bigger plan.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::api::LanguageCode;
 use crate::color_matting::MattedStrip;
@@ -1219,64 +1219,16 @@ pub trait LiveTranslator {
     ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String>;
 }
 
-#[cfg(feature = "ppocr")]
-impl LiveRecognizer for &crate::session::TranslatorSession {
-    fn recognize(
-        &self,
-        oriented: &OrientedImage,
-        boxes: &[DetectedTextBox],
-        source_selection: &OcrSourceSelection,
-        canonical_quadrant: Option<crate::coords::Quadrant>,
-    ) -> Result<Vec<RecognizedTextLine>, String> {
-        let session = *self;
-        let snap = session.snapshot();
-        let ppocr = session.ocr().engine(&snap).map_err(|e| format!("{e:?}"))?;
-        let script = match source_selection {
-            OcrSourceSelection::Auto => None,
-            OcrSourceSelection::Specific { language_code } => Some(
-                crate::ocr_runtime::recognizer_script_for_language(&snap, language_code)
-                    .map_err(|e| format!("{e:?}"))?,
-            ),
-        };
-        let mut lines = translator_ocr::engine::recognize_oriented(
-            &ppocr,
-            oriented,
-            boxes,
-            script,
-            canonical_quadrant,
-        )
-        .map_err(|e| format!("{e:?}"))?;
-        if matches!(source_selection, OcrSourceSelection::Auto) {
-            if let Some(code) = crate::ocr_runtime::ocr_source_for_lines(&snap, &lines, None) {
-                let code = code.as_str().to_owned();
-                for line in &mut lines {
-                    if !line.text.trim().is_empty() {
-                        line.source_code = Some(code.clone());
-                    }
-                }
-            }
-        }
-        Ok(lines)
-    }
-}
-
-impl LiveTranslator for &crate::session::TranslatorSession {
-    fn translate_mixed_texts_with_alignment(
-        &self,
-        inputs: &[String],
-        forced_source_code: Option<&str>,
-        target_code: &str,
-        available_language_codes: &[LanguageCode],
-    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
-        (*self)
-            .translate_mixed_texts_with_alignment(
-                inputs,
-                forced_source_code,
-                target_code,
-                available_language_codes,
-            )
-            .map_err(|e| format!("{e:?}"))
-    }
+/// The OCR/translation capabilities the live pipeline needs from its host
+/// session: a resolved warm recognizer engine, source-language script
+/// resolution for orientation, the installed language set, plus the
+/// recognize/translate operations. Implemented by the bindings on
+/// `TranslatorSession` and supplied as a mock by tests, so the live
+/// pipeline holds this interface instead of the facade session type.
+pub trait LiveOcrHost: LiveRecognizer + LiveTranslator + Send + Sync {
+    fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String>;
+    fn orient_script(&self, from_lang: &str, is_auto_source: bool) -> Option<crate::PpocrScript>;
+    fn available_language_codes(&self) -> Vec<LanguageCode>;
 }
 
 /// Stub translator: returns the source as the "translation". Suitable

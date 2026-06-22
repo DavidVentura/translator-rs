@@ -756,6 +756,92 @@ impl TranslatorSession {
     }
 }
 
+#[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+impl crate::live_session::LiveRecognizer for TranslatorSession {
+    fn recognize(
+        &self,
+        oriented: &crate::live_frame::OrientedImage,
+        boxes: &[crate::ocr::DetectedTextBox],
+        source_selection: &OcrSourceSelection,
+        canonical_quadrant: Option<crate::coords::Quadrant>,
+    ) -> Result<Vec<crate::ocr::RecognizedTextLine>, String> {
+        let snap = self.snapshot();
+        let ppocr = self.ocr().engine(&snap).map_err(|e| format!("{e:?}"))?;
+        let script = match source_selection {
+            OcrSourceSelection::Auto => None,
+            OcrSourceSelection::Specific { language_code } => Some(
+                crate::ocr_runtime::recognizer_script_for_language(&snap, language_code)
+                    .map_err(|e| format!("{e:?}"))?,
+            ),
+        };
+        let mut lines = translator_ocr::engine::recognize_oriented(
+            &ppocr,
+            oriented,
+            boxes,
+            script,
+            canonical_quadrant,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        if matches!(source_selection, OcrSourceSelection::Auto) {
+            if let Some(code) = crate::ocr_runtime::ocr_source_for_lines(&snap, &lines, None) {
+                let code = code.as_str().to_owned();
+                for line in &mut lines {
+                    if !line.text.trim().is_empty() {
+                        line.source_code = Some(code.clone());
+                    }
+                }
+            }
+        }
+        Ok(lines)
+    }
+}
+
+#[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+impl crate::live_session::LiveTranslator for TranslatorSession {
+    fn translate_mixed_texts_with_alignment(
+        &self,
+        inputs: &[String],
+        forced_source_code: Option<&str>,
+        target_code: &str,
+        available_language_codes: &[LanguageCode],
+    ) -> Result<Vec<crate::translate::TranslationWithAlignment>, String> {
+        self.translate_mixed_texts_with_alignment(
+            inputs,
+            forced_source_code,
+            target_code,
+            available_language_codes,
+        )
+        .map_err(|e| format!("{e:?}"))
+    }
+}
+
+#[cfg(all(feature = "ppocr", feature = "planar-tracker"))]
+impl crate::live_session::LiveOcrHost for TranslatorSession {
+    fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String> {
+        self.ocr()
+            .engine(&self.snapshot())
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    fn orient_script(&self, from_lang: &str, is_auto_source: bool) -> Option<crate::PpocrScript> {
+        if is_auto_source {
+            return None;
+        }
+        crate::ocr_runtime::recognizer_script_for_language(
+            &self.snapshot(),
+            &LanguageCode::from(from_lang),
+        )
+        .ok()
+    }
+
+    fn available_language_codes(&self) -> Vec<LanguageCode> {
+        self.language_rows()
+            .into_iter()
+            .map(|row| LanguageCode::from(row.language.code.as_str()))
+            .collect()
+    }
+}
+
 pub fn parse_selected_catalog(
     bundled_json: &str,
     disk_json: Option<&str>,
