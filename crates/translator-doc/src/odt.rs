@@ -10,10 +10,10 @@ use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::TranslationWithAlignment;
-use crate::api::{LanguageCode, TranslatorError};
-use crate::language_detect::detect_language_robust_code;
-use crate::session::TranslatorSession;
+use crate::document_translator::DocumentTranslator;
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_translate::language_detect::detect_language_robust_code;
+use translator_translate::translate::TranslationWithAlignment;
 
 const ODT_MIMETYPE: &str = "application/vnd.oasis.opendocument.text";
 
@@ -90,22 +90,22 @@ pub trait OdtTextTranslator {
     }
 }
 
-pub struct SessionOdtTranslator<'a> {
-    session: &'a TranslatorSession,
+pub struct DocumentOdtTranslator<'a> {
+    translator: &'a dyn DocumentTranslator,
     forced_source_code: Option<&'a str>,
     target_code: &'a str,
     available_language_codes: &'a [LanguageCode],
 }
 
-impl<'a> SessionOdtTranslator<'a> {
+impl<'a> DocumentOdtTranslator<'a> {
     pub fn new(
-        session: &'a TranslatorSession,
+        translator: &'a dyn DocumentTranslator,
         forced_source_code: Option<&'a str>,
         target_code: &'a str,
         available_language_codes: &'a [LanguageCode],
     ) -> Self {
         Self {
-            session,
+            translator,
             forced_source_code,
             target_code,
             available_language_codes,
@@ -113,7 +113,7 @@ impl<'a> SessionOdtTranslator<'a> {
     }
 }
 
-impl OdtTextTranslator for SessionOdtTranslator<'_> {
+impl OdtTextTranslator for DocumentOdtTranslator<'_> {
     fn translate_texts_with_alignment(
         &mut self,
         texts: &[String],
@@ -150,13 +150,13 @@ impl OdtTextTranslator for SessionOdtTranslator<'_> {
                 .map(|text| TranslationWithAlignment {
                     source_text: text.clone(),
                     translated_text: text.clone(),
-                    alignments: crate::translate::identity_char_alignments(text),
+                    alignments: translator_translate::translate::identity_char_alignments(text),
                 })
                 .collect());
         }
 
         let translations = self
-            .session
+            .translator
             .translate_texts_with_alignment_ctx(&source_code, &target_code, texts, on_progress)
             .map_err(|error| {
                 if error.is_cancelled() {
@@ -179,14 +179,14 @@ impl OdtTextTranslator for SessionOdtTranslator<'_> {
 }
 
 pub fn translate_odt(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     odt_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
 ) -> Result<Vec<u8>, OdtTranslateError> {
     translate_odt_with_progress(
-        session,
+        translator,
         odt_bytes,
         forced_source_code,
         target_code,
@@ -197,24 +197,24 @@ pub fn translate_odt(
 
 /// Progress is reported per sentence from slimt worker threads via
 /// `on_progress` (cheap, non-blocking, thread-safe). Cancellation is requested
-/// out-of-band via [`TranslatorSession::cancel_ongoing_work`] and surfaces as
+/// out-of-band via `TranslatorSession::cancel_ongoing_work` and surfaces as
 /// [`OdtTranslateError::Cancelled`].
 pub fn translate_odt_with_progress(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     odt_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
     on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<u8>, OdtTranslateError> {
-    session.begin_document_translation();
-    let mut translator = SessionOdtTranslator::new(
-        session,
+    translator.begin_document_translation();
+    let mut adapter = DocumentOdtTranslator::new(
+        translator,
         forced_source_code,
         target_code,
         available_language_codes,
     );
-    translate_odt_with_translator_and_progress(odt_bytes, &mut translator, on_progress)
+    translate_odt_with_translator_and_progress(odt_bytes, &mut adapter, on_progress)
 }
 
 pub fn translate_odt_with_translator(
@@ -1084,7 +1084,7 @@ fn is_word_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TokenAlignment;
+    use translator_translate::translate::TokenAlignment;
 
     struct FakeTranslator {
         outputs: Vec<TranslationWithAlignment>,

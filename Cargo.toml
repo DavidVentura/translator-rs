@@ -71,10 +71,10 @@ pdf = [
     "dep:translator-render",
     "dep:translator-pdf",
 ]
-odt = ["dep:zip"]
+odt = ["translator-doc/odt"]
 dom-translate = ["translator-translate/dom-translate"]
 html = ["dom-translate", "translator-translate/html"]
-epub = ["dom-translate", "dep:markup5ever", "dep:markup5ever_rcdom", "dep:zip", "dep:xml5ever", "dep:ttf-parser"]
+epub = ["translator-doc/epub"]
 image-render = [
     "dep:translator-render",
     "translator-core/script-from-unicode",
@@ -96,6 +96,7 @@ viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 [dependencies]
 translator-core = { path = "crates/translator-core" }
 translator-translate = { path = "crates/translator-translate" }
+translator-doc = { path = "crates/translator-doc" }
 translator-render = { path = "crates/translator-render", optional = true }
 translator-pdf = { path = "crates/translator-pdf", optional = true }
 translator-tracker = { path = "crates/translator-tracker", optional = true }
@@ -131,10 +132,6 @@ minifb = { version = "0.27", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 env_logger = { version = "0.11", optional = true }
 
-zip = { version = "2.4.2", optional = true, default-features = false, features = ["deflate"] }
-markup5ever = { version = "0.38", optional = true }
-markup5ever_rcdom = { version = "0.38", optional = true }
-xml5ever = { version = "0.38", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

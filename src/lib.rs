@@ -19,25 +19,27 @@ pub use translator_tracker::coarse_tracker;
 pub use translator_translate::bergamot;
 #[cfg(feature = "gpu")]
 pub mod gl_renderer;
-#[cfg(feature = "dom-translate")]
-pub use translator_translate::dom_translate;
-#[cfg(feature = "epub")]
-pub mod epub;
 pub use translator_core::homography;
 pub use translator_core::homography_ekf;
 pub use translator_core::language;
+#[cfg(feature = "epub")]
+pub use translator_doc::epub;
 #[cfg(feature = "raster")]
 pub use translator_raster::live_frame;
 #[cfg(feature = "image-render")]
 pub use translator_render::image_render;
 #[cfg(feature = "planar-tracker")]
 pub use translator_tracker::klt;
+#[cfg(feature = "dom-translate")]
+pub use translator_translate::dom_translate;
 #[cfg(feature = "html")]
 pub use translator_translate::html_translate;
 pub use translator_translate::language_detect;
 #[cfg(feature = "gpu")]
 pub mod live_gpu_tick;
 pub use translator_core::ocr;
+#[cfg(feature = "odt")]
+pub use translator_doc::odt;
 #[cfg(feature = "planar-tracker")]
 pub use translator_live::live_screen;
 #[cfg(feature = "planar-tracker")]
@@ -50,8 +52,6 @@ pub use translator_live::live_worker;
 pub use translator_mucab::mucab;
 #[cfg(feature = "ppocr")]
 pub use translator_ocr::ocr_runtime;
-#[cfg(feature = "odt")]
-pub mod odt;
 #[cfg(feature = "pdf")]
 pub use translator_pdf::pdf;
 #[cfg(feature = "pdf")]
@@ -93,6 +93,7 @@ pub use translator_core::settings;
 pub use translator_core::tts;
 #[cfg(feature = "dictionary")]
 pub use translator_dictionary::tarkka;
+pub use translator_doc::txt;
 #[cfg(feature = "raster")]
 pub use translator_raster::overlay;
 #[cfg(feature = "raster")]
@@ -109,7 +110,6 @@ pub use translator_translate::translate;
 pub use translator_transliterate::transliterate;
 #[cfg(feature = "tts")]
 pub use translator_tts::speech;
-pub mod txt;
 
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{

@@ -14,7 +14,6 @@ use crate::catalog::{
 use crate::routing::MixedTextTranslationResult;
 use crate::settings::BackgroundMode;
 use crate::styled::{OverlayScreenshot, StructuredTranslationResult, StyledFragment};
-#[cfg(any(feature = "odt", feature = "epub"))]
 use crate::translate::TranslationWithAlignment;
 use crate::translate::Translator;
 
@@ -358,7 +357,6 @@ impl TranslatorSession {
     }
 
     /// Cancellable, progress-reporting alignment translation for documents.
-    #[cfg(any(feature = "odt", feature = "epub"))]
     pub(crate) fn translate_texts_with_alignment_ctx(
         &self,
         from_code: &LanguageCode,
@@ -869,6 +867,32 @@ impl translator_pdf::pdf_image_translate::ImageTranslator for TranslatorSession 
             background_mode,
             detection,
         )
+    }
+}
+
+impl translator_doc::document_translator::DocumentTranslator for TranslatorSession {
+    fn begin_document_translation(&self) {
+        self.begin_document_translation();
+    }
+
+    fn translate_texts_ctx(
+        &self,
+        from_code: &str,
+        to_code: &str,
+        texts: &[String],
+        on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Vec<String>, TranslatorError> {
+        self.translate_texts_ctx(from_code, to_code, texts, on_progress)
+    }
+
+    fn translate_texts_with_alignment_ctx(
+        &self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+        texts: &[String],
+        on_progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Option<Vec<crate::translate::TranslationWithAlignment>>, TranslatorError> {
+        self.translate_texts_with_alignment_ctx(from_code, to_code, texts, on_progress)
     }
 }
 

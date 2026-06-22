@@ -16,7 +16,7 @@
 
 use std::num::NonZeroU32;
 
-use crate::session::TranslatorSession;
+use crate::document_translator::DocumentTranslator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxtLayout {
@@ -51,14 +51,14 @@ enum Plan {
 /// [`TranslatorSession::cancel_ongoing_work`] and surfaces here as
 /// [`TxtTranslateError::Cancelled`].
 pub fn translate_txt_with_progress(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     text: &str,
     source_code: &str,
     target_code: &str,
     layout: TxtLayout,
     on_progress: impl Fn(f32) + Sync,
 ) -> Result<String, TxtTranslateError> {
-    session.begin_document_translation();
+    translator.begin_document_translation();
     let (units, plan) = build_units(text, layout);
     if units.is_empty() {
         return Ok(String::new());
@@ -72,7 +72,7 @@ pub fn translate_txt_with_progress(
                 on_progress(done as f32 / total as f32);
             }
         };
-        session
+        translator
             .translate_texts_ctx(source_code, target_code, &units, &report)
             .map_err(|error| {
                 if error.is_cancelled() {

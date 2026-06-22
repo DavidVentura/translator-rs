@@ -27,12 +27,13 @@ use xml5ever::tendril::TendrilSink;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::TranslationWithAlignment;
-use crate::api::{LanguageCode, TranslatorError};
-use crate::dom_translate::{Scope, apply_indexed, collect_and_index, collect_named_elements};
-use crate::language_detect::detect_language_robust_code;
-use crate::session::TranslatorSession;
-use crate::translate::identity_char_alignments;
+use crate::document_translator::DocumentTranslator;
+use translator_core::api::{LanguageCode, TranslatorError};
+use translator_translate::dom_translate::{
+    Scope, apply_indexed, collect_and_index, collect_named_elements,
+};
+use translator_translate::language_detect::detect_language_robust_code;
+use translator_translate::translate::{TranslationWithAlignment, identity_char_alignments};
 
 const EPUB_MIMETYPE: &str = "application/epub+zip";
 
@@ -106,22 +107,22 @@ pub trait EpubTextTranslator {
     }
 }
 
-pub struct SessionEpubTranslator<'a> {
-    session: &'a TranslatorSession,
+pub struct DocumentEpubTranslator<'a> {
+    translator: &'a dyn DocumentTranslator,
     forced_source_code: Option<&'a str>,
     target_code: &'a str,
     available_language_codes: &'a [LanguageCode],
 }
 
-impl<'a> SessionEpubTranslator<'a> {
+impl<'a> DocumentEpubTranslator<'a> {
     pub fn new(
-        session: &'a TranslatorSession,
+        translator: &'a dyn DocumentTranslator,
         forced_source_code: Option<&'a str>,
         target_code: &'a str,
         available_language_codes: &'a [LanguageCode],
     ) -> Self {
         Self {
-            session,
+            translator,
             forced_source_code,
             target_code,
             available_language_codes,
@@ -129,7 +130,7 @@ impl<'a> SessionEpubTranslator<'a> {
     }
 }
 
-impl EpubTextTranslator for SessionEpubTranslator<'_> {
+impl EpubTextTranslator for DocumentEpubTranslator<'_> {
     fn translate_texts_with_alignment(
         &mut self,
         texts: &[String],
@@ -172,7 +173,7 @@ impl EpubTextTranslator for SessionEpubTranslator<'_> {
         }
 
         let translations = self
-            .session
+            .translator
             .translate_texts_with_alignment_ctx(&source_code, &target_code, texts, on_progress)
             .map_err(|error| {
                 if error.is_cancelled() {
@@ -195,14 +196,14 @@ impl EpubTextTranslator for SessionEpubTranslator<'_> {
 }
 
 pub fn translate_epub(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     epub_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
 ) -> Result<Vec<u8>, EpubTranslateError> {
     translate_epub_with_progress(
-        session,
+        translator,
         epub_bytes,
         forced_source_code,
         target_code,
@@ -213,24 +214,24 @@ pub fn translate_epub(
 
 /// Progress is reported per sentence from slimt worker threads via
 /// `on_progress` (cheap, non-blocking, thread-safe). Cancellation is requested
-/// out-of-band via [`TranslatorSession::cancel_ongoing_work`] and surfaces as
+/// out-of-band via `TranslatorSession::cancel_ongoing_work` and surfaces as
 /// [`EpubTranslateError::Cancelled`].
 pub fn translate_epub_with_progress(
-    session: &TranslatorSession,
+    translator: &dyn DocumentTranslator,
     epub_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
     available_language_codes: &[LanguageCode],
     on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<u8>, EpubTranslateError> {
-    session.begin_document_translation();
-    let mut translator = SessionEpubTranslator::new(
-        session,
+    translator.begin_document_translation();
+    let mut adapter = DocumentEpubTranslator::new(
+        translator,
         forced_source_code,
         target_code,
         available_language_codes,
     );
-    translate_epub_with_translator_and_progress(epub_bytes, &mut translator, on_progress)
+    translate_epub_with_translator_and_progress(epub_bytes, &mut adapter, on_progress)
 }
 
 pub fn translate_epub_with_translator(

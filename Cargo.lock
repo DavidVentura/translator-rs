@@ -2971,8 +2971,6 @@ dependencies = [
  "khronos-egl",
  "log",
  "lopdf",
- "markup5ever",
- "markup5ever_rcdom",
  "minifb",
  "mupdf",
  "ndarray 0.16.1",
@@ -2987,6 +2985,7 @@ dependencies = [
  "translator-align",
  "translator-core",
  "translator-dictionary",
+ "translator-doc",
  "translator-live",
  "translator-mucab",
  "translator-ocr",
@@ -3002,9 +3001,7 @@ dependencies = [
  "unicode-linebreak",
  "unicode-script",
  "uniffi",
- "xml5ever",
  "zeno",
- "zip",
 ]
 
 [[package]]
@@ -3034,6 +3031,20 @@ version = "0.1.0"
 dependencies = [
  "tarkka",
  "translator-core",
+]
+
+[[package]]
+name = "translator-doc"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "markup5ever",
+ "markup5ever_rcdom",
+ "translator-core",
+ "translator-translate",
+ "ttf-parser",
+ "xml5ever",
+ "zip",
 ]
 
 [[package]]
