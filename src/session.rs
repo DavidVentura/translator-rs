@@ -25,14 +25,16 @@ use crate::tarkka::{
 };
 
 #[cfg(feature = "doc-align")]
-use crate::doc_align::{DocAligner, DocumentDetection, DocumentQuad, WarpedImageRgba};
-#[cfg(feature = "ppocr")]
-use crate::engine::OcrEngine;
+use crate::doc_align::{DocumentDetection, DocumentQuad, WarpedImageRgba};
 use crate::ocr::PreparedImageOverlay;
 #[cfg(feature = "ppocr")]
 use crate::ocr::{OcrSourceSelection, ReadingOrder};
 #[cfg(feature = "ppocr")]
 use crate::ocr_runtime::translate_image_rgba_ppocr_in_snapshot;
+#[cfg(feature = "doc-align")]
+use translator_align::engine::DocAlignEngine;
+#[cfg(feature = "ppocr")]
+use translator_ocr::engine::OcrEngine;
 
 #[cfg(feature = "tts")]
 use crate::api::VoiceName;
@@ -69,21 +71,9 @@ pub struct TranslatorSession {
     #[cfg(feature = "dictionary")]
     dictionaries: Mutex<DictionaryCache>,
     #[cfg(feature = "doc-align")]
-    doc_align: Mutex<DocAlignCache>,
+    doc_align: DocAlignEngine,
     #[cfg(feature = "ppocr")]
     ocr: OcrEngine,
-}
-
-#[cfg(feature = "doc-align")]
-struct DocAlignCache {
-    state: Option<(String, Arc<DocAligner>)>,
-}
-
-#[cfg(feature = "doc-align")]
-impl DocAlignCache {
-    fn new() -> Self {
-        Self { state: None }
-    }
 }
 
 impl TranslatorSession {
@@ -96,7 +86,7 @@ impl TranslatorSession {
             #[cfg(feature = "dictionary")]
             dictionaries: Mutex::new(DictionaryCache::new()),
             #[cfg(feature = "doc-align")]
-            doc_align: Mutex::new(DocAlignCache::new()),
+            doc_align: DocAlignEngine::new(),
             #[cfg(feature = "ppocr")]
             ocr: OcrEngine::new(),
         }
@@ -867,53 +857,14 @@ impl TranslatorSession {
     }
 
     #[cfg(feature = "doc-align")]
-    fn doc_aligner(&self) -> Result<Arc<DocAligner>, TranslatorError> {
-        let snap = self.snapshot();
-        let files = snap.catalog.support_files_by_kind("doc_detect");
-        let file = files.first().ok_or_else(|| {
-            TranslatorError::new(
-                crate::api::TranslatorErrorKind::MissingAsset,
-                "no doc_detect support pack in catalog",
-            )
-        })?;
-        let abs_path = std::path::Path::new(&snap.base_dir).join(&file.install_path);
-        let abs_str = abs_path.to_string_lossy().into_owned();
-        if !abs_path.exists() {
-            return Err(TranslatorError::new(
-                crate::api::TranslatorErrorKind::MissingAsset,
-                format!("doc-align model not installed at {}", abs_str),
-            ));
-        }
-        let mut cache = self.doc_align.lock().expect("doc-align cache poisoned");
-        if let Some((ref path, ref aligner)) = cache.state {
-            if path == &abs_str {
-                return Ok(Arc::clone(aligner));
-            }
-        }
-        let aligner = Arc::new(DocAligner::load(&abs_path, 2)?);
-        cache.state = Some((abs_str, Arc::clone(&aligner)));
-        Ok(aligner)
-    }
-
-    #[cfg(feature = "doc-align")]
     pub fn detect_document_quad(
         &self,
         rgba: &[u8],
         width: u32,
         height: u32,
     ) -> Result<Option<DocumentDetection>, TranslatorError> {
-        let Some(mut detection) = self.doc_aligner()?.detect(rgba, width, height)? else {
-            return Ok(None);
-        };
-        let refined =
-            crate::doc_align_refine::refine_quad_with_quality(rgba, width, height, &detection.quad);
-        // Suppress the pre-fill when the model's quad doesn't trace real image edges. Better to
-        // show "no document detected" than to hand the user a confidently-wrong quad to nudge.
-        if refined.quality == crate::doc_align_refine::QuadQuality::Bad {
-            return Ok(None);
-        }
-        detection.quad = refined.quad;
-        Ok(Some(detection))
+        self.doc_align
+            .detect_document_quad(&self.snapshot(), rgba, width, height)
     }
 
     #[cfg(feature = "doc-align")]
