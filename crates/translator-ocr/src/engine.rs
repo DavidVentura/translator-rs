@@ -1,9 +1,3 @@
-//! The warm PPOCR engine handle. Owns the lazily-loaded [`PpocrEngine`]
-//! (detector + classifier + per-script recognizers, keyed off the installed
-//! pack set) and the OCR operations that drive it. The catalog snapshot is
-//! *not* owned here — it lives on the session and is passed in per call, so a
-//! freshly-installed pack rebuilds the engine on the next snapshot.
-
 use std::sync::{Arc, Mutex};
 
 use translator_core::api::{TranslatorError, TranslatorErrorKind};
@@ -26,8 +20,6 @@ struct PpocrEngineKey {
     recognizers: Vec<(PpocrScript, String, String)>,
 }
 
-/// Warm OCR engine: holds the loaded [`PpocrEngine`] and rebuilds it lazily
-/// when the installed pack set (the key) changes. Cheap to clone-call through.
 pub struct OcrEngine {
     warm: Mutex<Option<(PpocrEngineKey, Arc<PpocrEngine>)>>,
 }
@@ -45,9 +37,6 @@ impl OcrEngine {
         }
     }
 
-    /// Get-or-build the warm [`PpocrEngine`] for `snap`'s installed packs. The
-    /// detector + classifier load once; recognizers load lazily per script. The
-    /// key invalidates when the installed pack set changes.
     pub fn engine(&self, snap: &CatalogSnapshot) -> Result<Arc<PpocrEngine>, TranslatorError> {
         let catalog = &snap.catalog;
         let pack_installed = |pack_id: &str| {

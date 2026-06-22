@@ -1,7 +1,3 @@
-//! The warm TTS engine handle. Owns the [`SpeechCache`] (loaded piper voices)
-//! and the speech operations that drive it. The catalog snapshot is passed in
-//! per call, not owned here.
-
 use std::sync::Mutex;
 
 use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
@@ -13,7 +9,6 @@ use crate::speech::{
     synthesize_pcm_in_snapshot, warm_tts_model_in_snapshot,
 };
 
-/// Warm TTS engine: holds the speech model cache and serializes access to it.
 pub struct TtsEngine {
     cache: Mutex<SpeechCache>,
 }

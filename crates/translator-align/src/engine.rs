@@ -1,7 +1,3 @@
-//! The warm document-alignment engine handle. Owns the lazily-loaded
-//! [`DocAligner`] (the ONNX quad detector), keyed off its on-disk model path.
-//! The catalog snapshot is passed in per call, not owned here.
-
 use std::sync::{Arc, Mutex};
 
 use translator_core::api::{TranslatorError, TranslatorErrorKind};
@@ -10,8 +6,6 @@ use translator_core::catalog::CatalogSnapshot;
 use crate::doc_align::{DocAligner, DocumentDetection};
 use crate::doc_align_refine::{QuadQuality, refine_quad_with_quality};
 
-/// Warm doc-align engine: holds the loaded [`DocAligner`] and reloads it when
-/// the model path changes.
 pub struct DocAlignEngine {
     warm: Mutex<Option<(String, Arc<DocAligner>)>>,
 }
@@ -56,9 +50,6 @@ impl DocAlignEngine {
         Ok(aligner)
     }
 
-    /// Detect the document quad in `rgba`, refining the model's quad against the
-    /// real image edges. Returns `None` when nothing is detected or the refined
-    /// quad doesn't trace real edges (better than a confidently-wrong quad).
     pub fn detect_document_quad(
         &self,
         snap: &CatalogSnapshot,
