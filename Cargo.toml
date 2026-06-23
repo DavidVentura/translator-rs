@@ -150,6 +150,11 @@ mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, def
 
 
 [[test]]
+name = "translate_smoke"
+path = "tests/translate_smoke.rs"
+required-features = ["html"]
+
+[[test]]
 name = "pdf_smoke"
 path = "tests/pdf_smoke.rs"
 required-features = ["pdf"]
