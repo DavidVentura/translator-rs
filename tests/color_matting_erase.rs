@@ -31,7 +31,8 @@ use imageproc::drawing::draw_hollow_rect_mut;
 use imageproc::rect::Rect as ImgRect;
 use translator::DetectedTextBox;
 use translator::color_matting::{MattedStrip, mat_detections, union_ink_mask};
-use translator::ocr::{ReadingOrder, Rect, TextBlock, TextLine, prepare_overlay_image};
+use translator::ocr::{ReadingOrder, Rect, TextBlock, TextLine};
+use translator::overlay::prepare_overlay_image;
 use translator::ppocr::{PpocrEngine, PpocrProfile};
 use translator::settings::BackgroundMode;
 
@@ -141,15 +142,11 @@ fn run_case(image_path: &str, case: &str) {
     // Matte against the full-res frame, the same way the live compositor does.
     let full = DynamicImage::ImageRgba8(rgba.clone());
     let t_mat = Instant::now();
-    let ink_masks = engine.ink_masks(&full, &boxes);
-    let strips = mat_detections(&rgba, &boxes, &ink_masks);
+    let ink_masks = engine.ink_masks(&full, &boxes, None);
+    let strips = mat_detections(&rgba, &boxes, &ink_masks, &[]);
     let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
 
-    let matted: Vec<(usize, &MattedStrip)> = strips
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
-        .collect();
+    let matted: Vec<(usize, &MattedStrip)> = strips.iter().map(|s| (s.box_index, s)).collect();
 
     if std::env::var_os("MATTING_DUMP_STRIPS").is_some() {
         let strips_dir = dump_dir.join("strips");
@@ -501,8 +498,8 @@ fn overlay_case(image_path: &str, case: &str) {
     let boxes: Vec<DetectedTextBox> = det.iter().map(|b| b.scaled_xy(sx, sy)).collect();
 
     let full = DynamicImage::ImageRgba8(rgba.clone());
-    let ink_masks = engine.ink_masks(&full, &boxes);
-    let union = union_ink_mask(&rgba, &boxes, &ink_masks);
+    let ink_masks = engine.ink_masks(&full, &boxes, None);
+    let union = union_ink_mask(&rgba, &boxes, &ink_masks, &[]);
 
     // One block per detected line, empty translation so nothing is drawn over
     // the erased background — we only want to inspect the erase itself.
@@ -515,11 +512,12 @@ fn overlay_case(image_path: &str, case: &str) {
                 oriented_box: b.oriented_box,
                 tight_box: b.tight_box,
                 word_rects: vec![b.rect],
-                is_bold: false,
+                bold_ranges: Vec::new(),
             }],
         })
         .collect();
     let translated = vec![String::new(); blocks.len()];
+    let block_bold_ranges = vec![Vec::new(); blocks.len()];
 
     let (w, h) = rgba.dimensions();
     let prepared = prepare_overlay_image(
@@ -528,6 +526,7 @@ fn overlay_case(image_path: &str, case: &str) {
         h,
         &blocks,
         &translated,
+        &block_bold_ranges,
         BackgroundMode::AutoDetect,
         ReadingOrder::LeftToRight,
         Some(&union),

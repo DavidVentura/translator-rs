@@ -58,6 +58,7 @@ fn demo_image_matches_paddle_reference() {
             keys_path,
         }],
         1,
+        None,
     )
     .expect("load ppocr");
 

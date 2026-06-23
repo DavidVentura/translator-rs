@@ -71,12 +71,11 @@ fn indented_paragraph_first_line_groups_with_its_body() {
     let boxes = engine
         .detect_only_image(&image, PpocrProfile::Still)
         .expect("detect");
-    let gray = image.to_luma8();
     let scripts = vec![PpocrScript::Latin; boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image(&image, &gray, &boxes, &scripts, PpocrProfile::Still, None)
+        .recognize_text_in_boxes_image(&image, &boxes, &scripts, PpocrProfile::Still, None)
         .expect("recognize");
-    let masks = engine.ink_masks(&image, &boxes);
+    let masks = engine.ink_masks(&image, &boxes, None);
 
     // Same construction as the still pipeline: rebuild the grouping box from the
     // ink matte where available, otherwise keep the detection tight box.
@@ -90,14 +89,16 @@ fn indented_paragraph_first_line_groups_with_its_body() {
                 .get(i)
                 .and_then(|m| m.as_ref())
                 .and_then(|m| measure_line(m, b.oriented_box.width, b.oriented_box.height))
-                .map_or(b.tight_box, |m| m.refit(b.tight_box));
+                .map_or(b.tight_box, |m| {
+                    m.refit(b.tight_box, b.tight_box.angle_radians)
+                });
             TextLine {
                 text: line.text,
                 bounding_box: line.rect,
                 oriented_box: line.oriented_box,
                 tight_box,
                 word_rects: vec![line.rect],
-                is_bold: false,
+                bold_ranges: Vec::new(),
             }
         })
         .collect();

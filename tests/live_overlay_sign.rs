@@ -172,40 +172,29 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
         right: width,
         bottom: height,
     };
-    let frame = OrientedImage::build(&rgba.into_raw(), width, height, 0, crop, DET_MAX_PIXELS)
-        .expect("build live frame");
+    let frame =
+        OrientedImage::build_with_rgb(&rgba.into_raw(), width, height, 0, crop, DET_MAX_PIXELS)
+            .expect("build live frame");
+    let rgb = frame.rgb.as_ref().expect("rgb populated");
+    let rgb_det = frame.rgb_det.as_ref().expect("rgb_det populated");
 
     let recognizer_spec = PpocrRecognizerSpec {
         script: PpocrScript::Latin,
         model_path: rec_path.clone(),
         keys_path: keys_path.clone(),
     };
-    let engine =
-        PpocrEngine::load(&det_path, None, None, vec![recognizer_spec], 1).expect("load ppocr");
+    let engine = PpocrEngine::load(&det_path, None, None, vec![recognizer_spec], 1, None)
+        .expect("load ppocr");
     let det_boxes = engine
-        .detect_only_image(&frame.rgb_det, PpocrProfile::Live)
+        .detect_only_image(rgb_det, PpocrProfile::Live)
         .expect("live detection succeeds");
     let boxes: Vec<_> = det_boxes
         .into_iter()
-        .map(|b| {
-            scale_detected_box(
-                b,
-                frame.det_to_full_scale,
-                frame.rgb.width(),
-                frame.rgb.height(),
-            )
-        })
+        .map(|b| scale_detected_box(b, frame.det_to_full.0, rgb.width(), rgb.height()))
         .collect();
     let scripts = vec![PpocrScript::Latin; boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image(
-            &frame.rgb,
-            &frame.gray,
-            &boxes,
-            &scripts,
-            PpocrProfile::Live,
-            None,
-        )
+        .recognize_text_in_boxes_image(rgb, &boxes, &scripts, PpocrProfile::Live, None)
         .expect("live recognition succeeds");
     let recognised: Vec<_> = lines
         .into_iter()
@@ -224,7 +213,7 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
             oriented_box: line.oriented_box,
             tight_box: b.tight_box,
             word_rects: vec![line.rect],
-            is_bold: false,
+            bold_ranges: Vec::new(),
         })
         .collect();
     let blocks = group_live_lines_into_blocks(text_lines);

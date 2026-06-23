@@ -28,12 +28,12 @@ use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, imageops::FilterType};
 
-use translator::live_session::estimate_canonical_quadrant;
 use translator::ppocr::{
     PpocrEngine, PpocrProfile, PpocrRecognizerSpec, TextlineOriCandidate, TextlineOriLabel,
     contour_principal_axis_angle, dewarp_contour_to_strip,
 };
 use translator::{DetectedTextBox, PpocrScript};
+use translator_ocr::orientation::estimate_canonical_quadrant;
 
 const MODEL_DIR: &str = "/home/david/AndroidStudioProjects/bucket/ocr/1/PP-OCRv5";
 const INPUT_PATH: &str = "files/screen-rot.jpg";
@@ -80,6 +80,7 @@ fn dump_real_image_classification_across_rotations() {
             keys_path: keys,
         }],
         1,
+        None,
     )
     .expect("load ppocr");
 
@@ -150,7 +151,7 @@ fn dump_real_image_classification_across_rotations() {
             aabb.save(case_dir.join(format!("box-{i}-aabb.png"))).ok();
             let contour: Vec<(f32, f32)> =
                 b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-            if let Some(strip) = dewarp_contour_to_strip(&gray, &contour, None) {
+            if let Some(strip) = dewarp_contour_to_strip(&gray, &contour, None, 0.0) {
                 let theta = contour_principal_axis_angle(&contour).unwrap_or(0.0);
                 DynamicImage::ImageLuma8(strip)
                     .save(case_dir.join(format!(
@@ -171,7 +172,7 @@ fn dump_real_image_classification_across_rotations() {
             let Some(theta) = contour_principal_axis_angle(&contour) else {
                 continue;
             };
-            let Some(deskewed_luma) = dewarp_contour_to_strip(&gray, &contour, None) else {
+            let Some(deskewed_luma) = dewarp_contour_to_strip(&gray, &contour, None, 0.0) else {
                 continue;
             };
             let strip = DynamicImage::ImageLuma8(deskewed_luma);

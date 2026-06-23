@@ -23,9 +23,9 @@ use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 
 use translator::coords::Quadrant;
-use translator::live_session::estimate_canonical_quadrant;
 use translator::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
 use translator::{DetectedTextBox, PpocrScript};
+use translator_ocr::orientation::estimate_canonical_quadrant;
 
 const MODEL_DIR: &str = "/home/david/AndroidStudioProjects/bucket/ocr/1/PP-OCRv5";
 const FONT_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
@@ -62,6 +62,7 @@ fn estimator_and_dewarp_handle_all_four_rotations() {
             keys_path: keys,
         }],
         1,
+        None,
     )
     .expect("load ppocr");
 
@@ -128,12 +129,10 @@ fn run_case(
         ));
     }
 
-    let gray = rotated.to_luma8();
     let scripts = vec![PpocrScript::Latin; det_boxes.len()];
     let lines = engine
         .recognize_text_in_boxes_image(
             rotated,
-            &gray,
             &det_boxes,
             &scripts,
             PpocrProfile::Still,

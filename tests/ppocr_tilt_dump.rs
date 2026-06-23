@@ -48,28 +48,20 @@ fn dump_tilt_for_real_image() {
         .expect("open image")
         .decode()
         .expect("decode image");
-    let gray = dyn_image.to_luma8();
 
     let recognizer_spec = PpocrRecognizerSpec {
         script: PpocrScript::Latin,
         model_path: rec_path.clone(),
         keys_path: keys_path.clone(),
     };
-    let engine =
-        PpocrEngine::load(&det_path, None, None, vec![recognizer_spec], 1).expect("load ppocr");
+    let engine = PpocrEngine::load(&det_path, None, None, vec![recognizer_spec], 1, None)
+        .expect("load ppocr");
     let det_boxes = engine
         .detect_only_image(&dyn_image, PpocrProfile::Still)
         .expect("detection succeeds");
     let scripts = vec![PpocrScript::Latin; det_boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image(
-            &dyn_image,
-            &gray,
-            &det_boxes,
-            &scripts,
-            PpocrProfile::Still,
-            None,
-        )
+        .recognize_text_in_boxes_image(&dyn_image, &det_boxes, &scripts, PpocrProfile::Still, None)
         .expect("recognize succeeds");
 
     eprintln!("\n=== {} detections ===", lines.len());
