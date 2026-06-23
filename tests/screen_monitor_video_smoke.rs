@@ -31,18 +31,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use glow::HasContext;
 use image::{GrayImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut};
 use imageproc::rect::Rect as IpRect;
 use khronos_egl as egl;
+use std::ffi::c_void;
 use std::io::Write;
 use translator::DetectedTextBox;
 use translator::PpocrScript;
+use translator::gl_renderer::GlesRenderer;
 use translator::live_frame::OrientedImage;
 use translator::ocr::{OrientedRect, Rect};
 use translator::ppocr::{PpocrEngine, PpocrProfile, PpocrRecognizerSpec};
 use translator::screen_monitor::{FrameClassification, Lattice, MonitorConfig, ScreenMonitor};
-use translator::screen_monitor_gpu::{LatticeProbe, PillRegion};
 
 // ── prod constants mirrored from src/live_screen.rs + src/screen_monitor_gpu.rs ──
 // (kept in sync by hand so the baseline matches the device; see the plan)
@@ -100,54 +102,247 @@ fn load_engine() -> PpocrEngine {
         model_path: rec,
         keys_path: keys,
     };
-    PpocrEngine::load(&det, None, None, vec![spec], 1).expect("load ppocr")
+    PpocrEngine::load(&det, None, None, vec![spec], 1, None).expect("load ppocr")
 }
 
-fn make_probe() -> LatticeProbe {
-    let lib = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
-        .expect("load libEGL (install Mesa/llvmpipe for headless GL)");
-    let lib: &'static egl::DynamicInstance<egl::EGL1_5> = Box::leak(Box::new(lib));
-    let display = unsafe {
-        lib.get_platform_display(
-            PLATFORM_SURFACELESS_MESA,
-            egl::DEFAULT_DISPLAY,
-            &[egl::ATTRIB_NONE],
-        )
+/// Axis-aligned pill footprint in canonical coords. The recovery only needs "is
+/// this lattice point under a pill", so an oriented pill reduces to its enclosing
+/// box (a slight corner over-cover, harmless — corner holes outside the real box
+/// aren't in any monitored set).
+#[derive(Debug, Clone, Copy)]
+struct PillRegion {
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+}
+
+impl PillRegion {
+    fn from_oriented(r: &OrientedRect) -> Self {
+        let (c, s) = (r.angle_radians.cos().abs(), r.angle_radians.sin().abs());
+        let (hw, hh) = (r.width * 0.5, r.height * 0.5);
+        PillRegion {
+            cx: r.cx,
+            cy: r.cy,
+            half_w: hw * c + hh * s,
+            half_h: hw * s + hh * c,
+        }
     }
-    .expect("surfaceless display");
-    lib.initialize(display).expect("eglInitialize");
-    lib.bind_api(egl::OPENGL_ES_API).expect("bind GLES");
-    let config = lib
-        .choose_first_config(
+}
+
+const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+const IDENTITY_H: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+struct TexSet {
+    src: glow::Texture,
+    ext: glow::Texture,
+    image: egl::Image,
+    w: u32,
+    h: u32,
+}
+
+fn set_nearest_clamp(gl: &glow::Context, target: u32) {
+    unsafe {
+        gl.tex_parameter_i32(target, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+        gl.tex_parameter_i32(target, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+        gl.tex_parameter_i32(target, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(target, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    }
+}
+
+/// Surfaceless GLES3 context driving the real `gl_renderer` recovery. The captured
+/// luma is fed through `samplerExternalOES` by wrapping a `GL_TEXTURE_2D` in an
+/// EGLImage bound to `GL_TEXTURE_EXTERNAL_OES`, so the shipping device shader runs
+/// unchanged off-device (replacing the former host re-implementation). The EGL
+/// handles are leaked deliberately: they must outlive every GL call and the
+/// process exits at test end.
+struct Gpu {
+    lib: &'static egl::DynamicInstance<egl::EGL1_5>,
+    display: egl::Display,
+    ctx: egl::Context,
+    gl: glow::Context,
+    renderer: GlesRenderer,
+    image_target: extern "system" fn(u32, *const c_void),
+    tex: Option<TexSet>,
+}
+
+impl Gpu {
+    fn new() -> Self {
+        let lib = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
+            .expect("load libEGL (install Mesa/llvmpipe for headless GL)");
+        let lib: &'static egl::DynamicInstance<egl::EGL1_5> = Box::leak(Box::new(lib));
+        let display = unsafe {
+            lib.get_platform_display(
+                PLATFORM_SURFACELESS_MESA,
+                egl::DEFAULT_DISPLAY,
+                &[egl::ATTRIB_NONE],
+            )
+        }
+        .expect("surfaceless display");
+        lib.initialize(display).expect("eglInitialize");
+        lib.bind_api(egl::OPENGL_ES_API).expect("bind GLES");
+        let config = lib
+            .choose_first_config(
+                display,
+                &[
+                    egl::SURFACE_TYPE,
+                    egl::PBUFFER_BIT,
+                    egl::RENDERABLE_TYPE,
+                    egl::OPENGL_ES2_BIT,
+                    egl::RED_SIZE,
+                    8,
+                    egl::NONE,
+                ],
+            )
+            .expect("choose_config")
+            .expect("a matching config");
+        let ctx = lib
+            .create_context(
+                display,
+                config,
+                None,
+                &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
+            )
+            .expect("create GLES3 context");
+        lib.make_current(display, None, None, Some(ctx))
+            .expect("make current");
+        let loader = |name: &str| {
+            lib.get_proc_address(name)
+                .map(|p| p as *const c_void)
+                .unwrap_or(std::ptr::null())
+        };
+        let gl = unsafe { glow::Context::from_loader_function(loader) };
+        let renderer = GlesRenderer::new(loader).expect("build GlesRenderer");
+        let image_target: extern "system" fn(u32, *const c_void) = unsafe {
+            std::mem::transmute(
+                lib.get_proc_address("glEGLImageTargetTexture2DOES")
+                    .expect("glEGLImageTargetTexture2DOES (needs GL_OES_EGL_image_external)"),
+            )
+        };
+        Gpu {
+            lib,
             display,
-            &[
-                egl::SURFACE_TYPE,
-                egl::PBUFFER_BIT,
-                egl::RENDERABLE_TYPE,
-                egl::OPENGL_ES2_BIT,
-                egl::RED_SIZE,
-                8,
-                egl::NONE,
-            ],
-        )
-        .expect("choose_config")
-        .expect("a matching config");
-    let ctx = lib
-        .create_context(
-            display,
-            config,
-            None,
-            &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
-        )
-        .expect("create GLES3 context");
-    lib.make_current(display, None, None, Some(ctx))
-        .expect("make current");
-    LatticeProbe::new(|name| {
-        lib.get_proc_address(name)
-            .map(|p| p as *const std::ffi::c_void)
-            .unwrap_or(std::ptr::null())
-    })
-    .expect("build LatticeProbe")
+            ctx,
+            gl,
+            renderer,
+            image_target,
+            tex: None,
+        }
+    }
+
+    /// (Re)build the EGLImage-backed external camera texture when the frame size
+    /// changes (the clip's dims are constant, so this fires once).
+    fn ensure(&mut self, w: u32, h: u32) {
+        if matches!(&self.tex, Some(t) if t.w == w && t.h == h) {
+            return;
+        }
+        if let Some(t) = self.tex.take() {
+            let _ = self.lib.destroy_image(self.display, t.image);
+            unsafe {
+                self.gl.delete_texture(t.src);
+                self.gl.delete_texture(t.ext);
+            }
+        }
+        let src = unsafe { self.gl.create_texture() }.expect("create src tex");
+        unsafe {
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(src));
+            set_nearest_clamp(&self.gl, glow::TEXTURE_2D);
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&vec![0u8; (w * h * 4) as usize])),
+            );
+        }
+        let image = self
+            .lib
+            .create_image(
+                self.display,
+                self.ctx,
+                egl::GL_TEXTURE_2D as egl::Enum,
+                unsafe { egl::ClientBuffer::from_ptr(src.0.get() as usize as *mut c_void) },
+                &[egl::ATTRIB_NONE],
+            )
+            .expect("create EGLImage from GL texture (needs EGL_KHR_gl_texture_2D_image)");
+        let ext = unsafe { self.gl.create_texture() }.expect("create ext tex");
+        unsafe {
+            self.gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(ext));
+            (self.image_target)(TEXTURE_EXTERNAL_OES, image.as_ptr() as *const c_void);
+            set_nearest_clamp(&self.gl, TEXTURE_EXTERNAL_OES);
+            self.gl.bind_texture(TEXTURE_EXTERNAL_OES, None);
+        }
+        self.renderer.set_camera_external(ext.0.get(), IDENTITY_H);
+        self.tex = Some(TexSet {
+            src,
+            ext,
+            image,
+            w,
+            h,
+        });
+    }
+
+    /// Recover `screen_est` at every lattice point through the real renderer, given
+    /// a `w×h` luma capture that already carries our overlay.
+    fn recover(
+        &mut self,
+        captured_luma: &[u8],
+        w: u32,
+        h: u32,
+        lat: &Lattice,
+        pill_luma: u8,
+        pills: &[PillRegion],
+    ) -> Vec<[u8; 3]> {
+        assert_eq!(captured_luma.len(), (w * h) as usize);
+        self.ensure(w, h);
+        // Upload bottom-up: the recovery shader applies the acquire's 1−v Y-flip, so
+        // a top-down capture must land flipped in the texture to read back upright.
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for ty in 0..h {
+            let row = h - 1 - ty;
+            for x in 0..w {
+                let v = captured_luma[(row * w + x) as usize];
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let src = self.tex.as_ref().expect("ensured").src;
+        unsafe {
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(src));
+            self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            self.gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&rgba)),
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        let tuples: Vec<(f32, f32, f32, f32)> = pills
+            .iter()
+            .map(|p| (p.cx, p.cy, p.half_w, p.half_h))
+            .collect();
+        self.renderer
+            .read_lattice_screen_est(
+                lat.cols(),
+                lat.rows(),
+                w,
+                h,
+                lat.spacing(),
+                &tuples,
+                pill_luma as f32 / 255.0,
+                0.5,
+            )
+            .expect("read_lattice_screen_est (rec shader / external camera)")
+    }
 }
 
 /// Real detect + recognise on a CPU-built frame. Returns the full-res canonical
@@ -174,7 +369,7 @@ fn detect_and_rec(
     let rgb = frame.rgb.as_ref().expect("rgb populated");
     let scripts = vec![PpocrScript::Latin; boxes.len()];
     let lines = engine
-        .recognize_text_in_boxes_image(rgb, &frame.gray, &boxes, &scripts, PpocrProfile::Live, None)
+        .recognize_text_in_boxes_image(rgb, &boxes, &scripts, PpocrProfile::Live, None)
         .expect("recognition");
     let texts = lines.into_iter().map(|l| l.text).collect();
     (frame.gray, boxes, texts)
@@ -402,7 +597,7 @@ fn pearson_u8(a: &[u8], b: &[u8]) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn run_acquire(
     engine: &PpocrEngine,
-    probe: &mut LatticeProbe,
+    gpu: &mut Gpu,
     monitor: &mut ScreenMonitor,
     color: &RgbaImage,
     gray: &GrayImage,
@@ -426,7 +621,7 @@ fn run_acquire(
     // Clean read: recover screen_est with the CURRENT overlay up. Freshly-exposed
     // regions (full clear, or a dropped pill) read as raw screen; surviving pills are
     // inverted through their holes. This is the baseline the new boxes bind to.
-    let clean = probe.recover(
+    let clean = gpu.recover(
         &composite_capture(gray.as_raw(), w, h, monitor.lattice(), &cur_pills),
         w,
         h,
@@ -528,7 +723,7 @@ fn screen_monitor_video_smoke() {
 
     let warmup_frames = prod_monitor_config().warmup_frames;
     let engine = load_engine();
-    let mut probe = make_probe();
+    let mut gpu = Gpu::new();
 
     let bytes = decode_mp4_to_mjpeg(&clip);
     let mut frames = split_mjpeg_frames(&bytes);
@@ -620,7 +815,7 @@ fn screen_monitor_video_smoke() {
         let captured = composite_capture(gray.as_raw(), gw, gh, mon.lattice(), &pills);
         td_composite += s.elapsed();
         let s = Instant::now();
-        let samples = probe.recover(&captured, gw, gh, mon.lattice(), PILL_LUMA, &pills);
+        let samples = gpu.recover(&captured, gw, gh, mon.lattice(), PILL_LUMA, &pills);
         td_recover += s.elapsed();
 
         // 2. Gap-point inter-frame motion (mirror monitor_screen_v2).
@@ -713,7 +908,7 @@ fn screen_monitor_video_smoke() {
             let s = Instant::now();
             acquired = run_acquire(
                 &engine,
-                &mut probe,
+                &mut gpu,
                 mon,
                 &rgba,
                 &gray,

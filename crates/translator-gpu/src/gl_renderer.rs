@@ -17,9 +17,8 @@ use std::num::NonZeroU32;
 
 use glow::HasContext;
 
-use crate::homography::mat3_mul;
-#[cfg(feature = "planar-tracker")]
-use crate::live_session::OverlayDrawList;
+use translator_core::homography::mat3_mul;
+use translator_live::live_session::OverlayDrawList;
 
 #[derive(Debug)]
 pub enum GlError {
@@ -327,7 +326,7 @@ const R8: u32 = 0x8229;
 const Y_FLIP_CLIP: [f32; 9] = [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0];
 
 /// Row-major identity-affine helpers, matching the convention of
-/// [`crate::homography`] (`mat3_mul` is row-major, `a * b`).
+/// [`translator_core::homography`] (`mat3_mul` is row-major, `a * b`).
 fn translate(tx: f32, ty: f32) -> [f32; 9] {
     [1.0, 0.0, tx, 0.0, 1.0, ty, 0.0, 0.0, 1.0]
 }
@@ -483,7 +482,7 @@ struct GlyphAtlas {
     width: u32,
     height: u32,
     /// `(atlas_x, atlas_y)` for glyphs already uploaded.
-    slots: std::collections::HashMap<crate::image_render::GlyphKey, (u32, u32)>,
+    slots: std::collections::HashMap<translator_render::image_render::GlyphKey, (u32, u32)>,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
@@ -1128,7 +1127,6 @@ impl GlesRenderer {
     /// New glyph masks are uploaded to the atlas before the draw; the atlas clears
     /// and re-packs from scratch when it overflows. Returns false on failure.
     /// Must run on the GL thread; leaves no framebuffer bound.
-    #[cfg(feature = "planar-tracker")]
     pub fn render_overlay_to_texture(
         &mut self,
         dl: &OverlayDrawList,
@@ -1463,12 +1461,11 @@ impl GlesRenderer {
     /// shelf, a new shelf is started; if the atlas overflows entirely, all slots are
     /// cleared and the current frame's masks are re-uploaded from scratch. Returns
     /// the count of newly uploaded masks.
-    #[cfg(feature = "planar-tracker")]
     fn upload_new_glyphs(
         &mut self,
         masks: &std::collections::HashMap<
-            crate::image_render::GlyphKey,
-            crate::image_render::GlyphMaskData,
+            translator_render::image_render::GlyphKey,
+            translator_render::image_render::GlyphMaskData,
         >,
     ) -> usize {
         let atlas = match self.glyph_atlas.as_mut() {
@@ -1476,7 +1473,7 @@ impl GlesRenderer {
             None => return 0,
         };
         // Collect masks that are not yet in the atlas.
-        let missing: Vec<&crate::image_render::GlyphMaskData> = masks
+        let missing: Vec<&translator_render::image_render::GlyphMaskData> = masks
             .values()
             .filter(|m| !atlas.slots.contains_key(&m.key))
             .collect();
@@ -1485,7 +1482,8 @@ impl GlesRenderer {
         }
         // Try to place each missing mask. If any fails, clear the atlas and retry the
         // full current-frame mask set (which always fits if no single mask > atlas size).
-        let mut placed: Vec<(&crate::image_render::GlyphMaskData, u32, u32)> = Vec::new();
+        let mut placed: Vec<(&translator_render::image_render::GlyphMaskData, u32, u32)> =
+            Vec::new();
         let mut overflow = false;
         for m in &missing {
             if m.w == 0 || m.h == 0 {
@@ -1564,7 +1562,6 @@ impl GlesRenderer {
     /// over a transparent clear, no camera, no homography. Straight-alpha texture →
     /// premultiplied window output (SurfaceFlinger) via the global `overlay_alpha`.
     /// Uses the geometry recorded at bake time. The caller swaps after.
-    #[cfg(feature = "planar-tracker")]
     pub fn present_screen_overlay_fbo(
         &mut self,
         canonical_w: u32,
@@ -1596,7 +1593,6 @@ impl GlesRenderer {
     /// tracker homography. `h_surface_to_viewport` maps the anchor's surface coords
     /// to canonical view px; `display_xform` maps canonical px to clip. Returns false
     /// only when there's no external camera source (nothing to show). The caller swaps.
-    #[cfg(feature = "planar-tracker")]
     pub fn present_camera(
         &mut self,
         display_xform: &[f32; 9],
@@ -1638,7 +1634,6 @@ impl GlesRenderer {
     /// screen) vs plain source-over onto the opaque camera (false). Assumes the caller
     /// bound the present framebuffer, the quad VBO, and cleared. The grow-only FBO's
     /// used sub-rect is selected via the uv transform. Returns false if nothing baked.
-    #[cfg(feature = "planar-tracker")]
     fn draw_baked_overlay_quad(
         &self,
         base_surface_to_clip: &[f32; 9],
@@ -1724,7 +1719,6 @@ impl GlesRenderer {
     /// the `dst_w×dst_h` canonical frame, mapped to clip by `dst_to_clip` and sampled
     /// through the stored canonical uv transform (upright/crop/flip). No-op if no
     /// external source is set. Caller sets blend/clear state.
-    #[cfg(feature = "planar-tracker")]
     fn draw_camera_passthrough_ext(&self, dst_w: f32, dst_h: f32, dst_to_clip: &[f32; 9]) {
         let (Some((id, uv)), Some(e)) = (self.camera_external, self.ext.as_ref()) else {
             return;

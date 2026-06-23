@@ -17,12 +17,12 @@
 
 use std::sync::Arc;
 
-use crate::api::{TranslatorError, TranslatorErrorKind};
 use crate::gl_renderer::GlesRenderer;
-use crate::live_frame::{LiveFrame, OrientedImage, aligned_det_dims};
-use crate::live_screen::NormRect;
-use crate::live_tracker_pipeline::{LiveTrackerPipeline, ProcessFrameResult};
-use crate::ocr::Rect;
+use translator_core::api::{TranslatorError, TranslatorErrorKind};
+use translator_core::ocr::Rect;
+use translator_live::live_screen::NormRect;
+use translator_live::live_tracker_pipeline::{LiveTrackerPipeline, ProcessFrameResult};
+use translator_raster::live_frame::{LiveFrame, OrientedImage, aligned_det_dims};
 
 /// Row-major 3×3 mapping `w×h` dst-pixel coords → clip `[-1,1]` — the
 /// resolution-independent normalize `read_camera_*` wants as `dst_to_clip`
@@ -78,7 +78,7 @@ pub fn frame_from_camera_gray(
 /// Run the tracker for one frame, present the result on the GPU (camera
 /// passthrough + the baked overlay warped by the tracker homography), and, if the
 /// tracker asked for an acquire/refresh on this gray-only frame, satisfy the
-/// [`AcquireRequest`](crate::live_tracker_pipeline::AcquireRequest) by reading
+/// [`AcquireRequest`](translator_live::live_tracker_pipeline::AcquireRequest) by reading
 /// back the OCR inputs from the same external camera texture and handing them to
 /// [`LiveTrackerPipeline::provide_acquire_rgb`].
 ///

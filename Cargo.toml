@@ -90,7 +90,7 @@ raster = ["dep:translator-raster", "dep:image"]
 ppocr = ["dep:translator-ocr", "raster"]
 model-convert = ["dep:translator-convert"]
 planar-tracker = ["ppocr", "dep:translator-live", "dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
-gpu = ["dep:glow", "planar-tracker"]
+gpu = ["dep:translator-gpu", "planar-tracker"]
 surface-sim = ["planar-tracker", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
 viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
 
@@ -105,6 +105,7 @@ translator-raster = { path = "crates/translator-raster", optional = true }
 translator-ocr = { path = "crates/translator-ocr", optional = true }
 translator-convert = { path = "crates/translator-convert", optional = true }
 translator-live = { path = "crates/translator-live", optional = true }
+translator-gpu = { path = "crates/translator-gpu", optional = true }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -128,7 +129,6 @@ translator-align = { path = "crates/translator-align", optional = true }
 ndarray = { version = "0.16", optional = true }
 imageproc = { version = "0.25", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
-glow = { version = "0.17", optional = true, default-features = false }
 log = "0.4"
 minifb = { version = "0.27", optional = true }
 ab_glyph = { version = "0.2", optional = true }
@@ -140,6 +140,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 ab_glyph = "0.2"
 env_logger = "0.11"
 khronos-egl = { version = "6", features = ["dynamic"] }
+glow = { version = "0.17", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false, features = [] }
@@ -147,15 +148,6 @@ mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, def
 [target.'cfg(not(target_os = "android"))'.dependencies]
 mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, default-features = false, features = ["system-fonts"] }
 
-[[test]]
-name = "gpu_compositor"
-path = "tests/gpu_compositor.rs"
-required-features = ["gpu"]
-
-[[test]]
-name = "screen_monitor_gpu"
-path = "tests/screen_monitor_gpu.rs"
-required-features = ["gpu"]
 
 [[test]]
 name = "pdf_smoke"

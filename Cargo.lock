@@ -2923,6 +2923,7 @@ dependencies = [
  "translator-core",
  "translator-dictionary",
  "translator-doc",
+ "translator-gpu",
  "translator-live",
  "translator-mucab",
  "translator-ocr",
@@ -2989,6 +2990,20 @@ dependencies = [
  "ttf-parser",
  "xml5ever",
  "zip",
+]
+
+[[package]]
+name = "translator-gpu"
+version = "0.1.0"
+dependencies = [
+ "glow",
+ "khronos-egl",
+ "log",
+ "translator-core",
+ "translator-live",
+ "translator-raster",
+ "translator-render",
+ "translator-tracker",
 ]
 
 [[package]]
