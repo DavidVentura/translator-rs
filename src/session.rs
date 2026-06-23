@@ -5,11 +5,12 @@ use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::{BergamotEngine, TranslateCtx};
 use crate::catalog::{
     CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
-    LanguageOverview, PackInstallChecker, build_catalog_snapshot, build_language_overview,
-    language_rows_in_snapshot, parse_and_validate_catalog, plan_delete_dictionary,
-    plan_delete_language, plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts,
-    plan_delete_tts_pack, plan_dictionary_download, plan_language_download,
-    plan_support_download_by_kind, plan_tts_download, select_best_catalog,
+    LanguageOverview, MigrationJob, PackInstallChecker, build_catalog_snapshot,
+    build_language_overview, language_rows_in_snapshot, parse_and_validate_catalog,
+    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts,
+    plan_delete_support_by_kind, plan_delete_tts, plan_delete_tts_pack, plan_dictionary_download,
+    plan_language_download, plan_migrations, plan_support_download_by_kind, plan_tts_download,
+    select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
 #[cfg(feature = "ppocr")]
@@ -167,6 +168,29 @@ impl TranslatorSession {
             }
         }
 
+        self.refresh_snapshot();
+    }
+
+    /// The on-device ONNX→MNN conversions needed to migrate this install to the
+    /// MNN-only runtime: only entries whose `.onnx` is present on disk.
+    pub fn plan_migration(&self) -> Vec<MigrationJob> {
+        let snap = self.snapshot();
+        let checker = FsPackInstallChecker::new(&snap.base_dir);
+        plan_migrations(&snap.catalog, &checker)
+    }
+
+    /// Delete the source `.onnx` of each job without converting (either the user
+    /// opted to drop these models instead of migrating them, or a cleanup-only
+    /// job whose `.mnn` already exists). The actual ONNX→MNN conversion runs in a
+    /// separate link unit (the `translator-convert` crate / its own native lib)
+    /// because the MNN converter and slimt's sentencepiece vendor incompatible
+    /// protobufs that cannot coexist in one binary.
+    pub fn discard_migration(&self, jobs: &[MigrationJob]) {
+        let base_dir = self.snapshot().base_dir.clone();
+        let base = std::path::Path::new(&base_dir);
+        for job in jobs {
+            let _ = std::fs::remove_file(base.join(&job.entry.onnx));
+        }
         self.refresh_snapshot();
     }
 

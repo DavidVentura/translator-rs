@@ -624,6 +624,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
+source = "git+https://github.com/DavidVentura/piper-rs#f3c5a393413349139a6546135f0384067490d5b6"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -631,6 +632,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
+source = "git+https://github.com/DavidVentura/piper-rs#f3c5a393413349139a6546135f0384067490d5b6"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -1609,7 +1611,7 @@ dependencies = [
 [[package]]
 name = "mnn-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/mnn-sys#e97f467f8010f7c80888a77bed1ed7d25ed20792"
+source = "git+https://github.com/DavidVentura/mnn-sys#01b736b9e27320bdea6ab0eab207d6a934f4a515"
 dependencies = [
  "bindgen 0.69.5",
  "cc",
@@ -2021,6 +2023,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
+source = "git+https://github.com/DavidVentura/piper-rs#f3c5a393413349139a6546135f0384067490d5b6"
 dependencies = [
  "espeak-rs",
  "log",

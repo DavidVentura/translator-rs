@@ -88,6 +88,7 @@ pdf-image-translate = [
 doc-align = ["dep:translator-align", "dep:ndarray"]
 raster = ["dep:translator-raster", "dep:image"]
 ppocr = ["dep:translator-ocr", "raster"]
+model-convert = ["dep:translator-convert"]
 planar-tracker = ["ppocr", "dep:translator-live", "dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
 gpu = ["dep:glow", "planar-tracker"]
 surface-sim = ["planar-tracker", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
@@ -102,6 +103,7 @@ translator-pdf = { path = "crates/translator-pdf", optional = true }
 translator-tracker = { path = "crates/translator-tracker", optional = true }
 translator-raster = { path = "crates/translator-raster", optional = true }
 translator-ocr = { path = "crates/translator-ocr", optional = true }
+translator-convert = { path = "crates/translator-convert", optional = true }
 translator-live = { path = "crates/translator-live", optional = true }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -200,11 +202,14 @@ name = "live_video_overlay_smoke"
 path = "tests/live_video_overlay_smoke.rs"
 required-features = ["ppocr", "planar-tracker"]
 
+# [patch."https://github.com/DavidVentura/mnn-sys"]
+# mnn-sys = { path = "../mnn-sys" }
+
 # [patch."https://github.com/DavidVentura/piper-rs"]
 # piper-rs = { path = "../piper-rs" }
 
 # [patch."https://github.com/DavidVentura/mupdf-rs"]
-# piper-rs = { path = "../mupdf-rs" }
+# mupdf-rs = { path = "../mupdf-rs" }
 
 [[test]]
 name = "ppocr_textline_orientation"

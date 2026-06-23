@@ -8,8 +8,9 @@ mod wire;
 pub use model::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DeletePlan, DictionaryInfo, DownloadPlan,
     DownloadTask, FileRequirement, FileRole, InstalledTtsPack, LangAvailability, LanguageCatalog,
-    LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, OcrEngine, OcrPack, PackKind, PackRecord,
-    PpocrScript, ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
+    LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, MigrationAction, MigrationEntry,
+    MigrationJob, OcrEngine, OcrPack, PackKind, PackRecord, PpocrScript, ResolvedTtsVoiceFiles,
+    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 pub use planner::{
     CatalogSnapshot, FsPackInstallChecker, LanguageAvailabilityRow, LanguageOverview,
@@ -19,7 +20,7 @@ pub use planner::{
     installed_tts_voices_for_language, language_rows_in_snapshot, plan_delete_dictionary,
     plan_delete_language, plan_delete_superseded_files, plan_delete_superseded_tts,
     plan_delete_support_by_kind, plan_delete_tts, plan_delete_tts_pack, plan_dictionary_download,
-    plan_language_download, plan_ocr_engine_download, plan_ocr_engine_downloads,
+    plan_language_download, plan_migrations, plan_ocr_engine_download, plan_ocr_engine_downloads,
     plan_ocr_engine_upgrades, plan_support_download_by_kind, plan_tts_download,
     resolve_tts_voice_files, resolve_tts_voice_files_for_pack,
 };

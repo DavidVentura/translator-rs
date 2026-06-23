@@ -5,8 +5,8 @@ use crate::language::Language;
 
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole,
-    InstalledTtsPack, LangAvailability, LanguageCatalog, PackKind, PackRecord,
-    ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
+    InstalledTtsPack, LangAvailability, LanguageCatalog, MigrationAction, MigrationJob, PackKind,
+    PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,32 @@ impl PackInstallChecker for FsPackInstallChecker {
             .and_then(|value| i32::try_from(value).ok())
             == Some(expected_version)
     }
+}
+
+/// Select the on-device ONNX→MNN conversions for the current install: only
+/// entries whose source `.onnx` is actually present. An entry whose `.mnn`
+/// already exists alongside is cleanup-only (delete the stray `.onnx`), so the
+/// step is idempotent across re-runs and partial completions.
+pub fn plan_migrations(
+    catalog: &LanguageCatalog,
+    checker: &impl PackInstallChecker,
+) -> Vec<MigrationJob> {
+    catalog
+        .migrations
+        .iter()
+        .filter(|entry| checker.file_exists(&entry.onnx))
+        .map(|entry| {
+            let action = if checker.file_exists(&entry.mnn) {
+                MigrationAction::CleanupOnly
+            } else {
+                MigrationAction::Convert
+            };
+            MigrationJob {
+                entry: entry.clone(),
+                action,
+            }
+        })
+        .collect()
 }
 
 pub(crate) struct PackResolver<'a, C> {
@@ -628,12 +654,11 @@ pub fn resolve_tts_voice_files_for_pack(
         .catalog
         .pack_files_with_dependencies(&voice_pack_id);
     let engine = tts.engine.clone().unwrap_or_else(|| "piper".to_string());
-    let model_asset = match engine.as_str() {
-        "kokoro_mnn" => pack_files.iter().find(|file| file.name.ends_with(".mnn")),
-        _ => pack_files
-            .iter()
-            .find(|file| file.name.ends_with(".onnx") && !file.name.ends_with(".onnx.json")),
-    }?;
+    // The runtime is MNN-only: every engine's model blob is a `.mnn` (piper-family
+    // voices were migrated from `.onnx`; their `.onnx.json` sidecar is the aux file
+    // resolved below). Earlier this looked for `.onnx` for non-kokoro engines,
+    // which no longer matches the catalog and resolved no voice.
+    let model_asset = pack_files.iter().find(|file| file.name.ends_with(".mnn"))?;
     let aux_asset = match engine.as_str() {
         "kokoro" | "kokoro_mnn" => pack_files.iter().find(|file| file.name.ends_with(".bin")),
         "mms" => pack_files

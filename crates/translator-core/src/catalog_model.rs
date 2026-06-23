@@ -346,6 +346,32 @@ pub struct LanguageCatalog {
     pub(crate) translation_pack_ids: HashMap<(String, String), String>,
     pub(crate) dictionary_pack_ids_by_code: HashMap<String, String>,
     pub(crate) root_pack_ids_by_language_feature: HashMap<(String, LanguageFeature), Vec<String>>,
+    pub migrations: Vec<MigrationEntry>,
+}
+
+/// One ONNX→MNN conversion the app may run on-device to migrate an install that
+/// predates the MNN-only runtime. Self-contained (both sizes carried) so the UI
+/// can show reclaimed space without cross-referencing the pack file entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationEntry {
+    pub onnx: String,
+    pub mnn: String,
+    pub quant_bits: i32,
+    pub onnx_bytes: u64,
+    pub mnn_bytes: u64,
+    pub feature: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationAction {
+    Convert,
+    CleanupOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationJob {
+    pub entry: MigrationEntry,
+    pub action: MigrationAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

@@ -462,6 +462,7 @@ fn base_catalog() -> LanguageCatalog {
                 vec!["tts-es".to_string()],
             ),
         ]),
+        migrations: Vec::new(),
     }
 }
 
@@ -876,6 +877,40 @@ fn parses_bundled_catalog_asset() {
 }
 
 #[test]
+fn parses_v5_migrations_from_asset() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let asset_path = manifest_dir
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(|parent| {
+            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v5.json")
+        })
+        .expect("repo layout should have a parent");
+    let Ok(json) = std::fs::read_to_string(asset_path) else {
+        return;
+    };
+    let catalog =
+        crate::catalog::parse_and_validate_catalog(&json).expect("v5 catalog should parse");
+    assert!(
+        !catalog.migrations.is_empty(),
+        "v5 asset should carry migrations"
+    );
+    assert!(
+        catalog
+            .migrations
+            .iter()
+            .any(|entry| entry.feature == "doc_detect"),
+        "doc_detect migration should be present"
+    );
+    assert!(
+        catalog
+            .migrations
+            .iter()
+            .all(|entry| entry.onnx.ends_with(".onnx") && entry.mnn.ends_with(".mnn")),
+    );
+}
+
+#[test]
 fn selects_best_catalog_using_headers_only() {
     let bundled = r#"{"formatVersion":3,"generatedAt":1}"#;
     let disk = r#"{"formatVersion":3,"generatedAt":2}"#;
@@ -884,4 +919,84 @@ fn selects_best_catalog_using_headers_only() {
         .expect("header-only catalogs should still compare");
 
     assert_eq!(selected, disk);
+}
+
+fn catalog_json_with_migrations(migrations: &str) -> String {
+    format!(
+        r#"{{
+          "formatVersion":5,"generatedAt":1,"dictionaryVersion":1,
+          "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
+                      "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1}},
+          "languages":{{}},"packs":{{}},
+          "migrations":{migrations}
+        }}"#
+    )
+}
+
+#[test]
+fn parses_migrations_section() {
+    let json = catalog_json_with_migrations(
+        r#"[
+          {"onnx":"ocr/docrec/docaligner_lcnet050.onnx","mnn":"ocr/docrec/docaligner_lcnet050.mnn",
+           "quantBits":8,"onnxBytes":4911217,"mnnBytes":1760380,"feature":"doc_detect"},
+          {"onnx":"bin/piper/ar/v.onnx","mnn":"bin/piper/ar/v.mnn",
+           "quantBits":8,"onnxBytes":100,"mnnBytes":40,"feature":"tts"}
+        ]"#,
+    );
+    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("v5 catalog parses");
+    assert_eq!(catalog.migrations.len(), 2);
+    assert_eq!(catalog.migrations[0].feature, "doc_detect");
+    assert_eq!(
+        catalog.migrations[0].mnn,
+        "ocr/docrec/docaligner_lcnet050.mnn"
+    );
+    assert_eq!(catalog.migrations[1].onnx_bytes, 100);
+    assert_eq!(catalog.migrations[1].quant_bits, 8);
+}
+
+#[test]
+fn catalog_without_migrations_is_empty() {
+    let json = r#"{
+      "formatVersion":4,"generatedAt":1,"dictionaryVersion":1,
+      "sources":{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
+                 "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1},
+      "languages":{},"packs":{}
+    }"#;
+    let catalog = crate::catalog::parse_and_validate_catalog(json).expect("v4 catalog parses");
+    assert!(catalog.migrations.is_empty());
+}
+
+#[test]
+fn plan_migrations_classifies_by_disk_state() {
+    use crate::catalog::MigrationAction;
+
+    let json = catalog_json_with_migrations(
+        r#"[
+          {"onnx":"a.onnx","mnn":"a.mnn","quantBits":8,"onnxBytes":10,"mnnBytes":4,"feature":"tts"},
+          {"onnx":"b.onnx","mnn":"b.mnn","quantBits":8,"onnxBytes":10,"mnnBytes":4,"feature":"tts"},
+          {"onnx":"c.onnx","mnn":"c.mnn","quantBits":8,"onnxBytes":10,"mnnBytes":4,"feature":"tts"}
+        ]"#,
+    );
+    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("v5 catalog parses");
+    // a: onnx present, mnn absent -> Convert
+    // b: onnx present, mnn already present -> CleanupOnly
+    // c: onnx absent -> not in the plan
+    let checker = FakeInstallChecker::with_files(&["a.onnx", "b.onnx", "b.mnn"]);
+
+    let jobs = crate::catalog::plan_migrations(&catalog, &checker);
+    assert_eq!(jobs.len(), 2);
+
+    let job_a = jobs
+        .iter()
+        .find(|job| job.entry.onnx == "a.onnx")
+        .expect("a planned");
+    assert_eq!(job_a.action, MigrationAction::Convert);
+
+    let job_b = jobs
+        .iter()
+        .find(|job| job.entry.onnx == "b.onnx")
+        .expect("b planned");
+    assert_eq!(job_b.action, MigrationAction::CleanupOnly);
+
+    assert!(jobs.iter().all(|job| job.entry.onnx != "c.onnx"));
 }

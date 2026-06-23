@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use piper_rs::{
-    Backend, CoquiVitsModel, CotoviaVitsModel, KokoroModel, MmsModel, PiperModel, SherpaVitsModel,
+    Backend, CoquiVitsModel, CotoviaVitsModel, KokoroMnnModel, MmsModel, PiperModel,
+    SherpaVitsModel,
 };
 use serde::Deserialize;
 use translator::tts::{PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks};
 
-const DEFAULT_INDEX_PATH: &str = "~/AndroidStudioProjects/bucket/index.json";
+const DEFAULT_INDEX_PATH: &str = "~/AndroidStudioProjects/bucket/index_v4.json";
 const DEFAULT_OUTPUT_DIR: &str = "samples";
 const SAMPLE_TEXTS_JSON: &str = include_str!("../../data/sample_texts.json");
 
@@ -428,7 +429,12 @@ fn synthesize_pack_sample(
         "coqui_vits" => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
         "cotovia_vits" => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
         "sherpa_vits" => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
-        "kokoro" => synthesize_kokoro(pack_key, pack, catalog, bucket_dir, text)?,
+        "kokoro_mnn" => synthesize_kokoro_mnn(pack_key, pack, catalog, bucket_dir, text)?,
+        "kokoro" => {
+            return Err(format!(
+                "`{pack_key}` uses the legacy ort kokoro engine (superseded by kokoro_mnn); skipped"
+            ));
+        }
         other => return Err(format!("Unsupported engine `{other}` for `{pack_key}`")),
     };
 
@@ -503,8 +509,12 @@ fn synthesize_piper(
         file.name.ends_with(".onnx.json")
     })?;
 
-    let mut model = PiperModel::new(&model_path, &config_path, &Backend::Cpu)
-        .map_err(|err| format!("Failed to load Piper model `{pack_key}`: {err}"))?;
+    let mut model = PiperModel::new(
+        &model_path.with_extension("mnn"),
+        &config_path,
+        &Backend::Cpu,
+    )
+    .map_err(|err| format!("Failed to load Piper model `{pack_key}`: {err}"))?;
     let speaker_id = model
         .voices()
         .map(|voices| resolve_speaker_id(pack_key, pack, voices))
@@ -540,8 +550,12 @@ fn synthesize_cotovia(
     let lexicon_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
         file.name.ends_with("lexicon.txt.zst")
     })?;
-    let mut model = CotoviaVitsModel::new(&model_path, &lexicon_path, &Backend::Cpu)
-        .map_err(|err| format!("Failed to load Cotovia VITS model `{pack_key}`: {err}"))?;
+    let mut model = CotoviaVitsModel::new(
+        &model_path.with_extension("mnn"),
+        &lexicon_path,
+        &Backend::Cpu,
+    )
+    .map_err(|err| format!("Failed to load Cotovia VITS model `{pack_key}`: {err}"))?;
     // cotovia_vits tokenizes internally; synthesize the whole sample text.
     model
         .synthesize(text, None, None)
@@ -562,8 +576,12 @@ fn synthesize_mimic3(
         file.name.ends_with(".onnx.json")
     })?;
 
-    let mut model = PiperModel::from_mimic3(&model_path, &config_path, &Backend::Cpu)
-        .map_err(|err| format!("Failed to load Mimic3 model `{pack_key}`: {err}"))?;
+    let mut model = PiperModel::from_mimic3(
+        &model_path.with_extension("mnn"),
+        &config_path,
+        &Backend::Cpu,
+    )
+    .map_err(|err| format!("Failed to load Mimic3 model `{pack_key}`: {err}"))?;
     let speaker_id = model
         .voices()
         .map(|voices| resolve_speaker_id(pack_key, pack, voices))
@@ -599,8 +617,12 @@ fn synthesize_mms(
         file.name == "tokens.txt"
     })?;
 
-    let mut model = MmsModel::new(&model_path, &tokens_path, &Backend::Cpu)
-        .map_err(|err| format!("Failed to load MMS model `{pack_key}`: {err}"))?;
+    let mut model = MmsModel::new(
+        &model_path.with_extension("mnn"),
+        &tokens_path,
+        &Backend::Cpu,
+    )
+    .map_err(|err| format!("Failed to load MMS model `{pack_key}`: {err}"))?;
 
     let plan = plan_for_text("MMS", pack_key, text, |t| {
         model
@@ -636,8 +658,13 @@ fn synthesize_coqui(
         .as_deref()
         .ok_or_else(|| format!("Pack `{pack_key}` is missing `language`"))?;
 
-    let mut model = CoquiVitsModel::new(&model_path, &config_path, language, &Backend::Cpu)
-        .map_err(|err| format!("Failed to load Coqui VITS model `{pack_key}`: {err}"))?;
+    let mut model = CoquiVitsModel::new(
+        &model_path.with_extension("mnn"),
+        &config_path,
+        language,
+        &Backend::Cpu,
+    )
+    .map_err(|err| format!("Failed to load Coqui VITS model `{pack_key}`: {err}"))?;
     let speaker_id = model
         .voices()
         .map(|voices| resolve_speaker_id(pack_key, pack, voices))
@@ -673,8 +700,12 @@ fn synthesize_sherpa(
         file.name == "config.json"
     })?;
 
-    let mut model = SherpaVitsModel::new(&model_path, &config_path, &Backend::Cpu)
-        .map_err(|err| format!("Failed to load Sherpa VITS model `{pack_key}`: {err}"))?;
+    let mut model = SherpaVitsModel::new(
+        &model_path.with_extension("mnn"),
+        &config_path,
+        &Backend::Cpu,
+    )
+    .map_err(|err| format!("Failed to load Sherpa VITS model `{pack_key}`: {err}"))?;
 
     let plan = plan_for_text("Sherpa VITS", pack_key, text, |t| {
         model
@@ -692,7 +723,7 @@ fn synthesize_sherpa(
     })
 }
 
-fn synthesize_kokoro(
+fn synthesize_kokoro_mnn(
     pack_key: &str,
     pack: &Pack,
     catalog: &Catalog,
@@ -700,7 +731,7 @@ fn synthesize_kokoro(
     text: &str,
 ) -> Result<(Vec<f32>, u32), String> {
     let model_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
-        file.name == "kokoro-v1.0.int8.onnx"
+        file.name == "kokoro.mnn"
     })?;
     let voices_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
         file.name == "voices-v1.0.bin"
@@ -710,7 +741,7 @@ fn synthesize_kokoro(
         .as_deref()
         .ok_or_else(|| format!("Pack `{pack_key}` is missing `language`"))?;
 
-    let mut model = KokoroModel::new(&model_path, &voices_path, language, &Backend::Cpu)
+    let mut model = KokoroMnnModel::new(&model_path, &voices_path, language)
         .map_err(|err| format!("Failed to load Kokoro model `{pack_key}`: {err}"))?;
 
     load_kokoro_language_support(&mut model, pack_key, language, catalog, bucket_dir)?;
@@ -738,7 +769,7 @@ fn synthesize_kokoro(
 }
 
 fn load_kokoro_language_support(
-    model: &mut KokoroModel,
+    model: &mut KokoroMnnModel,
     pack_key: &str,
     language: &str,
     catalog: &Catalog,

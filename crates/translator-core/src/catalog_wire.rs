@@ -7,8 +7,8 @@ use crate::language::Language;
 use super::model::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, FileRequirement, FileRole,
     LanguageCatalog, LanguageFeature, LanguageInfo, LanguageResources, LanguageTtsRegionV2,
-    LanguageTtsV2, OcrPack, PackKind, PackRecord, PpocrScript, SupportPack, TranslationPack,
-    TtsPack, tts_pack_ids_from_config,
+    LanguageTtsV2, MigrationEntry, OcrPack, PackKind, PackRecord, PpocrScript, SupportPack,
+    TranslationPack, TtsPack, tts_pack_ids_from_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -176,6 +176,30 @@ enum AssetPackWire {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MigrationEntryWire {
+    onnx: String,
+    mnn: String,
+    quant_bits: i32,
+    onnx_bytes: u64,
+    mnn_bytes: u64,
+    feature: String,
+}
+
+impl From<MigrationEntryWire> for MigrationEntry {
+    fn from(value: MigrationEntryWire) -> Self {
+        Self {
+            onnx: value.onnx,
+            mnn: value.mnn,
+            quant_bits: value.quant_bits,
+            onnx_bytes: value.onnx_bytes,
+            mnn_bytes: value.mnn_bytes,
+            feature: value.feature,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LanguageCatalogWire {
     format_version: i32,
     generated_at: i64,
@@ -183,6 +207,8 @@ struct LanguageCatalogWire {
     sources: CatalogSourcesWire,
     languages: HashMap<String, LanguageEntryWire>,
     packs: HashMap<String, AssetPackWire>,
+    #[serde(default)]
+    migrations: Vec<MigrationEntryWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,6 +526,11 @@ pub fn parse_language_catalog(json: &str) -> Result<LanguageCatalog, String> {
         translation_pack_ids,
         dictionary_pack_ids_by_code,
         root_pack_ids_by_language_feature,
+        migrations: wire
+            .migrations
+            .into_iter()
+            .map(MigrationEntry::from)
+            .collect(),
     })
 }
 
