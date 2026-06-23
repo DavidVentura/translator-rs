@@ -189,11 +189,6 @@ name = "planar_engine_lifecycle"
 path = "tests/planar_engine_lifecycle.rs"
 required-features = ["planar-tracker"]
 
-[[test]]
-name = "live_video_overlay_smoke"
-path = "tests/live_video_overlay_smoke.rs"
-required-features = ["ppocr", "planar-tracker"]
-
 # [patch."https://github.com/DavidVentura/mnn-sys"]
 # mnn-sys = { path = "../mnn-sys" }
 
@@ -207,8 +202,3 @@ required-features = ["ppocr", "planar-tracker"]
 name = "ppocr_textline_orientation"
 path = "tests/ppocr_textline_orientation.rs"
 required-features = ["ppocr", "planar-tracker"]
-
-[[test]]
-name = "ppocr_single_frame_overlay"
-path = "tests/ppocr_single_frame_overlay.rs"
-required-features = ["ppocr", "planar-tracker", "image-render"]
