@@ -17,10 +17,6 @@ use translator_core::catalog::PpocrScript;
 
 const REC_TARGET_HEIGHT: u32 = 48;
 const REC_WIDTH_BUCKET: usize = 32;
-/// Ink strips bucket their widths up to this multiple before batched inference, so a page's
-/// many distinct widths collapse to a few MNN input shapes (one `resizeSession` each). A
-/// multiple of `PpocrInkModel::POOL_MULTIPLE` (16) so the padded width still divides the U-Net.
-const INK_WIDTH_BIN: u32 = 128;
 const REC_MIN_SCORE: f32 = 0.3;
 /// Per-character CTC score gate for punctuation glyphs. Kept lower than `REC_MIN_SCORE`
 /// because real punctuation is small and ambiguous (period vs comma vs apostrophe), so its
@@ -519,17 +515,13 @@ impl PpocrEngine {
             .filter_map(|(i, s)| s.as_ref().map(|d| (i, &d.image, d.src_map.as_ref())))
             .collect();
 
-        // Bucket by width binned up to `INK_WIDTH_BIN`, then run buckets in parallel (one MNN
-        // session per rayon worker, no lock contention). Each distinct input shape costs an MNN
-        // `resizeSession` (graph-geometry recompute), so a page's ~25 exact strip widths would
-        // be ~25 resizes; binning collapses them to a handful. Strips zero-pad to the bin width
-        // on the way in and crop back to their true width on the way out.
+        // Bucket by *exact* width (same-width strips batch into one call, no padding), then
+        // run buckets in parallel — one MNN session per rayon worker, no lock contention.
+        // Exact width beats binning here: the matte model is compute-bound, so padding to a
+        // bin width just adds wasted conv work and coarsens the parallelism granularity.
         let mut by_width: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
         for (j, (_, r, _)) in prepared.iter().enumerate() {
-            by_width
-                .entry(r.width().next_multiple_of(INK_WIDTH_BIN))
-                .or_default()
-                .push(j);
+            by_width.entry(r.width()).or_default().push(j);
         }
         let buckets: Vec<(u32, Vec<usize>)> = by_width.into_iter().collect();
         let n_batches = buckets.len();
