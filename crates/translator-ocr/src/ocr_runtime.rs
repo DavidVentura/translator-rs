@@ -32,6 +32,9 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     // Detected boxes from a prior `detect_image_boxes_ppocr` pass; when `Some`, detection is
     // skipped so the staged detect→translate path runs the detector only once.
     detection: Option<Vec<DetectedTextBox>>,
+    // Fired with the detected boxes (image coords) the moment detection finishes, before the
+    // slower recognize+translate, so the UI can pill the regions while the rest runs.
+    on_detected: Option<&(dyn Fn(&[DetectedTextBox]) + Sync)>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
     let det_max_pixels = saturating_square(max_image_size);
     let still = StillImage::build_still_rgb(rgba_bytes, width, height, det_max_pixels)
@@ -46,6 +49,9 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
             .map(|b| scale_detected_box(b, still.det_to_full, width, height))
             .collect(),
     };
+    if let Some(cb) = on_detected {
+        cb(&det_boxes);
+    }
 
     // Still images are display-oriented, so the canonical reading frame is R0.
     // Passing it explicitly (instead of None) pins the dewarp direction of

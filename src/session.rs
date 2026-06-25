@@ -362,6 +362,55 @@ impl TranslatorSession {
             background_mode,
             reading_order,
             detection,
+            None,
+        )
+        .map_err(|e| {
+            if e.message.to_lowercase().contains("no text found") {
+                TranslatorError::ocr("No text found in image (engine=ppocr)")
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Detect + recognize + translate a still image in one pass: detection runs once and its
+    /// boxes are handed to `on_detected` (for the UI to pill the regions) before recognition.
+    /// Replaces the staged `detect_image_boxes` + `translate_image_rgba` two-call path, which
+    /// built the image and crossed the FFI boundary twice.
+    #[cfg(feature = "ppocr")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn translate_image_rgba_streaming(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        max_image_size: u32,
+        source_selection: OcrSourceSelection,
+        target_code: &str,
+        min_confidence: u32,
+        reading_order: Option<ReadingOrder>,
+        background_mode: BackgroundMode,
+        on_detected: &(dyn Fn(&[crate::ocr::DetectedTextBox]) + Sync),
+    ) -> Result<PreparedImageOverlay, TranslatorError> {
+        let snap = self.snapshot();
+        let tgt = LanguageCode::from(target_code);
+        let ppocr = self.ocr.engine(&snap)?;
+        log::info!("ocr engine: ppocr streaming ({:?})", source_selection);
+        translate_image_rgba_ppocr_in_snapshot(
+            self.engine(),
+            &ppocr,
+            &snap,
+            rgba_bytes,
+            width,
+            height,
+            max_image_size,
+            &source_selection,
+            &tgt,
+            min_confidence,
+            background_mode,
+            reading_order,
+            None,
+            Some(on_detected),
         )
         .map_err(|e| {
             if e.message.to_lowercase().contains("no text found") {
