@@ -301,6 +301,12 @@ impl InkStrip {
     }
 }
 
+pub struct DewarpedStrip {
+    pub image: RgbImage,
+    /// `None` for the oriented-box fallback — only the contour warp can map pixels back.
+    pub src_map: Option<Vec<(f32, f32)>>,
+}
+
 pub struct PpocrRecognizer {
     /// One MnnSession per parallel worker. Each is wrapped in a Mutex but contention is zero —
     /// the rayon worker at index `i` only touches `sessions[i]`. The Mutex is just there to
@@ -429,25 +435,34 @@ impl PpocrEngine {
         boxes: &[translator_core::ocr::DetectedTextBox],
         canonical_quadrant: Option<translator_core::coords::Quadrant>,
     ) -> Vec<Option<InkStrip>> {
-        let Some(ink) = &self.ink else {
+        if self.ink.is_none() {
             return boxes.iter().map(|_| None).collect();
-        };
-        let h = PpocrInkModel::HEIGHT;
+        }
         let t_pre = Instant::now();
+        let strips = self.dewarp_strips(image, boxes, canonical_quadrant);
+        let pre_us = t_pre.elapsed().as_micros();
+        self.ink_strips_from(&strips, pre_us)
+    }
+
+    pub fn dewarp_strips(
+        &self,
+        image: &DynamicImage,
+        boxes: &[translator_core::ocr::DetectedTextBox],
+        canonical_quadrant: Option<translator_core::coords::Quadrant>,
+    ) -> Vec<Option<DewarpedStrip>> {
+        let h = PpocrInkModel::HEIGHT;
         let rgb = image.to_rgb8();
         let thickness_pad = self.detector.pool_comp();
-
         // Dewarp each box's text band straight to a 48px strip (width a multiple of the
-        // pooling factor), in parallel — the per-pixel warp dominates `pre` and the strips
+        // pooling factor), in parallel — the per-pixel warp dominates and the strips
         // are independent. Prefer the recognizer's curl-straightened contour dewarp with the
         // *same* params (contour, quadrant, thickness_pad), so the bold channel's columns
         // line up with the rec CTC firing fractions; keep the per-pixel source map so the
         // matting can scatter the matte back to image space. A box with no usable contour
         // falls back to the oriented-box affine (no map; no per-word bold there).
-        let prepared: Vec<(usize, RgbImage, Option<Vec<(f32, f32)>>)> = boxes
+        boxes
             .par_iter()
-            .enumerate()
-            .filter_map(|(i, b)| {
+            .map(|b| {
                 let contour: Option<Vec<(f32, f32)>> = (!b.contour.is_empty()
                     && b.contour.len() % 2 == 0)
                     .then(|| b.contour.chunks_exact(2).map(|c| (c[0], c[1])).collect());
@@ -465,7 +480,10 @@ impl PpocrEngine {
                         ..natural
                     };
                     let (strip, map) = render_contour_strip_rgb_with_map(&rgb, &warp);
-                    return Some((i, strip, Some(map)));
+                    return Some(DewarpedStrip {
+                        image: strip,
+                        src_map: Some(map),
+                    });
                 }
                 let o = &b.oriented_box;
                 if o.width <= 1.0 || o.height <= 1.0 {
@@ -474,10 +492,28 @@ impl PpocrEngine {
                 let aw = ((o.width * h as f32 / o.height).round() as u32)
                     .max(PpocrInkModel::POOL_MULTIPLE);
                 let w = aw.next_multiple_of(PpocrInkModel::POOL_MULTIPLE);
-                Some((i, dewarp_oriented_to_strip_rgb(&rgb, o, w, h), None))
+                Some(DewarpedStrip {
+                    image: dewarp_oriented_to_strip_rgb(&rgb, o, w, h),
+                    src_map: None,
+                })
             })
+            .collect()
+    }
+
+    pub fn ink_strips_from(
+        &self,
+        strips: &[Option<DewarpedStrip>],
+        pre_us: u128,
+    ) -> Vec<Option<InkStrip>> {
+        let Some(ink) = &self.ink else {
+            return strips.iter().map(|_| None).collect();
+        };
+        let h = PpocrInkModel::HEIGHT;
+        let prepared: Vec<(usize, &RgbImage, Option<&Vec<(f32, f32)>>)> = strips
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|d| (i, &d.image, d.src_map.as_ref())))
             .collect();
-        let pre_us = t_pre.elapsed().as_micros();
 
         // Bucket by *exact* width (same-width strips batch into one call, no padding), then
         // run buckets in parallel — one MNN session per rayon worker, no lock contention.
@@ -542,7 +578,7 @@ impl PpocrEngine {
                         }
                         let matte = GrayImage::from_raw(tw, h, matte)?;
                         let bold = bold.and_then(|b| GrayImage::from_raw(tw, h, b));
-                        let src_map = prepared[j].2.clone();
+                        let src_map = prepared[j].2.cloned();
                         Some((
                             box_idx,
                             InkStrip {
@@ -557,7 +593,7 @@ impl PpocrEngine {
             .collect();
         let inf_us = t_inf.elapsed().as_micros();
 
-        let mut out: Vec<Option<InkStrip>> = boxes.iter().map(|_| None).collect();
+        let mut out: Vec<Option<InkStrip>> = strips.iter().map(|_| None).collect();
         for group in groups {
             for (box_idx, strip) in group {
                 out[box_idx] = Some(strip);
@@ -886,13 +922,74 @@ impl PpocrEngine {
                 "ppocr recognition scripts length must match boxes length",
             ));
         }
-        let thresholds = profile.thresholds();
-        let width = image.width();
-        let height = image.height();
-
         let t_crops = Instant::now();
         let (crops, dewarp_count) =
             crop_text_strips(image, boxes, canonical_quadrant, self.detector.pool_comp());
+        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
+        self.recognize_from_crops(
+            crops,
+            dewarp_count,
+            crops_ms,
+            image.width(),
+            image.height(),
+            boxes,
+            scripts,
+            profile,
+        )
+    }
+
+    pub fn recognize_from_strips(
+        &self,
+        strips: &[Option<DewarpedStrip>],
+        boxes: &[translator_core::ocr::DetectedTextBox],
+        scripts: &[PpocrScript],
+        profile: PpocrProfile,
+        src_w: u32,
+        src_h: u32,
+        dewarp_ms: f32,
+    ) -> Result<Vec<translator_core::ocr::RecognizedTextLine>, TranslatorError> {
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if scripts.len() != boxes.len() {
+            return Err(TranslatorError::new(
+                TranslatorErrorKind::InvalidInput,
+                "ppocr recognition scripts length must match boxes length",
+            ));
+        }
+        let crops: Vec<DynamicImage> = strips
+            .iter()
+            .map(|s| match s {
+                Some(d) => DynamicImage::ImageRgb8(d.image.clone()),
+                None => DynamicImage::ImageRgb8(RgbImage::new(1, 1)),
+            })
+            .collect();
+        let dewarp_count = strips.iter().filter(|s| s.is_some()).count();
+        self.recognize_from_crops(
+            crops,
+            dewarp_count,
+            dewarp_ms,
+            src_w,
+            src_h,
+            boxes,
+            scripts,
+            profile,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recognize_from_crops(
+        &self,
+        crops: Vec<DynamicImage>,
+        dewarp_count: usize,
+        crops_ms: f32,
+        width: u32,
+        height: u32,
+        boxes: &[translator_core::ocr::DetectedTextBox],
+        scripts: &[PpocrScript],
+        profile: PpocrProfile,
+    ) -> Result<Vec<translator_core::ocr::RecognizedTextLine>, TranslatorError> {
+        let thresholds = profile.thresholds();
         let mean_crop_w: f32 =
             crops.iter().map(|c| c.width() as f32).sum::<f32>() / crops.len() as f32;
         let mean_crop_h: f32 =
@@ -922,7 +1019,6 @@ impl PpocrEngine {
                 });
             }
         }
-        let crops_ms = t_crops.elapsed().as_secs_f32() * 1000.0;
         let mean_chunk_w: f32 = rec_chunks
             .iter()
             .map(|c| c.image.width() as f32)

@@ -15,6 +15,8 @@
 //! This is the Rust-side primitive backing the `FrameHandle` exposed
 //! via uniffi.
 
+use std::time::Instant;
+
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
@@ -54,6 +56,63 @@ pub struct OrientedImage {
     /// recognition reads back at half res (GPU split path). Crop-from-`rgb`
     /// sites multiply canonical boxes by this before cropping.
     pub rec_scale: f32,
+}
+
+pub struct StillImage {
+    pub rgb: DynamicImage,
+    pub rgb_det: DynamicImage,
+    pub det_to_full: f32,
+}
+
+impl StillImage {
+    pub fn build_still_rgb(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        det_max_pixels: u32,
+    ) -> Result<StillImage, TranslatorError> {
+        validate_rgba_len(rgba, width, height)?;
+        let full_rect = Rect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let t_rgb = Instant::now();
+        let rgb_full = build_rgb_full(rgba, width, height, 0, full_rect)?;
+        let rgb_ms = t_rgb.elapsed().as_secs_f32() * 1000.0;
+        let display_w = rgb_full.width();
+        let display_h = rgb_full.height();
+        let full_pixels = (display_w as u64) * (display_h as u64);
+        let t_det = Instant::now();
+        let (det_scale, rgb_det) = if full_pixels > det_max_pixels as u64 {
+            let scale = (det_max_pixels as f64 / full_pixels as f64).sqrt() as f32;
+            let new_w = ((display_w as f32) * scale).max(1.0) as u32;
+            let new_h = ((display_h as f32) * scale).max(1.0) as u32;
+            (
+                scale,
+                rgb_full.resize_exact(new_w, new_h, FilterType::Triangle),
+            )
+        } else {
+            (1.0_f32, rgb_full.clone())
+        };
+        let det_ms = t_det.elapsed().as_secs_f32() * 1000.0;
+        log::info!(
+            "still build_rgb: {display_w}x{display_h} → det {}x{} — rgb_full={rgb_ms:.1}ms det_resize={det_ms:.1}ms",
+            rgb_det.width(),
+            rgb_det.height(),
+        );
+        let det_to_full = if det_scale > 0.0 {
+            1.0 / det_scale
+        } else {
+            1.0
+        };
+        Ok(StillImage {
+            rgb: rgb_full,
+            rgb_det,
+            det_to_full,
+        })
+    }
 }
 
 impl OrientedImage {

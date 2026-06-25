@@ -9,7 +9,7 @@ use translator_core::ocr::{
 };
 use translator_core::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock};
 use translator_core::settings::BackgroundMode;
-use translator_raster::live_frame::OrientedImage;
+use translator_raster::live_frame::StillImage;
 use translator_raster::overlay::prepare_overlay_image;
 use translator_raster::text_metrics::{LineMetrics, measure_line};
 use translator_translate::bergamot::BergamotEngine;
@@ -33,30 +33,18 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     // skipped so the staged detect→translate path runs the detector only once.
     detection: Option<Vec<DetectedTextBox>>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
-    let full_rect = Rect {
-        left: 0,
-        top: 0,
-        right: width,
-        bottom: height,
-    };
     let det_max_pixels = saturating_square(max_image_size);
-    let oriented =
-        OrientedImage::build_with_rgb(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
-            .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
-    let rgb = oriented.rgb.as_ref().expect("with_rgb path");
+    let still = StillImage::build_still_rgb(rgba_bytes, width, height, det_max_pixels)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr build still image failed: {e}")))?;
+    let rgb = &still.rgb;
     let det_boxes: Vec<DetectedTextBox> = match detection {
         Some(boxes) => boxes,
-        None => {
-            // PPOCR needs display-orient gray (same coord frame as `rgb` and detected boxes).
-            // `oriented.gray` is sensor-orient for the tracker; we don't reuse it here.
-            let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
-            ppocr
-                .detect_only_image(rgb_det, PpocrProfile::Still)
-                .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
-                .into_iter()
-                .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
-                .collect()
-        }
+        None => ppocr
+            .detect_only_image(&still.rgb_det, PpocrProfile::Still)
+            .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
+            .into_iter()
+            .map(|b| scale_detected_box(b, still.det_to_full, width, height))
+            .collect(),
     };
 
     // Still images are display-oriented, so the canonical reading frame is R0.
@@ -104,13 +92,19 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         resolved
     });
 
+    let t_dewarp = std::time::Instant::now();
+    let strips = ppocr.dewarp_strips(rgb, &det_boxes, Some(translator_core::coords::Quadrant::R0));
+    let dewarp_ms = t_dewarp.elapsed().as_secs_f32() * 1000.0;
+
     let lines = ppocr
-        .recognize_text_in_boxes_image(
-            rgb,
+        .recognize_from_strips(
+            &strips,
             &det_boxes,
             &scripts,
             PpocrProfile::Still,
-            Some(translator_core::coords::Quadrant::R0),
+            width,
+            height,
+            dewarp_ms,
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
 
@@ -118,15 +112,15 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     // recovery, applied to each line before it groups) and the overlay erase
     // (the union ink mask). Compute them once, here, before grouping needs them.
     let (ink_strips, ink_rgba) = if ppocr.has_ink() {
+        let ink_strips = ppocr.ink_strips_from(&strips, (dewarp_ms * 1000.0) as u128);
+        let t_ink_copy = std::time::Instant::now();
         let rgba = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
             .expect("rgba image from caller-owned bytes");
-        let dynimg = image::DynamicImage::ImageRgba8(rgba);
-        let strips = ppocr.ink_strips(
-            &dynimg,
-            &det_boxes,
-            Some(translator_core::coords::Quadrant::R0),
+        log::info!(
+            "ppocr ink rgba copy (union mask): {width}x{height} — {:.1}ms",
+            t_ink_copy.elapsed().as_secs_f32() * 1000.0,
         );
-        (strips, Some(dynimg.into_rgba8()))
+        (ink_strips, Some(rgba))
     } else {
         (Vec::new(), None)
     };
@@ -309,22 +303,14 @@ pub fn detect_image_boxes_ppocr(
     height: u32,
     max_image_size: u32,
 ) -> Result<Vec<DetectedTextBox>, TranslatorError> {
-    let full_rect = Rect {
-        left: 0,
-        top: 0,
-        right: width,
-        bottom: height,
-    };
     let det_max_pixels = saturating_square(max_image_size);
-    let oriented =
-        OrientedImage::build_with_rgb(rgba_bytes, width, height, 0, full_rect, det_max_pixels)
-            .map_err(|e| TranslatorError::ocr(format!("ppocr build oriented image failed: {e}")))?;
-    let rgb_det = oriented.rgb_det.as_ref().expect("with_rgb path");
+    let still = StillImage::build_still_rgb(rgba_bytes, width, height, det_max_pixels)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr build still image failed: {e}")))?;
     Ok(ppocr
-        .detect_only_image(rgb_det, PpocrProfile::Still)
+        .detect_only_image(&still.rgb_det, PpocrProfile::Still)
         .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
         .into_iter()
-        .map(|b| scale_detected_box(b, oriented.det_to_full.0, width, height))
+        .map(|b| scale_detected_box(b, still.det_to_full, width, height))
         .collect())
 }
 
