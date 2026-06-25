@@ -330,6 +330,7 @@ impl TranslatorSession {
     }
 
     #[cfg(feature = "ppocr")]
+    #[allow(clippy::too_many_arguments)]
     pub fn translate_image_rgba(
         &self,
         rgba_bytes: &[u8],
@@ -344,6 +345,62 @@ impl TranslatorSession {
         // Optional boxes from a prior `detect_image_boxes` call; when `Some`, detection is skipped.
         detection: Option<Vec<crate::ocr::DetectedTextBox>>,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
+        let still =
+            crate::ocr_runtime::build_still_image(rgba_bytes, width, height, max_image_size)?;
+        self.translate_from_still(
+            &still,
+            rgba_bytes,
+            width,
+            height,
+            source_selection,
+            target_code,
+            min_confidence,
+            reading_order,
+            background_mode,
+            detection,
+        )
+    }
+
+    /// Build the still image's RGB derivatives once; the `OcrImage` handle caches the result so a
+    /// staged detect→ocr pass over the same owned pixels rebuilds nothing.
+    #[cfg(feature = "ppocr")]
+    pub fn build_still_image(
+        &self,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        max_image_size: u32,
+    ) -> Result<crate::live_frame::StillImage, TranslatorError> {
+        crate::ocr_runtime::build_still_image(rgba_bytes, width, height, max_image_size)
+    }
+
+    #[cfg(feature = "ppocr")]
+    pub fn detect_boxes_from_still(
+        &self,
+        still: &crate::live_frame::StillImage,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
+        let snap = self.snapshot();
+        let ppocr = self.ocr.engine(&snap)?;
+        crate::ocr_runtime::detect_boxes_from_still(&ppocr, still, width, height)
+    }
+
+    #[cfg(feature = "ppocr")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn translate_from_still(
+        &self,
+        still: &crate::live_frame::StillImage,
+        rgba_bytes: &[u8],
+        width: u32,
+        height: u32,
+        source_selection: OcrSourceSelection,
+        target_code: &str,
+        min_confidence: u32,
+        reading_order: Option<ReadingOrder>,
+        background_mode: BackgroundMode,
+        detection: Option<Vec<crate::ocr::DetectedTextBox>>,
+    ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
         let tgt = LanguageCode::from(target_code);
         let ppocr = self.ocr.engine(&snap)?;
@@ -352,65 +409,16 @@ impl TranslatorSession {
             self.engine(),
             &ppocr,
             &snap,
+            still,
             rgba_bytes,
             width,
             height,
-            max_image_size,
             &source_selection,
             &tgt,
             min_confidence,
             background_mode,
             reading_order,
             detection,
-            None,
-        )
-        .map_err(|e| {
-            if e.message.to_lowercase().contains("no text found") {
-                TranslatorError::ocr("No text found in image (engine=ppocr)")
-            } else {
-                e
-            }
-        })
-    }
-
-    /// Detect + recognize + translate a still image in one pass: detection runs once and its
-    /// boxes are handed to `on_detected` (for the UI to pill the regions) before recognition.
-    /// Replaces the staged `detect_image_boxes` + `translate_image_rgba` two-call path, which
-    /// built the image and crossed the FFI boundary twice.
-    #[cfg(feature = "ppocr")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn translate_image_rgba_streaming(
-        &self,
-        rgba_bytes: &[u8],
-        width: u32,
-        height: u32,
-        max_image_size: u32,
-        source_selection: OcrSourceSelection,
-        target_code: &str,
-        min_confidence: u32,
-        reading_order: Option<ReadingOrder>,
-        background_mode: BackgroundMode,
-        on_detected: &(dyn Fn(&[crate::ocr::DetectedTextBox]) + Sync),
-    ) -> Result<PreparedImageOverlay, TranslatorError> {
-        let snap = self.snapshot();
-        let tgt = LanguageCode::from(target_code);
-        let ppocr = self.ocr.engine(&snap)?;
-        log::info!("ocr engine: ppocr streaming ({:?})", source_selection);
-        translate_image_rgba_ppocr_in_snapshot(
-            self.engine(),
-            &ppocr,
-            &snap,
-            rgba_bytes,
-            width,
-            height,
-            max_image_size,
-            &source_selection,
-            &tgt,
-            min_confidence,
-            background_mode,
-            reading_order,
-            None,
-            Some(on_detected),
         )
         .map_err(|e| {
             if e.message.to_lowercase().contains("no text found") {

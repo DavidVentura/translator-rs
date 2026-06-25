@@ -18,42 +18,56 @@ use translator_translate::bergamot::BergamotEngine;
 use translator_translate::language_detect::detect_language_robust_code;
 use translator_translate::translate::Translator;
 
-pub fn translate_image_rgba_ppocr_in_snapshot(
-    engine: &Mutex<BergamotEngine>,
-    ppocr: &PpocrEngine,
-    snapshot: &CatalogSnapshot,
+/// Build the still image's display-orient RGB + detector downscale once. The caller (e.g. the
+/// `OcrImage` handle) caches it so a staged detect→ocr pass doesn't rebuild it.
+pub fn build_still_image(
     rgba_bytes: &[u8],
     width: u32,
     height: u32,
     max_image_size: u32,
+) -> Result<StillImage, TranslatorError> {
+    let det_max_pixels = saturating_square(max_image_size);
+    StillImage::build_still_rgb(rgba_bytes, width, height, det_max_pixels)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr build still image failed: {e}")))
+}
+
+pub fn detect_boxes_from_still(
+    ppocr: &PpocrEngine,
+    still: &StillImage,
+    width: u32,
+    height: u32,
+) -> Result<Vec<DetectedTextBox>, TranslatorError> {
+    Ok(ppocr
+        .detect_only_image(&still.rgb_det, PpocrProfile::Still)
+        .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
+        .into_iter()
+        .map(|b| scale_detected_box(b, still.det_to_full, width, height))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn translate_image_rgba_ppocr_in_snapshot(
+    engine: &Mutex<BergamotEngine>,
+    ppocr: &PpocrEngine,
+    snapshot: &CatalogSnapshot,
+    still: &StillImage,
+    rgba_bytes: &[u8],
+    width: u32,
+    height: u32,
     source_selection: &OcrSourceSelection,
     target_code: &LanguageCode,
     min_confidence: u32,
     background_mode: BackgroundMode,
     reading_order: Option<ReadingOrder>,
-    // Detected boxes from a prior `detect_image_boxes_ppocr` pass; when `Some`, detection is
+    // Detected boxes from a prior `detect_boxes_from_still` pass; when `Some`, detection is
     // skipped so the staged detect→translate path runs the detector only once.
     detection: Option<Vec<DetectedTextBox>>,
-    // Fired with the detected boxes (image coords) the moment detection finishes, before the
-    // slower recognize+translate, so the UI can pill the regions while the rest runs.
-    on_detected: Option<&(dyn Fn(&[DetectedTextBox]) + Sync)>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
-    let det_max_pixels = saturating_square(max_image_size);
-    let still = StillImage::build_still_rgb(rgba_bytes, width, height, det_max_pixels)
-        .map_err(|e| TranslatorError::ocr(format!("ppocr build still image failed: {e}")))?;
     let rgb = &still.rgb;
     let det_boxes: Vec<DetectedTextBox> = match detection {
         Some(boxes) => boxes,
-        None => ppocr
-            .detect_only_image(&still.rgb_det, PpocrProfile::Still)
-            .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
-            .into_iter()
-            .map(|b| scale_detected_box(b, still.det_to_full, width, height))
-            .collect(),
+        None => detect_boxes_from_still(ppocr, still, width, height)?,
     };
-    if let Some(cb) = on_detected {
-        cb(&det_boxes);
-    }
 
     // Still images are display-oriented, so the canonical reading frame is R0.
     // Passing it explicitly (instead of None) pins the dewarp direction of
@@ -339,15 +353,8 @@ pub fn detect_image_boxes_ppocr(
     height: u32,
     max_image_size: u32,
 ) -> Result<Vec<DetectedTextBox>, TranslatorError> {
-    let det_max_pixels = saturating_square(max_image_size);
-    let still = StillImage::build_still_rgb(rgba_bytes, width, height, det_max_pixels)
-        .map_err(|e| TranslatorError::ocr(format!("ppocr build still image failed: {e}")))?;
-    Ok(ppocr
-        .detect_only_image(&still.rgb_det, PpocrProfile::Still)
-        .map_err(|e| TranslatorError::ocr(format!("ppocr detection failed: {e}")))?
-        .into_iter()
-        .map(|b| scale_detected_box(b, still.det_to_full, width, height))
-        .collect())
+    let still = build_still_image(rgba_bytes, width, height, max_image_size)?;
+    detect_boxes_from_still(ppocr, &still, width, height)
 }
 
 fn saturating_square(side: u32) -> u32 {
