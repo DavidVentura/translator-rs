@@ -3092,6 +3092,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "log",
+ "rayon",
  "translator-core",
 ]
 

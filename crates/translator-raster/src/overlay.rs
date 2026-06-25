@@ -1,9 +1,10 @@
 use image::{Rgb, Rgba};
+use rayon::prelude::*;
 use translator_core::BackgroundMode;
 use translator_core::ocr::{
     BoldRange, OrientedRect, OverlayColors, OverlayLayoutHints, OverlayLayoutMode,
-    PreparedImageOverlay, PreparedTextBlock, PreparedTextLine, RasterImageMut, ReadingOrder,
-    TextBlock, argb, channel_b, channel_g, channel_r, clamp_rect,
+    PreparedImageOverlay, PreparedTextBlock, PreparedTextLine, RasterImage, RasterImageMut,
+    ReadingOrder, TextBlock, argb, channel_b, channel_g, channel_r, clamp_rect,
 };
 
 use crate::color_matting::{BG_BLOCK, background_field, dilate, fill_radius, still_fg_argb};
@@ -39,12 +40,30 @@ fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> Overl
     }
 }
 
+/// A computed erase, kept separate from the image so the (expensive) inpaint can run in
+/// parallel over an immutable view and the (cheap) writes apply sequentially afterwards.
+enum ErasePatch {
+    Writes(Vec<(usize, [u8; 4])>),
+    Fill(OrientedRect, u32),
+}
+
+fn apply_erase_patch(image: &mut RasterImageMut, patch: ErasePatch) {
+    match patch {
+        ErasePatch::Writes(writes) => {
+            for (idx, bytes) in writes {
+                image.rgba[idx..idx + 4].copy_from_slice(&bytes);
+            }
+        }
+        ErasePatch::Fill(oriented, argb) => image.fill_oriented_rect(oriented, argb),
+    }
+}
+
 fn erase_text_region(
-    image: &mut RasterImageMut,
+    view: &RasterImage,
     oriented: OrientedRect,
     background_mode: BackgroundMode,
     ink_mask: Option<&[bool]>,
-) -> OverlayColors {
+) -> (OverlayColors, ErasePatch) {
     // The oriented rect carries the same DB-unclip + DET_BOX_BORDER inflation the AABB path
     // applies (see `oriented_rect_from_contour`), so it reliably covers ascenders/descenders
     // without spilling sideways the way an AABB does for tilted lines.
@@ -54,16 +73,14 @@ fn erase_text_region(
                 background_argb: argb(0, 0, 0),
                 foreground_argb: argb(255, 255, 255),
             };
-            image.fill_oriented_rect(oriented, colors.background_argb);
-            colors
+            (colors, ErasePatch::Fill(oriented, colors.background_argb))
         }
         BackgroundMode::BlackOnWhite => {
             let colors = OverlayColors {
                 background_argb: argb(255, 255, 255),
                 foreground_argb: argb(0, 0, 0),
             };
-            image.fill_oriented_rect(oriented, colors.background_argb);
-            colors
+            (colors, ErasePatch::Fill(oriented, colors.background_argb))
         }
         BackgroundMode::AutoDetect => {
             // No algorithmic colour guess. When the ink model matted the line we
@@ -72,19 +89,21 @@ fn erase_text_region(
             // foreground, the same derivation the live overlay uses. Lines the
             // model couldn't matte fall back to a flat white-on-black pill.
             if let Some(mask) = ink_mask {
-                if let Some(fg) = matte_erase_oriented(image, oriented, mask) {
-                    return OverlayColors {
-                        background_argb: argb(0, 0, 0),
-                        foreground_argb: fg,
-                    };
+                if let Some((fg, writes)) = matte_erase_oriented(view, oriented, mask) {
+                    return (
+                        OverlayColors {
+                            background_argb: argb(0, 0, 0),
+                            foreground_argb: fg,
+                        },
+                        ErasePatch::Writes(writes),
+                    );
                 }
             }
             let colors = OverlayColors {
                 background_argb: argb(0, 0, 0),
                 foreground_argb: argb(255, 255, 255),
             };
-            image.fill_oriented_rect(oriented, colors.background_argb);
-            colors
+            (colors, ErasePatch::Fill(oriented, colors.background_argb))
         }
     }
 }
@@ -98,42 +117,40 @@ fn erase_text_region(
 /// [`translator_core::color_matting::mat_detections`] uses for the live overlay's
 /// `fg_argb`, so still and live colour text identically.
 fn matte_erase_oriented(
-    image: &mut RasterImageMut,
+    view: &RasterImage,
     oriented: OrientedRect,
     ink_mask: &[bool],
-) -> Option<u32> {
-    let aabb = clamp_rect(oriented.to_aabb(), image.width, image.height)?;
+) -> Option<(u32, Vec<(usize, [u8; 4])>)> {
+    let aabb = clamp_rect(oriented.to_aabb(), view.width, view.height)?;
     let aw = aabb.right - aabb.left;
     let ah = aabb.bottom - aabb.top;
     if aw == 0 || ah == 0 {
         return None;
     }
-    let w = image.width;
+    let w = view.width;
     let mut pixels = vec![Rgba([0u8; 4]); (aw * ah) as usize];
     let mut sub = vec![false; (aw * ah) as usize];
-    {
-        let view = image.as_image();
-        for ly in 0..ah {
-            for lx in 0..aw {
-                let (gx, gy) = (aabb.left + lx, aabb.top + ly);
-                let c = view.pixel_argb(gx, gy);
-                let i = (ly * aw + lx) as usize;
-                pixels[i] = Rgba([channel_r(c), channel_g(c), channel_b(c), 255]);
-                sub[i] = ink_mask[(gy * w + gx) as usize];
-            }
+    for ly in 0..ah {
+        for lx in 0..aw {
+            let (gx, gy) = (aabb.left + lx, aabb.top + ly);
+            let c = view.pixel_argb(gx, gy);
+            let i = (ly * aw + lx) as usize;
+            pixels[i] = Rgba([channel_r(c), channel_g(c), channel_b(c), 255]);
+            sub[i] = ink_mask[(gy * w + gx) as usize];
         }
     }
 
     // Foreground colour via the shared still-path derivation (between-stroke/margin background
     // + fg_from_samples), so still and live colour text identically and the decision is
     // reproducible outside the erase.
-    let fg = still_fg_argb(&pixels, &sub, aw, ah);
+    let fg = still_fg_argb(&pixels, &sub, aw, ah)?;
 
     // Grow the fill set by a height-proportional radius so the original ink's
     // anti-aliased rim is replaced too (the matte edge sits just inside it).
     let sub = dilate(&sub, aw, ah, fill_radius(oriented.height));
     let bg: Vec<Rgb<u8>> = background_field(&pixels, &sub, aw, ah, BG_BLOCK);
 
+    let mut writes = Vec::new();
     for ly in 0..ah {
         for lx in 0..aw {
             let i = (ly * aw + lx) as usize;
@@ -141,12 +158,11 @@ fn matte_erase_oriented(
                 continue;
             }
             let b = bg[i];
-            let bytes = argb(b[0], b[1], b[2]).to_ne_bytes();
             let idx = (((aabb.top + ly) * w + (aabb.left + lx)) * 4) as usize;
-            image.rgba[idx..idx + 4].copy_from_slice(&bytes);
+            writes.push((idx, argb(b[0], b[1], b[2]).to_ne_bytes()));
         }
     }
-    fg
+    Some((fg, writes))
 }
 
 pub fn prepare_overlay_image(
@@ -161,80 +177,105 @@ pub fn prepare_overlay_image(
     ink_mask: Option<&[bool]>,
 ) -> Result<PreparedImageOverlay, String> {
     let mut image = RasterImageMut::new(rgba_bytes, width, height)?;
-    let mut prepared_blocks = Vec::with_capacity(blocks.len());
 
-    for (index, (block, translated_text)) in blocks.iter().zip(translated_blocks.iter()).enumerate()
-    {
-        let block_bounds = block.bounds();
-        let layout_hints = overlay_layout_hints(block, reading_order);
-        // Per-word bold carried through translation (byte ranges into the translated text).
-        let bold_ranges = block_bold_ranges.get(index).cloned().unwrap_or_default();
-        match reading_order {
-            ReadingOrder::LeftToRight => {
-                let mut prepared_lines = Vec::with_capacity(block.lines.len());
-                let mut block_background = argb(255, 255, 255);
-                let mut block_foreground = argb(0, 0, 0);
-                for (index, line) in block.lines.iter().enumerate() {
-                    let colors =
-                        erase_text_region(&mut image, line.oriented_box, background_mode, ink_mask);
-                    if index == 0 {
-                        block_background = colors.background_argb;
-                        block_foreground = colors.foreground_argb;
+    // The per-line inpaint (`background_field`) dominates and each line reads a disjoint
+    // region, so compute every block's colours + erase patches in parallel over an immutable
+    // view, then apply the (cheap) writes sequentially in block/line order.
+    let computed: Vec<(PreparedTextBlock, Vec<ErasePatch>)> = {
+        let view = image.as_image();
+        blocks
+            .par_iter()
+            .zip(translated_blocks.par_iter())
+            .enumerate()
+            .map(|(index, (block, translated_text))| {
+                let block_bounds = block.bounds();
+                let layout_hints = overlay_layout_hints(block, reading_order);
+                // Per-word bold carried through translation (byte ranges into the translated text).
+                let bold_ranges = block_bold_ranges.get(index).cloned().unwrap_or_default();
+                match reading_order {
+                    ReadingOrder::LeftToRight => {
+                        let mut prepared_lines = Vec::with_capacity(block.lines.len());
+                        let mut patches = Vec::with_capacity(block.lines.len());
+                        let mut block_background = argb(255, 255, 255);
+                        let mut block_foreground = argb(0, 0, 0);
+                        for (li, line) in block.lines.iter().enumerate() {
+                            let (colors, patch) = erase_text_region(
+                                &view,
+                                line.oriented_box,
+                                background_mode,
+                                ink_mask,
+                            );
+                            patches.push(patch);
+                            if li == 0 {
+                                block_background = colors.background_argb;
+                                block_foreground = colors.foreground_argb;
+                            }
+                            prepared_lines.push(PreparedTextLine {
+                                text: line.text.clone(),
+                                bounding_box: line.bounding_box,
+                                oriented_box: line.oriented_box,
+                                word_rects: line.word_rects.clone(),
+                                background_argb: colors.background_argb,
+                                foreground_argb: colors.foreground_argb,
+                            });
+                        }
+                        let prepared = PreparedTextBlock {
+                            source_text: block.source_text(),
+                            translated_text: translated_text.clone(),
+                            bounding_box: block_bounds,
+                            lines: prepared_lines,
+                            layout_hints,
+                            background_argb: block_background,
+                            foreground_argb: block_foreground,
+                            bold_ranges,
+                        };
+                        (prepared, patches)
                     }
-                    prepared_lines.push(PreparedTextLine {
-                        text: line.text.clone(),
-                        bounding_box: line.bounding_box,
-                        oriented_box: line.oriented_box,
-                        word_rects: line.word_rects.clone(),
-                        background_argb: colors.background_argb,
-                        foreground_argb: colors.foreground_argb,
-                    });
+                    ReadingOrder::TopToBottomRightToLeft => {
+                        // Block-rect (CJK vertical) layout: the per-block region is the union of
+                        // possibly differently-rotated lines, so rotation doesn't carry up. Erase the
+                        // block AABB unrotated.
+                        let (colors, patch) = erase_text_region(
+                            &view,
+                            OrientedRect::axis_aligned(block_bounds),
+                            background_mode,
+                            ink_mask,
+                        );
+                        let prepared_lines = block
+                            .lines
+                            .iter()
+                            .map(|line| PreparedTextLine {
+                                text: line.text.clone(),
+                                bounding_box: line.bounding_box,
+                                oriented_box: line.oriented_box,
+                                word_rects: line.word_rects.clone(),
+                                background_argb: colors.background_argb,
+                                foreground_argb: colors.foreground_argb,
+                            })
+                            .collect();
+                        let prepared = PreparedTextBlock {
+                            source_text: block.source_text(),
+                            translated_text: translated_text.clone(),
+                            bounding_box: block_bounds,
+                            lines: prepared_lines,
+                            layout_hints,
+                            background_argb: colors.background_argb,
+                            foreground_argb: colors.foreground_argb,
+                            bold_ranges,
+                        };
+                        (prepared, vec![patch])
+                    }
                 }
-                prepared_blocks.push(PreparedTextBlock {
-                    source_text: block.source_text(),
-                    translated_text: translated_text.clone(),
-                    bounding_box: block_bounds,
-                    lines: prepared_lines,
-                    layout_hints,
-                    background_argb: block_background,
-                    foreground_argb: block_foreground,
-                    bold_ranges: bold_ranges.clone(),
-                });
-            }
-            ReadingOrder::TopToBottomRightToLeft => {
-                // Block-rect (CJK vertical) layout: the per-block region is the union of
-                // possibly differently-rotated lines, so rotation doesn't carry up. Erase the
-                // block AABB unrotated.
-                let colors = erase_text_region(
-                    &mut image,
-                    OrientedRect::axis_aligned(block_bounds),
-                    background_mode,
-                    ink_mask,
-                );
-                let prepared_lines = block
-                    .lines
-                    .iter()
-                    .map(|line| PreparedTextLine {
-                        text: line.text.clone(),
-                        bounding_box: line.bounding_box,
-                        oriented_box: line.oriented_box,
-                        word_rects: line.word_rects.clone(),
-                        background_argb: colors.background_argb,
-                        foreground_argb: colors.foreground_argb,
-                    })
-                    .collect();
-                prepared_blocks.push(PreparedTextBlock {
-                    source_text: block.source_text(),
-                    translated_text: translated_text.clone(),
-                    bounding_box: block_bounds,
-                    lines: prepared_lines,
-                    layout_hints,
-                    background_argb: colors.background_argb,
-                    foreground_argb: colors.foreground_argb,
-                    bold_ranges,
-                });
-            }
+            })
+            .collect()
+    };
+
+    let mut prepared_blocks = Vec::with_capacity(blocks.len());
+    for (block, patches) in computed {
+        for patch in patches {
+            apply_erase_patch(&mut image, patch);
         }
+        prepared_blocks.push(block);
     }
 
     Ok(PreparedImageOverlay {

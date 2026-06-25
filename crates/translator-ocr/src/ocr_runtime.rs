@@ -1,5 +1,7 @@
 use std::sync::Mutex;
 
+use rayon::prelude::*;
+
 use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
 use translator_core::api::{LanguageCode, TranslatorError};
 use translator_core::catalog::CatalogSnapshot;
@@ -132,7 +134,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     };
     // The matte (ch0) drives grouping metrics + the overlay union mask; the bold channel
     // (ch1), pooled per box and thresholded, is the typography weight when present.
-    let t_metrics = std::time::Instant::now();
+    let t_clone = std::time::Instant::now();
     let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
         .iter()
         .map(|s| s.as_ref().map(|s| s.matte.clone()))
@@ -141,6 +143,8 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         .iter()
         .map(|s| s.as_ref().and_then(|s| s.src_map.clone()))
         .collect();
+    let clone_ms = t_clone.elapsed().as_secs_f32() * 1000.0;
+    let t_bold_pool = std::time::Instant::now();
     let model_bold: Vec<Option<bool>> = ink_strips
         .iter()
         .map(|s| {
@@ -149,8 +153,10 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
                 .map(|p| p >= translator_raster::text_metrics::MODEL_BOLD_THRESHOLD)
         })
         .collect();
+    let bold_pool_ms = t_bold_pool.elapsed().as_secs_f32() * 1000.0;
+    let t_box_metrics = std::time::Instant::now();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
-    let metrics_ms = t_metrics.elapsed().as_secs_f32() * 1000.0;
+    let metrics_ms = t_box_metrics.elapsed().as_secs_f32() * 1000.0;
 
     // Absolute baseline angle per line, in image space, from the ink matte mapped
     // back through its strip's src_map. `None` without an ink model or src_map (the
@@ -233,8 +239,9 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         reading_order,
     );
     log::info!(
-        "ppocr post-ink: collect+metrics={metrics_ms:.1}ms line_angles={angles_ms:.1}ms \
-         bold_ranges={bold_ms:.1}ms source_words={words_ms:.1}ms blocks+grouping={:.1}ms",
+        "ppocr post-ink: clones={clone_ms:.1}ms model_bold={bold_pool_ms:.1}ms \
+         box_metrics={metrics_ms:.1}ms line_angles={angles_ms:.1}ms bold_ranges={bold_ms:.1}ms \
+         source_words={words_ms:.1}ms blocks+grouping={:.1}ms",
         t_blocks.elapsed().as_secs_f32() * 1000.0,
     );
     let source_code = match source_selection {
@@ -381,7 +388,7 @@ fn box_line_metrics(
     masks: &[Option<image::GrayImage>],
 ) -> Vec<Option<LineMetrics>> {
     boxes
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, b)| {
             let mask = masks.get(i)?.as_ref()?;
