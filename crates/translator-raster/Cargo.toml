@@ -11,4 +11,5 @@ path = "src/lib.rs"
 [dependencies]
 translator-core = { path = "../translator-core" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+fast_image_resize = "5"
 log = "0.4"

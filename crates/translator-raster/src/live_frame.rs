@@ -89,10 +89,8 @@ impl StillImage {
             let scale = (det_max_pixels as f64 / full_pixels as f64).sqrt() as f32;
             let new_w = ((display_w as f32) * scale).max(1.0) as u32;
             let new_h = ((display_h as f32) * scale).max(1.0) as u32;
-            (
-                scale,
-                rgb_full.resize_exact(new_w, new_h, FilterType::Triangle),
-            )
+            let det = fast_downscale_rgb(rgb_full.as_rgb8().expect("rgb8"), new_w, new_h);
+            (scale, DynamicImage::ImageRgb8(det))
         } else {
             (1.0_f32, rgb_full.clone())
         };
@@ -423,6 +421,20 @@ fn build_gray_fused_downsampled(
 /// `display_crop` and returns RGB **in sensor orientation** (no rotation).
 /// The Kotlin SurfaceView rotates the final composite for display at
 /// scanout; the OCR pipeline operates entirely in sensor frame.
+fn fast_downscale_rgb(src: &RgbImage, new_w: u32, new_h: u32) -> RgbImage {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+
+    let (w, h) = src.dimensions();
+    let src_view = ImageRef::new(w, h, src.as_raw(), PixelType::U8x3).expect("rgb source view");
+    let mut dst = Image::new(new_w, new_h, PixelType::U8x3);
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new()
+        .resize(&src_view, &mut dst, &opts)
+        .expect("rgb downscale");
+    RgbImage::from_raw(new_w, new_h, dst.into_vec()).expect("downscaled rgb buffer")
+}
+
 fn build_rgb_full(
     rgba: &[u8],
     sensor_width: u32,
