@@ -101,7 +101,8 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     });
 
     let t_dewarp = std::time::Instant::now();
-    let strips = ppocr.dewarp_strips(rgb, &det_boxes, Some(translator_core::coords::Quadrant::R0));
+    let mut strips =
+        ppocr.dewarp_strips(rgb, &det_boxes, Some(translator_core::coords::Quadrant::R0));
     let dewarp_ms = t_dewarp.elapsed().as_secs_f32() * 1000.0;
 
     let lines = ppocr
@@ -115,6 +116,14 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
             dewarp_ms,
         )
         .map_err(|e| TranslatorError::ocr(format!("ppocr recognition failed: {e}")))?;
+
+    // A box recognition rejected (empty / low-score) never reaches the overlay, so its matte is
+    // wasted inference — drop it before inking. The dewarp already ran (shared with rec).
+    for (i, line) in lines.iter().enumerate() {
+        if line.text.trim().is_empty() {
+            strips[i] = None;
+        }
+    }
 
     // Per-box ink mattes feed both paragraph grouping (x-height + baseline-tilt
     // recovery, applied to each line before it groups) and the overlay erase
