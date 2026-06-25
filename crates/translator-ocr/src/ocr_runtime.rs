@@ -132,6 +132,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     };
     // The matte (ch0) drives grouping metrics + the overlay union mask; the bold channel
     // (ch1), pooled per box and thresholded, is the typography weight when present.
+    let t_metrics = std::time::Instant::now();
     let ink_masks: Vec<Option<image::GrayImage>> = ink_strips
         .iter()
         .map(|s| s.as_ref().map(|s| s.matte.clone()))
@@ -149,10 +150,12 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         })
         .collect();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
+    let metrics_ms = t_metrics.elapsed().as_secs_f32() * 1000.0;
 
     // Absolute baseline angle per line, in image space, from the ink matte mapped
     // back through its strip's src_map. `None` without an ink model or src_map (the
     // oriented-box affine fallback), where the line keeps its detection angle.
+    let t_angles = std::time::Instant::now();
     let line_angles: Vec<Option<f32>> = det_boxes
         .iter()
         .enumerate()
@@ -168,10 +171,12 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
             }
         })
         .collect();
+    let angles_ms = t_angles.elapsed().as_secs_f32() * 1000.0;
 
     // Per-word bold from the ink bold channel + the line's CTC firings. Falls back to a
     // whole-line range when the model pooled bold but firings weren't usable (RTL,
     // multi-chunk), and to nothing when neither fired.
+    let t_bold = std::time::Instant::now();
     let line_bold_ranges: Vec<Vec<translator_core::ocr::BoldRange>> = lines
         .iter()
         .enumerate()
@@ -208,12 +213,16 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
             }
         })
         .collect();
+    let bold_ms = t_bold.elapsed().as_secs_f32() * 1000.0;
 
     // Per-word source boxes from the CTC firings, in recognition order. Built here while the
     // recognized `lines` are still in hand (grouping below consumes them) and the translation
     // hasn't run yet, so the boxes register against the original recognized text.
+    let t_words = std::time::Instant::now();
     let source_words = still_source_words(&lines, &scripts);
+    let words_ms = t_words.elapsed().as_secs_f32() * 1000.0;
 
+    let t_blocks = std::time::Instant::now();
     let blocks = still_ppocr_lines_to_blocks(
         &det_boxes,
         lines,
@@ -222,6 +231,11 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         &line_bold_ranges,
         min_confidence,
         reading_order,
+    );
+    log::info!(
+        "ppocr post-ink: collect+metrics={metrics_ms:.1}ms line_angles={angles_ms:.1}ms \
+         bold_ranges={bold_ms:.1}ms source_words={words_ms:.1}ms blocks+grouping={:.1}ms",
+        t_blocks.elapsed().as_secs_f32() * 1000.0,
     );
     let source_code = match source_selection {
         OcrSourceSelection::Specific { language_code } => language_code.clone(),
