@@ -42,7 +42,7 @@ def pooled_scores(plan_fn, n, pool=None):
     out = []
     for _ in range(n):
         g._run_plan = plan_fn(rng)
-        img, cov, bold = g.sample(rng, width=320)
+        img, cov, bold, _ = g.sample(rng, width=320)
         ink = cov > 0.5
         if ink.sum() < 40:
             continue

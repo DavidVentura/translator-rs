@@ -18,6 +18,10 @@
 #     the cgroup, not nproc.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# Target a specific interpreter (e.g. a venv) with PYTHON=…; defaults to system python3.
+# On a Vast PyTorch image set PYTHON=/venv/main/bin/python so torch is found there and not
+# reinstalled into the system.
+PY="${PYTHON:-python3}"
 
 echo "== apt: pip, fontconfig, dictionary, libraqm =="
 apt-get update -qq
@@ -94,27 +98,24 @@ echo "== font coverage: ${nlatin} latin faces =="
 missing=""
 for mod_pkg in torch:torch numpy:numpy PIL:pillow scipy:scipy fontTools:fonttools cv2:opencv-python-headless; do
   mod=${mod_pkg%%:*}; pkg=${mod_pkg##*:}
-  python3 -c "import $mod" 2>/dev/null || missing="$missing $pkg"
+  "$PY" -c "import $mod" 2>/dev/null || missing="$missing $pkg"
 done
 if [ -n "$missing" ]; then
-  echo "== installing missing:$missing (via uv from pypi) =="
+  echo "== installing missing:$missing into $PY =="
+  # uv targets the chosen interpreter with --python; fall back to that interpreter's pip.
   UV=$(command -v uv || echo /usr/local/bin/uv)
-  # Newer images (Python 3.12, PEP 668 externally-managed) refuse bare pip installs; many
-  # vast images ship uv already, so only bootstrap it if absent, and break-system-packages
-  # for the system install.
-  # Plain pip works on older images; PEP 668 (Python 3.12) images need --break-system-packages.
-  [ -x "$UV" ] || python3 -m pip install --default-timeout=120 --retries 10 uv 2>/dev/null \
-    || python3 -m pip install --break-system-packages --default-timeout=120 --retries 10 uv
-  UV=$(command -v uv || echo /usr/local/bin/uv)
-  UV_HTTP_TIMEOUT=180 "$UV" pip install --system $missing 2>/dev/null \
-    || UV_HTTP_TIMEOUT=180 "$UV" pip install --system --break-system-packages $missing
+  if [ -x "$UV" ]; then
+    UV_HTTP_TIMEOUT=180 "$UV" pip install --python "$PY" $missing
+  else
+    "$PY" -m pip install --default-timeout=120 --retries 10 $missing
+  fi
 else
   echo "== all python deps already present =="
 fi
 
 echo "== verify =="
-python3 -c "import torch, numpy, PIL, scipy, cv2; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
-python3 -c "import subprocess; n=len({l.split(':')[0] for l in subprocess.check_output(['fc-list',':lang=ko','file'],text=True).splitlines()}); print('cjk fonts:', n)"
+"$PY" -c "import torch, numpy, PIL, scipy, cv2; print('py', '$PY', 'torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+"$PY" -c "import subprocess; n=len({l.split(':')[0] for l in subprocess.check_output(['fc-list',':lang=ko','file'],text=True).splitlines()}); print('cjk fonts:', n)"
 
 # Worker count from the container's real CPU quota (cgroup v2 then v1), not nproc.
 if [ -r /sys/fs/cgroup/cpu.max ]; then

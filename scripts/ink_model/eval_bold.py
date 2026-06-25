@@ -29,7 +29,7 @@ rng = random.Random(7)
 g2rgb = lambda a: np.repeat(a[..., None], 3, axis=2)  # noqa: E731
 rows = []
 for _ in range(10):
-    img, cov, bold = sample(rng, width=320)
+    img, cov, bold, _ = sample(rng, width=320)
     x = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))[None]
     with torch.no_grad():
         out = torch.sigmoid(model(x))[0].numpy()  # (2, 48, W)

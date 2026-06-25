@@ -48,26 +48,28 @@ class SyntheticStrips(IterableDataset):
         # apply_degrade=False (GPU path): degrade + legibility run batched on the GPU.
         gen = stream(rng, self.width, self.reuse, apply_degrade=self.apply_degrade)
         while True:
-            imgs, covs, bolds, nhs = [], [], [], []
+            imgs, covs, bolds, rules, nhs = [], [], [], [], []
             for _ in range(self.batch):
-                img, cov, bold, native_h = next(gen)
+                img, cov, bold, rule, native_h = next(gen)
                 imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
                 covs.append(torch.from_numpy(cov[None]))
                 bolds.append(torch.from_numpy(bold[None]))
+                rules.append(torch.from_numpy(rule[None]))
                 nhs.append(native_h)
-            yield (torch.stack(imgs), torch.stack(covs), torch.stack(bolds),
+            yield (torch.stack(imgs), torch.stack(covs), torch.stack(bolds), torch.stack(rules),
                    torch.tensor(nhs, dtype=torch.float32))
 
 
 def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     rng = random.Random(seed)
-    imgs, covs, bolds = [], [], []
+    imgs, covs, bolds, rules = [], [], [], []
     for _ in range(n):
-        img, cov, bold = sample(rng, width=width)
+        img, cov, bold, rule = sample(rng, width=width)
         imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
         covs.append(torch.from_numpy(cov[None]))
         bolds.append(torch.from_numpy(bold[None]))
-    return torch.stack(imgs), torch.stack(covs), torch.stack(bolds)
+        rules.append(torch.from_numpy(rule[None]))
+    return torch.stack(imgs), torch.stack(covs), torch.stack(bolds), torch.stack(rules)
 
 
 # Confident-margin band: targets at/above CONF_BOLD_T are clearly bold, at/below CONF_NORM_T
@@ -88,7 +90,8 @@ MATTE_TVERSKY_BETA = 0.7
 
 
 def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
-               bold_asym_t0=0.15, bold_margin=0.0, matte_tversky=0.0):
+               bold_asym_t0=0.15, bold_margin=0.0, matte_tversky=0.0,
+               rule=None, rule_weight=1.0, rule_tversky=0.5):
     """Matte BCE over the whole strip + asymmetric bold L1 *masked to ink*. `bold` is the
     continuous per-pixel stroke-width target in [0,1] (gen_data `_font_stroke_ratio` through
     the logistic `_target_q`), not a binary class: the head regresses how thick the ink is so
@@ -105,9 +108,13 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
     `bold_margin` weights a logit-space confident-margin hinge: it lifts clearly-bold scores
     toward the rail (L1 alone leaves them compressed below the saturated target) and pulls the
     clearly-normal tail down, while leaving the ambiguous middle to regression. 0 disables it.
+    `rule` (B,1,H,W) is the horizontal-rule coverage label (under/strike/over line) when the
+    model has a rule head (3rd channel); its loss is BCE plus the same recall-biased Tversky
+    as the matte, since a missed rule leaves residual ink. `None`/2-channel model disables it.
+
     `strip_w` (B,) is the per-strip legibility weight (illegible strips contribute zero);
-    None = all ones. Returns (total, matte, bold, margin) for logging."""
-    matte_logit, bold_logit = logits[:, :1], logits[:, 1:]
+    None = all ones. Returns (total, matte, bold, margin, rule) for logging."""
+    matte_logit, bold_logit = logits[:, :1], logits[:, 1:2]
     if strip_w is None:
         strip_w = torch.ones(logits.shape[0], device=logits.device)
     w = strip_w.view(-1, 1, 1, 1)
@@ -130,9 +137,23 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
              + conf_norm * torch.relu(bold_logit + MARGIN_LOGIT))
     loss_margin = (hinge * ink).sum() / ink.sum().clamp_min(1.0)
 
+    loss_rule = logits.new_zeros(())
+    if rule is not None and logits.shape[1] >= 3:
+        rule_logit = logits[:, 2:3]
+        bce_r = F.binary_cross_entropy_with_logits(rule_logit, rule, reduction="none")
+        loss_rule = (bce_r * w).sum() / w.expand_as(bce_r).sum().clamp_min(1.0)
+        if rule_tversky > 0:
+            p_r = torch.sigmoid(rule_logit)
+            tpr = (p_r * rule * w).sum()
+            fpr = (p_r * (1.0 - rule) * w).sum()
+            fnr = ((1.0 - p_r) * rule * w).sum()
+            tv_r = 1.0 - (tpr + 1.0) / (tpr + MATTE_TVERSKY_ALPHA * fpr + MATTE_TVERSKY_BETA * fnr + 1.0)
+            loss_rule = loss_rule + rule_tversky * tv_r
+
     total = (loss_matte + matte_tversky * loss_tversky
-             + bold_weight * loss_bold + bold_margin * loss_margin)
-    return total, loss_matte, loss_bold, loss_margin
+             + bold_weight * loss_bold + bold_margin * loss_margin
+             + rule_weight * loss_rule)
+    return total, loss_matte, loss_bold, loss_margin, loss_rule
 
 
 def main():
@@ -144,6 +165,9 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--prefetch", type=int, default=4,
                     help="DataLoader prefetch_factor; lower on low-RAM boxes (each in-flight batch is ~150MB)")
+    ap.add_argument("--pin-memory", action="store_true",
+                    help="pin host buffers for faster H2D; worth it on high-RAM boxes (off by default — "
+                         "pointless when dataloader-bound and adds non-reclaimable RAM on small boxes)")
     ap.add_argument("--out", default="ckpt")
     ap.add_argument("--resume", default=None)
     ap.add_argument("--log-every", type=int, default=100)
@@ -151,7 +175,10 @@ def main():
     ap.add_argument("--no-compile", action="store_true", help="disable torch.compile (GPU)")
     ap.add_argument("--base", type=int, default=16, help="base channel width (capacity)")
     ap.add_argument("--levels", type=int, default=2, help="U-Net depth (3 = bigger RF)")
-    ap.add_argument("--reuse", type=int, default=1, help="composites per rasterized strip")
+    ap.add_argument("--reuse", type=int, default=16,
+                    help="composites per rasterized strip (fresh bg/ink/degrade each). Font raster is "
+                         "the dominant CPU cost, so this divides it — reuse=1 starves the GPU (~500 vs "
+                         "~1100+ strips/s). Keep high unless deliberately maximizing glyph-shape diversity")
     ap.add_argument("--val-batch", type=int, default=32, help="validation set size")
     ap.add_argument("--bold-weight", type=float, default=1.5, help="weight on the bold L1 term")
     ap.add_argument("--bold-asym", type=float, default=1.5,
@@ -168,6 +195,13 @@ def main():
                     help="EXPERIMENTAL: batched degrade on the GPU (faster but degrade@48 ≠ @native; regresses quality)")
     ap.add_argument("--bold-head", choices=["dilated", "1x1"], default="dilated",
                     help="bold head: dilated 3×3 (default) or cheap 1×1")
+    ap.add_argument("--rule", action="store_true",
+                    help="add the horizontal-rule head (under/strike/over line) as a 3rd channel")
+    ap.add_argument("--rule-weight", type=float, default=1.0, help="weight on the rule loss")
+    ap.add_argument("--rule-tversky", type=float, default=0.5,
+                    help="weight on the recall-biased rule Tversky term (FN>FP); 0 = plain BCE")
+    ap.add_argument("--rule-head", choices=["dilated", "1x1"], default="dilated",
+                    help="rule head: dilated 3×3 (default, wide RF for thin rules) or cheap 1×1")
     args = ap.parse_args()
 
     # spawn (not fork) workers: plain fork inherits the parent's cv2/fontconfig/freetype +
@@ -180,9 +214,11 @@ def main():
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = InkUNet(base=args.base, levels=args.levels, bold_from=args.bold_from,
-                    detach_bold=args.detach_bold, bold_head=args.bold_head).to(device)
+                    detach_bold=args.detach_bold, bold_head=args.bold_head,
+                    rule=args.rule, rule_head=args.rule_head).to(device)
     print(f"device={device} base={args.base} levels={args.levels} bold_from={args.bold_from} "
-          f"detach_bold={args.detach_bold} bold_head={args.bold_head} params={param_count(model):,}")
+          f"detach_bold={args.detach_bold} bold_head={args.bold_head} rule={args.rule} "
+          f"rule_head={args.rule_head} params={param_count(model):,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     start_step = 0
     if args.resume:
@@ -210,13 +246,14 @@ def main():
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
         prefetch_factor=args.prefetch if args.workers > 0 else None,
-        # No pin_memory: this job is dataloader-bound (the GPU waits on the CPU), so pinned
-        # host buffers buy nothing and just add non-reclaimable RAM pressure on a 15GB box.
-        pin_memory=False,
+        # pin_memory off by default (dataloader-bound → pinned buffers buy little and add
+        # non-reclaimable RAM on small boxes); --pin-memory enables it on high-RAM boxes.
+        pin_memory=args.pin_memory,
         multiprocessing_context=mp_ctx,
     )
-    val_img, val_cov, val_bold = validation_batch(n=args.val_batch, width=args.width)
-    val_img, val_cov, val_bold = val_img.to(device), val_cov.to(device), val_bold.to(device)
+    val_img, val_cov, val_bold, val_rule = validation_batch(n=args.val_batch, width=args.width)
+    val_img, val_cov, val_bold, val_rule = (val_img.to(device), val_cov.to(device),
+                                            val_bold.to(device), val_rule.to(device))
 
     # GPU degrade state: a device RNG (augmentation randomness) + the cached DCT matrix.
     degrade_gen = torch.Generator(device=device).manual_seed(0)
@@ -226,12 +263,13 @@ def main():
     model.train()
     t0 = time.time()
     running = 0.0
-    for step, (img, cov, bold, native_h) in enumerate(loader, start=start_step + 1):
+    for step, (img, cov, bold, rule, native_h) in enumerate(loader, start=start_step + 1):
         if step > args.steps:
             break
         img = img.to(device, non_blocking=device == "cuda")
         cov = cov.to(device, non_blocking=device == "cuda")
         bold = bold.to(device, non_blocking=device == "cuda")
+        rule = rule.to(device, non_blocking=device == "cuda")
         native_h = native_h.to(device, non_blocking=device == "cuda")
         # GPU degrade path (experimental): degrade + legibility batched on the GPU, illegible
         # strips become zero-weight. Default path: strips arrive already CPU-degraded + legible.
@@ -242,9 +280,11 @@ def main():
                 strip_w = gpu_degrade.legible_mask(img, cov, native_h).float()
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss, _, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
-                                       bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
-                                       bold_margin=args.bold_margin, matte_tversky=args.matte_tversky)
+            loss, _, _, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
+                                          bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
+                                          bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
+                                          rule=rule if args.rule else None, rule_weight=args.rule_weight,
+                                          rule_tversky=args.rule_tversky)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -262,17 +302,20 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
-                vl, vm, vb, vg = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight,
-                                            bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
-                                            bold_margin=args.bold_margin, matte_tversky=args.matte_tversky)
+                vl, vm, vb, vg, vr = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight,
+                                                bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
+                                                bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
+                                                rule=val_rule if args.rule else None, rule_weight=args.rule_weight,
+                                                rule_tversky=args.rule_tversky)
             model.train()
             print(
-                f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f} margin {vg.item():.4f})",
+                f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f} "
+                f"margin {vg.item():.4f} rule {vr.item():.4f})",
                 flush=True,
             )
             state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                      "base": args.base, "levels": args.levels, "bold_from": args.bold_from,
-                     "bold_head": args.bold_head}
+                     "bold_head": args.bold_head, "rule": args.rule, "rule_head": args.rule_head}
             torch.save(state, os.path.join(args.out, "ink-latest.pt"))
     print("done")
 

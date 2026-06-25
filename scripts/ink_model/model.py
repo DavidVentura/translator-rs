@@ -25,12 +25,14 @@ def conv_block(cin: int, cout: int) -> nn.Sequential:
 
 class InkUNet(nn.Module):
     def __init__(self, base: int = 16, levels: int = 2, bold_from: int = 1, detach_bold: bool = False,
-                 bold_head: str = "dilated"):
+                 bold_head: str = "dilated", rule: bool = False, rule_head: str = "dilated"):
         super().__init__()
         self.levels = levels
         self.bold_from = bold_from
         self.detach_bold = detach_bold
         self.bold_head_kind = bold_head
+        self.rule = rule
+        self.rule_head_kind = rule_head
         self.enc1 = conv_block(3, base)
         self.enc2 = conv_block(base, base * 2)
         self.enc3 = conv_block(base * 2, base * 4)
@@ -63,6 +65,21 @@ class InkUNet(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(bc, 1, 1),
             )
+        # Rule head (under/strike/over line): reads full-res d1. A rule is a long, thin,
+        # horizontal structure, so the dilated variant's wide receptive field helps it
+        # separate a real rule from a glyph's horizontal strokes. Optional — kept absent
+        # for matte+bold checkpoints so they still load strict.
+        if rule:
+            if rule_head == "1x1":
+                self.rule_head = nn.Conv2d(base, 1, 1)
+            else:
+                self.rule_head = nn.Sequential(
+                    nn.Conv2d(base, base, 3, padding=4, dilation=4),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(base, base, 3, padding=8, dilation=8),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(base, 1, 1),
+                )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
@@ -85,7 +102,10 @@ class InkUNet(nn.Module):
         bold = self.bold_head(bold_src)
         if self.bold_from > 1:
             bold = F.interpolate(bold, size=d1.shape[-2:], mode="bilinear", align_corners=False)
-        return torch.cat([self.matte_head(d1), bold], dim=1)
+        outs = [self.matte_head(d1), bold]
+        if self.rule:
+            outs.append(self.rule_head(d1))
+        return torch.cat(outs, dim=1)
 
 
 def param_count(model: nn.Module) -> int:

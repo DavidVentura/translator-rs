@@ -77,7 +77,7 @@ def time_it(fn, iters):
 
 
 def cpu_full(rng):
-    cov, fill, _bold = render_coverage(rng, W, H)
+    cov, fill, _bold, _rule = render_coverage(rng, W, H)
     bg = gradient_field(rng, H, W)
     ink = np.random.rand(3).astype(np.float32)
     img = cov[..., None] * ink + (1 - cov[..., None]) * bg

@@ -24,7 +24,7 @@ model.eval()
 rng = random.Random(99)
 bold_scores, reg_scores, correct, n, rank_ok = [], [], 0, 0, 0
 for _ in range(400):
-    img, cov, bold = sample(rng, width=320)
+    img, cov, bold, _ = sample(rng, width=320)
     ink = cov > 0.5
     # `bold` is the continuous stroke-width target now, so this splits ink into
     # measured-thick vs measured-thin pixels within the strip.

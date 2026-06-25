@@ -60,7 +60,7 @@ ratios, labels = [], []
 for _ in range(1200):
     target = rng.random() < 0.5
     g._run_plan = uniform_plan(target)
-    img, cov, bold = g.sample(rng, width=320)
+    img, cov, bold, _ = g.sample(rng, width=320)
     if (cov > 0.5).sum() < 40:
         continue
     ratios.append(geom_ratio(cov))

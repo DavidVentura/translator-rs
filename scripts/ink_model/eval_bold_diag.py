@@ -36,8 +36,8 @@ def run(score_fn, key_fn):
         target = rng.random() < 0.5
         g._run_plan = single_plan(script, target)
         for _try in range(4):
-            cov, fill, bold, nh, nw = g._render_once(rng, 320)
-            img, c, b, ok = g._composite_once(rng, cov, fill, bold, nh, nw, 320)
+            cov, fill, bold, rule, nh, nw = g._render_once(rng, 320)
+            img, c, b, _r, ok = g._composite_once(rng, cov, fill, bold, rule, nh, nw, 320)
             if ok:
                 break
         ink = c > 0.5

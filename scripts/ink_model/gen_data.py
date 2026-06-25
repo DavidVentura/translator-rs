@@ -12,6 +12,7 @@ Importable: sample() -> (image float32 HxWx3 in 0..1, coverage float32 HxW)
 """
 
 import argparse
+import glob
 import os
 import random
 import subprocess
@@ -376,17 +377,29 @@ def _target_q(ratio: float) -> int:
     return round(255 * float(t))
 
 
+# Fraction of strips that carry a horizontal rule (underline / strikethrough / overline).
+# The rule is real ink — it goes into `total` so the matte erases it — and is also recorded
+# in its own `rule` channel: one learned "is this pixel part of a rule" map. The three rule
+# *types* are not separate channels; the runtime names them from the rule's vertical position
+# vs the matte's baseline/x-height band. This channel is rules only — bold has its own channel
+# and a slant (italic) is not a per-pixel mask at all. Display-heavy headers are excluded.
+RULE_FRAC = float(os.environ.get("INK_RULE_FRAC", "0.22"))
+RULE_KINDS = ("underline", "strike", "overline")
+RULE_WEIGHTS = (0.7, 0.2, 0.1)
+
+
 def render_coverage(
     rng: random.Random, width: int, height: int, log: dict | None = None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Antialiased glyph coverage for a multi-run line on a height x width canvas.
 
-    Returns `(total, fill, bold)`: `total` is the union coverage incl. any outline
-    stroke (the matte label — outlines are ink); `fill` is the glyph core only (so
-    the caller can colour the outline ring); `bold` is the continuous per-pixel
+    Returns `(total, fill, bold, rule)`: `total` is the union coverage incl. any outline
+    stroke and any rule (the matte label — all of it is ink); `fill` is the glyph core only
+    (so the caller can colour the outline ring); `bold` is the continuous per-pixel
     stroke-width target in [0,1] (each run painted with its cached `_font_stroke_ratio`,
-    LO..HI → 0..1), the regression label for the bold head. `fill` aliases `total` when
-    there's no outline.
+    LO..HI → 0..1), the regression label for the bold head; `rule` is the horizontal-rule
+    coverage (underline/strikethrough/overline), the label for the rule head. `fill` aliases
+    `total` when there's no outline.
     """
     # Render oversized then rotate, so the rotation doesn't clip glyphs.
     pad = max(8, height // 2)
@@ -395,6 +408,8 @@ def render_coverage(
     td = ImageDraw.Draw(total)
     boldval = Image.new("L", size, 0)  # per-pixel stroke-width target (0..255 = LO..HI)
     bvd = ImageDraw.Draw(boldval)
+    rule_img = Image.new("L", size, 0)  # horizontal-rule coverage (under/strike/over)
+    rd = ImageDraw.Draw(rule_img)
     jitter = max(1, height // 12)
     stroke = rng.randint(1, max(1, height // 10)) if rng.random() < 0.2 else 0
     outlined = stroke > 0
@@ -414,6 +429,13 @@ def render_coverage(
         font_px = rng.randint(max(20, int(height * 0.45)), max(21, int(height * 0.95)))
     x = pad + rng.randint(-jitter, 2 * jitter)
     y0 = pad + rng.randint(-jitter, jitter)
+    # Rule decoration: a strip-level kind, applied either to the whole line or a random subset
+    # of its runs (real underlines often cover only the link portion of a line).
+    rule_kind = None
+    if not display and rng.random() < RULE_FRAC:
+        rule_kind = rng.choices(RULE_KINDS, weights=RULE_WEIGHTS)[0]
+    rule_all = rng.random() < 0.6
+    drew_rule = False
     scripts, bold_runs, last_font = [], 0, "?"
     drew = False
     plan = [("latin", True)] if display else _run_plan(rng)
@@ -442,6 +464,27 @@ def render_coverage(
             bvd.text((x, y), s, font=font, fill=_target_q(_font_stroke_ratio(path, script)))
             if ub:
                 bold_runs += 1
+            adv = int(td.textlength(s, font=font))
+            # Draw the rule across this run's advance, into `total` (ink, so the matte erases
+            # it), `rule_img` (its own label), and the outline-fill core when outlined (so the
+            # ring colour split doesn't mistake the rule for an outline edge). Never into
+            # `boldval`: a rule has no stroke-width weight.
+            if rule_kind and (rule_all or rng.random() < 0.5):
+                ascent, descent = font.getmetrics()
+                baseline = y + ascent
+                thick = max(1, round(font_px * rng.uniform(0.045, 0.085)))
+                if rule_kind == "underline":
+                    ry = baseline + max(1, round(descent * 0.30))
+                elif rule_kind == "strike":
+                    ry = baseline - round(ascent * 0.30)
+                else:
+                    ry = baseline - round(ascent * 0.92)
+                rect = [x, ry, x + adv, ry + thick - 1]
+                td.rectangle(rect, fill=255)
+                rd.rectangle(rect, fill=255)
+                if outlined:
+                    fill_draw.rectangle(rect, fill=255)
+                drew_rule = True
             # CJK is set flush (no inter-unit gap); spaced scripts get a word gap. Display mode
             # packs tight (condensed headers have small inter-letter gaps) to keep coverage high.
             if script == "cjk":
@@ -450,14 +493,14 @@ def render_coverage(
                 gap = rng.randint(max(1, font_px // 12), max(2, font_px // 6))
             else:
                 gap = rng.randint(font_px // 6, font_px // 2)
-            x += int(td.textlength(s, font=font)) + gap
+            x += adv + gap
             drew, last_font = True, os.path.basename(path)
             scripts.append(script)
         if x > size[0] - pad:
             break
     if not drew:
         z = np.zeros((height, width), dtype=np.float32)
-        return z, z, z  # caller retries
+        return z, z, z, z  # caller retries
 
     if rng.random() < 0.5:
         angle = rng.uniform(-3.0, 3.0)
@@ -465,10 +508,12 @@ def render_coverage(
         total = total.rotate(angle, resample=Image.BILINEAR, center=center)
         # NEAREST keeps the stroke-width value flat instead of blending it toward 0 at edges.
         boldval = boldval.rotate(angle, resample=Image.NEAREST, center=center)
+        rule_img = rule_img.rotate(angle, resample=Image.BILINEAR, center=center)
         if outlined:
             fill_canvas = fill_canvas.rotate(angle, resample=Image.BILINEAR, center=center)
     tot = np.asarray(total, dtype=np.float32) / 255.0
     bv = np.asarray(boldval, dtype=np.float32) / 255.0
+    rl = np.asarray(rule_img, dtype=np.float32) / 255.0
     fl = np.asarray(fill_canvas, dtype=np.float32) / 255.0 if outlined else tot
     thick_k = 0
     if height >= 48 and rng.random() < 0.4:
@@ -489,6 +534,7 @@ def render_coverage(
 
         tot = mf(tot)
         fl = mf(fl) if outlined else tot
+        rl = mf(rl)  # keep the rule label aligned with the thickened matte
         # Thickening adds real stroke width, so the target must rise: grow the value region
         # with the matte, then raise it. Added half-width is (thick_k-1)/font_px of stroke
         # ratio, which under the logistic target is a constant logit shift on the grown value.
@@ -505,9 +551,46 @@ def render_coverage(
             heavy=bold_runs > 0,
             stroke=stroke,
             thick_k=thick_k,
+            rule=rule_kind if drew_rule else "",
         )
     crop = lambda a: a[pad : pad + height, pad : pad + width]  # noqa: E731
-    return crop(tot), crop(fl), crop(bv)
+    return crop(tot), crop(fl), crop(bv), crop(rl)
+
+
+# Real photo backgrounds (OTR gt_image plates: text-free scenes). Compositing our synth
+# text onto these makes *everything except the glyphs* a real negative — saturated/textured
+# objects labelled not-ink — which is the lever against the matte over-marking busy
+# backgrounds. Env-gated: off unless INK_OTR_PLATES points at a dir of plate images.
+OTR_PLATES_DIR = os.environ.get("INK_OTR_PLATES", "")
+OTR_BG_FRAC = float(os.environ.get("INK_OTR_BG_FRAC", "0.0"))
+
+
+@lru_cache(maxsize=1)
+def _otr_plate_paths() -> tuple[str, ...]:
+    if not OTR_PLATES_DIR:
+        return ()
+    return tuple(sorted(glob.glob(os.path.join(OTR_PLATES_DIR, "**", "*.png"), recursive=True)
+                        + glob.glob(os.path.join(OTR_PLATES_DIR, "**", "*.jpg"), recursive=True)))
+
+
+@lru_cache(maxsize=256)
+def _otr_plate(path: str) -> Image.Image:
+    # Decode once and cache: PNG decode dominates the per-composite cost (resize/crop are
+    # cheap), and at reuse>1 the same plate is sampled repeatedly within a worker.
+    return Image.open(path).convert("RGB")
+
+
+def _otr_background(rng: random.Random, h: int, w: int, log: dict | None = None) -> np.ndarray:
+    """A random (h, w) crop of a real OTR plate, at a random zoom so texture scale varies."""
+    im = _otr_plate(rng.choice(_otr_plate_paths()))
+    iw, ih = im.size
+    s = max(w / iw, h / ih) * rng.uniform(1.0, 2.5)  # cover the crop, with random zoom-in
+    nw, nh = max(w, round(iw * s)), max(h, round(ih * s))
+    im = im.resize((nw, nh), Image.BILINEAR)
+    x0, y0 = rng.randint(0, nw - w), rng.randint(0, nh - h)
+    if log is not None:
+        log["bg"] = "otr"
+    return np.asarray(im.crop((x0, y0, x0 + w, y0 + h)), dtype=np.float32) / 255.0
 
 
 def gradient_field(rng: random.Random, h: int, w: int, log: dict | None = None) -> np.ndarray:
@@ -569,17 +652,17 @@ def sample(rng: random.Random | None = None, width: int | None = None):
     rng = rng or random.Random()
     width = width or rng.choice(WIDTHS)
     for _attempt in range(8):
-        cov, fill, bold, native_h, native_w = _render_once(rng, width)
-        img, cov_out, bold_out, ok = _composite_once(
-            rng, cov, fill, bold, native_h, native_w, width
+        cov, fill, bold, rule, native_h, native_w = _render_once(rng, width)
+        img, cov_out, bold_out, rule_out, ok = _composite_once(
+            rng, cov, fill, bold, rule, native_h, native_w, width
         )
         if ok:
             break
-    return img, cov_out, bold_out
+    return img, cov_out, bold_out, rule_out
 
 
 def stream(rng: random.Random, width: int, reuse: int = 1, apply_degrade: bool = True):
-    """Infinite (img, cov, bold, native_h) pairs with glyph-raster reuse.
+    """Infinite (img, cov, bold, rule, native_h) pairs with glyph-raster reuse.
 
     Rasterizing text dominates generation cost, so each rendered coverage is reused
     across `reuse` composites with fresh background/ink/degradation — dividing the
@@ -590,16 +673,16 @@ def stream(rng: random.Random, width: int, reuse: int = 1, apply_degrade: bool =
     GPU does them on the batch); `native_h` is yielded so the GPU can rescale blur.
     """
     while True:
-        cov, fill, bold, native_h, native_w = _render_once(rng, width)
+        cov, fill, bold, rule, native_h, native_w = _render_once(rng, width)
         for _ in range(reuse):
-            img = cov_out = bold_out = None
+            img = cov_out = bold_out = rule_out = None
             for _try in range(3):
-                img, cov_out, bold_out, ok = _composite_once(
-                    rng, cov, fill, bold, native_h, native_w, width, apply_degrade=apply_degrade
+                img, cov_out, bold_out, rule_out, ok = _composite_once(
+                    rng, cov, fill, bold, rule, native_h, native_w, width, apply_degrade=apply_degrade
                 )
                 if ok:
                     break
-            yield img, cov_out, bold_out, native_h
+            yield img, cov_out, bold_out, rule_out, native_h
 
 
 def _render_once(rng: random.Random, width: int, log: dict | None = None):
@@ -618,13 +701,16 @@ def _render_once(rng: random.Random, width: int, log: dict | None = None):
     if log is not None:
         log["native_h"] = native_h
     native_w = max(16, round(width * native_h / HEIGHT))
-    cov, fill, bold = render_coverage(rng, native_w, native_h, log)
-    return cov, fill, bold, native_h, native_w
+    cov, fill, bold, rule = render_coverage(rng, native_w, native_h, log)
+    return cov, fill, bold, rule, native_h, native_w
 
 
-def _composite_once(rng: random.Random, cov, fill, bold, native_h: int, native_w: int, width: int,
+def _composite_once(rng: random.Random, cov, fill, bold, rule, native_h: int, native_w: int, width: int,
                     log: dict | None = None, apply_degrade: bool = True):
-    bg = gradient_field(rng, native_h, native_w, log)
+    if _otr_plate_paths() and rng.random() < OTR_BG_FRAC:
+        bg = _otr_background(rng, native_h, native_w, log)
+    else:
+        bg = gradient_field(rng, native_h, native_w, log)
     if rng.random() < 0.15:
         # Drop shadow: an offset dark replica behind the glyphs. It is *not* ink —
         # the label stays `cov` — so the model learns to leave shadows to the
@@ -685,10 +771,15 @@ def _composite_once(rng: random.Random, cov, fill, bold, native_h: int, native_w
             Image.fromarray(bold, mode="F").resize((width, HEIGHT), Image.BILINEAR),
             dtype=np.float32,
         )
+        rule = np.asarray(
+            Image.fromarray(rule, mode="F").resize((width, HEIGHT), Image.BILINEAR),
+            dtype=np.float32,
+        )
     return (
         img.astype(np.float32, copy=False),
         np.clip(cov, 0.0, 1.0).astype(np.float32, copy=False),
         np.clip(bold, 0.0, 1.0).astype(np.float32, copy=False),
+        np.clip(rule, 0.0, 1.0).astype(np.float32, copy=False),
         ok,
     )
 
@@ -706,29 +797,31 @@ def main():
         # Replicate sample() but capture the per-sample params into `log`. Fresh log
         # per attempt — optional fields would otherwise leak from a failed retry.
         width = rng.choice(WIDTHS)
-        img = cov = bold = None
+        img = cov = bold = rule = None
         log: dict = {}
         for _ in range(8):
             log = {}
-            c, fl, bl, nh, nw = _render_once(rng, width, log)
-            img, cov, bold, ok = _composite_once(rng, c, fl, bl, nh, nw, width, log)
+            c, fl, bl, rl, nh, nw = _render_once(rng, width, log)
+            img, cov, bold, rule, ok = _composite_once(rng, c, fl, bl, rl, nh, nw, width, log)
             if ok:
                 break
         h, w = cov.shape
         ink = cov > 0.5
         bmu = float(bold[ink].mean()) if ink.any() else 0.0  # mean stroke target over ink
         band = 26
-        # Three stacked rows: composited image, matte label, bold label.
-        sheet = np.ones((band + h * 3 + 8, max(w, 360), 3), dtype=np.float32)
+        # Four stacked rows: composited image, matte label, bold label, rule label.
+        sheet = np.ones((band + h * 4 + 12, max(w, 360), 3), dtype=np.float32)
         sheet[band : band + h, :w] = img
         sheet[band + h + 4 : band + h * 2 + 4, :w] = cov[..., None]
-        sheet[band + h * 2 + 8 :, :w] = bold[..., None]
+        sheet[band + h * 2 + 8 : band + h * 3 + 8, :w] = bold[..., None]
+        sheet[band + h * 3 + 12 :, :w] = rule[..., None]
         pim = Image.fromarray((sheet * 255).astype(np.uint8))
         deg = " ".join(
             f"{kk}{log[kk]}" for kk in ("blur", "downsample", "jpeg", "noise", "squeeze",
                                         "motion", "shade", "hardshadow") if kk in log)
         head = (f"{i:03d} nh{log.get('native_h')} sz{log.get('size')} k{log.get('thick_k', 0)} "
                 f"bμ{bmu:.2f} {log.get('script', '')} {'HVY ' if log.get('heavy') else ''}"
+                f"{(log.get('rule') + ' ') if log.get('rule') else ''}"
                 f"{log.get('bg', '')} ct{log.get('contrast', '?')}")
         d = ImageDraw.Draw(pim)
         d.text((2, 1), head, fill=(220, 0, 0))

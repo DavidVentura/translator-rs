@@ -31,7 +31,9 @@ def load_coordmap(path: str) -> np.ndarray:
     return data  # [..., 0]=src_x, [..., 1]=src_y
 
 
-def matte_strip(model: InkUNet, strip: np.ndarray) -> np.ndarray:
+def model_strip(model: InkUNet, strip: np.ndarray) -> np.ndarray:
+    """Sigmoid channel stack at the strip's own (h, w): [..., 0]=matte, [..., 2]=rule
+    (when the model has the rule head). Channels resized back from the 48px model input."""
     h, w = strip.shape[:2]
     mult = 2 ** model.levels  # H/W must divide by 2**levels for the U-Net pooling
     sw = max(mult, round(w * HEIGHT / h))
@@ -42,8 +44,19 @@ def matte_strip(model: InkUNet, strip: np.ndarray) -> np.ndarray:
     ) / 255.0
     with torch.no_grad():
         x = torch.from_numpy(np.ascontiguousarray(small.transpose(2, 0, 1)))[None]
-        m = torch.sigmoid(model(x))[0, 0].numpy()
-    return np.asarray(Image.fromarray(m, mode="F").resize((w, h), Image.BILINEAR), dtype=np.float32)
+        y = torch.sigmoid(model(x))[0].numpy()  # (C, HEIGHT, sw)
+    return np.stack(
+        [np.asarray(Image.fromarray(y[c], mode="F").resize((w, h), Image.BILINEAR), dtype=np.float32)
+         for c in range(y.shape[0])],
+        axis=-1,
+    )
+
+
+def erase_ink(chans: np.ndarray) -> np.ndarray:
+    """Pixels to erase = matte ∪ rule. ch2 (under/strike/over rule) is a thin structure the
+    matte under-covers, so the dedicated channel is what makes rules erase reliably."""
+    matte = chans[..., 0]
+    return matte if chans.shape[-1] < 3 else np.maximum(matte, chans[..., 2])
 
 
 def background_field(strip: np.ndarray, exclude: np.ndarray, block: int = 10) -> np.ndarray:
@@ -70,6 +83,63 @@ def background_field(strip: np.ndarray, exclude: np.ndarray, block: int = 10) ->
     ) / 255.0
 
 
+def load_ink_model(ckpt: str) -> InkUNet:
+    state = torch.load(ckpt, map_location="cpu")
+    model = InkUNet(base=state.get("base", 16), levels=state.get("levels", 2),
+                    bold_from=state.get("bold_from", 1), bold_head=state.get("bold_head", "dilated"),
+                    rule=state.get("rule", False), rule_head=state.get("rule_head", "dilated"))
+    model.load_state_dict(state["model"])
+    model.eval()
+    return model
+
+
+def erase_from_strips(model: InkUNet, img: np.ndarray, strips_dir: str, dilate: int = 7):
+    """Matte every deskewed strip and splat the erase back through its coordmap.
+
+    `img` is HxWx3 float32 in 0..1. Returns `(out, alpha_img, raw_img, quads)`: the erased
+    image, the final composite erase alpha (dilated/hardened — what actually got removed),
+    the raw (undilated) matte projected to image space, and the per-box dewarp quads.
+    """
+    ih, iw = img.shape[:2]
+    alpha_img = np.zeros((ih, iw), dtype=np.float32)
+    color_img = np.zeros((ih, iw, 3), dtype=np.float32)
+    raw_img = np.zeros((ih, iw), dtype=np.float32)  # raw matte, no dilate/harden
+    quads = []
+
+    maps = sorted(glob.glob(os.path.join(strips_dir, "box-*.map")))
+    for mp in maps:
+        png = mp[:-4] + ".png"
+        if not os.path.exists(png):
+            continue
+        strip = np.asarray(Image.open(png).convert("RGB"), dtype=np.float32) / 255.0
+        coord = load_coordmap(mp)
+        if strip.shape[:2] != coord.shape[:2]:
+            continue
+        ink = erase_ink(model_strip(model, strip))
+        k = dilate
+        comp_a = np.clip(grey_dilation(ink, size=(k, k)) * 1.8, 0, 1)
+        bg = background_field(strip, grey_dilation(ink, size=(k + 4, k + 4)))
+
+        # Splat strip pixels onto the image through the coordmap; assign in order of
+        # increasing alpha so the strongest-ink contributor wins at each target pixel.
+        sx = np.clip(np.round(coord[..., 0]).astype(np.int64), 0, iw - 1).ravel()
+        sy = np.clip(np.round(coord[..., 1]).astype(np.int64), 0, ih - 1).ravel()
+        order = np.argsort(comp_a.ravel(), kind="stable")
+        ty, tx = sy[order], sx[order]
+        alpha_img[ty, tx] = np.maximum(alpha_img[ty, tx], comp_a.ravel()[order])
+        color_img[ty, tx] = bg.reshape(-1, 3)[order]
+        raw_img[ty, tx] = np.maximum(raw_img[ty, tx], ink.ravel()[order])
+        h, w = coord.shape[:2]
+        quads.append([tuple(coord[0, 0]), tuple(coord[0, w - 1]),
+                      tuple(coord[h - 1, w - 1]), tuple(coord[h - 1, 0])])
+
+    # Close splat holes / cover JPEG ringing at image scale, then composite.
+    alpha_img = grey_dilation(alpha_img, size=(dilate, dilate))
+    color_img = grey_dilation(color_img, size=(dilate, dilate, 1))
+    out = alpha_img[..., None] * color_img + (1 - alpha_img[..., None]) * img
+    return out, alpha_img, raw_img, quads
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
@@ -80,51 +150,11 @@ def main():
     ap.add_argument("--dilate", type=int, default=7)
     args = ap.parse_args()
 
-    state = torch.load(args.ckpt, map_location="cpu")
-    model = InkUNet(base=state.get("base", 16), levels=state.get("levels", 2))
-    model.load_state_dict(state["model"])
-    model.eval()
-
+    model = load_ink_model(args.ckpt)
     img = np.asarray(Image.open(args.image).convert("RGB"), dtype=np.float32) / 255.0
-    ih, iw = img.shape[:2]
-    alpha_img = np.zeros((ih, iw), dtype=np.float32)
-    color_img = np.zeros((ih, iw, 3), dtype=np.float32)
-    raw_img = np.zeros((ih, iw), dtype=np.float32)  # raw matte, no dilate/harden
-    quads = []
-
-    maps = sorted(glob.glob(os.path.join(args.strips, "box-*.map")))
-    for mp in maps:
-        png = mp[:-4] + ".png"
-        if not os.path.exists(png):
-            continue
-        strip = np.asarray(Image.open(png).convert("RGB"), dtype=np.float32) / 255.0
-        coord = load_coordmap(mp)
-        if strip.shape[:2] != coord.shape[:2]:
-            continue
-        matte = matte_strip(model, strip)
-        k = args.dilate
-        comp_a = np.clip(grey_dilation(matte, size=(k, k)) * 1.8, 0, 1)
-        bg = background_field(strip, grey_dilation(matte, size=(k + 4, k + 4)))
-
-        # Splat strip pixels onto the image through the coordmap; assign in order of
-        # increasing alpha so the strongest-ink contributor wins at each target pixel.
-        sx = np.clip(np.round(coord[..., 0]).astype(np.int64), 0, iw - 1).ravel()
-        sy = np.clip(np.round(coord[..., 1]).astype(np.int64), 0, ih - 1).ravel()
-        order = np.argsort(comp_a.ravel(), kind="stable")
-        ty, tx = sy[order], sx[order]
-        alpha_img[ty, tx] = np.maximum(alpha_img[ty, tx], comp_a.ravel()[order])
-        color_img[ty, tx] = bg.reshape(-1, 3)[order]
-        raw_img[ty, tx] = np.maximum(raw_img[ty, tx], matte.ravel()[order])
-        h, w = coord.shape[:2]
-        quads.append([tuple(coord[0, 0]), tuple(coord[0, w - 1]),
-                      tuple(coord[h - 1, w - 1]), tuple(coord[h - 1, 0])])
-
-    # Close splat holes / cover JPEG ringing at image scale, then composite.
-    alpha_img = grey_dilation(alpha_img, size=(args.dilate, args.dilate))
-    color_img = grey_dilation(color_img, size=(args.dilate, args.dilate, 1))
-    out = alpha_img[..., None] * color_img + (1 - alpha_img[..., None]) * img
+    out, _alpha, raw_img, quads = erase_from_strips(model, img, args.strips, args.dilate)
     Image.fromarray((np.clip(out, 0, 1) * 255).astype(np.uint8)).save(args.out)
-    print(f"erased {len(maps)} boxes -> {args.out}")
+    print(f"erased {len(quads)} boxes -> {args.out}")
 
     if args.mask_out:
         # Tint the original toward magenta by the raw matte: pixels the model calls

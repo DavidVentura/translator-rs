@@ -32,7 +32,7 @@ def fp_rate(pool):
     rng = random.Random(7)
     scores = []
     for _ in range(700):
-        img, cov, bold = g.sample(rng, width=320)
+        img, cov, bold, _ = g.sample(rng, width=320)
         ink = cov > 0.5
         if ink.sum() < 40:
             continue

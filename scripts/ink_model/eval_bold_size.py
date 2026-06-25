@@ -23,8 +23,8 @@ model.eval()
 
 def sample_nh(rng, width):
     for _ in range(8):
-        cov, fill, bold, nh, nw = _render_once(rng, width)
-        img, c, b, ok = _composite_once(rng, cov, fill, bold, nh, nw, width)
+        cov, fill, bold, rule, nh, nw = _render_once(rng, width)
+        img, c, b, _r, ok = _composite_once(rng, cov, fill, bold, rule, nh, nw, width)
         if ok:
             return img, c, b, nh
     return img, c, b, nh
