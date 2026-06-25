@@ -47,6 +47,11 @@ path = "src/bin/ink_bench.rs"
 required-features = ["ppocr"]
 
 [[bin]]
+name = "dump_det_boxes"
+path = "src/bin/dump_det_boxes.rs"
+required-features = ["ppocr"]
+
+[[bin]]
 name = "golden_eval"
 path = "src/bin/golden_eval.rs"
 required-features = ["ppocr"]
@@ -92,7 +97,7 @@ model-convert = ["dep:translator-convert"]
 planar-tracker = ["ppocr", "dep:translator-live", "dep:translator-tracker", "translator-tracker/image-render", "image-render", "raster", "dep:image", "dep:imageproc", "dep:rayon"]
 gpu = ["dep:translator-gpu", "planar-tracker"]
 surface-sim = ["planar-tracker", "dep:minifb", "dep:ab_glyph", "dep:env_logger"]
-viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger"]
+viz = ["ppocr", "doc-align", "image-render", "dep:ab_glyph", "dep:env_logger", "dep:image", "dep:imageproc"]
 
 [dependencies]
 translator-core = { path = "crates/translator-core" }
