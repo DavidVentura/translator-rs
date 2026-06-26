@@ -98,7 +98,7 @@ fn indented_paragraph_first_line_groups_with_its_body() {
                 oriented_box: line.oriented_box,
                 tight_box,
                 word_rects: vec![line.rect],
-                bold_ranges: Vec::new(),
+                style_ranges: Vec::new(),
             }
         })
         .collect();

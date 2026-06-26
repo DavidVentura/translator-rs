@@ -213,7 +213,7 @@ fn run_live_fixture(default_image: &str) -> Option<LiveFixtureOutput> {
             oriented_box: line.oriented_box,
             tight_box: b.tight_box,
             word_rects: vec![line.rect],
-            bold_ranges: Vec::new(),
+            style_ranges: Vec::new(),
         })
         .collect();
     let blocks = group_live_lines_into_blocks(text_lines);

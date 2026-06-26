@@ -512,7 +512,7 @@ fn overlay_case(image_path: &str, case: &str) {
                 oriented_box: b.oriented_box,
                 tight_box: b.tight_box,
                 word_rects: vec![b.rect],
-                bold_ranges: Vec::new(),
+                style_ranges: Vec::new(),
             }],
         })
         .collect();

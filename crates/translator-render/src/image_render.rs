@@ -2096,4 +2096,103 @@ mod word_box_tests {
             );
         }
     }
+
+    /// Per-line geometric core colour: each output line must render in its own source line's
+    /// colour, not one collapsed block colour. Five stacked lines carry an ink gradient from black
+    /// to mid-grey (mirrors the `gradient_test.png` fixture); the rendered glyph cores must follow
+    /// it. Guards the per-block colour regression the geometric-core split fixed.
+    #[test]
+    fn per_line_core_colour_follows_the_ink_gradient() {
+        if !std::path::Path::new(REGULAR).exists() {
+            eprintln!("DejaVu fonts missing; skipping");
+            return;
+        }
+        let gray = |v: u8| 0xFF00_0000 | (v as u32) << 16 | (v as u32) << 8 | v as u32;
+        let levels = [0u8, 34, 68, 102, 136];
+        let words = ["alpha", "bravo", "gamma", "delta", "sigma"];
+        let (w, h) = (260u32, 5 * 48 + 20);
+
+        let lines: Vec<PreparedTextLine> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let top = 10 + i as u32 * 48;
+                let rect = Rect {
+                    left: 15,
+                    top,
+                    right: 145,
+                    bottom: top + 38,
+                };
+                PreparedTextLine {
+                    text: words[i].to_string(),
+                    bounding_box: rect,
+                    oriented_box: OrientedRect {
+                        cx: 80.0,
+                        cy: top as f32 + 19.0,
+                        width: 130.0,
+                        height: 38.0,
+                        angle_radians: 0.0,
+                    },
+                    word_rects: vec![rect],
+                    background_argb: 0xFFFF_FFFF,
+                    foreground: vec![translator_core::ocr::LineColorStop {
+                        at: 0.0,
+                        argb: gray(v),
+                    }],
+                }
+            })
+            .collect();
+        let translated = words.join(" ");
+        let block = PreparedTextBlock {
+            source_text: translated.clone(),
+            translated_text: translated.clone(),
+            bounding_box: Rect {
+                left: 15,
+                top: 10,
+                right: 145,
+                bottom: h - 10,
+            },
+            lines,
+            layout_hints: OverlayLayoutHints {
+                layout_mode: OverlayLayoutMode::PerLine,
+                suggested_font_size_px: 28.0,
+            },
+            style_spans: translator_core::ocr::style_spans_from_styles(translated.len(), &[]),
+        };
+        let prepared = PreparedImageOverlay {
+            rgba_bytes: vec![0xFF; (w * h * 4) as usize],
+            width: w,
+            height: h,
+            extracted_text: translated.clone(),
+            translated_text: translated,
+            blocks: vec![block],
+            source_words: Vec::new(),
+            translated_words: Vec::new(),
+        };
+        let rendered =
+            render_overlay(&prepared, &WeightFonts, &RenderOptions::default()).expect("render");
+
+        // Darkest glyph-core pixel in each line's band ≈ that line's ink level (a fully covered
+        // stem pixel takes the core colour exactly; anti-aliased edges only lighten it).
+        let core_level = |line: usize| -> u8 {
+            let y0 = 10 + line as u32 * 48;
+            (y0..y0 + 38)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .map(|(x, y)| rendered.rgba_bytes[((y * w + x) * 4) as usize])
+                .min()
+                .unwrap_or(255)
+        };
+        let cores: Vec<u8> = (0..levels.len()).map(core_level).collect();
+        for (i, (&got, &want)) in cores.iter().zip(levels.iter()).enumerate() {
+            assert!(
+                (got as i32 - want as i32).abs() <= 16,
+                "line {i}: core grey {got} should match ink level {want} (all cores {cores:?})",
+            );
+        }
+        // The gradient must actually span — a per-block collapse would make every line identical.
+        assert!(
+            cores[4] as i32 - cores[0] as i32 >= 80,
+            "expected a clear black→grey gradient across lines, got {cores:?}",
+        );
+    }
 }
