@@ -407,6 +407,38 @@ pub fn style_spans_from_styles(text_len: usize, ranges: &[StyleRange]) -> Vec<St
     spans
 }
 
+/// Extract per-attribute [`StyleRange`]s from a span tiling — the inverse of
+/// [`style_spans_from_styles`]. A bold span yields a `Bold` range, a coloured span a `Color`
+/// range, a decorated span a `Decoration` range; `merge_style_ranges` coalesces adjacent equals.
+/// Used to re-remap a block's source styles onto a new translation.
+pub fn style_ranges_from_spans(spans: &[StyleSpan]) -> Vec<StyleRange> {
+    let mut out = Vec::new();
+    for s in spans {
+        if s.bold {
+            out.push(StyleRange {
+                start: s.start,
+                end: s.end,
+                kind: StyleKind::Bold,
+            });
+        }
+        if let Some(argb) = s.foreground {
+            out.push(StyleRange {
+                start: s.start,
+                end: s.end,
+                kind: StyleKind::Color(argb),
+            });
+        }
+        if let Some(dec) = s.decoration {
+            out.push(StyleRange {
+                start: s.start,
+                end: s.end,
+                kind: StyleKind::Decoration(dec),
+            });
+        }
+    }
+    merge_style_ranges(out)
+}
+
 /// One control point of a line's geometric core colour, at reading-axis fraction `at` in `[0, 1]`.
 /// The core colour is the line's ink colour as it sits on the page — a geometric property of
 /// *where* the text is drawn (illumination, region), not of the token, so it never crosses the
@@ -485,6 +517,11 @@ pub struct PreparedTextBlock {
     /// text. The renderer splits each line's text on these. Replaces the old `bold_ranges` +
     /// per-line/block colour fields.
     pub style_spans: Vec<StyleSpan>,
+    /// The same style, but over `source_text` (the recognised source language). Carried so a
+    /// language switch (`retranslate`) can re-remap the styles onto the new translation through a
+    /// fresh alignment, instead of leaving `style_spans` stranded at the old language's offsets.
+    /// Empty for paths that never retranslate (live/tracker).
+    pub source_style_spans: Vec<StyleSpan>,
 }
 
 /// One selectable word with its position on the image, in image-pixel space. Emitted for
@@ -3403,5 +3440,34 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].start, spans[0].end, spans[0].bold), (0, 4, true));
         assert_eq!((spans[1].start, spans[1].end, spans[1].bold), (4, 6, false));
+    }
+
+    #[test]
+    fn style_ranges_round_trip_through_spans() {
+        // Tiling then extracting must recover the original ranges — this is what `retranslate`
+        // relies on to recover a block's source styles from its cached `source_style_spans`.
+        let ranges = vec![
+            StyleRange {
+                start: 0,
+                end: 5,
+                kind: StyleKind::Bold,
+            },
+            StyleRange {
+                start: 3,
+                end: 8,
+                kind: StyleKind::Color(0xFFCC2020),
+            },
+            StyleRange {
+                start: 10,
+                end: 14,
+                kind: StyleKind::Decoration(LineDecoration::Underline),
+            },
+        ];
+        let spans = style_spans_from_styles(16, &ranges);
+        let mut recovered = super::style_ranges_from_spans(&spans);
+        recovered.sort_by_key(|r| (super::style_kind_key(r.kind), r.start));
+        let mut expected = super::merge_style_ranges(ranges);
+        expected.sort_by_key(|r| (super::style_kind_key(r.kind), r.start));
+        assert_eq!(recovered, expected);
     }
 }

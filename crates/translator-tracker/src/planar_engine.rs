@@ -2344,6 +2344,7 @@ pub fn render_text_overlay_bitmap(
                     it.translated_text.len(),
                     &[],
                 ),
+                source_style_spans: Vec::new(),
             }
         })
         .collect();

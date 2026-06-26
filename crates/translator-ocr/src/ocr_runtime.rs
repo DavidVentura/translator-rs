@@ -800,7 +800,7 @@ fn finalize_image_overlay(
     let translate_ms = t_translate.elapsed().as_secs_f32() * 1000.0;
 
     let t_overlay = std::time::Instant::now();
-    let result = prepare_overlay_image(
+    let mut overlay = prepare_overlay_image(
         rgba_bytes,
         width,
         height,
@@ -811,7 +811,15 @@ fn finalize_image_overlay(
         reading_order,
         ink_mask,
     )
-    .map_err(TranslatorError::ocr);
+    .map_err(TranslatorError::ocr)?;
+    // Carry the source-language styles (pre-remap, over the source text) so a later language switch
+    // can re-remap them onto the new translation instead of stranding `style_spans` at these offsets.
+    for (pb, tb) in overlay.blocks.iter_mut().zip(blocks.iter()) {
+        let (src_text, src_ranges) = tb.translation_text_with_styles();
+        pb.source_style_spans =
+            translator_core::ocr::style_spans_from_styles(src_text.len(), &src_ranges);
+        pb.source_text = src_text;
+    }
     let overlay_ms = t_overlay.elapsed().as_secs_f32() * 1000.0;
     log::info!(
         "finalize_image_overlay: {} blocks — translate={:.1}ms overlay_prep={:.1}ms",
@@ -819,7 +827,7 @@ fn finalize_image_overlay(
         translate_ms,
         overlay_ms,
     );
-    result
+    Ok(overlay)
 }
 
 type BlockStyles = Vec<translator_core::ocr::StyleRange>;
@@ -894,6 +902,19 @@ fn translate_block_texts(
         .iter()
         .map(TextBlock::translation_text_with_styles)
         .collect();
+    translate_from_sources(engine, snapshot, source_code, target_code, &sources)
+}
+
+/// Translate each block's source text and remap its source-space style ranges onto the result.
+/// `sources` is `(source_text, source_style_ranges)` per block. Shared by the initial overlay build
+/// (ranges from the OCR blocks) and `retranslate` (ranges recovered from the cached overlay).
+fn translate_from_sources(
+    engine: &mut BergamotEngine,
+    snapshot: &CatalogSnapshot,
+    source_code: &LanguageCode,
+    target_code: &LanguageCode,
+    sources: &[(String, BlockStyles)],
+) -> Result<(Vec<String>, Vec<BlockStyles>), TranslatorError> {
     let block_texts: Vec<String> = sources.iter().map(|(t, _)| t.clone()).collect();
     let non_empty_indices = block_texts
         .iter()
@@ -907,7 +928,7 @@ fn translate_block_texts(
 
     // Identity: no model runs, so the source style ranges already index the output text.
     if source_code == target_code {
-        let styles = sources.into_iter().map(|(_, b)| b).collect();
+        let styles = sources.iter().map(|(_, b)| b.clone()).collect();
         return Ok((block_texts, styles));
     }
 
@@ -929,7 +950,7 @@ fn translate_block_texts(
     )?;
 
     let mut translated_blocks = block_texts;
-    let mut target_styles: Vec<BlockStyles> = vec![Vec::new(); blocks.len()];
+    let mut target_styles: Vec<BlockStyles> = vec![Vec::new(); sources.len()];
     match aligned {
         Some(results) => {
             for (slot, &bi) in non_empty_indices.iter().enumerate() {
@@ -951,4 +972,52 @@ fn translate_block_texts(
         }
     }
     Ok((translated_blocks, target_styles))
+}
+
+/// Re-translate a cached overlay to a new language in place, re-remapping the styles. Recovers each
+/// block's source-language style ranges from `source_style_spans` (carried for exactly this) and
+/// runs them through a fresh alignment, so emphasis/bold/decoration follow the new translation
+/// instead of staying at the previous language's byte offsets.
+pub fn retranslate_overlay(
+    engine: &Mutex<BergamotEngine>,
+    snapshot: &CatalogSnapshot,
+    overlay: &mut PreparedImageOverlay,
+    source_code: &LanguageCode,
+    target_code: &LanguageCode,
+) -> Result<(), TranslatorError> {
+    let sources: Vec<(String, BlockStyles)> = overlay
+        .blocks
+        .iter()
+        .map(|b| {
+            (
+                b.source_text.clone(),
+                translator_core::ocr::style_ranges_from_spans(&b.source_style_spans),
+            )
+        })
+        .collect();
+    let (translated_blocks, target_styles) = {
+        let mut engine_guard = engine.lock().expect("bergamot engine lock poisoned");
+        translate_from_sources(
+            &mut engine_guard,
+            snapshot,
+            source_code,
+            target_code,
+            &sources,
+        )?
+    };
+    for (block, (text, styles)) in overlay
+        .blocks
+        .iter_mut()
+        .zip(translated_blocks.into_iter().zip(target_styles))
+    {
+        block.style_spans = translator_core::ocr::style_spans_from_styles(text.len(), &styles);
+        block.translated_text = text;
+    }
+    overlay.translated_text = overlay
+        .blocks
+        .iter()
+        .map(|b| b.translated_text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(())
 }

@@ -226,6 +226,9 @@ pub fn prepare_overlay_image(
                                 translated_text.len(),
                                 &style_ranges,
                             ),
+                            // Source-space styles are filled by the caller (it has the pre-remap
+                            // source ranges) so a later retranslate can re-remap them.
+                            source_style_spans: Vec::new(),
                         };
                         (prepared, patches)
                     }
@@ -264,6 +267,7 @@ pub fn prepare_overlay_image(
                                 translated_text.len(),
                                 &style_ranges,
                             ),
+                            source_style_spans: Vec::new(),
                         };
                         (prepared, vec![patch])
                     }

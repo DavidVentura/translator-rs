@@ -458,70 +458,31 @@ impl TranslatorSession {
 
     pub fn retranslate_prepared_overlay(
         &self,
-        mut prepared: PreparedImageOverlay,
+        prepared: PreparedImageOverlay,
         source_code: &str,
         target_code: &str,
     ) -> Result<PreparedImageOverlay, TranslatorError> {
-        let snap = self.snapshot();
-        let src = LanguageCode::from(source_code);
-        let tgt = LanguageCode::from(target_code);
-
-        let block_texts: Vec<String> = prepared
-            .blocks
-            .iter()
-            .map(|block| {
-                block
-                    .lines
-                    .iter()
-                    .map(|line| line.text.trim())
-                    .filter(|line| !line.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect();
-
-        let non_empty_indices: Vec<usize> = block_texts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, text)| (!text.trim().is_empty()).then_some(index))
-            .collect();
-
-        if non_empty_indices.is_empty() {
-            return Err(TranslatorError::ocr("No text found in image"));
+        #[cfg(feature = "ppocr")]
+        {
+            let snap = self.snapshot();
+            let src = LanguageCode::from(source_code);
+            let tgt = LanguageCode::from(target_code);
+            let mut prepared = prepared;
+            crate::ocr_runtime::retranslate_overlay(
+                self.engine(),
+                &snap,
+                &mut prepared,
+                &src,
+                &tgt,
+            )?;
+            Ok(prepared)
         }
-
-        let translated_blocks: Vec<String> = if src == tgt {
-            block_texts.clone()
-        } else {
-            let texts_to_translate: Vec<String> = non_empty_indices
-                .iter()
-                .map(|&index| block_texts[index].clone())
-                .collect();
-            let translated = {
-                let mut engine_guard = self.engine().lock().expect("bergamot engine lock poisoned");
-                Translator::new(&mut engine_guard, &snap).translate_texts(
-                    &src,
-                    &tgt,
-                    &texts_to_translate,
-                )?
-            };
-            let mut merged = block_texts.clone();
-            for (index, translated_text) in non_empty_indices
-                .iter()
-                .copied()
-                .zip(translated.into_iter())
-            {
-                merged[index] = translated_text;
-            }
-            merged
-        };
-
-        for (block, translated_text) in prepared.blocks.iter_mut().zip(translated_blocks.iter()) {
-            block.translated_text = translated_text.clone();
+        // Image overlays require the OCR pipeline; without it there's nothing to retranslate.
+        #[cfg(not(feature = "ppocr"))]
+        {
+            let _ = (source_code, target_code);
+            Ok(prepared)
         }
-        prepared.translated_text = translated_blocks.join("\n");
-
-        Ok(prepared)
     }
 
     pub fn plan_download(

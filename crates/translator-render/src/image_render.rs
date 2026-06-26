@@ -2087,6 +2087,7 @@ mod word_box_tests {
                     kind: StyleKind::Bold,
                 }],
             ),
+            source_style_spans: Vec::new(),
         };
         let prepared = PreparedImageOverlay {
             rgba_bytes: vec![0xFF; (w * h * 4) as usize], // opaque white
@@ -2187,6 +2188,7 @@ mod word_box_tests {
                 suggested_font_size_px: 28.0,
             },
             style_spans: translator_core::ocr::style_spans_from_styles(translated.len(), &[]),
+            source_style_spans: Vec::new(),
         };
         let prepared = PreparedImageOverlay {
             rgba_bytes: vec![0xFF; (w * h * 4) as usize],
@@ -2277,6 +2279,7 @@ mod word_box_tests {
                     kind: StyleKind::Color(red),
                 }],
             ),
+            source_style_spans: Vec::new(),
         };
         let prepared = PreparedImageOverlay {
             rgba_bytes: vec![0xFF; (w * h * 4) as usize],

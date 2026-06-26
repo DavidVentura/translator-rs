@@ -2794,6 +2794,7 @@ fn build_block_text_block(
             spec.display_text.len(),
             &spec.bold_ranges,
         ),
+        source_style_spans: Vec::new(),
     })
 }
 
