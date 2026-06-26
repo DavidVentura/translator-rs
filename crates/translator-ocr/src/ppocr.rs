@@ -323,6 +323,13 @@ impl InkStrip {
     pub fn bold_profile(&self) -> Option<translator_raster::text_metrics::BoldProfile> {
         translator_raster::text_metrics::BoldProfile::from_strip(self.bold.as_ref()?, &self.matte)
     }
+
+    /// Reduce the strip's rule + matte channels to a per-reading-axis-column
+    /// [`translator_raster::text_metrics::RuleProfile`] for per-word decoration recovery. `None`
+    /// when there is no rule channel (legacy matte-only / bold-only models).
+    pub fn rule_profile(&self) -> Option<translator_raster::text_metrics::RuleProfile> {
+        translator_raster::text_metrics::RuleProfile::from_strip(self.rule.as_ref()?, &self.matte)
+    }
 }
 
 pub struct DewarpedStrip {

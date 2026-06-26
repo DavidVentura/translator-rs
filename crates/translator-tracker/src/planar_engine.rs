@@ -2336,7 +2336,7 @@ pub fn render_text_overlay_bitmap(
                     layout_mode: OverlayLayoutMode::PerLine,
                     suggested_font_size_px: it.suggested_font_px.max(6.0),
                 },
-                style_spans: translator_core::ocr::style_spans_from_bold(
+                style_spans: translator_core::ocr::style_spans_from_styles(
                     it.translated_text.len(),
                     &[],
                     it.fg_argb,

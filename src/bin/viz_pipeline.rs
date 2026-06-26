@@ -1555,7 +1555,7 @@ fn run_rewrite_stage(
     // bold channel + CTC firings, with a whole-line fallback (mirrors the still pipeline).
     let mut blocks: Vec<TextBlock> = Vec::new();
     let mut translated: Vec<String> = Vec::new();
-    let mut bold_ranges: Vec<Vec<translator::ocr::BoldRange>> = Vec::new();
+    let mut style_ranges: Vec<Vec<translator::ocr::StyleRange>> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if line.text.trim().is_empty() {
             continue;
@@ -1576,23 +1576,41 @@ fn run_rewrite_stage(
             ),
             None => Vec::new(),
         };
-        let bold: Vec<translator::ocr::BoldRange> = if !word_ranges.is_empty() {
+        let mut style: Vec<translator::ocr::StyleRange> = if !word_ranges.is_empty() {
             word_ranges
                 .into_iter()
-                .map(|(start, end)| translator::ocr::BoldRange { start, end })
+                .map(|(start, end)| translator::ocr::StyleRange {
+                    start,
+                    end,
+                    kind: translator::ocr::StyleKind::Bold,
+                })
                 .collect()
         } else if strip
             .and_then(|s| s.pooled_bold())
             .map(|p| p >= 0.65)
             .unwrap_or(false)
         {
-            vec![translator::ocr::BoldRange {
+            vec![translator::ocr::StyleRange {
                 start: 0,
                 end: line.text.len() as u32,
+                kind: translator::ocr::StyleKind::Bold,
             }]
         } else {
             Vec::new()
         };
+        if let Some(profile) = strip.and_then(|s| s.rule_profile()) {
+            style.extend(
+                translator::text_metrics::word_decoration_ranges(
+                    &line.text, &firings, is_cjk, &profile,
+                )
+                .into_iter()
+                .map(|(start, end, dec)| translator::ocr::StyleRange {
+                    start,
+                    end,
+                    kind: translator::ocr::StyleKind::Decoration(dec),
+                }),
+            );
+        }
         blocks.push(TextBlock {
             lines: vec![TextLine {
                 text: line.text.clone(),
@@ -1600,11 +1618,11 @@ fn run_rewrite_stage(
                 oriented_box: line.oriented_box,
                 tight_box: line.oriented_box,
                 word_rects: Vec::new(),
-                bold_ranges: bold.clone(),
+                style_ranges: style.clone(),
             }],
         });
         translated.push(line.text.clone());
-        bold_ranges.push(bold);
+        style_ranges.push(style);
     }
 
     let rgba = image.to_rgba8();
@@ -1629,7 +1647,7 @@ fn run_rewrite_stage(
         h,
         &blocks,
         &translated,
-        &bold_ranges,
+        &style_ranges,
         BackgroundMode::AutoDetect,
         ReadingOrder::LeftToRight,
         ink_mask.as_deref(),

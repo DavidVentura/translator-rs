@@ -30,7 +30,7 @@
 
 use image::GrayImage;
 
-use translator_core::ocr::OrientedRect;
+use translator_core::ocr::{LineDecoration, OrientedRect};
 
 /// Matte alpha at or above which a texel counts as ink. The single source of truth for
 /// "what is ink"; the erase path's `color_matting::INK_ALPHA_CUT` aliases it.
@@ -73,6 +73,16 @@ pub const MODEL_BOLD_THRESHOLD: f32 = 0.65;
 /// new word — the fallback for recognizer models/charsets that under-emit the space class.
 /// Above typical kerning and letter-spacing jitter, below a true inter-word gap.
 pub const WORD_GAP_FACTOR: f32 = 1.8;
+/// Rule channel (ch2) value above which a texel counts as part of a line decoration. Matches the
+/// cut the bold pool uses to *exclude* rule pixels, so the two channels partition the same ink.
+const RULE_CUT: u8 = 127;
+/// Minimum rule-active pixels under a word to call it decorated — below this it's stray firing,
+/// not a line.
+const RULE_MIN_PX: u64 = 10;
+/// Minimum mean rule-active pixels per reading-axis column over a word's window. A real
+/// under/strike/over-line runs the width of the word (≈1–3px tall in every column), so its mean
+/// clears this comfortably; sparse noise does not.
+const RULE_MIN_COVERAGE: f32 = 0.45;
 
 /// Per-reading-axis-column reduction of an ink strip's bold channel: for each strip column,
 /// the matte-gated sum of the bold channel and the count of ink pixels, prefix-summed so any
@@ -138,6 +148,99 @@ impl BoldProfile {
             return 0.0;
         }
         (self.psum[x1] - self.psum[x0]) as f32 / n as f32 / 255.0
+    }
+}
+
+/// Per-reading-axis-column reduction of an ink strip's rule channel (ch2 — under/strike/over-line
+/// coverage): for each column, the count of rule-active pixels and their summed row, prefix-summed
+/// so any reading-axis fraction window pools in O(1). Carries the matte's central ink band
+/// (`band_mid` ± `band_half`) so a pooled rule's mean row can be classified — below the band it's
+/// an underline, through it a strikethrough, above it an overline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleProfile {
+    width: u32,
+    /// `rcount[x]` = rule-active pixel count in columns `[0, x)`; length `width + 1`.
+    rcount: Vec<u64>,
+    /// `rysum[x]` = Σ row over rule-active pixels in columns `[0, x)`; length `width + 1`.
+    rysum: Vec<u64>,
+    band_mid: f32,
+    band_half: f32,
+}
+
+impl RuleProfile {
+    pub fn from_strip(rule: &GrayImage, matte: &GrayImage) -> Option<Self> {
+        if rule.dimensions() != matte.dimensions() || matte.width() == 0 {
+            return None;
+        }
+        let (w, h) = matte.dimensions();
+        // Matte ink central band (ink-weighted mean row + std): the typographic reference the
+        // rule's vertical position is judged against. Glyph ink only — the rule lives in ch2, so
+        // an under/over-line doesn't drag this band toward itself.
+        let (mut wsum, mut wy, mut wyy) = (0f64, 0f64, 0f64);
+        for y in 0..h {
+            for x in 0..w {
+                if matte.get_pixel(x, y)[0] as u16 >= INK_CUT {
+                    wsum += 1.0;
+                    wy += y as f64;
+                    wyy += (y as f64) * (y as f64);
+                }
+            }
+        }
+        if wsum < 1.0 {
+            return None;
+        }
+        let mean = wy / wsum;
+        let band_mid = mean as f32;
+        let band_half = ((wyy / wsum - mean * mean).max(0.0).sqrt() as f32).max(1.0);
+
+        let mut rcount = vec![0u64; w as usize + 1];
+        let mut rysum = vec![0u64; w as usize + 1];
+        for x in 0..w {
+            let (mut c, mut ys) = (0u64, 0u64);
+            for y in 0..h {
+                if rule.get_pixel(x, y)[0] > RULE_CUT {
+                    c += 1;
+                    ys += y as u64;
+                }
+            }
+            rcount[x as usize + 1] = rcount[x as usize] + c;
+            rysum[x as usize + 1] = rysum[x as usize] + ys;
+        }
+        Some(Self {
+            width: w,
+            rcount,
+            rysum,
+            band_mid,
+            band_half,
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The decoration over the reading-axis fraction window `[frac_lo, frac_hi)`, or `None` when
+    /// the rule channel doesn't cover enough of the window to be a line. Strip rows increase
+    /// downward, so a mean row below the matte band is an underline and above it an overline.
+    fn classify(&self, frac_lo: f32, frac_hi: f32) -> Option<LineDecoration> {
+        let w = self.width as f32;
+        let x0 = (frac_lo * w).floor().clamp(0.0, w) as usize;
+        let x1 = (frac_hi * w).ceil().clamp(0.0, w) as usize;
+        if x1 <= x0 {
+            return None;
+        }
+        let n = self.rcount[x1] - self.rcount[x0];
+        if n < RULE_MIN_PX || (n as f32 / (x1 - x0) as f32) < RULE_MIN_COVERAGE {
+            return None;
+        }
+        let mean_y = (self.rysum[x1] - self.rysum[x0]) as f32 / n as f32;
+        Some(if mean_y >= self.band_mid + self.band_half {
+            LineDecoration::Underline
+        } else if mean_y <= self.band_mid - self.band_half {
+            LineDecoration::Overline
+        } else {
+            LineDecoration::Strikethrough
+        })
     }
 }
 
@@ -316,27 +419,66 @@ pub fn word_bold_ranges(
     profile: &BoldProfile,
     threshold: f32,
 ) -> Vec<(u32, u32)> {
-    if firings.is_empty() || profile.width() == 0 {
+    if profile.width() == 0 {
+        return Vec::new();
+    }
+    firing_unit_windows(text, firings, is_cjk)
+        .into_iter()
+        .filter(|(_, (lo, hi))| profile.pool(*lo, *hi) >= threshold)
+        .map(|(range, _)| range)
+        .collect()
+}
+
+/// Per-word line decorations within `text`, from CTC firings paired with the ink rule channel:
+/// the same word units as [`word_bold_ranges`], each unit's reading-axis window classified by
+/// [`RuleProfile::classify`] into an under/strike/over-line (or nothing). Empty when firings are
+/// absent or don't align 1:1 with the text.
+pub fn word_decoration_ranges(
+    text: &str,
+    firings: &[(char, f32)],
+    is_cjk: bool,
+    profile: &RuleProfile,
+) -> Vec<(u32, u32, LineDecoration)> {
+    if profile.width() == 0 {
+        return Vec::new();
+    }
+    firing_unit_windows(text, firings, is_cjk)
+        .into_iter()
+        .filter_map(|((bs, be), (lo, hi))| profile.classify(lo, hi).map(|d| (bs, be, d)))
+        .collect()
+}
+
+/// Per word unit (positionally aligned to `text`'s words), its text byte range and reading-axis
+/// fraction window `[lo, hi)` over the strip. The window runs from the unit's first firing to the
+/// next unit's first firing (1.0 for the last). Shared by the bold and decoration pooling, which
+/// only differ in how they reduce the strip over the window. Empty when firings are absent or
+/// don't align 1:1 with the text.
+fn firing_unit_windows(
+    text: &str,
+    firings: &[(char, f32)],
+    is_cjk: bool,
+) -> Vec<((u32, u32), (f32, f32))> {
+    if firings.is_empty() {
         return Vec::new();
     }
     let Some((units, text_words)) = firing_units_and_words(text, firings, is_cjk) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for (k, &(s, _)) in units.iter().enumerate() {
-        let lo = firings[s].1.clamp(0.0, 1.0);
-        let hi = if k + 1 < units.len() {
-            firings[units[k + 1].0].1.clamp(0.0, 1.0)
-        } else {
-            1.0
-        }
-        .max(lo);
-        if profile.pool(lo, hi) >= threshold {
+    units
+        .iter()
+        .enumerate()
+        .map(|(k, &(s, _))| {
+            let lo = firings[s].1.clamp(0.0, 1.0);
+            let hi = if k + 1 < units.len() {
+                firings[units[k + 1].0].1.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+            .max(lo);
             let (bs, be) = text_words[k];
-            out.push((bs as u32, be as u32));
-        }
-    }
-    out
+            ((bs as u32, be as u32), (lo, hi))
+        })
+        .collect()
 }
 
 /// Typography recovered from one line's ink matte, in the source image's pixel
@@ -848,6 +990,47 @@ mod tests {
         let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
         let ranges = word_bold_ranges("aa bb", &firings, false, &profile, MODEL_BOLD_THRESHOLD);
         assert_eq!(ranges, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn word_decoration_ranges_classify_underline_under_one_word() {
+        // 100×40 strip. Glyph matte fills the central band (rows 12..28) across the whole width.
+        // An underline band (rows 34..36) sits below the matte, but only under the left word
+        // (x < 50). The right word has no rule ink.
+        let matte = GrayImage::from_fn(100, 40, |_, y| {
+            image::Luma([if (12..28).contains(&y) { 255 } else { 0 }])
+        });
+        let rule = GrayImage::from_fn(100, 40, |x, y| {
+            image::Luma([if x < 50 && (34..36).contains(&y) {
+                255
+            } else {
+                0
+            }])
+        });
+        let profile = RuleProfile::from_strip(&rule, &matte).expect("profile");
+        let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
+        let decs = word_decoration_ranges("aa bb", &firings, false, &profile);
+        assert_eq!(decs, vec![(0, 2, LineDecoration::Underline)]);
+    }
+
+    #[test]
+    fn rule_profile_classifies_by_vertical_position() {
+        // Matte band centred on rows 12..28 (mid ≈ 19.5). Rule ink confined to the bottom rows is
+        // an underline; to the top rows an overline; through the band a strikethrough.
+        let matte = GrayImage::from_fn(60, 40, |_, y| {
+            image::Luma([if (12..28).contains(&y) { 255 } else { 0 }])
+        });
+        let band = |lo: u32, hi: u32| {
+            let rule = GrayImage::from_fn(60, 40, |_, y| {
+                image::Luma([if (lo..hi).contains(&y) { 255 } else { 0 }])
+            });
+            RuleProfile::from_strip(&rule, &matte)
+                .expect("profile")
+                .classify(0.0, 1.0)
+        };
+        assert_eq!(band(36, 38), Some(LineDecoration::Underline));
+        assert_eq!(band(2, 4), Some(LineDecoration::Overline));
+        assert_eq!(band(18, 21), Some(LineDecoration::Strikethrough));
     }
 
     #[test]

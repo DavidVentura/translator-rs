@@ -207,27 +207,54 @@ pub struct DetectedWord {
     pub end_line: bool,
 }
 
-/// A byte range `[start, end)` of bold text within a string (line, block source, or
-/// translated block). Empty range list means "no per-word bold information"; a single
-/// `[0, len)` means the whole string is bold. Carries per-word weight through grouping and
-/// translation so the overlay can render mixed-weight lines, not one bold flag per block.
+/// The style a [`StyleRange`] applies. Bold is a weight flag; the decoration variants carry
+/// an under/strike/over-line. A run can be both bold and decorated — those are two overlapping
+/// ranges of different kinds, resolved into per-byte [`StyleSpan`] attributes downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BoldRange {
-    pub start: u32,
-    pub end: u32,
+pub enum StyleKind {
+    Bold,
+    Decoration(LineDecoration),
 }
 
-/// Sort and coalesce touching/overlapping bold ranges into a minimal set.
-pub fn merge_bold_ranges(mut ranges: Vec<BoldRange>) -> Vec<BoldRange> {
-    ranges.sort_by_key(|r| r.start);
-    let mut out: Vec<BoldRange> = Vec::with_capacity(ranges.len());
+/// A byte range `[start, end)` of text (line, block source, or translated block) carrying one
+/// [`StyleKind`]. Empty list means "no per-word style information"; a single `[0, len)` Bold
+/// means the whole string is bold. Carries per-word weight and decoration through grouping and
+/// translation so the overlay can reproduce mixed-weight/decorated lines, not one flag per block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleRange {
+    pub start: u32,
+    pub end: u32,
+    pub kind: StyleKind,
+}
+
+/// Sort and coalesce touching/overlapping ranges of the *same* kind into a minimal set. Ranges
+/// of different kinds never merge (a bold range and an underline range stay distinct even when
+/// they cover the same bytes), so overlap between kinds is preserved.
+pub fn merge_style_ranges(mut ranges: Vec<StyleRange>) -> Vec<StyleRange> {
+    ranges.sort_by(|a, b| {
+        style_kind_ord(a.kind)
+            .cmp(&style_kind_ord(b.kind))
+            .then(a.start.cmp(&b.start))
+    });
+    let mut out: Vec<StyleRange> = Vec::with_capacity(ranges.len());
     for r in ranges {
         match out.last_mut() {
-            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            Some(last) if last.kind == r.kind && r.start <= last.end => {
+                last.end = last.end.max(r.end)
+            }
             _ => out.push(r),
         }
     }
     out
+}
+
+fn style_kind_ord(kind: StyleKind) -> u8 {
+    match kind {
+        StyleKind::Bold => 0,
+        StyleKind::Decoration(LineDecoration::Underline) => 1,
+        StyleKind::Decoration(LineDecoration::Strikethrough) => 2,
+        StyleKind::Decoration(LineDecoration::Overline) => 3,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,10 +273,10 @@ pub struct TextLine {
     /// for engines that don't expose a tighter metric.
     pub tight_box: OrientedRect,
     pub word_rects: Vec<Rect>,
-    /// Bold byte ranges within `text`, from per-word ink-bold pooling (CTC firings paired
-    /// with the ink model's bold channel). Empty = not bold; a whole-bold line is
-    /// `[0, text.len())`. Carried through grouping so the overlay renders mixed-weight lines.
-    pub bold_ranges: Vec<BoldRange>,
+    /// Per-word style byte ranges within `text`: bold from ink-bold pooling and decoration from
+    /// the ink rule channel (both paired with the line's CTC firings). Empty = plain text.
+    /// Carried through grouping so the overlay renders mixed-weight/decorated lines.
+    pub style_ranges: Vec<StyleRange>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,6 +301,7 @@ pub struct OverlayLayoutHints {
 /// under/strike/over-line. Carried per-span (only the hyperlink portion of a line is
 /// underlined, etc.) so the overlay reproduces it on the matching translated run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum LineDecoration {
     Underline,
     Strikethrough,
@@ -286,6 +314,7 @@ pub enum LineDecoration {
 /// `bold_ranges` + per-line colour: bold is a span flag, colour is per-span (adjacent words can
 /// differ; for now the line's single colour is copied onto its spans), decoration is the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct StyleSpan {
     pub start: u32,
     pub end: u32,
@@ -294,47 +323,77 @@ pub struct StyleSpan {
     pub decoration: Option<LineDecoration>,
 }
 
-/// Build style spans tiling `[0, text_len)` from bold byte ranges plus one colour (the per-line/
-/// block colour today; per-span colour later). Non-bold gaps get spans too, so every byte is
-/// covered. Decoration is `None` here — the rule-channel pass fills it once wired.
-pub fn style_spans_from_bold(
+/// Build style spans tiling `[0, text_len)` from per-word [`StyleRange`]s plus one colour (the
+/// per-line/block colour today; per-span colour later). Bold and decoration ranges may overlap;
+/// the text is split at every range boundary and each resulting tile records whether a Bold range
+/// covers it and which decoration (if any) does. Plain gaps get spans too, so every byte is
+/// covered. Adjacent tiles with identical attributes are coalesced.
+pub fn style_spans_from_styles(
     text_len: usize,
-    bold: &[BoldRange],
+    ranges: &[StyleRange],
     foreground_argb: u32,
 ) -> Vec<StyleSpan> {
     let len = text_len as u32;
-    let mk = |start: u32, end: u32, bold: bool| StyleSpan {
-        start,
-        end,
-        bold,
-        foreground_argb,
-        decoration: None,
-    };
-    let mut bolds: Vec<(u32, u32)> = bold
-        .iter()
-        .map(|r| (r.start.min(len), r.end.min(len)))
-        .filter(|(s, e)| s < e)
-        .collect();
-    bolds.sort_by_key(|r| r.0);
-    let mut spans = Vec::new();
-    let mut cur = 0u32;
-    for (s, e) in bolds {
-        if s > cur {
-            spans.push(mk(cur, s, false));
+    if len == 0 {
+        return Vec::new();
+    }
+    let clip = |r: &StyleRange| (r.start.min(len), r.end.min(len));
+    let mut cuts: Vec<u32> = vec![0, len];
+    for r in ranges {
+        let (s, e) = clip(r);
+        if s < e {
+            cuts.push(s);
+            cuts.push(e);
         }
-        spans.push(mk(s.max(cur), e, true));
-        cur = e.max(cur);
     }
-    if cur < len {
-        spans.push(mk(cur, len, false));
-    }
-    if spans.is_empty() && len > 0 {
-        spans.push(mk(0, len, false));
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let covers = |s: u32, e: u32, kind: StyleKind| {
+        ranges.iter().any(|r| {
+            let (rs, re) = clip(r);
+            r.kind == kind && rs <= s && re >= e && rs < re
+        })
+    };
+    let decoration_at = |s: u32, e: u32| {
+        [
+            LineDecoration::Underline,
+            LineDecoration::Strikethrough,
+            LineDecoration::Overline,
+        ]
+        .into_iter()
+        .find(|&d| covers(s, e, StyleKind::Decoration(d)))
+    };
+
+    let mut spans: Vec<StyleSpan> = Vec::new();
+    for w in cuts.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        if s >= e {
+            continue;
+        }
+        let span = StyleSpan {
+            start: s,
+            end: e,
+            bold: covers(s, e, StyleKind::Bold),
+            foreground_argb,
+            decoration: decoration_at(s, e),
+        };
+        match spans.last_mut() {
+            Some(last)
+                if last.end == s
+                    && last.bold == span.bold
+                    && last.decoration == span.decoration =>
+            {
+                last.end = e
+            }
+            _ => spans.push(span),
+        }
     }
     spans
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextLine {
     pub text: String,
     pub bounding_box: Rect,
@@ -349,6 +408,7 @@ pub struct PreparedTextLine {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextBlock {
     pub source_text: String,
     pub translated_text: String,
@@ -607,13 +667,13 @@ impl TextBlock {
         out
     }
 
-    /// Like [`Self::translation_text`] but also returns the block's bold byte ranges, each
-    /// line's per-word [`TextLine::bold_ranges`] re-based onto the joined string (accounting
+    /// Like [`Self::translation_text`] but also returns the block's style byte ranges, each
+    /// line's per-word [`TextLine::style_ranges`] re-based onto the joined string (accounting
     /// for per-line trim, the dropped soft hyphen, and the space/concat separator). Drives
-    /// per-word bold through translation; empty when no line carried bold ranges.
-    pub fn translation_text_with_bold(&self) -> (String, Vec<BoldRange>) {
+    /// per-word bold and decoration through translation; empty when no line carried style ranges.
+    pub fn translation_text_with_styles(&self) -> (String, Vec<StyleRange>) {
         let mut out = String::new();
-        let mut bold: Vec<BoldRange> = Vec::new();
+        let mut styles: Vec<StyleRange> = Vec::new();
         for line in &self.lines {
             let trimmed = line.text.trim();
             if trimmed.is_empty() {
@@ -636,23 +696,24 @@ impl TextBlock {
             }
             let base = out.len();
             out.push_str(trimmed);
-            for r in &line.bold_ranges {
+            for r in &line.style_ranges {
                 let s = (r.start as usize).max(lead);
                 let e = (r.end as usize).min(trail_end);
                 if s < e {
-                    bold.push(BoldRange {
+                    styles.push(StyleRange {
                         start: (base + s - lead) as u32,
                         end: (base + e - lead) as u32,
+                        kind: r.kind,
                     });
                 }
             }
         }
         let len = out.len() as u32;
-        for r in bold.iter_mut() {
+        for r in styles.iter_mut() {
             r.end = r.end.min(len);
         }
-        bold.retain(|r| r.start < r.end);
-        (out, merge_bold_ranges(bold))
+        styles.retain(|r| r.start < r.end);
+        (out, merge_style_ranges(styles))
     }
 
     pub fn bounds(&self) -> Rect {
@@ -964,10 +1025,11 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
     text.push_str(separator);
     text.push_str(&b.text);
     let b_offset = (a_text_len + separator.len()) as u32;
-    let mut bold_ranges = a.bold_ranges;
-    bold_ranges.extend(b.bold_ranges.iter().map(|r| BoldRange {
+    let mut style_ranges = a.style_ranges;
+    style_ranges.extend(b.style_ranges.iter().map(|r| StyleRange {
         start: r.start + b_offset,
         end: r.end + b_offset,
+        kind: r.kind,
     }));
     let new_left = a_left.min(b_left);
     let new_right = a_right.max(b_right);
@@ -992,7 +1054,7 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
         oriented_box: OrientedRect::axis_aligned(bb),
         tight_box,
         word_rects,
-        bold_ranges,
+        style_ranges,
     }
 }
 
@@ -1309,7 +1371,7 @@ fn transpose_line(line: TextLine, frame_x: u32) -> TextLine {
             .into_iter()
             .map(|r| transpose_rect(r, frame_x))
             .collect(),
-        bold_ranges: line.bold_ranges,
+        style_ranges: line.style_ranges,
     }
 }
 
@@ -1324,7 +1386,7 @@ fn untranspose_line(line: TextLine, frame_x: u32) -> TextLine {
             .into_iter()
             .map(|r| untranspose_rect(r, frame_x))
             .collect(),
-        bold_ranges: line.bold_ranges,
+        style_ranges: line.style_ranges,
     }
 }
 
@@ -2336,7 +2398,7 @@ pub fn build_text_blocks(
                 oriented_box: OrientedRect::axis_aligned(word.bounding_box),
                 tight_box: OrientedRect::axis_aligned(word.bounding_box),
                 word_rects: vec![word.bounding_box],
-                bold_ranges: Vec::new(),
+                style_ranges: Vec::new(),
             });
         } else if let Some(line) = current_line.as_mut() {
             let delta = word.bounding_box.left.saturating_sub(last_right);
@@ -2355,7 +2417,7 @@ pub fn build_text_blocks(
                     oriented_box: OrientedRect::axis_aligned(word.bounding_box),
                     tight_box: OrientedRect::axis_aligned(word.bounding_box),
                     word_rects: vec![word.bounding_box],
-                    bold_ranges: Vec::new(),
+                    style_ranges: Vec::new(),
                 };
                 if !lines.is_empty() {
                     blocks.push(TextBlock {
@@ -2411,9 +2473,10 @@ pub fn build_text_blocks(
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectedWord, OrientedRect, ParagraphGroupingOptions, Rect, TextBlock, TextLine,
-        build_text_blocks, group_lines_into_paragraphs, group_live_lines_into_blocks,
-        group_vertical_lines_into_paragraphs,
+        DetectedWord, LineDecoration, OrientedRect, ParagraphGroupingOptions, Rect, StyleKind,
+        StyleRange, TextBlock, TextLine, build_text_blocks, group_lines_into_paragraphs,
+        group_live_lines_into_blocks, group_vertical_lines_into_paragraphs,
+        style_spans_from_styles,
     };
 
     #[test]
@@ -2504,7 +2567,7 @@ mod tests {
             },
             tight_box: tight,
             word_rects: vec![rect],
-            bold_ranges: Vec::new(),
+            style_ranges: Vec::new(),
         }
     }
 
@@ -2531,7 +2594,7 @@ mod tests {
             oriented_box: OrientedRect::axis_aligned(rect),
             tight_box: tight,
             word_rects: vec![rect],
-            bold_ranges: Vec::new(),
+            style_ranges: Vec::new(),
         }
     }
 
@@ -3062,7 +3125,7 @@ mod tests {
                 angle_radians: theta,
             },
             word_rects: vec![rect],
-            bold_ranges: Vec::new(),
+            style_ranges: Vec::new(),
         }
     }
 
@@ -3222,5 +3285,57 @@ mod tests {
                 vec!["WARNING!   ".to_string()],
             ]
         );
+    }
+
+    #[test]
+    fn style_spans_tile_overlapping_bold_and_underline() {
+        // "ab cd ef" (len 8): bold over [0,5), underline over [3,8). The two ranges overlap on
+        // "cd" (bytes 3..5), which must come out as a single span that is both bold and underlined.
+        let ranges = vec![
+            StyleRange {
+                start: 0,
+                end: 5,
+                kind: StyleKind::Bold,
+            },
+            StyleRange {
+                start: 3,
+                end: 8,
+                kind: StyleKind::Decoration(LineDecoration::Underline),
+            },
+        ];
+        let spans = style_spans_from_styles(8, &ranges, 0xFF00_0000);
+        let summary: Vec<(u32, u32, bool, Option<LineDecoration>)> = spans
+            .iter()
+            .map(|s| (s.start, s.end, s.bold, s.decoration))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, 3, true, None),
+                (3, 5, true, Some(LineDecoration::Underline)),
+                (5, 8, false, Some(LineDecoration::Underline)),
+            ]
+        );
+    }
+
+    #[test]
+    fn style_spans_coalesce_identical_neighbours() {
+        // Two touching bold ranges tile into one continuous bold span, not two.
+        let ranges = vec![
+            StyleRange {
+                start: 0,
+                end: 2,
+                kind: StyleKind::Bold,
+            },
+            StyleRange {
+                start: 2,
+                end: 4,
+                kind: StyleKind::Bold,
+            },
+        ];
+        let spans = style_spans_from_styles(6, &ranges, 0xFF00_0000);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].start, spans[0].end, spans[0].bold), (0, 4, true));
+        assert_eq!((spans[1].start, spans[1].end, spans[1].bold), (4, 6, false));
     }
 }

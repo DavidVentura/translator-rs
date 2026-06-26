@@ -48,7 +48,7 @@ pub struct SurfaceLine {
     /// Per-word bold byte ranges over `source_text` (trimmed), pooled from the ink bold
     /// channel + CTC firings at the last rec. Cached so lines that skip re-rec (held camera)
     /// keep their per-word weight instead of falling back to a whole-line estimate.
-    pub source_bold_ranges: Vec<translator_core::ocr::BoldRange>,
+    pub source_bold_ranges: Vec<translator_core::ocr::StyleRange>,
     /// BCP-47 source language tag (e.g. "nl", "en"), or empty when
     /// the source language wasn't recorded.
     pub source_language: String,

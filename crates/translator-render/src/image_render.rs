@@ -19,7 +19,8 @@ use std::sync::Arc;
 use crate::font_provider::{FontHandle, FontProvider, FontRequest};
 use crate::text_shape::{self, DirRun, ShapedGlyph, segment_runs};
 use translator_core::ocr::{
-    OrientedRect, OverlayLayoutMode, PositionedWord, PreparedImageOverlay, PreparedTextBlock,
+    LineDecoration, OrientedRect, OverlayLayoutMode, PositionedWord, PreparedImageOverlay,
+    PreparedTextBlock,
 };
 use translator_core::script::Script;
 
@@ -724,6 +725,26 @@ fn block_color(block: &PreparedTextBlock) -> u32 {
         .unwrap_or(0xFF00_0000)
 }
 
+/// Decorated spans of `block.style_spans`, rebased onto the trimmed translated string (same
+/// rebasing as [`block_bold_spans`]). Each carries the under/strike/over-line to draw over that
+/// byte run.
+fn block_decoration_spans(block: &PreparedTextBlock) -> Vec<(usize, usize, LineDecoration)> {
+    let translated = block.translated_text.trim();
+    let trim_lead = block.translated_text.len() - block.translated_text.trim_start().len();
+    block
+        .style_spans
+        .iter()
+        .filter_map(|s| {
+            let dec = s.decoration?;
+            let start = (s.start as usize).saturating_sub(trim_lead);
+            let end = (s.end as usize)
+                .saturating_sub(trim_lead)
+                .min(translated.len());
+            (start < end).then_some((start, end, dec))
+        })
+        .collect()
+}
+
 /// Horizontal layout: re-flow the block's translated text across its OCR-provided per-line
 /// boxes, shrinking the font until every line fits its box width.
 fn layout_per_line(
@@ -907,6 +928,7 @@ fn render_per_line(
     };
     let translated = block.translated_text.trim();
     let bold_spans = block_bold_spans(block);
+    let decoration_spans = block_decoration_spans(block);
     let bold = layout.bold;
     let size = layout.size;
     let language = opts.language.clone();
@@ -953,6 +975,9 @@ fn render_per_line(
         // perp_down direction (line-local +v) in image space is (-sin, cos).
         let mut origin_x = oriented.cx - half_w * cos + v_from_center * (-sin);
         let mut origin_y = oriented.cy - half_w * sin + v_from_center * cos;
+        // Baseline origin (line-local u=0) before the segment loop advances the pen — the anchor
+        // the line decorations are drawn from.
+        let (baseline_x0, baseline_y0) = (origin_x, origin_y);
         // Draw each bold/regular run with its own font chain, advancing the baseline cursor by the
         // run's width so mixed-weight lines (a bold lead-in, a bold term) render in the right faces
         // instead of one weight for the whole block. `cum_px[i]` records the reading-axis advance
@@ -1001,6 +1026,103 @@ fn render_per_line(
         }
         if let Some(carver) = words.as_deref_mut() {
             carver.carve_line(line_text, &oriented, &cum_px);
+        }
+
+        // Line decorations (under/strike/over). Only the CPU canvas path draws them; the GPU
+        // collector composites atlas glyph quads and has no solid-quad primitive, and the live
+        // path it feeds doesn't detect decoration yet.
+        if let GlyphSink::Canvas {
+            canvas,
+            width,
+            height,
+        } = sink
+        {
+            for (ds, de, dec) in line_decorations(&decoration_spans, line_start, line_text.len()) {
+                let u0 = cum_px[ds];
+                let u1 = cum_px[de];
+                if u1 <= u0 {
+                    continue;
+                }
+                draw_decoration(
+                    canvas,
+                    *width,
+                    *height,
+                    (baseline_x0, baseline_y0),
+                    (cos, sin),
+                    (u0, u1),
+                    decoration_offset(dec, ascent_px, descent_px, size),
+                    (size * 0.06).max(1.0),
+                    line.foreground_argb,
+                );
+            }
+        }
+    }
+}
+
+/// Clip the block's decoration spans to one line (`line_start` is the line's byte offset within
+/// the trimmed translated text) and rebase them to line-local byte ranges.
+fn line_decorations(
+    spans: &[(usize, usize, LineDecoration)],
+    line_start: usize,
+    line_len: usize,
+) -> Vec<(usize, usize, LineDecoration)> {
+    let line_end = line_start + line_len;
+    spans
+        .iter()
+        .filter_map(|&(s, e, dec)| {
+            let s = s.max(line_start);
+            let e = e.min(line_end);
+            (s < e).then_some((s - line_start, e - line_start, dec))
+        })
+        .collect()
+}
+
+/// Signed cross-reading offset (image px, line-local +v = downward) of a decoration line from the
+/// baseline: underline just below it, overline at the cap top, strikethrough through the x-height.
+fn decoration_offset(dec: LineDecoration, ascent_px: f32, descent_px: f32, size: f32) -> f32 {
+    match dec {
+        LineDecoration::Underline => (descent_px * 0.6).max(size * 0.1),
+        LineDecoration::Strikethrough => -size * 0.28,
+        LineDecoration::Overline => -ascent_px,
+    }
+}
+
+/// Fill a thin rotated rectangle (a decoration line) into the RGBA canvas. The rect runs along the
+/// reading direction `(cos, sin)` from `u0` to `u1` at cross-reading offset `d` from the baseline
+/// anchor, `thickness` px tall. Opaque write — a decoration line is solid ink in the text colour.
+#[allow(clippy::too_many_arguments)]
+fn draw_decoration(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    (baseline_x0, baseline_y0): (f32, f32),
+    (cos, sin): (f32, f32),
+    (u0, u1): (f32, f32),
+    d: f32,
+    thickness: f32,
+    color_argb: u32,
+) {
+    let u_mid = (u0 + u1) * 0.5;
+    let cx = baseline_x0 + cos * u_mid + (-sin) * d;
+    let cy = baseline_y0 + sin * u_mid + cos * d;
+    let hw = (u1 - u0) * 0.5;
+    let hh = (thickness * 0.5).max(0.5);
+    let bytes = color_argb.to_ne_bytes();
+    let reach = hw.max(hh) + 1.0;
+    let x_lo = ((cx - reach).floor().max(0.0)) as u32;
+    let x_hi = ((cx + reach).ceil().min(width as f32)) as u32;
+    let y_lo = ((cy - reach).floor().max(0.0)) as u32;
+    let y_hi = ((cy + reach).ceil().min(height as f32)) as u32;
+    for y in y_lo..y_hi {
+        for x in x_lo..x_hi {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let lx = dx * cos + dy * sin;
+            let ly = -dx * sin + dy * cos;
+            if lx.abs() <= hw && ly.abs() <= hh {
+                let idx = ((y * width + x) * 4) as usize;
+                canvas[idx..idx + 4].copy_from_slice(&bytes);
+            }
         }
     }
 }
@@ -1827,8 +1949,8 @@ mod break_tests {
 mod word_box_tests {
     use super::*;
     use translator_core::ocr::{
-        BoldRange, OrientedRect, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay,
-        PreparedTextBlock, PreparedTextLine, Rect,
+        OrientedRect, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay,
+        PreparedTextBlock, PreparedTextLine, Rect, StyleKind, StyleRange,
     };
 
     const REGULAR: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
@@ -1916,9 +2038,13 @@ mod word_box_tests {
                 suggested_font_size_px: 40.0,
             },
             // "Aaaa" (bytes 0..4) bold; the rest regular.
-            style_spans: translator_core::ocr::style_spans_from_bold(
+            style_spans: translator_core::ocr::style_spans_from_styles(
                 text.len(),
-                &[BoldRange { start: 0, end: 4 }],
+                &[StyleRange {
+                    start: 0,
+                    end: 4,
+                    kind: StyleKind::Bold,
+                }],
                 0xFF00_0000,
             ),
         };

@@ -240,7 +240,7 @@ pub struct BlockSpec {
     >,
     /// Bold byte ranges within `display_text` (per-word weight carried through translation).
     /// Empty = not bold; `[0, len)` = whole block bold.
-    pub bold_ranges: Vec<translator_core::ocr::BoldRange>,
+    pub bold_ranges: Vec<translator_core::ocr::StyleRange>,
 }
 
 /// Per-anchor live state. Each acquired anchor (engine
@@ -893,7 +893,7 @@ impl LiveSession {
         line_id: SurfaceLineId,
         source_text: &str,
         source_language: &str,
-        bold_ranges: &[translator_core::ocr::BoldRange],
+        bold_ranges: &[translator_core::ocr::StyleRange],
     ) {
         if let Ok(mut states) = self.anchor_states.lock() {
             if let Some(state) = states.get_mut(&anchor_id) {
@@ -945,7 +945,7 @@ impl LiveSession {
         source_text: String,
         translated_text: String,
         language: String,
-        bold_ranges: Vec<translator_core::ocr::BoldRange>,
+        bold_ranges: Vec<translator_core::ocr::StyleRange>,
         font_provider: &dyn translator_render::font_provider::FontProvider,
     ) {
         if strips.is_empty() {
@@ -1446,7 +1446,7 @@ impl LiveSession {
             source_code: String,
             /// Per-word bold ranges over `source_text` (trimmed), pooled from this run's ink
             /// bold profile + the line's CTC firings, or restored from the rec cache.
-            bold_ranges: Vec<translator_core::ocr::BoldRange>,
+            bold_ranges: Vec<translator_core::ocr::StyleRange>,
             rec_attempted: bool,
         }
         let mut entries: Vec<Entry> = input
@@ -1774,37 +1774,40 @@ impl LiveSession {
                 // re-based onto it. Both walk the block's strips in the same order with the
                 // same non-empty filter and `\n` separator, so the bold offsets line up with
                 // the text the translator sees.
-                let block_built: Vec<(String, Vec<translator_core::ocr::BoldRange>)> = ready_blocks
-                    .iter()
-                    .map(|&bi| {
-                        let mut text = String::new();
-                        let mut bold: Vec<translator_core::ocr::BoldRange> = Vec::new();
-                        for &i in &block_strip_indices[bi] {
-                            let s = entries[i].source_text.as_str();
-                            if s.is_empty() {
-                                continue;
+                let block_built: Vec<(String, Vec<translator_core::ocr::StyleRange>)> =
+                    ready_blocks
+                        .iter()
+                        .map(|&bi| {
+                            let mut text = String::new();
+                            let mut bold: Vec<translator_core::ocr::StyleRange> = Vec::new();
+                            for &i in &block_strip_indices[bi] {
+                                let s = entries[i].source_text.as_str();
+                                if s.is_empty() {
+                                    continue;
+                                }
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                let base = text.len() as u32;
+                                text.push_str(s);
+                                for r in &entries[i].bold_ranges {
+                                    bold.push(translator_core::ocr::StyleRange {
+                                        start: base + r.start,
+                                        end: base + r.end,
+                                        kind: r.kind,
+                                    });
+                                }
                             }
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            let base = text.len() as u32;
-                            text.push_str(s);
-                            for r in &entries[i].bold_ranges {
-                                bold.push(translator_core::ocr::BoldRange {
-                                    start: base + r.start,
-                                    end: base + r.end,
-                                });
-                            }
-                        }
-                        (text, translator_core::ocr::merge_bold_ranges(bold))
-                    })
-                    .collect();
-                let kept: Vec<(usize, String, Vec<translator_core::ocr::BoldRange>)> = ready_blocks
-                    .drain(..)
-                    .zip(block_built)
-                    .filter(|(_, (s, _))| !s.trim().is_empty())
-                    .map(|(bi, (s, b))| (bi, s, b))
-                    .collect();
+                            (text, translator_core::ocr::merge_style_ranges(bold))
+                        })
+                        .collect();
+                let kept: Vec<(usize, String, Vec<translator_core::ocr::StyleRange>)> =
+                    ready_blocks
+                        .drain(..)
+                        .zip(block_built)
+                        .filter(|(_, (s, _))| !s.trim().is_empty())
+                        .map(|(bi, (s, b))| (bi, s, b))
+                        .collect();
                 if !kept.is_empty() {
                     let inputs: Vec<String> = kept.iter().map(|(_, s, _)| s.clone()).collect();
                     let forced = if input.is_auto_source {
@@ -1897,13 +1900,17 @@ impl LiveSession {
                         // still path.
                         let src_ranges: Vec<(u32, u32)> =
                             src_bold.iter().map(|r| (r.start, r.end)).collect();
-                        let block_bold_ranges: Vec<translator_core::ocr::BoldRange> =
+                        let block_bold_ranges: Vec<translator_core::ocr::StyleRange> =
                             translator_translate::translate::remap_byte_ranges_through_alignment(
                                 &src_ranges,
                                 twa,
                             )
                             .into_iter()
-                            .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
+                            .map(|(start, end)| translator_core::ocr::StyleRange {
+                                start,
+                                end,
+                                kind: translator_core::ocr::StyleKind::Bold,
+                            })
                             .collect();
                         self.ingest_translation(input.anchor_id, &line_ids, &translated);
                         self.upsert_block(
@@ -2025,7 +2032,7 @@ fn entry_bold_ranges(
     source_text: &str,
     line: &RecognizedTextLine,
     profile: Option<&Option<translator_raster::text_metrics::BoldProfile>>,
-) -> Vec<translator_core::ocr::BoldRange> {
+) -> Vec<translator_core::ocr::StyleRange> {
     let Some(profile) = profile.and_then(|p| p.as_ref()) else {
         return Vec::new();
     };
@@ -2047,16 +2054,21 @@ fn entry_bold_ranges(
     if !word_ranges.is_empty() {
         return word_ranges
             .into_iter()
-            .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
+            .map(|(start, end)| translator_core::ocr::StyleRange {
+                start,
+                end,
+                kind: translator_core::ocr::StyleKind::Bold,
+            })
             .collect();
     }
     let whole_bold = profile
         .whole_pooled_bold()
         .is_some_and(|p| p >= translator_raster::text_metrics::MODEL_BOLD_THRESHOLD);
     if whole_bold {
-        vec![translator_core::ocr::BoldRange {
+        vec![translator_core::ocr::StyleRange {
             start: 0,
             end: source_text.len() as u32,
+            kind: translator_core::ocr::StyleKind::Bold,
         }]
     } else {
         Vec::new()
@@ -2205,7 +2217,7 @@ pub struct DetectionOutcome {
     pub cached_source_language: String,
     /// Cached per-word bold ranges over `cached_source_text`, when `!needs_rec`. Empty
     /// otherwise.
-    pub cached_bold_ranges: Vec<translator_core::ocr::BoldRange>,
+    pub cached_bold_ranges: Vec<translator_core::ocr::StyleRange>,
 }
 
 impl DetectionOutcome {
@@ -2765,7 +2777,7 @@ fn build_block_text_block(
             layout_mode: OverlayLayoutMode::PerLine,
             suggested_font_size_px: suggested_font_px,
         },
-        style_spans: translator_core::ocr::style_spans_from_bold(
+        style_spans: translator_core::ocr::style_spans_from_styles(
             spec.display_text.len(),
             &spec.bold_ranges,
             block_fallback_fg,
@@ -2835,7 +2847,7 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
             oriented_box: l.bbox.clone(),
             tight_box: l.bbox.clone(),
             word_rects: Vec::new(),
-            bold_ranges: Vec::new(),
+            style_ranges: Vec::new(),
         })
         .collect();
     let blocks = translator_core::ocr::group_live_lines_into_blocks_in_quadrant(

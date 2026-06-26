@@ -209,11 +209,12 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         .collect();
     let angles_ms = t_angles.elapsed().as_secs_f32() * 1000.0;
 
-    // Per-word bold from the ink bold channel + the line's CTC firings. Falls back to a
-    // whole-line range when the model pooled bold but firings weren't usable (RTL,
-    // multi-chunk), and to nothing when neither fired.
+    // Per-word style from the ink channels + the line's CTC firings: bold from the bold channel
+    // (falling back to a whole-line range when the model pooled bold but firings weren't usable —
+    // RTL, multi-chunk), and under/strike/over-line decoration from the rule channel. Bold and
+    // decoration ranges may overlap; they carry distinct `StyleKind`s.
     let t_bold = std::time::Instant::now();
-    let line_bold_ranges: Vec<Vec<translator_core::ocr::BoldRange>> = lines
+    let line_style_ranges: Vec<Vec<translator_core::ocr::StyleRange>> = lines
         .iter()
         .enumerate()
         .map(|(i, line)| {
@@ -223,30 +224,52 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
                 .iter()
                 .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
                 .collect();
-            let word_ranges = match strip.and_then(|s| s.bold_profile()) {
+            let is_cjk = scripts[i] == PpocrScript::Cj;
+            let mut ranges: Vec<translator_core::ocr::StyleRange> = Vec::new();
+
+            let bold_words = match strip.and_then(|s| s.bold_profile()) {
                 Some(profile) => translator_raster::text_metrics::word_bold_ranges(
                     &line.text,
                     &firings,
-                    scripts[i] == PpocrScript::Cj,
+                    is_cjk,
                     &profile,
                     translator_raster::text_metrics::MODEL_BOLD_THRESHOLD,
                 ),
                 None => Vec::new(),
             };
-            if !word_ranges.is_empty() {
-                word_ranges
-                    .into_iter()
-                    .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
-                    .collect()
+            if !bold_words.is_empty() {
+                ranges.extend(bold_words.into_iter().map(|(start, end)| {
+                    translator_core::ocr::StyleRange {
+                        start,
+                        end,
+                        kind: translator_core::ocr::StyleKind::Bold,
+                    }
+                }));
             } else if model_bold.get(i).copied().flatten().unwrap_or(false) && !line.text.is_empty()
             {
-                vec![translator_core::ocr::BoldRange {
+                ranges.push(translator_core::ocr::StyleRange {
                     start: 0,
                     end: line.text.len() as u32,
-                }]
-            } else {
-                Vec::new()
+                    kind: translator_core::ocr::StyleKind::Bold,
+                });
             }
+
+            if let Some(profile) = strip.and_then(|s| s.rule_profile()) {
+                ranges.extend(
+                    translator_raster::text_metrics::word_decoration_ranges(
+                        &line.text, &firings, is_cjk, &profile,
+                    )
+                    .into_iter()
+                    .map(|(start, end, dec)| {
+                        translator_core::ocr::StyleRange {
+                            start,
+                            end,
+                            kind: translator_core::ocr::StyleKind::Decoration(dec),
+                        }
+                    }),
+                );
+            }
+            ranges
         })
         .collect();
     let bold_ms = t_bold.elapsed().as_secs_f32() * 1000.0;
@@ -264,7 +287,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         lines,
         &text_metrics,
         &line_angles,
-        &line_bold_ranges,
+        &line_style_ranges,
         min_confidence,
         reading_order,
     );
@@ -433,7 +456,7 @@ fn still_ppocr_lines_to_blocks(
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
     line_angles: &[Option<f32>],
-    line_bold_ranges: &[Vec<translator_core::ocr::BoldRange>],
+    line_style_ranges: &[Vec<translator_core::ocr::StyleRange>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -446,11 +469,11 @@ fn still_ppocr_lines_to_blocks(
         .zip(lines.into_iter())
         .zip(text_metrics.iter())
         .zip(line_angles.iter())
-        .zip(line_bold_ranges.iter())
+        .zip(line_style_ranges.iter())
         .filter(|((((_, line), _), _), _)| {
             !line.text.trim().is_empty() && line.confidence >= min_score
         })
-        .map(|((((b, line), metrics), line_angle), bold_ranges)| {
+        .map(|((((b, line), metrics), line_angle), style_ranges)| {
             // Line orientation: the ink-measured absolute baseline angle (image
             // space, via the strip's src_map) when it deviates visibly from the
             // detection reading frame; otherwise the detection angle itself. This
@@ -485,7 +508,7 @@ fn still_ppocr_lines_to_blocks(
                 oriented_box,
                 tight_box,
                 word_rects: vec![line.rect],
-                bold_ranges: bold_ranges.clone(),
+                style_ranges: style_ranges.clone(),
             }
         })
         .collect();
@@ -757,7 +780,7 @@ fn finalize_image_overlay(
     ink_mask: Option<&[bool]>,
 ) -> Result<PreparedImageOverlay, TranslatorError> {
     let t_translate = std::time::Instant::now();
-    let (translated_blocks, block_bold_ranges) = {
+    let (translated_blocks, block_style_ranges) = {
         let mut engine_guard = engine.lock().expect("bergamot engine lock poisoned");
         translate_block_texts(
             &mut engine_guard,
@@ -776,7 +799,7 @@ fn finalize_image_overlay(
         height,
         &blocks,
         &translated_blocks,
-        &block_bold_ranges,
+        &block_style_ranges,
         background_mode,
         reading_order,
         ink_mask,
@@ -792,7 +815,40 @@ fn finalize_image_overlay(
     result
 }
 
-type BlockBold = Vec<translator_core::ocr::BoldRange>;
+type BlockStyles = Vec<translator_core::ocr::StyleRange>;
+
+/// Remap a block's source style ranges onto its translation, one [`StyleKind`] at a time so the
+/// alignment remap's within-call merge never fuses ranges of different kinds (a bold range and an
+/// underline range over the same translated word must stay distinct).
+fn remap_block_styles(
+    src: &[translator_core::ocr::StyleRange],
+    twa: &translator_translate::translate::TranslationWithAlignment,
+) -> BlockStyles {
+    use translator_core::ocr::{LineDecoration, StyleKind};
+    const KINDS: [StyleKind; 4] = [
+        StyleKind::Bold,
+        StyleKind::Decoration(LineDecoration::Underline),
+        StyleKind::Decoration(LineDecoration::Strikethrough),
+        StyleKind::Decoration(LineDecoration::Overline),
+    ];
+    let mut out = BlockStyles::new();
+    for kind in KINDS {
+        let ranges: Vec<(u32, u32)> = src
+            .iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| (r.start, r.end))
+            .collect();
+        if ranges.is_empty() {
+            continue;
+        }
+        out.extend(
+            translator_translate::translate::remap_byte_ranges_through_alignment(&ranges, twa)
+                .into_iter()
+                .map(|(start, end)| translator_core::ocr::StyleRange { start, end, kind }),
+        );
+    }
+    out
+}
 
 fn translate_block_texts(
     engine: &mut BergamotEngine,
@@ -800,10 +856,10 @@ fn translate_block_texts(
     source_code: &LanguageCode,
     target_code: &LanguageCode,
     blocks: &[TextBlock],
-) -> Result<(Vec<String>, Vec<BlockBold>), TranslatorError> {
-    let sources: Vec<(String, BlockBold)> = blocks
+) -> Result<(Vec<String>, Vec<BlockStyles>), TranslatorError> {
+    let sources: Vec<(String, BlockStyles)> = blocks
         .iter()
-        .map(TextBlock::translation_text_with_bold)
+        .map(TextBlock::translation_text_with_styles)
         .collect();
     let block_texts: Vec<String> = sources.iter().map(|(t, _)| t.clone()).collect();
     let non_empty_indices = block_texts
@@ -816,10 +872,10 @@ fn translate_block_texts(
         return Err(TranslatorError::ocr("No text found in image"));
     }
 
-    // Identity: no model runs, so the source bold ranges already index the output text.
+    // Identity: no model runs, so the source style ranges already index the output text.
     if source_code == target_code {
-        let bold = sources.into_iter().map(|(_, b)| b).collect();
-        return Ok((block_texts, bold));
+        let styles = sources.into_iter().map(|(_, b)| b).collect();
+        return Ok((block_texts, styles));
     }
 
     let texts_to_translate = non_empty_indices
@@ -840,26 +896,17 @@ fn translate_block_texts(
     )?;
 
     let mut translated_blocks = block_texts;
-    let mut target_bold: Vec<BlockBold> = vec![Vec::new(); blocks.len()];
+    let mut target_styles: Vec<BlockStyles> = vec![Vec::new(); blocks.len()];
     match aligned {
         Some(results) => {
             for (slot, &bi) in non_empty_indices.iter().enumerate() {
                 let twa = &results[slot];
-                let src_ranges: Vec<(u32, u32)> =
-                    sources[bi].1.iter().map(|r| (r.start, r.end)).collect();
-                target_bold[bi] =
-                    translator_translate::translate::remap_byte_ranges_through_alignment(
-                        &src_ranges,
-                        twa,
-                    )
-                    .into_iter()
-                    .map(|(start, end)| translator_core::ocr::BoldRange { start, end })
-                    .collect();
+                target_styles[bi] = remap_block_styles(&sources[bi].1, twa);
                 translated_blocks[bi] = twa.translated_text.clone();
             }
         }
         None => {
-            // No alignment plan for this pair — translate plainly and drop per-word bold.
+            // No alignment plan for this pair — translate plainly and drop per-word style.
             let translated = Translator::new(engine, snapshot).translate_texts(
                 source_code,
                 target_code,
@@ -870,5 +917,5 @@ fn translate_block_texts(
             }
         }
     }
-    Ok((translated_blocks, target_bold))
+    Ok((translated_blocks, target_styles))
 }

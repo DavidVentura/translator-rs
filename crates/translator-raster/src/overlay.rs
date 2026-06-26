@@ -2,9 +2,9 @@ use image::{Rgb, Rgba};
 use rayon::prelude::*;
 use translator_core::BackgroundMode;
 use translator_core::ocr::{
-    BoldRange, OrientedRect, OverlayColors, OverlayLayoutHints, OverlayLayoutMode,
-    PreparedImageOverlay, PreparedTextBlock, PreparedTextLine, RasterImage, RasterImageMut,
-    ReadingOrder, TextBlock, argb, channel_b, channel_g, channel_r, clamp_rect,
+    OrientedRect, OverlayColors, OverlayLayoutHints, OverlayLayoutMode, PreparedImageOverlay,
+    PreparedTextBlock, PreparedTextLine, RasterImage, RasterImageMut, ReadingOrder, TextBlock,
+    argb, channel_b, channel_g, channel_r, clamp_rect,
 };
 
 use crate::color_matting::{BG_BLOCK, background_field, dilate, fill_radius, still_fg_argb};
@@ -171,7 +171,7 @@ pub fn prepare_overlay_image(
     height: u32,
     blocks: &[TextBlock],
     translated_blocks: &[String],
-    block_bold_ranges: &[Vec<BoldRange>],
+    block_style_ranges: &[Vec<translator_core::ocr::StyleRange>],
     background_mode: BackgroundMode,
     reading_order: ReadingOrder,
     ink_mask: Option<&[bool]>,
@@ -191,7 +191,7 @@ pub fn prepare_overlay_image(
                 let block_bounds = block.bounds();
                 let layout_hints = overlay_layout_hints(block, reading_order);
                 // Per-word bold carried through translation (byte ranges into the translated text).
-                let bold_ranges = block_bold_ranges.get(index).cloned().unwrap_or_default();
+                let style_ranges = block_style_ranges.get(index).cloned().unwrap_or_default();
                 match reading_order {
                     ReadingOrder::LeftToRight => {
                         let mut prepared_lines = Vec::with_capacity(block.lines.len());
@@ -222,9 +222,9 @@ pub fn prepare_overlay_image(
                             bounding_box: block_bounds,
                             lines: prepared_lines,
                             layout_hints,
-                            style_spans: translator_core::ocr::style_spans_from_bold(
+                            style_spans: translator_core::ocr::style_spans_from_styles(
                                 translated_text.len(),
-                                &bold_ranges,
+                                &style_ranges,
                                 block_foreground,
                             ),
                         };
@@ -257,9 +257,9 @@ pub fn prepare_overlay_image(
                             bounding_box: block_bounds,
                             lines: prepared_lines,
                             layout_hints,
-                            style_spans: translator_core::ocr::style_spans_from_bold(
+                            style_spans: translator_core::ocr::style_spans_from_styles(
                                 translated_text.len(),
-                                &bold_ranges,
+                                &style_ranges,
                                 colors.foreground_argb,
                             ),
                         };
@@ -333,7 +333,7 @@ mod tests {
                     oriented_box: translator_core::ocr::OrientedRect::axis_aligned(top_rect),
                     tight_box: translator_core::ocr::OrientedRect::axis_aligned(top_rect),
                     word_rects: vec![top_rect],
-                    bold_ranges: Vec::new(),
+                    style_ranges: Vec::new(),
                 },
                 TextLine {
                     text: "bottom".to_string(),
@@ -341,7 +341,7 @@ mod tests {
                     oriented_box: translator_core::ocr::OrientedRect::axis_aligned(bottom_rect),
                     tight_box: translator_core::ocr::OrientedRect::axis_aligned(bottom_rect),
                     word_rects: vec![bottom_rect],
-                    bold_ranges: Vec::new(),
+                    style_ranges: Vec::new(),
                 },
             ],
         }];
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn block_bold_ranges_pass_through_to_prepared() {
+    fn block_style_ranges_pass_through_to_prepared() {
         let rgba = vec![0xFFu8; 8 * 8 * 4];
         let rect = Rect {
             left: 1,
@@ -403,13 +403,17 @@ mod tests {
                 oriented_box: translator_core::ocr::OrientedRect::axis_aligned(rect),
                 tight_box: translator_core::ocr::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
-                bold_ranges: Vec::new(),
+                style_ranges: Vec::new(),
             }],
         };
         let blocks = vec![make(), make()];
         let translated = vec!["a".to_string(), "b".to_string()];
-        let block_bold_ranges = vec![
-            vec![translator_core::ocr::BoldRange { start: 0, end: 1 }],
+        let block_style_ranges = vec![
+            vec![translator_core::ocr::StyleRange {
+                start: 0,
+                end: 1,
+                kind: translator_core::ocr::StyleKind::Bold,
+            }],
             Vec::new(),
         ];
         let prepared = prepare_overlay_image(
@@ -418,7 +422,7 @@ mod tests {
             8,
             &blocks,
             &translated,
-            &block_bold_ranges,
+            &block_style_ranges,
             BackgroundMode::BlackOnWhite,
             ReadingOrder::LeftToRight,
             None,
@@ -457,7 +461,7 @@ mod tests {
                 oriented_box: translator_core::ocr::OrientedRect::axis_aligned(rect),
                 tight_box: translator_core::ocr::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
-                bold_ranges: Vec::new(),
+                style_ranges: Vec::new(),
             }],
         }];
 
