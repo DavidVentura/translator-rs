@@ -35,7 +35,9 @@ def main():
     state = torch.load(args.ckpt, map_location="cpu")
     base, levels = state.get("base", 16), state.get("levels", 2)
     bold_from, bold_head = state.get("bold_from", 1), state.get("bold_head", "dilated")
-    model = InkUNet(base=base, levels=levels, bold_from=bold_from, bold_head=bold_head)
+    rule, rule_head = state.get("rule", False), state.get("rule_head", "dilated")
+    model = InkUNet(base=base, levels=levels, bold_from=bold_from, bold_head=bold_head,
+                    rule=rule, rule_head=rule_head)
     model.load_state_dict(state["model"])
     model.eval()
     params = sum(p.numel() for p in model.parameters())

@@ -5,6 +5,7 @@ Resume: --resume ckpt/ink-latest.pt
 """
 
 import argparse
+import glob
 import os
 import random
 import time
@@ -12,10 +13,31 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader, IterableDataset
 
 import gpu_degrade
 from gen_data import sample, stream
+
+
+def load_real_strip(matte_path: str, width: int, rng: random.Random):
+    """A real (strip, matte) pair fit to 48 x `width`: random-crop if wider, median-bg-pad at a
+    random x if narrower (no reflect — that would fabricate text with no matte). Returns
+    (img HxWx3, matte HxW) in 0..1. Real samples have no bold/rule label (masked downstream)."""
+    strip = np.asarray(Image.open(matte_path.replace(".matte.png", ".png")).convert("RGB"),
+                       dtype=np.float32) / 255.0
+    matte = np.asarray(Image.open(matte_path).convert("L"), dtype=np.float32) / 255.0
+    h, w = matte.shape
+    if w >= width:
+        x0 = rng.randint(0, w - width)
+        return strip[:, x0:x0 + width], matte[:, x0:x0 + width]
+    bg = np.median(strip.reshape(-1, 3), axis=0)
+    canvas = np.broadcast_to(bg, (h, width, 3)).copy()
+    cmatte = np.zeros((h, width), dtype=np.float32)
+    x0 = rng.randint(0, width - w)
+    canvas[:, x0:x0 + w] = strip
+    cmatte[:, x0:x0 + w] = matte
+    return canvas, cmatte
 from model import InkUNet, param_count
 
 # Module level so spawn workers (which re-import this module but never run main) share via
@@ -34,12 +56,14 @@ class SyntheticStrips(IterableDataset):
     """
 
     def __init__(self, batch: int, width: int = 320, seed: int = 0, reuse: int = 1,
-                 apply_degrade: bool = True):
+                 apply_degrade: bool = True, real_dir: str | None = None, real_frac: float = 0.0):
         self.batch = batch
         self.width = width
         self.seed = seed
         self.reuse = reuse
         self.apply_degrade = apply_degrade
+        self.real_dir = real_dir
+        self.real_frac = real_frac
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -47,17 +71,27 @@ class SyntheticStrips(IterableDataset):
         rng = random.Random(self.seed + worker * 7919 + os.getpid())
         # apply_degrade=False (GPU path): degrade + legibility run batched on the GPU.
         gen = stream(rng, self.width, self.reuse, apply_degrade=self.apply_degrade)
+        real_files = (sorted(glob.glob(os.path.join(self.real_dir, "*.matte.png")))
+                      if self.real_dir and self.real_frac > 0 else [])
         while True:
-            imgs, covs, bolds, rules, nhs = [], [], [], [], []
+            imgs, covs, bolds, rules, reals, nhs = [], [], [], [], [], []
             for _ in range(self.batch):
-                img, cov, bold, rule, native_h = next(gen)
+                if real_files and rng.random() < self.real_frac:
+                    img, cov = load_real_strip(rng.choice(real_files), self.width, rng)
+                    bold = np.zeros_like(cov)  # no bold/rule label on real — masked in the loss
+                    rule = np.zeros_like(cov)
+                    native_h, is_real = float(cov.shape[0]), 1.0
+                else:
+                    img, cov, bold, rule, native_h = next(gen)
+                    is_real = 0.0
                 imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
                 covs.append(torch.from_numpy(cov[None]))
                 bolds.append(torch.from_numpy(bold[None]))
                 rules.append(torch.from_numpy(rule[None]))
+                reals.append(is_real)
                 nhs.append(native_h)
             yield (torch.stack(imgs), torch.stack(covs), torch.stack(bolds), torch.stack(rules),
-                   torch.tensor(nhs, dtype=torch.float32))
+                   torch.tensor(reals, dtype=torch.float32), torch.tensor(nhs, dtype=torch.float32))
 
 
 def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
@@ -91,7 +125,7 @@ MATTE_TVERSKY_BETA = 0.7
 
 def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
                bold_asym_t0=0.15, bold_margin=0.0, matte_tversky=0.0,
-               rule=None, rule_weight=1.0, rule_tversky=0.5):
+               rule=None, rule_weight=1.0, rule_tversky=0.5, real_mask=None):
     """Matte BCE over the whole strip + asymmetric bold L1 *masked to ink*. `bold` is the
     continuous per-pixel stroke-width target in [0,1] (gen_data `_font_stroke_ratio` through
     the logistic `_target_q`), not a binary class: the head regresses how thick the ink is so
@@ -118,6 +152,12 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
     if strip_w is None:
         strip_w = torch.ones(logits.shape[0], device=logits.device)
     w = strip_w.view(-1, 1, 1, 1)
+    # Matte is valid on every sample (incl. real OTR). bold/rule have no label on real samples,
+    # so they use `sw` = w zeroed on real — matte learns from real, bold/rule only from synth.
+    if real_mask is None:
+        sw = w
+    else:
+        sw = w * (1.0 - real_mask.view(-1, 1, 1, 1))
     bce_m = F.binary_cross_entropy_with_logits(matte_logit, cov, reduction="none")
     loss_matte = (bce_m * w).sum() / w.expand_as(bce_m).sum().clamp_min(1.0)
     p_m = torch.sigmoid(matte_logit)
@@ -125,7 +165,7 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
     fp = (p_m * (1.0 - cov) * w).sum()
     fn = ((1.0 - p_m) * cov * w).sum()
     loss_tversky = 1.0 - (tp + 1.0) / (tp + MATTE_TVERSKY_ALPHA * fp + MATTE_TVERSKY_BETA * fn + 1.0)
-    ink = (cov > 0.5).float() * w
+    ink = (cov > 0.5).float() * sw
     err = torch.sigmoid(bold_logit) - bold
     thin_gate = torch.clamp(1.0 - bold / bold_asym_t0, min=0.0)
     pen = err.abs() + bold_asym * torch.relu(err) * thin_gate
@@ -141,12 +181,12 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
     if rule is not None and logits.shape[1] >= 3:
         rule_logit = logits[:, 2:3]
         bce_r = F.binary_cross_entropy_with_logits(rule_logit, rule, reduction="none")
-        loss_rule = (bce_r * w).sum() / w.expand_as(bce_r).sum().clamp_min(1.0)
+        loss_rule = (bce_r * sw).sum() / sw.expand_as(bce_r).sum().clamp_min(1.0)
         if rule_tversky > 0:
             p_r = torch.sigmoid(rule_logit)
-            tpr = (p_r * rule * w).sum()
-            fpr = (p_r * (1.0 - rule) * w).sum()
-            fnr = ((1.0 - p_r) * rule * w).sum()
+            tpr = (p_r * rule * sw).sum()
+            fpr = (p_r * (1.0 - rule) * sw).sum()
+            fnr = ((1.0 - p_r) * rule * sw).sum()
             tv_r = 1.0 - (tpr + 1.0) / (tpr + MATTE_TVERSKY_ALPHA * fpr + MATTE_TVERSKY_BETA * fnr + 1.0)
             loss_rule = loss_rule + rule_tversky * tv_r
 
@@ -158,27 +198,39 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    # Run-defining params are REQUIRED, not defaulted: silent defaults (reuse=1, matte-tversky=0,
+    # levels=2, bold-head=dilated) quietly wrecked runs. Force every launch to state them.
+    ap.add_argument("--steps", type=int, required=True)
+    ap.add_argument("--batch", type=int, required=True)
+    ap.add_argument("--lr", type=float, required=True)
     ap.add_argument("--width", type=int, default=320)
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, required=True)
+    ap.add_argument("--reuse", type=int, required=True,
+                    help="composites per rasterized strip (fresh bg/ink/degrade each). Font raster is "
+                         "the dominant CPU cost, so this divides it — reuse=1 starves the GPU (~500 vs "
+                         "~1100+ strips/s). Use 16 unless deliberately maximizing glyph-shape diversity")
+    ap.add_argument("--base", type=int, required=True, help="base channel width (capacity)")
+    ap.add_argument("--levels", type=int, required=True, help="U-Net depth (4 = bigger RF)")
+    ap.add_argument("--bold-head", choices=["dilated", "1x1"], required=True,
+                    help="bold head: dilated 3×3 or cheap 1×1 (prod = 1x1)")
+    ap.add_argument("--matte-tversky", type=float, required=True,
+                    help="weight on the recall-biased matte Tversky term (FN>FP); 0 = plain BCE. "
+                         "OTR hard-negative backgrounds lean the matte precise — set >0 to protect recall")
     ap.add_argument("--prefetch", type=int, default=4,
                     help="DataLoader prefetch_factor; lower on low-RAM boxes (each in-flight batch is ~150MB)")
     ap.add_argument("--pin-memory", action="store_true",
                     help="pin host buffers for faster H2D; worth it on high-RAM boxes (off by default — "
                          "pointless when dataloader-bound and adds non-reclaimable RAM on small boxes)")
+    ap.add_argument("--real-dir", default=None,
+                    help="dir of real (strip.png, strip.matte.png) pairs to mix in (matte-only; "
+                         "bold+rule loss masked on these). e.g. data/otr_real")
+    ap.add_argument("--real-frac", type=float, default=0.0,
+                    help="fraction of each batch drawn from --real-dir (0 = synth only)")
     ap.add_argument("--out", default="ckpt")
     ap.add_argument("--resume", default=None)
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--val-every", type=int, default=1000)
     ap.add_argument("--no-compile", action="store_true", help="disable torch.compile (GPU)")
-    ap.add_argument("--base", type=int, default=16, help="base channel width (capacity)")
-    ap.add_argument("--levels", type=int, default=2, help="U-Net depth (3 = bigger RF)")
-    ap.add_argument("--reuse", type=int, default=16,
-                    help="composites per rasterized strip (fresh bg/ink/degrade each). Font raster is "
-                         "the dominant CPU cost, so this divides it — reuse=1 starves the GPU (~500 vs "
-                         "~1100+ strips/s). Keep high unless deliberately maximizing glyph-shape diversity")
     ap.add_argument("--val-batch", type=int, default=32, help="validation set size")
     ap.add_argument("--bold-weight", type=float, default=1.5, help="weight on the bold L1 term")
     ap.add_argument("--bold-asym", type=float, default=1.5,
@@ -187,14 +239,10 @@ def main():
                     help="target above which the thin-overshoot penalty fades to 0 (bold left as pure L1)")
     ap.add_argument("--bold-margin", type=float, default=0.0,
                     help="weight on the confident-margin hinge (lifts clearly-bold scores to the rail); 0 = off")
-    ap.add_argument("--matte-tversky", type=float, default=0.0,
-                    help="weight on the recall-biased matte Tversky term (FN>FP); 0 = plain BCE")
     ap.add_argument("--bold-from", type=int, default=1, help="decoder stage feeding the bold head (1=full,2=½,3=¼)")
     ap.add_argument("--detach-bold", action="store_true", help="stop bold gradient into the trunk (matte-priority)")
     ap.add_argument("--gpu-degrade", action="store_true",
                     help="EXPERIMENTAL: batched degrade on the GPU (faster but degrade@48 ≠ @native; regresses quality)")
-    ap.add_argument("--bold-head", choices=["dilated", "1x1"], default="dilated",
-                    help="bold head: dilated 3×3 (default) or cheap 1×1")
     ap.add_argument("--rule", action="store_true",
                     help="add the horizontal-rule head (under/strike/over line) as a 3rd channel")
     ap.add_argument("--rule-weight", type=float, default=1.0, help="weight on the rule loss")
@@ -218,7 +266,8 @@ def main():
                     rule=args.rule, rule_head=args.rule_head).to(device)
     print(f"device={device} base={args.base} levels={args.levels} bold_from={args.bold_from} "
           f"detach_bold={args.detach_bold} bold_head={args.bold_head} rule={args.rule} "
-          f"rule_head={args.rule_head} params={param_count(model):,}")
+          f"rule_head={args.rule_head} real_frac={args.real_frac} real_dir={args.real_dir} "
+          f"params={param_count(model):,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     start_step = 0
     if args.resume:
@@ -241,7 +290,8 @@ def main():
 
     loader = DataLoader(
         SyntheticStrips(batch=args.batch, width=args.width, reuse=args.reuse,
-                        apply_degrade=not args.gpu_degrade),
+                        apply_degrade=not args.gpu_degrade,
+                        real_dir=args.real_dir, real_frac=args.real_frac),
         batch_size=None,  # the dataset yields whole batches (one IPC transfer each)
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
@@ -263,13 +313,14 @@ def main():
     model.train()
     t0 = time.time()
     running = 0.0
-    for step, (img, cov, bold, rule, native_h) in enumerate(loader, start=start_step + 1):
+    for step, (img, cov, bold, rule, real, native_h) in enumerate(loader, start=start_step + 1):
         if step > args.steps:
             break
         img = img.to(device, non_blocking=device == "cuda")
         cov = cov.to(device, non_blocking=device == "cuda")
         bold = bold.to(device, non_blocking=device == "cuda")
         rule = rule.to(device, non_blocking=device == "cuda")
+        real = real.to(device, non_blocking=device == "cuda")
         native_h = native_h.to(device, non_blocking=device == "cuda")
         # GPU degrade path (experimental): degrade + legibility batched on the GPU, illegible
         # strips become zero-weight. Default path: strips arrive already CPU-degraded + legible.
@@ -284,7 +335,7 @@ def main():
                                           bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
                                           bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
                                           rule=rule if args.rule else None, rule_weight=args.rule_weight,
-                                          rule_tversky=args.rule_tversky)
+                                          rule_tversky=args.rule_tversky, real_mask=real)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)

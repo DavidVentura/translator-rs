@@ -162,6 +162,13 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         .iter()
         .map(|s| s.as_ref().map(|s| s.matte.clone()))
         .collect();
+    // Erase mask = matte ∪ rule, so under/strike/over-line rules are erased too. Kept separate
+    // from `ink_masks` (pure matte) so the rule never distorts x-height/baseline/grouping metrics.
+    // Identical to the matte for 1-/2-channel models (no rule channel) — graceful downgrade.
+    let erase_masks: Vec<Option<image::GrayImage>> = ink_strips
+        .iter()
+        .map(|s| s.as_ref().map(|s| s.erase_mask()))
+        .collect();
     let ink_src_maps: Vec<Option<Vec<(f32, f32)>>> = ink_strips
         .iter()
         .map(|s| s.as_ref().and_then(|s| s.src_map.clone()))
@@ -293,7 +300,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         translator_raster::color_matting::union_ink_mask(
             rgba,
             &det_boxes,
-            &ink_masks,
+            &erase_masks,
             &ink_src_maps,
         )
     });

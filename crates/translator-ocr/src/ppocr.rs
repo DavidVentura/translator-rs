@@ -259,12 +259,18 @@ impl PpocrInkModel {
     }
 }
 
-/// One box's ink-model output: the soft matte (ch0, always present) and the per-pixel
-/// bold logit-derived map (ch1, present only when a 2-channel bold model is loaded;
-/// `None` for the legacy matte-only model). Both are 0..255 at the 48px strip height.
+/// One box's ink-model output, 0..255 at the 48px strip height. Channels are detected from the
+/// model's output depth, so older models load and run unchanged:
+/// - `matte` (ch0) always present;
+/// - `bold` (ch1) present for a 2-channel bold model, `None` for the legacy matte-only model;
+/// - `rule` (ch2) present for a 3-channel model: per-pixel under/strike/over-line coverage
+///   (the type is named downstream from its vertical position vs the matte's baseline/x-height).
+///   `None` for matte-only and bold models — so a user still on the shipped 2-channel bold model
+///   simply gets no rule, and rule-aware code degrades to "no underline" with no version flag.
 pub struct InkStrip {
     pub matte: GrayImage,
     pub bold: Option<GrayImage>,
+    pub rule: Option<GrayImage>,
     /// Source-image `(x, y)` each matte/bold column-row sampled, row-major over
     /// the strip's own `matte.width() × matte.height()`. Lets the matting scatter
     /// the strip back into image space (the strip is a curl-straightened contour
@@ -274,6 +280,21 @@ pub struct InkStrip {
 }
 
 impl InkStrip {
+    /// Mask of pixels to erase = matte ∪ rule (pixel max). Under/strike/over-line rules are thin
+    /// structures the matte under-covers, so the dedicated rule channel (ch2) is what makes them
+    /// erase. Just the matte when there's no rule channel (legacy/bold models).
+    pub fn erase_mask(&self) -> GrayImage {
+        let Some(rule) = self.rule.as_ref() else {
+            return self.matte.clone();
+        };
+        let mut buf = self.matte.as_raw().clone();
+        for (m, r) in buf.iter_mut().zip(rule.iter()) {
+            *m = (*m).max(*r);
+        }
+        GrayImage::from_raw(self.matte.width(), self.matte.height(), buf)
+            .unwrap_or_else(|| self.matte.clone())
+    }
+
     /// Mean bold probability (0..1) over the strip's ink pixels — the per-line weight
     /// estimate the caller thresholds (≈0.65). `None` when there is no bold channel
     /// (legacy matte-only model) or too little ink to be reliable.
@@ -282,9 +303,12 @@ impl InkStrip {
         let core = translator_raster::text_metrics::stroke_core_cut(
             self.matte.iter().copied().max().unwrap_or(0),
         );
+        // Exclude rule (under/strike/over) pixels: they're non-glyph ink, so their stroke-width
+        // reading is meaningless and would drag the per-line bold estimate.
+        let rule = self.rule.as_ref().map(|r| r.as_raw());
         let (mut sum, mut n) = (0u64, 0u64);
-        for (m, b) in self.matte.iter().zip(bold.iter()) {
-            if *m >= core {
+        for (i, (m, b)) in self.matte.iter().zip(bold.iter()).enumerate() {
+            if *m >= core && rule.map_or(true, |r| r[i] <= 127) {
                 sum += *b as u64;
                 n += 1;
             }
@@ -557,9 +581,9 @@ impl PpocrEngine {
                 if o.len() < nb * plane {
                     return Vec::new();
                 }
-                // Output is [nb, chans, h, bw]: chans=1 for the legacy matte-only model,
-                // 2 for the bold model (ch0=matte, ch1=bold). Each strip's planes are
-                // contiguous, so a strip's ch0 starts at slot*chans*plane.
+                // Output is [nb, chans, h, bw]: chans=1 legacy matte-only, 2 = +bold (ch1),
+                // 3 = +rule (ch2, under/strike/over). Each strip's planes are contiguous, so a
+                // strip's ch0 starts at slot*chans*plane and chan c at +c*plane.
                 let chans = o.len() / (nb * plane);
                 idxs.iter()
                     .enumerate()
@@ -568,6 +592,7 @@ impl PpocrEngine {
                         let sbase = slot * chans * plane;
                         let mut matte = vec![0u8; (h * tw) as usize];
                         let mut bold = (chans >= 2).then(|| vec![0u8; (h * tw) as usize]);
+                        let mut rule = (chans >= 3).then(|| vec![0u8; (h * tw) as usize]);
                         for y in 0..h {
                             for x in 0..tw {
                                 let i = (y * bw + x) as usize;
@@ -576,16 +601,21 @@ impl PpocrEngine {
                                 if let Some(b) = bold.as_mut() {
                                     b[o_i] = sigmoid_u8(o[sbase + plane + i]);
                                 }
+                                if let Some(r) = rule.as_mut() {
+                                    r[o_i] = sigmoid_u8(o[sbase + 2 * plane + i]);
+                                }
                             }
                         }
                         let matte = GrayImage::from_raw(tw, h, matte)?;
                         let bold = bold.and_then(|b| GrayImage::from_raw(tw, h, b));
+                        let rule = rule.and_then(|r| GrayImage::from_raw(tw, h, r));
                         let src_map = prepared[j].2.cloned();
                         Some((
                             box_idx,
                             InkStrip {
                                 matte,
                                 bold,
+                                rule,
                                 src_map,
                             },
                         ))
