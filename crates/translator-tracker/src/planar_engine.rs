@@ -2326,6 +2326,10 @@ pub fn render_text_overlay_bitmap(
                 oriented_box: text_box,
                 word_rects: vec![bbox.clone()],
                 background_argb: it.bg_argb,
+                foreground: vec![translator_core::ocr::LineColorStop {
+                    at: 0.0,
+                    argb: it.fg_argb,
+                }],
             };
             PreparedTextBlock {
                 source_text: it.source_text.clone(),
@@ -2339,7 +2343,6 @@ pub fn render_text_overlay_bitmap(
                 style_spans: translator_core::ocr::style_spans_from_styles(
                     it.translated_text.len(),
                     &[],
-                    it.fg_argb,
                 ),
             }
         })

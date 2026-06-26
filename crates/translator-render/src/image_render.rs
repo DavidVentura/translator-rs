@@ -20,7 +20,7 @@ use crate::font_provider::{FontHandle, FontProvider, FontRequest};
 use crate::text_shape::{self, DirRun, ShapedGlyph, segment_runs};
 use translator_core::ocr::{
     LineDecoration, OrientedRect, OverlayLayoutMode, PositionedWord, PreparedImageOverlay,
-    PreparedTextBlock,
+    PreparedTextBlock, PreparedTextLine,
 };
 use translator_core::script::Script;
 
@@ -715,14 +715,22 @@ fn block_bold_spans(block: &PreparedTextBlock) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// The block's text colour. Colour is one-per-block today (the style spans all carry it); the
-/// span carrier lets it become per-run later without touching the renderer's interface.
-fn block_color(block: &PreparedTextBlock) -> u32 {
+/// A block-level fallback colour from the first line's geometric core. Used by the vertical layout,
+/// which wraps text freely into columns with no per-source-line correspondence to colour from.
+fn block_core_color(block: &PreparedTextBlock) -> u32 {
     block
-        .style_spans
+        .lines
         .first()
-        .map(|s| s.foreground_argb)
+        .and_then(|l| translator_core::ocr::sample_line_color(&l.foreground, 0.5))
         .unwrap_or(0xFF00_0000)
+}
+
+/// The colour an output line draws in: the source line's geometric core, falling back to the
+/// block core when this line carries no sampled colour. A span `foreground` override (emphasis /
+/// PDF) is applied per byte at draw time, not here.
+fn line_core_color(source_line: &PreparedTextLine, block: &PreparedTextBlock) -> u32 {
+    translator_core::ocr::sample_line_color(&source_line.foreground, 0.5)
+        .unwrap_or_else(|| block_core_color(block))
 }
 
 /// Decorated spans of `block.style_spans`, rebased onto the trimmed translated string (same
@@ -802,7 +810,7 @@ fn layout_per_line(
         .map(|(text, pl)| LaidLine {
             text,
             oriented: pl.oriented_box,
-            foreground_argb: block_color(block),
+            foreground_argb: line_core_color(pl, block),
         })
         .collect();
     Some(BlockLayout { size, bold, lines })
@@ -880,7 +888,7 @@ fn layout_vertical(
             LaidLine {
                 text,
                 oriented,
-                foreground_argb: block_color(block),
+                foreground_argb: block_core_color(block),
             }
         })
         .collect();
@@ -2027,6 +2035,10 @@ mod word_box_tests {
             oriented_box: oriented,
             word_rects: Vec::new(),
             background_argb: 0xFFFF_FFFF,
+            foreground: vec![translator_core::ocr::LineColorStop {
+                at: 0.0,
+                argb: 0xFF00_0000,
+            }],
         };
         let block = PreparedTextBlock {
             source_text: text.to_string(),
@@ -2045,7 +2057,6 @@ mod word_box_tests {
                     end: 4,
                     kind: StyleKind::Bold,
                 }],
-                0xFF00_0000,
             ),
         };
         let prepared = PreparedImageOverlay {

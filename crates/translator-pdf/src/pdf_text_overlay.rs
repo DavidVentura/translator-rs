@@ -484,8 +484,15 @@ fn pad_user_rect(r: UserRect, pad: f32) -> UserRect {
 fn block_foreground(block: &PreparedTextBlock) -> u32 {
     block
         .style_spans
-        .first()
-        .map_or(0xFF00_0000, |s| s.foreground_argb)
+        .iter()
+        .find_map(|s| s.foreground)
+        .or_else(|| {
+            block
+                .lines
+                .first()
+                .and_then(|l| translator_core::ocr::sample_line_color(&l.foreground, 0.5))
+        })
+        .unwrap_or(0xFF00_0000)
 }
 
 fn argb_to_rgb(argb: u32) -> (f32, f32, f32) {

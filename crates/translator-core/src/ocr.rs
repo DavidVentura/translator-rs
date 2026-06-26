@@ -309,30 +309,28 @@ pub enum LineDecoration {
 }
 
 /// A byte range `[start, end)` of `translated_text` (or a source string) with constant style:
-/// weight, colour, and line decoration. Spans tile the text — every byte is in exactly one —
-/// and the renderer draws each run with these attributes. Generalises the former parallel
-/// `bold_ranges` + per-line colour: bold is a span flag, colour is per-span (adjacent words can
-/// differ; for now the line's single colour is copied onto its spans), decoration is the rule.
+/// weight, decoration, and an optional colour *override*. Spans tile the text — every byte is in
+/// exactly one. `foreground` is `None` when the run takes the line's geometric core colour (the
+/// common image-overlay case — colour there is a per-line geometric property, not a per-token
+/// one); `Some(argb)` is an explicit override, for the PDF's true per-run colours and (later) an
+/// emphasis colour carried through alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct StyleSpan {
     pub start: u32,
     pub end: u32,
     pub bold: bool,
-    pub foreground_argb: u32,
+    pub foreground: Option<u32>,
     pub decoration: Option<LineDecoration>,
 }
 
-/// Build style spans tiling `[0, text_len)` from per-word [`StyleRange`]s plus one colour (the
-/// per-line/block colour today; per-span colour later). Bold and decoration ranges may overlap;
-/// the text is split at every range boundary and each resulting tile records whether a Bold range
-/// covers it and which decoration (if any) does. Plain gaps get spans too, so every byte is
-/// covered. Adjacent tiles with identical attributes are coalesced.
-pub fn style_spans_from_styles(
-    text_len: usize,
-    ranges: &[StyleRange],
-    foreground_argb: u32,
-) -> Vec<StyleSpan> {
+/// Build style spans tiling `[0, text_len)` from per-word [`StyleRange`]s. Bold and decoration
+/// ranges may overlap; the text is split at every range boundary and each resulting tile records
+/// whether a Bold range covers it and which decoration (if any) does. Plain gaps get spans too,
+/// so every byte is covered. Adjacent tiles with identical attributes are coalesced. `foreground`
+/// is `None` — image-overlay colour is the line's geometric core, applied at render; a per-run
+/// colour override is set separately (PDF) or carried later as an emphasis range.
+pub fn style_spans_from_styles(text_len: usize, ranges: &[StyleRange]) -> Vec<StyleSpan> {
     let len = text_len as u32;
     if len == 0 {
         return Vec::new();
@@ -375,7 +373,7 @@ pub fn style_spans_from_styles(
             start: s,
             end: e,
             bold: covers(s, e, StyleKind::Bold),
-            foreground_argb,
+            foreground: None,
             decoration: decoration_at(s, e),
         };
         match spans.last_mut() {
@@ -392,6 +390,53 @@ pub fn style_spans_from_styles(
     spans
 }
 
+/// One control point of a line's geometric core colour, at reading-axis fraction `at` in `[0, 1]`.
+/// The core colour is the line's ink colour as it sits on the page — a geometric property of
+/// *where* the text is drawn (illumination, region), not of the token, so it never crosses the
+/// translation. One stop is a flat line colour; more stops interpolate a gradient along the line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct LineColorStop {
+    pub at: f32,
+    pub argb: u32,
+}
+
+/// Sample a line's core colour field at reading-axis fraction `frac`. `None` for an empty field
+/// (no geometric colour — the caller falls back). One stop is constant; otherwise the bracketing
+/// stops are linearly interpolated per channel.
+pub fn sample_line_color(stops: &[LineColorStop], frac: f32) -> Option<u32> {
+    match stops {
+        [] => None,
+        [only] => Some(only.argb),
+        _ => {
+            let f = frac.clamp(0.0, 1.0);
+            let hi = stops
+                .iter()
+                .position(|s| s.at >= f)
+                .unwrap_or(stops.len() - 1);
+            if hi == 0 {
+                return Some(stops[0].argb);
+            }
+            let (a, b) = (&stops[hi - 1], &stops[hi]);
+            let span = (b.at - a.at).max(f32::EPSILON);
+            Some(lerp_argb(
+                a.argb,
+                b.argb,
+                ((f - a.at) / span).clamp(0.0, 1.0),
+            ))
+        }
+    }
+}
+
+fn lerp_argb(a: u32, b: u32, t: f32) -> u32 {
+    let mix = |sh: u32| {
+        let ca = ((a >> sh) & 0xFF) as f32;
+        let cb = ((b >> sh) & 0xFF) as f32;
+        ((ca + (cb - ca) * t).round() as u32 & 0xFF) << sh
+    };
+    mix(24) | mix(16) | mix(8) | mix(0)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextLine {
@@ -405,6 +450,10 @@ pub struct PreparedTextLine {
     /// before drawing the translation. Not a text-style attribute (the image overlay erases via
     /// the ink matte, not a flat fill), so it stays off `StyleSpan`. Image path ignores it.
     pub background_argb: u32,
+    /// Geometric core colour along the line (reading-axis fraction → colour). The renderer colours
+    /// this output line from its source line's field, overridden per byte by a span's
+    /// `foreground`. One stop today; a gradient later. Empty for paths with no sampled ink colour.
+    pub foreground: Vec<LineColorStop>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3303,7 +3352,7 @@ mod tests {
                 kind: StyleKind::Decoration(LineDecoration::Underline),
             },
         ];
-        let spans = style_spans_from_styles(8, &ranges, 0xFF00_0000);
+        let spans = style_spans_from_styles(8, &ranges);
         let summary: Vec<(u32, u32, bool, Option<LineDecoration>)> = spans
             .iter()
             .map(|s| (s.start, s.end, s.bold, s.decoration))
@@ -3333,7 +3382,7 @@ mod tests {
                 kind: StyleKind::Bold,
             },
         ];
-        let spans = style_spans_from_styles(6, &ranges, 0xFF00_0000);
+        let spans = style_spans_from_styles(6, &ranges);
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].start, spans[0].end, spans[0].bold), (0, 4, true));
         assert_eq!((spans[1].start, spans[1].end, spans[1].bold), (4, 6, false));
