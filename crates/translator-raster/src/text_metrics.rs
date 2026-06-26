@@ -85,15 +85,12 @@ const RULE_MIN_PX: u64 = 10;
 const RULE_MIN_COVERAGE: f32 = 0.45;
 /// Minimum core-ink pixels a word's colour histogram needs before its colour is trusted.
 const EMPHASIS_MIN_PX: u64 = 8;
-/// Per-channel distance (0..255) from the line's dominant ink at which a word counts as a
-/// differently-coloured emphasis run. Above letter-spacing/JPEG colour jitter, below a real hue
-/// change (a red or blue word against black body clears it easily).
-const EMPHASIS_DIST: u32 = 60;
-/// Minimum chroma (max−min channel) for a run to be emphasis. Emphasis is a *coloured* word; a
-/// grey/white outlier is either a matte artifact (background bleeding into the sample) or shading
-/// the geometric per-line core already handles — and rendering a near-white "emphasis" on a light
-/// page is invisible. Gating on chroma keeps real hues (red/blue/green) and drops those.
-const EMPHASIS_MIN_CHROMA: u32 = 45;
+/// Chromatic (luminance-invariant) distance from the line's dominant ink at which a word counts as
+/// a differently-coloured emphasis run. Measured in opponent channels (R−G, G−B), so a word that
+/// differs only in *brightness* — shadow, lighting, a lighter mis-sample — never qualifies (that's
+/// the geometric per-line core's job); only a genuine *hue* change does. Above sensor/JPEG chroma
+/// noise (~±15 per opponent channel), well below a real red/blue/green word (≈150+).
+const EMPHASIS_CHROMA_DIST: u32 = 60;
 
 /// Per-reading-axis-column reduction of an ink strip's bold channel: for each strip column,
 /// the matte-gated sum of the bold channel and the count of ink pixels, prefix-summed so any
@@ -540,18 +537,23 @@ fn window_ink_color(
     (n >= EMPHASIS_MIN_PX).then(|| argb((r / n) as u8, (g / n) as u8, (b / n) as u8))
 }
 
-fn channel_max_dist(a: u32, b: u32) -> u32 {
-    [16u32, 8, 0]
-        .into_iter()
-        .map(|sh| ((a >> sh) & 0xFF).abs_diff((b >> sh) & 0xFF))
-        .max()
-        .unwrap_or(0)
+/// Opponent-colour channels `(R−G, G−B)` — a cheap luminance-invariant signature. Grey/white/black
+/// all map near `(0, 0)` regardless of brightness; a saturated hue lands far from the origin.
+fn opponent(c: u32) -> (i32, i32) {
+    let (r, g, b) = (
+        ((c >> 16) & 0xFF) as i32,
+        ((c >> 8) & 0xFF) as i32,
+        (c & 0xFF) as i32,
+    );
+    (r - g, g - b)
 }
 
-/// Chroma = max−min channel. Zero for grey/white/black; high for a saturated hue.
-fn chroma(c: u32) -> u32 {
-    let ch: [u32; 3] = [(c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF];
-    ch.iter().max().unwrap() - ch.iter().min().unwrap()
+/// Chromatic distance: L1 distance in opponent space. Insensitive to brightness, so it fires on a
+/// hue change (red word vs black body) but not on shading (a darker word, same hue).
+fn chromatic_dist(a: u32, b: u32) -> u32 {
+    let (a0, a1) = opponent(a);
+    let (b0, b1) = opponent(b);
+    ((a0 - b0).abs() + (a1 - b1).abs()) as u32
 }
 
 /// Per-run emphasis colours `(byte_start, byte_end, argb)`: maximal runs of consecutive non-space
@@ -590,7 +592,7 @@ pub fn word_emphasis_colors(
     let is_outlier = |i: usize| {
         let (lo, hi) = (edge[i].min(edge[i + 1]), edge[i].max(edge[i + 1]));
         window_ink_color(matte, src_map, source, core, lo, hi)
-            .is_some_and(|c| channel_max_dist(c, line_color) > EMPHASIS_DIST)
+            .is_some_and(|c| chromatic_dist(c, line_color) > EMPHASIS_CHROMA_DIST)
     };
     let mut out = Vec::new();
     let mut i = 0;
@@ -603,10 +605,10 @@ pub fn word_emphasis_colors(
         while i + 1 < n && !chars[i + 1].is_whitespace() && is_outlier(i + 1) {
             i += 1;
         }
-        // The run's colour from one pooled window over its whole extent (robust to per-char noise).
-        // Emit only a chromatic run — a grey/white outlier is a matte artifact, not emphasis.
+        // The run's colour from one pooled window over its whole extent (robust to per-char noise),
+        // confirmed chromatic against the line dominant so a brightness-only run never slips through.
         if let Some(rc) = window_ink_color(matte, src_map, source, core, edge[start], edge[i + 1]) {
-            if chroma(rc) >= EMPHASIS_MIN_CHROMA {
+            if chromatic_dist(rc, line_color) > EMPHASIS_CHROMA_DIST {
                 out.push((byte[start] as u32, byte[i + 1] as u32, rc));
             }
         }
@@ -1152,6 +1154,26 @@ mod tests {
         assert!(
             r > 150 && g < 80 && b < 80,
             "expected red emphasis, got ({r},{g},{b})"
+        );
+    }
+
+    #[test]
+    fn word_emphasis_ignores_brightness_only_differences() {
+        // Same hue throughout (grey), but "bb" is much darker than "aa" — a lighting/shadow
+        // difference, not a colour one. Emphasis is chromatic, so nothing should fire.
+        let matte = GrayImage::from_pixel(100, 20, image::Luma([255]));
+        let src_map: Vec<(f32, f32)> = (0..20)
+            .flat_map(|y| (0..100).map(move |x| (x as f32, y as f32)))
+            .collect();
+        let source = RgbaImage::from_fn(100, 20, |x, _| {
+            let v = if (44..72).contains(&x) { 40 } else { 170 };
+            image::Rgba([v, v, v, 255])
+        });
+        let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
+        let out = word_emphasis_colors("aa bb", &firings, &matte, &src_map, &source);
+        assert!(
+            out.is_empty(),
+            "brightness-only difference must not be emphasis: {out:?}"
         );
     }
 
