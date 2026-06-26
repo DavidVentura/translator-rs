@@ -89,6 +89,11 @@ const EMPHASIS_MIN_PX: u64 = 8;
 /// differently-coloured emphasis run. Above letter-spacing/JPEG colour jitter, below a real hue
 /// change (a red or blue word against black body clears it easily).
 const EMPHASIS_DIST: u32 = 60;
+/// Minimum chroma (max−min channel) for a run to be emphasis. Emphasis is a *coloured* word; a
+/// grey/white outlier is either a matte artifact (background bleeding into the sample) or shading
+/// the geometric per-line core already handles — and rendering a near-white "emphasis" on a light
+/// page is invisible. Gating on chroma keeps real hues (red/blue/green) and drops those.
+const EMPHASIS_MIN_CHROMA: u32 = 45;
 
 /// Per-reading-axis-column reduction of an ink strip's bold channel: for each strip column,
 /// the matte-gated sum of the bold channel and the count of ink pixels, prefix-summed so any
@@ -543,6 +548,12 @@ fn channel_max_dist(a: u32, b: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// Chroma = max−min channel. Zero for grey/white/black; high for a saturated hue.
+fn chroma(c: u32) -> u32 {
+    let ch: [u32; 3] = [(c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF];
+    ch.iter().max().unwrap() - ch.iter().min().unwrap()
+}
+
 /// Per-run emphasis colours `(byte_start, byte_end, argb)`: maximal runs of consecutive non-space
 /// characters whose ink colour is an outlier from the line's *dominant* ink (the mode over the
 /// whole line, so a minority coloured word doesn't move it). Works per character — firings are 1:1
@@ -593,8 +604,11 @@ pub fn word_emphasis_colors(
             i += 1;
         }
         // The run's colour from one pooled window over its whole extent (robust to per-char noise).
+        // Emit only a chromatic run — a grey/white outlier is a matte artifact, not emphasis.
         if let Some(rc) = window_ink_color(matte, src_map, source, core, edge[start], edge[i + 1]) {
-            out.push((byte[start] as u32, byte[i + 1] as u32, rc));
+            if chroma(rc) >= EMPHASIS_MIN_CHROMA {
+                out.push((byte[start] as u32, byte[i + 1] as u32, rc));
+            }
         }
         i += 1;
     }
