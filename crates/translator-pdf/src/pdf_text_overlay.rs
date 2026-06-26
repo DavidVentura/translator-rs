@@ -266,11 +266,20 @@ fn emit_per_line(
         return;
     }
     let translated_lines = redistribute_lines(block_translated, line_count);
+    let foreground_argb = block_foreground(block);
     for (line, src_line) in translated_lines.iter().zip(block.lines.iter()) {
         if line.is_empty() {
             continue;
         }
-        emit_line(builder, line, src_line, page, metrics, embed);
+        emit_line(
+            builder,
+            line,
+            src_line,
+            page,
+            metrics,
+            embed,
+            foreground_argb,
+        );
     }
 }
 
@@ -310,7 +319,7 @@ fn emit_block_rect(
     let baseline_x = user_rect.x0;
     let mut baseline_y = user_rect.y1 - font_size;
 
-    let (r, g, b) = argb_to_rgb(block.foreground_argb);
+    let (r, g, b) = argb_to_rgb(block_foreground(block));
     builder.set_fill_rgb(r, g, b);
     builder.begin_text();
     let resource_name: &[u8] = match embed {
@@ -344,6 +353,7 @@ fn emit_line(
     page: &OverlayPage,
     metrics: &FontMetrics,
     embed: Option<&EmbeddedFont>,
+    foreground_argb: u32,
 ) {
     let user_rect = pixel_rect_to_user(src_line.bounding_box, page);
     if !user_rect_is_drawable(user_rect) {
@@ -366,7 +376,7 @@ fn emit_line(
     // baseline = bbox_top - 0.7 × font_size.
     let baseline_y = user_rect.y1 - font_size * 0.7;
 
-    let (r, g, b) = argb_to_rgb(src_line.foreground_argb);
+    let (r, g, b) = argb_to_rgb(foreground_argb);
     builder.set_fill_rgb(r, g, b);
     builder.begin_text();
     let resource_name: &[u8] = match embed {
@@ -469,6 +479,13 @@ fn pad_user_rect(r: UserRect, pad: f32) -> UserRect {
         x1: r.x1 + pad,
         y1: r.y1 + pad,
     }
+}
+
+fn block_foreground(block: &PreparedTextBlock) -> u32 {
+    block
+        .style_spans
+        .first()
+        .map_or(0xFF00_0000, |s| s.foreground_argb)
 }
 
 fn argb_to_rgb(argb: u32) -> (f32, f32, f32) {

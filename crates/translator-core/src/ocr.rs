@@ -212,7 +212,6 @@ pub struct DetectedWord {
 /// `[0, len)` means the whole string is bold. Carries per-word weight through grouping and
 /// translation so the overlay can render mixed-weight lines, not one bold flag per block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct BoldRange {
     pub start: u32,
     pub end: u32,
@@ -259,7 +258,6 @@ pub struct TextBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OverlayColors {
     pub background_argb: u32,
     pub foreground_argb: u32,
@@ -272,8 +270,71 @@ pub struct OverlayLayoutHints {
     pub suggested_font_size_px: f32,
 }
 
+/// A line decoration that runs along the text rather than being part of a glyph: an
+/// under/strike/over-line. Carried per-span (only the hyperlink portion of a line is
+/// underlined, etc.) so the overlay reproduces it on the matching translated run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineDecoration {
+    Underline,
+    Strikethrough,
+    Overline,
+}
+
+/// A byte range `[start, end)` of `translated_text` (or a source string) with constant style:
+/// weight, colour, and line decoration. Spans tile the text — every byte is in exactly one —
+/// and the renderer draws each run with these attributes. Generalises the former parallel
+/// `bold_ranges` + per-line colour: bold is a span flag, colour is per-span (adjacent words can
+/// differ; for now the line's single colour is copied onto its spans), decoration is the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleSpan {
+    pub start: u32,
+    pub end: u32,
+    pub bold: bool,
+    pub foreground_argb: u32,
+    pub decoration: Option<LineDecoration>,
+}
+
+/// Build style spans tiling `[0, text_len)` from bold byte ranges plus one colour (the per-line/
+/// block colour today; per-span colour later). Non-bold gaps get spans too, so every byte is
+/// covered. Decoration is `None` here — the rule-channel pass fills it once wired.
+pub fn style_spans_from_bold(
+    text_len: usize,
+    bold: &[BoldRange],
+    foreground_argb: u32,
+) -> Vec<StyleSpan> {
+    let len = text_len as u32;
+    let mk = |start: u32, end: u32, bold: bool| StyleSpan {
+        start,
+        end,
+        bold,
+        foreground_argb,
+        decoration: None,
+    };
+    let mut bolds: Vec<(u32, u32)> = bold
+        .iter()
+        .map(|r| (r.start.min(len), r.end.min(len)))
+        .filter(|(s, e)| s < e)
+        .collect();
+    bolds.sort_by_key(|r| r.0);
+    let mut spans = Vec::new();
+    let mut cur = 0u32;
+    for (s, e) in bolds {
+        if s > cur {
+            spans.push(mk(cur, s, false));
+        }
+        spans.push(mk(s.max(cur), e, true));
+        cur = e.max(cur);
+    }
+    if cur < len {
+        spans.push(mk(cur, len, false));
+    }
+    if spans.is_empty() && len > 0 {
+        spans.push(mk(0, len, false));
+    }
+    spans
+}
+
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextLine {
     pub text: String,
     pub bounding_box: Rect,
@@ -281,24 +342,23 @@ pub struct PreparedTextLine {
     /// `TextLine::oriented_box`.
     pub oriented_box: OrientedRect,
     pub word_rects: Vec<Rect>,
+    /// Mask/erase colour for the PDF overlay, which paints a filled rect over the original text
+    /// before drawing the translation. Not a text-style attribute (the image overlay erases via
+    /// the ink matte, not a flat fill), so it stays off `StyleSpan`. Image path ignores it.
     pub background_argb: u32,
-    pub foreground_argb: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PreparedTextBlock {
     pub source_text: String,
     pub translated_text: String,
     pub bounding_box: Rect,
     pub lines: Vec<PreparedTextLine>,
     pub layout_hints: OverlayLayoutHints,
-    pub background_argb: u32,
-    pub foreground_argb: u32,
-    /// Bold byte ranges within `translated_text` — per-word weight carried through
-    /// translation (empty = not bold; `[0, len)` = whole block bold). The renderer splits
-    /// each line into bold/regular runs on these.
-    pub bold_ranges: Vec<BoldRange>,
+    /// Style spans over `translated_text` (weight + colour + decoration per run), tiling the
+    /// text. The renderer splits each line's text on these. Replaces the old `bold_ranges` +
+    /// per-line/block colour fields.
+    pub style_spans: Vec<StyleSpan>,
 }
 
 /// One selectable word with its position on the image, in image-pixel space. Emitted for

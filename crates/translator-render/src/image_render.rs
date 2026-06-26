@@ -695,22 +695,33 @@ struct BlockLayout {
     lines: Vec<LaidLine>,
 }
 
-/// Block bold spans rebased onto the trimmed translated string (`block.bold_ranges` index the
-/// untrimmed text). A whole-bold block is one `[0, len)` span.
+/// Bold spans of `block.style_spans`, rebased onto the trimmed translated string (style spans
+/// index the untrimmed text). A whole-bold block is one `[0, len)` span.
 fn block_bold_spans(block: &PreparedTextBlock) -> Vec<(usize, usize)> {
     let translated = block.translated_text.trim();
     let trim_lead = block.translated_text.len() - block.translated_text.trim_start().len();
     block
-        .bold_ranges
+        .style_spans
         .iter()
-        .filter_map(|r| {
-            let s = (r.start as usize).saturating_sub(trim_lead);
-            let e = (r.end as usize)
+        .filter(|s| s.bold)
+        .filter_map(|s| {
+            let start = (s.start as usize).saturating_sub(trim_lead);
+            let end = (s.end as usize)
                 .saturating_sub(trim_lead)
                 .min(translated.len());
-            (s < e).then_some((s, e))
+            (start < end).then_some((start, end))
         })
         .collect()
+}
+
+/// The block's text colour. Colour is one-per-block today (the style spans all carry it); the
+/// span carrier lets it become per-run later without touching the renderer's interface.
+fn block_color(block: &PreparedTextBlock) -> u32 {
+    block
+        .style_spans
+        .first()
+        .map(|s| s.foreground_argb)
+        .unwrap_or(0xFF00_0000)
 }
 
 /// Horizontal layout: re-flow the block's translated text across its OCR-provided per-line
@@ -770,7 +781,7 @@ fn layout_per_line(
         .map(|(text, pl)| LaidLine {
             text,
             oriented: pl.oriented_box,
-            foreground_argb: pl.foreground_argb,
+            foreground_argb: block_color(block),
         })
         .collect();
     Some(BlockLayout { size, bold, lines })
@@ -793,7 +804,7 @@ fn layout_vertical(
     }
     let language = &opts.language;
     // Vertical CJK keeps one weight per block (no per-glyph runs); bold if any run is bold.
-    let bold = !block.bold_ranges.is_empty();
+    let bold = block.style_spans.iter().any(|s| s.bold);
     let mut size = block
         .layout_hints
         .suggested_font_size_px
@@ -848,7 +859,7 @@ fn layout_vertical(
             LaidLine {
                 text,
                 oriented,
-                foreground_argb: block.foreground_argb,
+                foreground_argb: block_color(block),
             }
         })
         .collect();
@@ -1894,7 +1905,6 @@ mod word_box_tests {
             oriented_box: oriented,
             word_rects: Vec::new(),
             background_argb: 0xFFFF_FFFF,
-            foreground_argb: 0xFF00_0000,
         };
         let block = PreparedTextBlock {
             source_text: text.to_string(),
@@ -1905,10 +1915,12 @@ mod word_box_tests {
                 layout_mode: OverlayLayoutMode::PerLine,
                 suggested_font_size_px: 40.0,
             },
-            background_argb: 0xFFFF_FFFF,
-            foreground_argb: 0xFF00_0000,
             // "Aaaa" (bytes 0..4) bold; the rest regular.
-            bold_ranges: vec![BoldRange { start: 0, end: 4 }],
+            style_spans: translator_core::ocr::style_spans_from_bold(
+                text.len(),
+                &[BoldRange { start: 0, end: 4 }],
+                0xFF00_0000,
+            ),
         };
         let prepared = PreparedImageOverlay {
             rgba_bytes: vec![0xFF; (w * h * 4) as usize], // opaque white

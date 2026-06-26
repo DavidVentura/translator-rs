@@ -2721,16 +2721,7 @@ fn build_block_text_block(
     let lines: Vec<PreparedTextLine> = local
         .iter()
         .enumerate()
-        .map(|(i, v)| {
-            // Per-line ink colour from this line's own strip: a block that spans a
-            // light→shadow gradient needs each line coloured independently, else a
-            // single block colour is unreadable on the lighter or darker lines.
-            let foreground_argb = spec
-                .matted_strips
-                .get(i)
-                .and_then(|m| m.as_ref())
-                .map(|s| s.fg_argb)
-                .unwrap_or(block_fallback_fg);
+        .map(|(_i, v)| {
             let text_box = OrientedRect {
                 cx: v.cx,
                 cy: v.cy,
@@ -2755,7 +2746,6 @@ fn build_block_text_block(
                 oriented_box: text_box,
                 word_rects: vec![bbox],
                 background_argb: 0,
-                foreground_argb,
             }
         })
         .collect();
@@ -2775,9 +2765,11 @@ fn build_block_text_block(
             layout_mode: OverlayLayoutMode::PerLine,
             suggested_font_size_px: suggested_font_px,
         },
-        background_argb: 0,
-        foreground_argb: block_fallback_fg,
-        bold_ranges: spec.bold_ranges.clone(),
+        style_spans: translator_core::ocr::style_spans_from_bold(
+            spec.display_text.len(),
+            &spec.bold_ranges,
+            block_fallback_fg,
+        ),
     })
 }
 

@@ -2326,7 +2326,6 @@ pub fn render_text_overlay_bitmap(
                 oriented_box: text_box,
                 word_rects: vec![bbox.clone()],
                 background_argb: it.bg_argb,
-                foreground_argb: it.fg_argb,
             };
             PreparedTextBlock {
                 source_text: it.source_text.clone(),
@@ -2337,9 +2336,11 @@ pub fn render_text_overlay_bitmap(
                     layout_mode: OverlayLayoutMode::PerLine,
                     suggested_font_size_px: it.suggested_font_px.max(6.0),
                 },
-                background_argb: it.bg_argb,
-                foreground_argb: it.fg_argb,
-                bold_ranges: Vec::new(),
+                style_spans: translator_core::ocr::style_spans_from_bold(
+                    it.translated_text.len(),
+                    &[],
+                    it.fg_argb,
+                ),
             }
         })
         .collect();

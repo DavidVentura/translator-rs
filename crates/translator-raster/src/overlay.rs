@@ -196,7 +196,6 @@ pub fn prepare_overlay_image(
                     ReadingOrder::LeftToRight => {
                         let mut prepared_lines = Vec::with_capacity(block.lines.len());
                         let mut patches = Vec::with_capacity(block.lines.len());
-                        let mut block_background = argb(255, 255, 255);
                         let mut block_foreground = argb(0, 0, 0);
                         for (li, line) in block.lines.iter().enumerate() {
                             let (colors, patch) = erase_text_region(
@@ -207,7 +206,6 @@ pub fn prepare_overlay_image(
                             );
                             patches.push(patch);
                             if li == 0 {
-                                block_background = colors.background_argb;
                                 block_foreground = colors.foreground_argb;
                             }
                             prepared_lines.push(PreparedTextLine {
@@ -216,7 +214,6 @@ pub fn prepare_overlay_image(
                                 oriented_box: line.oriented_box,
                                 word_rects: line.word_rects.clone(),
                                 background_argb: colors.background_argb,
-                                foreground_argb: colors.foreground_argb,
                             });
                         }
                         let prepared = PreparedTextBlock {
@@ -225,9 +222,11 @@ pub fn prepare_overlay_image(
                             bounding_box: block_bounds,
                             lines: prepared_lines,
                             layout_hints,
-                            background_argb: block_background,
-                            foreground_argb: block_foreground,
-                            bold_ranges,
+                            style_spans: translator_core::ocr::style_spans_from_bold(
+                                translated_text.len(),
+                                &bold_ranges,
+                                block_foreground,
+                            ),
                         };
                         (prepared, patches)
                     }
@@ -250,7 +249,6 @@ pub fn prepare_overlay_image(
                                 oriented_box: line.oriented_box,
                                 word_rects: line.word_rects.clone(),
                                 background_argb: colors.background_argb,
-                                foreground_argb: colors.foreground_argb,
                             })
                             .collect();
                         let prepared = PreparedTextBlock {
@@ -259,9 +257,11 @@ pub fn prepare_overlay_image(
                             bounding_box: block_bounds,
                             lines: prepared_lines,
                             layout_hints,
-                            background_argb: colors.background_argb,
-                            foreground_argb: colors.foreground_argb,
-                            bold_ranges,
+                            style_spans: translator_core::ocr::style_spans_from_bold(
+                                translated_text.len(),
+                                &bold_ranges,
+                                colors.foreground_argb,
+                            ),
                         };
                         (prepared, vec![patch])
                     }
@@ -376,7 +376,10 @@ mod tests {
         );
         assert_eq!(erased_pixel, 0xFFFF_FFFF);
         assert_eq!(prepared.blocks[0].lines.len(), 2);
-        assert_eq!(prepared.blocks[0].lines[0].foreground_argb, 0xFF00_0000);
+        assert_eq!(
+            prepared.blocks[0].style_spans[0].foreground_argb,
+            0xFF00_0000
+        );
         assert_eq!(
             prepared.blocks[0].layout_hints.layout_mode,
             OverlayLayoutMode::PerLine
@@ -421,14 +424,13 @@ mod tests {
             None,
         )
         .expect("overlay should prepare");
-        assert_eq!(
-            prepared.blocks[0].bold_ranges,
-            vec![translator_core::ocr::BoldRange { start: 0, end: 1 }],
-            "bold range carried to the prepared block"
+        assert!(
+            prepared.blocks[0].style_spans.iter().any(|s| s.bold),
+            "bold range carried into the prepared block's style spans"
         );
         assert!(
-            prepared.blocks[1].bold_ranges.is_empty(),
-            "regular block has no bold ranges"
+            !prepared.blocks[1].style_spans.iter().any(|s| s.bold),
+            "regular block has no bold style spans"
         );
     }
 
@@ -475,6 +477,9 @@ mod tests {
         let idx = ((2 * width + 3) * 4) as usize;
         let erased = u32::from_ne_bytes(prepared.rgba_bytes[idx..idx + 4].try_into().unwrap());
         assert_eq!(erased, 0xFF00_0000);
-        assert_eq!(prepared.blocks[0].lines[0].foreground_argb, 0xFFFF_FFFF);
+        assert_eq!(
+            prepared.blocks[0].style_spans[0].foreground_argb,
+            0xFFFF_FFFF
+        );
     }
 }
