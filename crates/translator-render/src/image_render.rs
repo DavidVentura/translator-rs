@@ -753,6 +753,26 @@ fn block_decoration_spans(block: &PreparedTextBlock) -> Vec<(usize, usize, LineD
         .collect()
 }
 
+/// Emphasis colour-override spans of `block.style_spans`, rebased onto the trimmed translated
+/// string (same rebasing as [`block_bold_spans`]). Only spans with an explicit `foreground`; the
+/// rest inherit the line's geometric core at render.
+fn block_color_spans(block: &PreparedTextBlock) -> Vec<(usize, usize, u32)> {
+    let translated = block.translated_text.trim();
+    let trim_lead = block.translated_text.len() - block.translated_text.trim_start().len();
+    block
+        .style_spans
+        .iter()
+        .filter_map(|s| {
+            let argb = s.foreground?;
+            let start = (s.start as usize).saturating_sub(trim_lead);
+            let end = (s.end as usize)
+                .saturating_sub(trim_lead)
+                .min(translated.len());
+            (start < end).then_some((start, end, argb))
+        })
+        .collect()
+}
+
 /// Horizontal layout: re-flow the block's translated text across its OCR-provided per-line
 /// boxes, shrinking the font until every line fits its box width.
 fn layout_per_line(
@@ -937,6 +957,7 @@ fn render_per_line(
     let translated = block.translated_text.trim();
     let bold_spans = block_bold_spans(block);
     let decoration_spans = block_decoration_spans(block);
+    let color_spans = block_color_spans(block);
     let bold = layout.bold;
     let size = layout.size;
     let language = opts.language.clone();
@@ -963,7 +984,13 @@ fn render_per_line(
             .map(|p| span_cursor + p)
             .unwrap_or(span_cursor);
         span_cursor = line_start + line_text.len();
-        let segments = split_line_by_bold(line_text, line_start, &bold_spans);
+        let segments = split_line_by_style(
+            line_text,
+            line_start,
+            &bold_spans,
+            &color_spans,
+            line.foreground_argb,
+        );
         // Origin in image space at line-local cursor=0 along the baseline. In line-local
         // coords this point is at u=-width/2 (left edge); the v coord is chosen so the
         // glyph mass (ascent + descent) is centered on the rect's centre. For a rect
@@ -994,7 +1021,7 @@ fn render_per_line(
         let mut cum_px = vec![0.0f32; line_text.len() + 1];
         let mut acc = 0.0f32;
         let mut byte = 0usize;
-        for (seg_text, seg_bold) in &segments {
+        for (seg_text, seg_bold, seg_color) in &segments {
             let chain_fn = |script: Script, c: &mut FontCache| -> Vec<FontHandle> {
                 c.chain_for(script, *seg_bold, false, false, &language, fonts)
                     .to_vec()
@@ -1012,15 +1039,7 @@ fn render_per_line(
                 continue;
             }
             draw_shaped_line(
-                sink,
-                &seg_shape,
-                cache,
-                origin_x,
-                origin_y,
-                cos,
-                sin,
-                size,
-                line.foreground_argb,
+                sink, &seg_shape, cache, origin_x, origin_y, cos, sin, size, *seg_color,
             );
             let last = seg_shape.cum_em_at_byte.len() - 1;
             for sb in 0..=seg_len {
@@ -1135,21 +1154,31 @@ fn draw_decoration(
     }
 }
 
-/// Split a rendered line into consecutive `(text, is_bold)` runs by the block's bold byte
-/// spans (`line_start` is the line's byte offset within the trimmed translated text). A run
-/// boundary falls wherever boldness flips; coalesces same-weight chars.
-fn split_line_by_bold(
+/// Split a rendered line into consecutive `(text, is_bold, colour)` runs by the block's bold and
+/// emphasis-colour byte spans (`line_start` is the line's byte offset within the trimmed translated
+/// text). A run boundary falls wherever weight *or* colour flips; coalesces matching chars. Colour
+/// is the emphasis override where one covers the byte, otherwise the line's geometric core.
+fn split_line_by_style(
     line: &str,
     line_start: usize,
     bold: &[(usize, usize)],
-) -> Vec<(String, bool)> {
+    colors: &[(usize, usize, u32)],
+    line_core: u32,
+) -> Vec<(String, bool, u32)> {
     let is_bold_at = |gb: usize| bold.iter().any(|&(s, e)| gb >= s && gb < e);
-    let mut segs: Vec<(String, bool)> = Vec::new();
+    let color_at = |gb: usize| {
+        colors
+            .iter()
+            .find_map(|&(s, e, c)| (gb >= s && gb < e).then_some(c))
+            .unwrap_or(line_core)
+    };
+    let mut segs: Vec<(String, bool, u32)> = Vec::new();
     for (i, ch) in line.char_indices() {
         let b = is_bold_at(line_start + i);
+        let c = color_at(line_start + i);
         match segs.last_mut() {
-            Some((s, sb)) if *sb == b => s.push(ch),
-            _ => segs.push((ch.to_string(), b)),
+            Some((s, sb, sc)) if *sb == b && *sc == c => s.push(ch),
+            _ => segs.push((ch.to_string(), b, c)),
         }
     }
     segs
@@ -2193,6 +2222,99 @@ mod word_box_tests {
         assert!(
             cores[4] as i32 - cores[0] as i32 >= 80,
             "expected a clear black→grey gradient across lines, got {cores:?}",
+        );
+    }
+
+    /// Emphasis: a span with an explicit `foreground` override must render in that colour while the
+    /// rest of the line keeps its geometric core. Guards `split_line_by_style` applying per-run
+    /// colour. Colours live in the canvas `[B, G, R, A]` byte order, so a logical-red override shows
+    /// up as a high byte-2 (R) value among the inked pixels; a per-block collapse never would.
+    #[test]
+    fn emphasis_span_renders_in_its_override_colour() {
+        if !std::path::Path::new(REGULAR).exists() {
+            eprintln!("DejaVu fonts missing; skipping");
+            return;
+        }
+        let (w, h) = (700u32, 70u32);
+        let text = "alpha bravo gamma";
+        let red = translator_core::ocr::argb(200, 30, 30); // override only on "bravo" (bytes 6..11)
+        let line = PreparedTextLine {
+            text: text.to_string(),
+            bounding_box: Rect {
+                left: 20,
+                top: 15,
+                right: 680,
+                bottom: 55,
+            },
+            oriented_box: OrientedRect {
+                cx: 350.0,
+                cy: 35.0,
+                width: 660.0,
+                height: 40.0,
+                angle_radians: 0.0,
+            },
+            word_rects: Vec::new(),
+            background_argb: 0xFFFF_FFFF,
+            foreground: vec![translator_core::ocr::LineColorStop {
+                at: 0.0,
+                argb: 0xFF00_0000,
+            }],
+        };
+        let block = PreparedTextBlock {
+            source_text: text.to_string(),
+            translated_text: text.to_string(),
+            bounding_box: line.bounding_box,
+            lines: vec![line],
+            layout_hints: OverlayLayoutHints {
+                layout_mode: OverlayLayoutMode::PerLine,
+                suggested_font_size_px: 32.0,
+            },
+            style_spans: translator_core::ocr::style_spans_from_styles(
+                text.len(),
+                &[StyleRange {
+                    start: 6,
+                    end: 11,
+                    kind: StyleKind::Color(red),
+                }],
+            ),
+        };
+        let prepared = PreparedImageOverlay {
+            rgba_bytes: vec![0xFF; (w * h * 4) as usize],
+            width: w,
+            height: h,
+            extracted_text: text.to_string(),
+            translated_text: text.to_string(),
+            blocks: vec![block],
+            source_words: Vec::new(),
+            translated_words: Vec::new(),
+        };
+        let r = render_overlay(&prepared, &WeightFonts, &RenderOptions::default()).expect("render");
+
+        // Red glyph pixels (canvas R = byte 2 high, B = byte 0 low) and their x-range; plus the
+        // x-range of all inked (non-white) pixels.
+        let (mut red_lo, mut red_hi) = (u32::MAX, 0u32);
+        let (mut ink_lo, mut ink_hi) = (u32::MAX, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                let p = &r.rgba_bytes[((y * w + x) * 4) as usize..][..3];
+                if p[0] as u32 + p[1] as u32 + p[2] as u32 >= 720 {
+                    continue; // white background
+                }
+                ink_lo = ink_lo.min(x);
+                ink_hi = ink_hi.max(x);
+                if p[2] > 150 && p[0] < 110 {
+                    red_lo = red_lo.min(x);
+                    red_hi = red_hi.max(x);
+                }
+            }
+        }
+        assert!(red_lo <= red_hi, "no red emphasis pixels rendered");
+        // The red run is "bravo" in the middle — strictly inside the inked span, with the black
+        // "alpha"/"gamma" on either side.
+        let span = (ink_hi - ink_lo) as f32;
+        assert!(
+            (red_lo - ink_lo) as f32 > 0.15 * span && (ink_hi - red_hi) as f32 > 0.15 * span,
+            "emphasis should sit on the middle word: red {red_lo}..{red_hi} within ink {ink_lo}..{ink_hi}",
         );
     }
 }

@@ -1556,6 +1556,7 @@ fn run_rewrite_stage(
     let mut blocks: Vec<TextBlock> = Vec::new();
     let mut translated: Vec<String> = Vec::new();
     let mut style_ranges: Vec<Vec<translator::ocr::StyleRange>> = Vec::new();
+    let src_rgba = image.to_rgba8();
     for (i, line) in lines.iter().enumerate() {
         if line.text.trim().is_empty() {
             continue;
@@ -1608,6 +1609,19 @@ fn run_rewrite_stage(
                     start,
                     end,
                     kind: translator::ocr::StyleKind::Decoration(dec),
+                }),
+            );
+        }
+        if let Some((s, src_map)) = strip.and_then(|s| Some((s, s.src_map.as_ref()?))) {
+            style.extend(
+                translator::text_metrics::word_emphasis_colors(
+                    &line.text, &firings, &s.matte, src_map, &src_rgba,
+                )
+                .into_iter()
+                .map(|(start, end, argb)| translator::ocr::StyleRange {
+                    start,
+                    end,
+                    kind: translator::ocr::StyleKind::Color(argb),
                 }),
             );
         }

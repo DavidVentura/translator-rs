@@ -208,12 +208,16 @@ pub struct DetectedWord {
 }
 
 /// The style a [`StyleRange`] applies. Bold is a weight flag; the decoration variants carry
-/// an under/strike/over-line. A run can be both bold and decorated — those are two overlapping
-/// ranges of different kinds, resolved into per-byte [`StyleSpan`] attributes downstream.
+/// an under/strike/over-line; `Color` is an emphasis foreground override (a word whose ink colour
+/// is an outlier from its line's geometric core). A run can be several at once — those are
+/// overlapping ranges of different kinds, resolved into per-byte [`StyleSpan`] attributes
+/// downstream. Unlike the others, `Color` is semantic (follows the token through translation),
+/// whereas the line's base colour is geometric and assigned at render — see [`StyleSpan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StyleKind {
     Bold,
     Decoration(LineDecoration),
+    Color(u32),
 }
 
 /// A byte range `[start, end)` of text (line, block source, or translated block) carrying one
@@ -232,8 +236,8 @@ pub struct StyleRange {
 /// they cover the same bytes), so overlap between kinds is preserved.
 pub fn merge_style_ranges(mut ranges: Vec<StyleRange>) -> Vec<StyleRange> {
     ranges.sort_by(|a, b| {
-        style_kind_ord(a.kind)
-            .cmp(&style_kind_ord(b.kind))
+        style_kind_key(a.kind)
+            .cmp(&style_kind_key(b.kind))
             .then(a.start.cmp(&b.start))
     });
     let mut out: Vec<StyleRange> = Vec::with_capacity(ranges.len());
@@ -248,12 +252,15 @@ pub fn merge_style_ranges(mut ranges: Vec<StyleRange>) -> Vec<StyleRange> {
     out
 }
 
-fn style_kind_ord(kind: StyleKind) -> u8 {
+/// Sort key grouping equal kinds together (distinct colours stay in distinct groups so they never
+/// coalesce). The tag separates the variants; the payload orders colours among themselves.
+fn style_kind_key(kind: StyleKind) -> (u8, u32) {
     match kind {
-        StyleKind::Bold => 0,
-        StyleKind::Decoration(LineDecoration::Underline) => 1,
-        StyleKind::Decoration(LineDecoration::Strikethrough) => 2,
-        StyleKind::Decoration(LineDecoration::Overline) => 3,
+        StyleKind::Bold => (0, 0),
+        StyleKind::Decoration(LineDecoration::Underline) => (1, 0),
+        StyleKind::Decoration(LineDecoration::Strikethrough) => (2, 0),
+        StyleKind::Decoration(LineDecoration::Overline) => (3, 0),
+        StyleKind::Color(c) => (4, c),
     }
 }
 
@@ -362,6 +369,15 @@ pub fn style_spans_from_styles(text_len: usize, ranges: &[StyleRange]) -> Vec<St
         .into_iter()
         .find(|&d| covers(s, e, StyleKind::Decoration(d)))
     };
+    let color_at = |s: u32, e: u32| {
+        ranges.iter().find_map(|r| {
+            let (rs, re) = clip(r);
+            match r.kind {
+                StyleKind::Color(c) if rs <= s && re >= e && rs < re => Some(c),
+                _ => None,
+            }
+        })
+    };
 
     let mut spans: Vec<StyleSpan> = Vec::new();
     for w in cuts.windows(2) {
@@ -373,13 +389,14 @@ pub fn style_spans_from_styles(text_len: usize, ranges: &[StyleRange]) -> Vec<St
             start: s,
             end: e,
             bold: covers(s, e, StyleKind::Bold),
-            foreground: None,
+            foreground: color_at(s, e),
             decoration: decoration_at(s, e),
         };
         match spans.last_mut() {
             Some(last)
                 if last.end == s
                     && last.bold == span.bold
+                    && last.foreground == span.foreground
                     && last.decoration == span.decoration =>
             {
                 last.end = e

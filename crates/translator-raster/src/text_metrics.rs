@@ -28,9 +28,9 @@
 //! the box's vertical padding, shows up as a band *off* the strip centre; the
 //! central-band pick drops it without per-pixel classification.
 
-use image::GrayImage;
+use image::{GrayImage, RgbaImage};
 
-use translator_core::ocr::{LineDecoration, OrientedRect};
+use translator_core::ocr::{LineDecoration, OrientedRect, argb};
 
 /// Matte alpha at or above which a texel counts as ink. The single source of truth for
 /// "what is ink"; the erase path's `color_matting::INK_ALPHA_CUT` aliases it.
@@ -83,6 +83,12 @@ const RULE_MIN_PX: u64 = 10;
 /// under/strike/over-line runs the width of the word (≈1–3px tall in every column), so its mean
 /// clears this comfortably; sparse noise does not.
 const RULE_MIN_COVERAGE: f32 = 0.45;
+/// Minimum core-ink pixels a word's colour histogram needs before its colour is trusted.
+const EMPHASIS_MIN_PX: u64 = 8;
+/// Per-channel distance (0..255) from the line's dominant ink at which a word counts as a
+/// differently-coloured emphasis run. Above letter-spacing/JPEG colour jitter, below a real hue
+/// change (a red or blue word against black body clears it easily).
+const EMPHASIS_DIST: u32 = 60;
 
 /// Per-reading-axis-column reduction of an ink strip's bold channel: for each strip column,
 /// the matte-gated sum of the bold channel and the count of ink pixels, prefix-summed so any
@@ -450,10 +456,10 @@ pub fn word_decoration_ranges(
 
 /// Per word unit (positionally aligned to `text`'s words), its text byte range and reading-axis
 /// fraction window `[lo, hi)` over the strip. The window runs from the unit's first firing to the
-/// next unit's first firing (1.0 for the last). Shared by the bold and decoration pooling, which
-/// only differ in how they reduce the strip over the window. Empty when firings are absent or
-/// don't align 1:1 with the text.
-fn firing_unit_windows(
+/// next unit's first firing (1.0 for the last). Shared by the bold, decoration, and emphasis-colour
+/// pooling, which only differ in how they reduce the strip over the window. Empty when firings are
+/// absent or don't align 1:1 with the text.
+pub fn firing_unit_windows(
     text: &str,
     firings: &[(char, f32)],
     is_cjk: bool,
@@ -479,6 +485,120 @@ fn firing_unit_windows(
             ((bs as u32, be as u32), (lo, hi))
         })
         .collect()
+}
+
+/// Mode ink colour over a strip's reading-axis fraction window `[lo, hi)`: histogram the source
+/// pixels under the matte's stroke core (mapped back via `src_map`), 5-bit-quantised so near-equal
+/// shades fuse, and average the winning bin. `None` when too little ink. `src_map[y*mw + x]` is the
+/// source `(x, y)` strip pixel `(x, y)` sampled from.
+fn window_ink_color(
+    matte: &GrayImage,
+    src_map: &[(f32, f32)],
+    source: &RgbaImage,
+    core: u8,
+    lo: f32,
+    hi: f32,
+) -> Option<u32> {
+    let (mw, mh) = matte.dimensions();
+    let x0 = (lo * mw as f32).floor().clamp(0.0, mw as f32) as u32;
+    let x1 = (hi * mw as f32).ceil().clamp(0.0, mw as f32) as u32;
+    let (sw, sh) = (source.width() as i64, source.height() as i64);
+    let mut bins: std::collections::HashMap<u32, (u64, u64, u64, u64)> =
+        std::collections::HashMap::new();
+    for y in 0..mh {
+        for x in x0..x1 {
+            if matte.get_pixel(x, y)[0] < core {
+                continue;
+            }
+            let Some(&(fx, fy)) = src_map.get((y * mw + x) as usize) else {
+                continue;
+            };
+            let (sx, sy) = (fx.round() as i64, fy.round() as i64);
+            if sx < 0 || sy < 0 || sx >= sw || sy >= sh {
+                continue;
+            }
+            // The overlay canvas stores pixels in `[B, G, R, A]` byte order (so `channel_r` reads
+            // byte 2); `source` shares those bytes, so logical R/G/B are bytes 2/1/0. Reading them
+            // the same way the geometric core (`still_fg_argb`) does keeps emphasis and base colour
+            // in one convention.
+            let p = source.get_pixel(sx as u32, sy as u32).0;
+            let (r, g, b) = (p[2], p[1], p[0]);
+            let key = ((r >> 3) as u32) << 10 | ((g >> 3) as u32) << 5 | (b >> 3) as u32;
+            let e = bins.entry(key).or_default();
+            e.0 += r as u64;
+            e.1 += g as u64;
+            e.2 += b as u64;
+            e.3 += 1;
+        }
+    }
+    let (_, (r, g, b, n)) = bins.into_iter().max_by_key(|(_, (_, _, _, n))| *n)?;
+    (n >= EMPHASIS_MIN_PX).then(|| argb((r / n) as u8, (g / n) as u8, (b / n) as u8))
+}
+
+fn channel_max_dist(a: u32, b: u32) -> u32 {
+    [16u32, 8, 0]
+        .into_iter()
+        .map(|sh| ((a >> sh) & 0xFF).abs_diff((b >> sh) & 0xFF))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Per-run emphasis colours `(byte_start, byte_end, argb)`: maximal runs of consecutive non-space
+/// characters whose ink colour is an outlier from the line's *dominant* ink (the mode over the
+/// whole line, so a minority coloured word doesn't move it). Works per character — firings are 1:1
+/// with the recognised chars, so this needs no word segmentation — and reads colour from `source`
+/// via `src_map`. The line's *base* colour stays geometric (assigned per line at render); only
+/// these runs cross translation. Empty when firings don't match the char count or there's too
+/// little ink.
+pub fn word_emphasis_colors(
+    text: &str,
+    firings: &[(char, f32)],
+    matte: &GrayImage,
+    src_map: &[(f32, f32)],
+    source: &RgbaImage,
+) -> Vec<(u32, u32, u32)> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if matte.width() == 0 || firings.len() != n || n == 0 {
+        return Vec::new();
+    }
+    let core = stroke_core_cut(matte.iter().copied().max().unwrap_or(0));
+    let Some(line_color) = window_ink_color(matte, src_map, source, core, 0.0, 1.0) else {
+        return Vec::new();
+    };
+    // Char `i` spans reading-axis fraction `[edge[i], edge[i+1])` (a firing sits at its glyph's
+    // trailing edge, so a glyph runs from the previous firing to its own). Byte offsets index `text`.
+    let edge: Vec<f32> = std::iter::once(0.0)
+        .chain(firings.iter().map(|f| f.1.clamp(0.0, 1.0)))
+        .collect();
+    let byte: Vec<usize> = text
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let is_outlier = |i: usize| {
+        let (lo, hi) = (edge[i].min(edge[i + 1]), edge[i].max(edge[i + 1]));
+        window_ink_color(matte, src_map, source, core, lo, hi)
+            .is_some_and(|c| channel_max_dist(c, line_color) > EMPHASIS_DIST)
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if chars[i].is_whitespace() || !is_outlier(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i + 1 < n && !chars[i + 1].is_whitespace() && is_outlier(i + 1) {
+            i += 1;
+        }
+        // The run's colour from one pooled window over its whole extent (robust to per-char noise).
+        if let Some(rc) = window_ink_color(matte, src_map, source, core, edge[start], edge[i + 1]) {
+            out.push((byte[start] as u32, byte[i + 1] as u32, rc));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Typography recovered from one line's ink matte, in the source image's pixel
@@ -990,6 +1110,35 @@ mod tests {
         let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
         let ranges = word_bold_ranges("aa bb", &firings, false, &profile, MODEL_BOLD_THRESHOLD);
         assert_eq!(ranges, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn word_emphasis_colors_flags_only_the_outlier_word() {
+        // 100×20 strip, all ink. Red ink only under "bb" (cols 44..72, the [0.45,0.7) span its two
+        // firings bracket); black elsewhere, so the line dominant is black and "bb" is the outlier.
+        // `src_map` is identity (strip pixel == source pixel).
+        let matte = GrayImage::from_pixel(100, 20, image::Luma([255]));
+        let src_map: Vec<(f32, f32)> = (0..20)
+            .flat_map(|y| (0..100).map(move |x| (x as f32, y as f32)))
+            .collect();
+        // Canvas byte order is [B, G, R, A], so logical red (200,30,30) is stored [30,30,200,255].
+        let source = RgbaImage::from_fn(100, 20, |x, _| {
+            if (44..72).contains(&x) {
+                image::Rgba([30, 30, 200, 255])
+            } else {
+                image::Rgba([0, 0, 0, 255])
+            }
+        });
+        let firings = [('a', 0.1), ('a', 0.2), (' ', 0.45), ('b', 0.6), ('b', 0.7)];
+        let out = word_emphasis_colors("aa bb", &firings, &matte, &src_map, &source);
+        assert_eq!(out.len(), 1, "only the red word is an outlier: {out:?}");
+        let (bs, be, argb) = out[0];
+        assert_eq!((bs, be), (3, 5), "byte range of \"bb\"");
+        let (r, g, b) = ((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF);
+        assert!(
+            r > 150 && g < 80 && b < 80,
+            "expected red emphasis, got ({r},{g},{b})"
+        );
     }
 
     #[test]

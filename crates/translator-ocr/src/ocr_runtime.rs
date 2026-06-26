@@ -269,6 +269,13 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
                     }),
                 );
             }
+
+            // Emphasis colour: words whose ink colour is an outlier from the line's dominant ink
+            // (a red word in black body). The line's base colour stays geometric (assigned per
+            // line at render); only these overrides cross translation.
+            if let (Some(strip), Some(src)) = (strip, ink_rgba.as_ref()) {
+                ranges.extend(line_emphasis_colors(strip, src, &line.text, &firings));
+            }
             ranges
         })
         .collect();
@@ -817,30 +824,56 @@ fn finalize_image_overlay(
 
 type BlockStyles = Vec<translator_core::ocr::StyleRange>;
 
+/// Emphasis colour ranges for one line: a `Color` [`StyleRange`] for each word whose ink colour is
+/// an outlier from the line's dominant ink. `None` `src_map` (oriented-box fallback) yields nothing
+/// — no mapping back to source pixels to read colour from.
+fn line_emphasis_colors(
+    strip: &crate::ppocr::InkStrip,
+    source: &image::RgbaImage,
+    text: &str,
+    firings: &[(char, f32)],
+) -> Vec<translator_core::ocr::StyleRange> {
+    let Some(src_map) = strip.src_map.as_ref() else {
+        return Vec::new();
+    };
+    translator_raster::text_metrics::word_emphasis_colors(
+        text,
+        firings,
+        &strip.matte,
+        src_map,
+        source,
+    )
+    .into_iter()
+    .map(|(start, end, argb)| translator_core::ocr::StyleRange {
+        start,
+        end,
+        kind: translator_core::ocr::StyleKind::Color(argb),
+    })
+    .collect()
+}
+
 /// Remap a block's source style ranges onto its translation, one [`StyleKind`] at a time so the
 /// alignment remap's within-call merge never fuses ranges of different kinds (a bold range and an
-/// underline range over the same translated word must stay distinct).
+/// underline range — or two differently-coloured emphasis runs — over the same translated word
+/// must stay distinct). Iterates the distinct kinds actually present, so open-ended
+/// `Color(u32)` kinds are each remapped on their own.
 fn remap_block_styles(
     src: &[translator_core::ocr::StyleRange],
     twa: &translator_translate::translate::TranslationWithAlignment,
 ) -> BlockStyles {
-    use translator_core::ocr::{LineDecoration, StyleKind};
-    const KINDS: [StyleKind; 4] = [
-        StyleKind::Bold,
-        StyleKind::Decoration(LineDecoration::Underline),
-        StyleKind::Decoration(LineDecoration::Strikethrough),
-        StyleKind::Decoration(LineDecoration::Overline),
-    ];
+    let mut kinds: Vec<translator_core::ocr::StyleKind> = Vec::new();
+    for r in src {
+        if !kinds.contains(&r.kind) {
+            kinds.push(r.kind);
+        }
+    }
     let mut out = BlockStyles::new();
-    for kind in KINDS {
+    for kind in kinds {
         let ranges: Vec<(u32, u32)> = src
             .iter()
             .filter(|r| r.kind == kind)
             .map(|r| (r.start, r.end))
             .collect();
-        if ranges.is_empty() {
-            continue;
-        }
         out.extend(
             translator_translate::translate::remap_byte_ranges_through_alignment(&ranges, twa)
                 .into_iter()

@@ -141,17 +141,18 @@ fn gradient_image_yields_a_per_line_colour_gradient() {
     }
 }
 
-/// Black body paragraph with a few coloured words. Per-line colour is the line's dominant ink, so
-/// every line reads near-black; the coloured words are a minority the line-level sample doesn't
-/// surface. This pins the *current* behaviour — emphasis colour is the deferred phase-2 work, and
-/// when it lands this is where the per-word override would be asserted.
+/// Black body paragraph with a few coloured words. The per-line *geometric core* is the line's
+/// dominant ink, so every line reads near-black regardless of the emphasis words — emphasis is a
+/// per-word override (semantic, needs recognition firings), separate from this geometric colour.
+/// This path runs det+ink only, so it checks the geometric core stays black; the per-word emphasis
+/// detection itself is covered hermetically by `text_metrics::word_emphasis_colors`.
 #[test]
 fn emphasis_image_lines_read_as_black_body() {
     let Some(lines) = run("tests/fixtures/emphasis_test.png") else {
         return;
     };
     let lums: Vec<i32> = lines.iter().map(|l| l.lum).collect();
-    eprintln!("emphasis per-line luminance (emphasis words not surfaced yet): {lums:?}");
+    eprintln!("emphasis per-line geometric-core luminance (black body): {lums:?}");
 
     assert!(
         lines.len() >= 3,
