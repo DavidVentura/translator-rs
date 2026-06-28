@@ -671,10 +671,18 @@ fn missing_optional_file_keeps_pack_installed_and_offers_it_as_upgrade() {
     assert!(detector_status.installed);
     assert!(detector_status.missing_files.is_empty());
 
+    // A (re)download now pulls the best optional up front, so the user isn't
+    // immediately prompted to fetch it right after installing the language.
     let en = [LanguageCode::from("en")];
     let downloads = plan_ocr_engine_downloads(&snapshot, &en, "ppocr");
-    assert!(downloads.tasks.is_empty());
+    let download_paths = downloads
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(download_paths, vec!["ppocr/ink.mnn"]);
 
+    // It is still offered as an upgrade for installs that predate it on disk.
     let upgrades = plan_ocr_engine_upgrades(&snapshot, &en, "ppocr");
     let paths = upgrades
         .tasks
@@ -682,6 +690,45 @@ fn missing_optional_file_keeps_pack_installed_and_offers_it_as_upgrade() {
         .map(|task| task.install_path.as_str())
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["ppocr/ink.mnn"]);
+}
+
+#[test]
+fn fresh_install_pulls_best_optional_and_then_offers_no_upgrade() {
+    let en = [LanguageCode::from("en")];
+
+    let empty = FakeInstallChecker::with_files(&[]);
+    let snapshot = build_catalog_snapshot(catalog_with_optional_ink(), "/base".to_string(), &empty);
+    let download = plan_ocr_engine_downloads(&snapshot, &en, "ppocr");
+    let mut paths = download
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec![
+            "ppocr/det_new.mnn",
+            "ppocr/ink.mnn",
+            "ppocr/latin.mnn",
+            "ppocr/pulc.mnn"
+        ]
+    );
+
+    // After that full plan lands on disk there is nothing left to prompt for.
+    let installed = FakeInstallChecker::with_files(&[
+        "ppocr/det_new.mnn",
+        "ppocr/ink.mnn",
+        "ppocr/latin.mnn",
+        "ppocr/pulc.mnn",
+    ]);
+    let snapshot =
+        build_catalog_snapshot(catalog_with_optional_ink(), "/base".to_string(), &installed);
+    assert!(
+        plan_ocr_engine_upgrades(&snapshot, &en, "ppocr")
+            .tasks
+            .is_empty()
+    );
 }
 
 #[test]

@@ -402,7 +402,7 @@ pub fn plan_ocr_engine_download(
     let pack_id = snapshot
         .catalog
         .ocr_pack_id_for_engine(language_code, engine)?;
-    let tasks = missing_files_in_snapshot(snapshot, [pack_id.as_str()])
+    let tasks = install_files_in_snapshot(snapshot, [pack_id.as_str()])
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
@@ -428,7 +428,7 @@ pub fn plan_ocr_engine_downloads(
                 .ocr_pack_id_for_engine(language_code, engine)
         })
         .collect::<Vec<_>>();
-    let tasks = missing_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
+    let tasks = install_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
@@ -441,20 +441,37 @@ pub fn plan_ocr_engine_downloads(
     }
 }
 
-fn missing_files_in_snapshot<'a, I>(
+// A fresh install fetches the best file of every role, optional ones included:
+// the highest-priority optional surfaces as an upgrade_file when nothing of that
+// role is on disk, so folding those into the download plan means a fresh install
+// lands the best+latest optional and never self-prompts for it afterwards.
+// Required version upgrades of files already on disk stay out of the plan — they
+// remain a deliberate, user-initiated upgrade rather than a silent re-download.
+fn install_files_in_snapshot<'a, I>(
     snapshot: &'a CatalogSnapshot,
     pack_ids: I,
 ) -> Vec<MissingPackFile>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    status_files_in_snapshot(snapshot, pack_ids, |status| &status.missing_files)
+    status_files_in_snapshot(snapshot, pack_ids, |status| {
+        status
+            .missing_files
+            .iter()
+            .chain(
+                status
+                    .upgrade_files
+                    .iter()
+                    .filter(|file| matches!(file.requirement, FileRequirement::Optional)),
+            )
+            .collect()
+    })
 }
 
 fn status_files_in_snapshot<'a, I>(
     snapshot: &'a CatalogSnapshot,
     pack_ids: I,
-    select: impl Fn(&PackInstallStatus) -> &[AssetFileV2],
+    select: impl for<'s> Fn(&'s PackInstallStatus) -> Vec<&'s AssetFileV2>,
 ) -> Vec<MissingPackFile>
 where
     I: IntoIterator<Item = &'a str>,
@@ -496,7 +513,7 @@ pub fn plan_ocr_engine_upgrades(
         })
         .collect::<Vec<_>>();
     let tasks = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
-        &status.upgrade_files
+        status.upgrade_files.iter().collect()
     })
     .into_iter()
     .filter_map(|item| {
@@ -708,7 +725,7 @@ pub fn plan_language_download(
     let root_pack_ids = snapshot
         .catalog
         .core_pack_ids_for_language(language_code.as_str());
-    let tasks = missing_files_in_snapshot(snapshot, root_pack_ids.iter().map(String::as_str))
+    let tasks = install_files_in_snapshot(snapshot, root_pack_ids.iter().map(String::as_str))
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
@@ -728,7 +745,7 @@ pub fn plan_dictionary_download(
     let pack_id = snapshot
         .catalog
         .dictionary_pack_id_for_language(language_code.as_str())?;
-    let tasks = missing_files_in_snapshot(snapshot, [pack_id.as_str()])
+    let tasks = install_files_in_snapshot(snapshot, [pack_id.as_str()])
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
@@ -826,7 +843,7 @@ pub fn plan_tts_download(
             .catalog
             .default_tts_pack_id_for_language(language_code)?,
     };
-    let tasks = missing_files_in_snapshot(snapshot, [selected_pack_id.as_str()])
+    let tasks = install_files_in_snapshot(snapshot, [selected_pack_id.as_str()])
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
@@ -847,7 +864,7 @@ pub fn plan_support_download_by_kind(
     if pack_ids.is_empty() {
         return None;
     }
-    let tasks = missing_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
+    let tasks = install_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
