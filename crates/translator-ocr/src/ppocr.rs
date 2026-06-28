@@ -2641,11 +2641,6 @@ const TILT_X_BINS: usize = 16;
 /// scanning skew jitter.
 const TILT_AGREEMENT_SLOPE: f32 = 0.05;
 
-/// Evidence (`length_confidence × angle_confidence`) a box's own lean must reach for
-/// `resolve_box_angle` to keep it over the frame. Tuned so a square glyph clamps at any
-/// angle, a few-word line keeps only sizeable leans, and a long line keeps even a small one.
-const TILT_KEEP_EVIDENCE: f32 = 0.08;
-
 /// Per-bin extreme-y tolerance for outlier filtering, expressed as a fraction of the contour's
 /// vertical extent. Descenders / ascenders / random spikes stick out beyond the median edge by
 /// more than this and get dropped from the regression.
@@ -3002,16 +2997,13 @@ fn fit_tilt_field(votes: &[TiltVote]) -> Option<TiltField> {
 /// enough to clear its length's noise floor. With no consensus the frame is image-horizontal.
 ///
 /// Only the in-axis lean is decided here; the ±90° reading-axis choice is `build_oriented_boxes`.
+/// With no consensus the frame is image-horizontal.
 fn resolve_box_angle(m: &TiltMeasurement, consensus: Option<f32>) -> f32 {
-    let frame = consensus.unwrap_or(0.0);
-    let delta = m.angle - frame;
-    let evidence = translator_raster::text_metrics::length_confidence(m.aspect)
-        * translator_raster::text_metrics::angle_confidence(delta.abs());
-    if evidence >= TILT_KEEP_EVIDENCE {
-        m.angle
-    } else {
-        frame
-    }
+    translator_raster::text_metrics::clamp_lean_to_frame(
+        m.angle,
+        m.aspect,
+        consensus.unwrap_or(0.0),
+    )
 }
 
 #[cfg(test)]

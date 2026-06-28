@@ -188,27 +188,6 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
     let metrics_ms = t_box_metrics.elapsed().as_secs_f32() * 1000.0;
 
-    // Absolute baseline angle per line, in image space, from the ink matte mapped
-    // back through its strip's src_map. `None` without an ink model or src_map (the
-    // oriented-box affine fallback), where the line keeps its detection angle.
-    let t_angles = std::time::Instant::now();
-    let line_angles: Vec<Option<f32>> = det_boxes
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            match (
-                ink_masks.get(i).and_then(|m| m.as_ref()),
-                ink_src_maps.get(i).and_then(|s| s.as_ref()),
-            ) {
-                (Some(matte), Some(src)) => {
-                    translator_raster::text_metrics::baseline_angle_source(matte, src)
-                }
-                _ => None,
-            }
-        })
-        .collect();
-    let angles_ms = t_angles.elapsed().as_secs_f32() * 1000.0;
-
     // Per-word style from the ink channels + the line's CTC firings: bold from the bold channel
     // (falling back to a whole-line range when the model pooled bold but firings weren't usable —
     // RTL, multi-chunk), and under/strike/over-line decoration from the rule channel. Bold and
@@ -293,14 +272,13 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         &det_boxes,
         lines,
         &text_metrics,
-        &line_angles,
         &line_style_ranges,
         min_confidence,
         reading_order,
     );
     log::info!(
         "ppocr post-ink: clones={clone_ms:.1}ms model_bold={bold_pool_ms:.1}ms \
-         box_metrics={metrics_ms:.1}ms line_angles={angles_ms:.1}ms bold_ranges={bold_ms:.1}ms \
+         box_metrics={metrics_ms:.1}ms bold_ranges={bold_ms:.1}ms \
          source_words={words_ms:.1}ms blocks+grouping={:.1}ms",
         t_blocks.elapsed().as_secs_f32() * 1000.0,
     );
@@ -427,12 +405,6 @@ fn scale_detected_box(b: DetectedTextBox, scale: f32, max_w: u32, max_h: u32) ->
     }
 }
 
-/// Below this gap between the ink-measured line angle and the detection reading
-/// frame, the line is treated as co-aligned and snapped to the reading frame, so
-/// co-aligned lines share one angle instead of each carrying sub-visible jitter.
-/// ~2.3°; a line genuinely rotated more than this keeps its own measured angle.
-const SUBVISIBLE_TILT: f32 = 0.04;
-
 /// Per-box ink-matte typography (x-height + baseline tilt), 1:1 with `boxes`.
 /// `None` for a box with no matte (no ink model, degenerate box, or no coherent
 /// ink band); the caller then keeps the box's own tight height and angle.
@@ -462,7 +434,6 @@ fn still_ppocr_lines_to_blocks(
     boxes: &[DetectedTextBox],
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
-    line_angles: &[Option<f32>],
     line_style_ranges: &[Vec<translator_core::ocr::StyleRange>],
     min_confidence: u32,
     reading_order: ReadingOrder,
@@ -475,29 +446,14 @@ fn still_ppocr_lines_to_blocks(
         .iter()
         .zip(lines.into_iter())
         .zip(text_metrics.iter())
-        .zip(line_angles.iter())
         .zip(line_style_ranges.iter())
-        .filter(|((((_, line), _), _), _)| {
-            !line.text.trim().is_empty() && line.confidence >= min_score
-        })
-        .map(|((((b, line), metrics), line_angle), style_ranges)| {
-            // Line orientation: the ink-measured absolute baseline angle (image
-            // space, via the strip's src_map) when it deviates visibly from the
-            // detection reading frame; otherwise the detection angle itself. This
-            // keeps co-aligned lines on one shared angle (no per-line jitter that
-            // makes a screenshot's labels point every which way, and no spurious
-            // splits when grouping keys on angle) while still honouring a line that
-            // is genuinely rotated differently. The old path folded the strip-frame
-            // `baseline_angle_delta` into the angle, which is the wrong frame and
-            // injected exactly that jitter.
-            let reading_angle = line.oriented_box.angle_radians;
-            let angle = match line_angle {
-                Some(a) if (a - reading_angle).abs() > SUBVISIBLE_TILT => *a,
-                _ => reading_angle,
-            };
-
-            let mut oriented_box = line.oriented_box;
-            oriented_box.angle_radians = angle;
+        .filter(|(((_, line), _), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
+        .map(|(((b, line), metrics), style_ranges)| {
+            // Line orientation is the detection reading frame — its adaptive clamp already
+            // keeps a genuine lean and snaps short labels to the frame. The ink matte resolves
+            // typography (x-height, centre, decoration, bold) but no longer re-decides the angle.
+            let angle = line.oriented_box.angle_radians;
+            let oriented_box = line.oriented_box;
 
             // Re-fit the grouping box to the actual ink (x-height, ink width,
             // centred on the ink) where the matte resolved it; otherwise keep the

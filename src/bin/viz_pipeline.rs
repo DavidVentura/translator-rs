@@ -999,19 +999,8 @@ fn run(cli: Cli) -> Result<(), String> {
                         let mp = model_bold_p[i];
                         let is_bold = mp.map(|p| p >= 0.65).unwrap_or(false);
                         // Matte band in cyan: box re-fit to actual ink on both axes, at the
-                        // ink's absolute baseline angle (source space via src_map), snapped to
-                        // the detection reading frame when the lean is sub-visible — the same
-                        // angle the still pipeline now renders.
-                        let reading_angle = b.tight_box.angle_radians;
-                        let angle = strips
-                            .get(i)
-                            .and_then(|s| s.as_ref())
-                            .and_then(|s| {
-                                let sm = s.src_map.as_ref()?;
-                                translator::text_metrics::baseline_angle_source(&s.matte, sm)
-                            })
-                            .filter(|a| (a - reading_angle).abs() > 0.04)
-                            .unwrap_or(reading_angle);
+                        // detection reading angle — the same angle the still pipeline renders.
+                        let angle = b.tight_box.angle_radians;
                         let band = m.refit(b.tight_box, angle);
                         draw_closed_polyline(
                             &mut canvas,
@@ -1039,7 +1028,7 @@ fn run(cli: Cli) -> Result<(), String> {
                             ),
                         );
                         csv.push_str(&format!(
-                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2},{:.2},{:.3},{},{},{}\n",
+                            "{:.0},{:.0},{:.0},{:.1},{:.1},{:.1},{:.2},{:.2},{:.2},{},{},{}\n",
                             b.tight_box.cx,
                             b.tight_box.cy,
                             b.tight_box.width,

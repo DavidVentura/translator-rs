@@ -84,6 +84,25 @@ pub fn length_confidence(aspect: f32) -> f32 {
 pub fn angle_confidence(abs_delta_radians: f32) -> f32 {
     (abs_delta_radians / TRUSTED_TILT_DELTA).clamp(0.0, 1.0)
 }
+
+/// Evidence (`length_confidence × angle_confidence`) a measured lean must reach to be kept
+/// over the frame. Below it the measurement is treated as noise. Shared by the detection
+/// tilt path and the ink baseline override.
+pub const TILT_KEEP_EVIDENCE: f32 = 0.08;
+
+/// Adaptive clamp of a `measured` reading-direction lean against a `frame` reference, given
+/// the region's oriented `aspect`. The measurement is kept whole when it carries enough
+/// evidence to be real — long enough region *and* a deviation large enough to clear its
+/// length's noise floor — and otherwise snapped to the frame. Never blended: a sub-evidence
+/// lean is noise to be zeroed, not a fraction of a real angle.
+pub fn clamp_lean_to_frame(measured: f32, aspect: f32, frame: f32) -> f32 {
+    let evidence = length_confidence(aspect) * angle_confidence((measured - frame).abs());
+    if evidence >= TILT_KEEP_EVIDENCE {
+        measured
+    } else {
+        frame
+    }
+}
 /// Clamp on the recovered tilt. The matte was produced from a strip dewarped
 /// with the rough angle, so a real residual is small; a larger fit is a
 /// degenerate matte, not a steeper line.
@@ -693,8 +712,7 @@ impl LineMetrics {
     /// Re-fit a detection box to the measured ink: x-height as the height, the ink
     /// column span as the width, the centre snapped to the ink along both the
     /// reading (`u`) and cross-reading (`v`) axes. The output orientation is the
-    /// caller-supplied `angle_radians` — the absolute line angle, which for the ink
-    /// path comes from [`baseline_angle_source`] (measured in image space), not the
+    /// caller-supplied `angle_radians` — the resolved detection line angle, not the
     /// strip-frame [`Self::baseline_angle_delta`]. The centre offsets are rotated by
     /// the box's own reading frame (`base.angle_radians`), where they were measured.
     /// Shared by the still pipeline, the integration test, and the `viz_pipeline`
@@ -787,120 +805,6 @@ pub fn measure_line(matte: &GrayImage, box_width: f32, box_height: f32) -> Optio
         baseline_angle_delta,
         stroke_width,
     })
-}
-
-/// Absolute baseline angle of the line in **source-image** space (radians), or
-/// `None` when too few baseline points carry ink.
-///
-/// Unlike [`LineMetrics::baseline_angle_delta`] — a residual *inside* the dewarped
-/// strip — this maps each column's baseline pixel back through the strip's
-/// `src_map` to its original image position and fits those points. The dewarp's
-/// straightening is undone by `src_map`, so a 45°-rotated line of horizontal text
-/// reads 45° here (its strip-frame residual would read ~0°). The direction is the
-/// principal axis of the baseline points, refit twice after dropping perpendicular
-/// outliers, so a stray descender or mis-mapped column can't lean it. The result
-/// is canonicalised to `ux >= 0` (angle in `(-π/2, π/2]`), i.e. the reading-ish
-/// direction; vertical (CJK) columns are handled by the caller's quadrant, not here.
-pub fn baseline_angle_source(matte: &GrayImage, src_map: &[(f32, f32)]) -> Option<f32> {
-    let (mw, mh) = matte.dimensions();
-    let mw_us = mw as usize;
-    if mw == 0 || mh == 0 || src_map.len() < mw_us * mh as usize {
-        return None;
-    }
-    let data = matte.as_raw();
-    let row_sum: Vec<u32> = (0..mh as usize)
-        .map(|y| {
-            data[y * mw_us..(y + 1) * mw_us]
-                .iter()
-                .map(|&a| a as u32)
-                .sum()
-        })
-        .collect();
-    let peak = *row_sum.iter().max()?;
-    if peak == 0 {
-        return None;
-    }
-    let (sup_top, sup_bottom) = central_band(&row_sum, peak as f32 * SUPPORT_FRAC, mh as usize)?;
-
-    let span_cov = column_span_coverage(data, mw_us, mh as usize, sup_top, sup_bottom);
-    let (xheight_top, baseline_row) = band_edges(&span_cov, sup_top, sup_bottom);
-    let x_height = (baseline_row - xheight_top).max(1.0);
-    let (col_left, col_right) = ink_column_span(data, mw_us, sup_top, sup_bottom);
-    let reading_span = (col_right - col_left + 1) as f32;
-    if reading_span < MIN_LINE_ASPECT * x_height {
-        return None;
-    }
-
-    let mut pts: Vec<(f32, f32)> = Vec::new();
-    for x in 0..mw_us {
-        let Some(b) = column_baseline_row(data, mw_us, x, sup_top, sup_bottom) else {
-            continue;
-        };
-        let row = (b.round() as usize).min(mh as usize - 1);
-        pts.push(src_map[row * mw_us + x]);
-    }
-    robust_axis_angle(&pts)
-}
-
-/// Principal-axis angle of a point cloud, refit twice after dropping points more
-/// than 3·MAD off the line perpendicular. Robust to the handful of off-baseline
-/// points (a descender that survived the support band, a mis-mapped column).
-fn robust_axis_angle(pts: &[(f32, f32)]) -> Option<f32> {
-    let mut keep: Vec<(f32, f32)> = pts.to_vec();
-    let mut angle = None;
-    for _ in 0..2 {
-        let n = keep.len() as f32;
-        if keep.len() < MIN_TILT_COLUMNS {
-            break;
-        }
-        let (mut mx, mut my) = (0.0f32, 0.0f32);
-        for &(x, y) in &keep {
-            mx += x;
-            my += y;
-        }
-        mx /= n;
-        my /= n;
-        let (mut cxx, mut cyy, mut cxy) = (0.0f32, 0.0f32, 0.0f32);
-        for &(x, y) in &keep {
-            let (dx, dy) = (x - mx, y - my);
-            cxx += dx * dx;
-            cyy += dy * dy;
-            cxy += dx * dy;
-        }
-        let trace = cxx + cyy;
-        let disc = ((trace * trace - 4.0 * (cxx * cyy - cxy * cxy)).max(0.0)).sqrt();
-        let l1 = (trace + disc) * 0.5;
-        let (ex, ey) = if cxy.abs() > 1e-6 {
-            (l1 - cyy, cxy)
-        } else if cxx >= cyy {
-            (1.0, 0.0)
-        } else {
-            (0.0, 1.0)
-        };
-        let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
-        let (mut ux, mut uy) = (ex / norm, ey / norm);
-        if ux < 0.0 {
-            ux = -ux;
-            uy = -uy;
-        }
-        angle = Some(uy.atan2(ux));
-        // Drop points whose perpendicular distance to the fitted line is a clear outlier.
-        let (px, py) = (-uy, ux);
-        let mut absr: Vec<f32> = keep
-            .iter()
-            .map(|&(x, y)| ((x - mx) * px + (y - my) * py).abs())
-            .collect();
-        let mut sorted = absr.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mad = sorted[sorted.len() / 2].max(0.5);
-        let mut it = absr.drain(..);
-        keep = keep
-            .iter()
-            .filter(|_| it.next().map(|r| r <= 3.0 * mad).unwrap_or(false))
-            .copied()
-            .collect();
-    }
-    angle
 }
 
 /// Mean stroke width over the line's ink, in image-space pixels, as
@@ -1439,37 +1343,5 @@ mod tests {
     fn empty_matte_is_none() {
         let m = GrayImage::from_pixel(32, 48, image::Luma([0]));
         assert!(measure_line(&m, 32.0, 48.0).is_none());
-    }
-
-    /// A flat band in the strip whose `src_map` rotates it by `theta` into the
-    /// source: the baseline points trace `theta`, so the absolute angle is `theta`
-    /// even though the matte itself is straight.
-    fn rotated_strip(theta: f32) -> (GrayImage, Vec<(f32, f32)>) {
-        let (mw, mh) = (64u32, 48u32);
-        let matte = GrayImage::from_fn(mw, mh, |_x, y| {
-            image::Luma([if (16..=31).contains(&y) { 255 } else { 0 }])
-        });
-        let (s, c) = theta.sin_cos();
-        let src_map: Vec<(f32, f32)> = (0..mh)
-            .flat_map(|y| {
-                (0..mw).map(move |x| (x as f32 * c - y as f32 * s, x as f32 * s + y as f32 * c))
-            })
-            .collect();
-        (matte, src_map)
-    }
-
-    #[test]
-    fn baseline_angle_source_recovers_rotation() {
-        let theta = std::f32::consts::FRAC_PI_4; // 45°
-        let (matte, src_map) = rotated_strip(theta);
-        let a = baseline_angle_source(&matte, &src_map).expect("angle");
-        assert!((a - theta).abs() < 0.05, "angle {a} want {theta}");
-    }
-
-    #[test]
-    fn baseline_angle_source_flat_strip_is_zero() {
-        let (matte, src_map) = rotated_strip(0.0);
-        let a = baseline_angle_source(&matte, &src_map).expect("angle");
-        assert!(a.abs() < 0.02, "angle {a}");
     }
 }
