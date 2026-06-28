@@ -749,7 +749,7 @@ impl PpocrEngine {
             aabb: translator_core::ocr::Rect,
             contour: Option<Vec<(f32, f32)>>,
             score: f32,
-            tilt: TiltEstimate,
+            tilt: TiltMeasurement,
         }
 
         let pool_comp = self.detector.pool_comp();
@@ -767,7 +767,11 @@ impl PpocrEngine {
                     .contour
                     .as_ref()
                     .map(|c| estimate_horizontal_tilt(c))
-                    .unwrap_or_else(TiltEstimate::none);
+                    .unwrap_or_else(|| {
+                        let cx = (aabb.left + aabb.right) as f32 * 0.5;
+                        let cy = (aabb.top + aabb.bottom) as f32 * 0.5;
+                        TiltMeasurement::none(cx, cy)
+                    });
                 Detected {
                     aabb,
                     contour: tb.contour,
@@ -777,13 +781,15 @@ impl PpocrEngine {
             })
             .collect();
 
+        // Frame consensus: each contour votes its own lean, weighted by its length confidence
+        // (a long line defines the frame; a short one barely nudges it), sited at its centroid.
         let votes: Vec<TiltVote> = detected
             .iter()
             .filter_map(|d| {
                 d.tilt.vote.map(|angle| TiltVote {
-                    x: (d.aabb.left + d.aabb.right) as f32 * 0.5,
-                    y: (d.aabb.top + d.aabb.bottom) as f32 * 0.5,
-                    weight: (d.aabb.right - d.aabb.left).max(1) as f32,
+                    x: d.tilt.cx,
+                    y: d.tilt.cy,
+                    weight: translator_raster::text_metrics::length_confidence(d.tilt.aspect),
                     angle,
                 })
             })
@@ -793,12 +799,7 @@ impl PpocrEngine {
         let out: Vec<translator_core::ocr::DetectedTextBox> = detected
             .into_iter()
             .map(|d| {
-                let consensus = field.as_ref().map(|f| {
-                    f.at(
-                        (d.aabb.left + d.aabb.right) as f32 * 0.5,
-                        (d.aabb.top + d.aabb.bottom) as f32 * 0.5,
-                    )
-                });
+                let consensus = field.as_ref().map(|f| f.at(d.tilt.cx, d.tilt.cy));
                 let angle = resolve_box_angle(&d.tilt, consensus);
                 let contour_boxes = d
                     .contour
@@ -2640,19 +2641,15 @@ const TILT_X_BINS: usize = 16;
 /// scanning skew jitter.
 const TILT_AGREEMENT_SLOPE: f32 = 0.05;
 
+/// Evidence (`length_confidence × angle_confidence`) a box's own lean must reach for
+/// `resolve_box_angle` to keep it over the frame. Tuned so a square glyph clamps at any
+/// angle, a few-word line keeps only sizeable leans, and a long line keeps even a small one.
+const TILT_KEEP_EVIDENCE: f32 = 0.08;
+
 /// Per-bin extreme-y tolerance for outlier filtering, expressed as a fraction of the contour's
 /// vertical extent. Descenders / ascenders / random spikes stick out beyond the median edge by
 /// more than this and get dropped from the regression.
 const TILT_EDGE_OUTLIER_FRACTION: f32 = 0.20;
-
-/// Minimum end-to-end y-deviation (slope × contour width), expressed as a fraction of the
-/// contour's height, for a tilt to be reported as non-zero. Short asymmetric contours like a
-/// 4-letter word with a cap-height opener bias both the top and bottom regressions slightly
-/// downward — the agreement gate then averages two biased numbers into a phantom tilt. By
-/// also requiring the actual y-deviation across the contour to be ≥ 20% of its height, we
-/// reject sub-visible tilts where the per-edge slopes likely come from regression artefacts
-/// rather than from a genuine baseline lean.
-const TILT_MIN_DEVIATION_FRACTION: f32 = 0.20;
 
 /// Extra vertical strip span reserved on the descender side, as a fraction of the
 /// text-band thickness. Covers descender tails that the p05–p95 band drops on long
@@ -2666,34 +2663,59 @@ const STRIP_DESCENDER_VPAD_FRAC: f32 = 0.4;
 /// lean. ~0.12 ⇒ needs roughly a 2.5:1 aspect, which any real word clears.
 const STRIP_ELONG_MAX: f32 = 0.12;
 
-/// Per-contour tilt measurement. `angle` is what the box uses on its own (post agreement and
-/// sub-visibility gates: 0 when the contour is degenerate, content-asymmetric, or its tilt is
-/// below the visibility floor). `vote` is the reading-direction sample this contour contributes
-/// to the frame-level consensus — present only when the two edges agree (so the value is
-/// trustworthy even when sub-visibly small), absent when the contour is degenerate or its edges
-/// disagree.
-struct TiltEstimate {
+/// Per-contour tilt measurement, in oriented terms (no AABB). `angle` is the reading-
+/// direction lean the contour measured for itself (0 when degenerate or content-
+/// asymmetric); `aspect` is its oriented long:short extent ratio along that lean — the
+/// length-confidence input that decides, in `resolve_box_angle`, how much the measurement
+/// is trusted against the frame. `(cx, cy)` is the contour centroid, where the consensus
+/// field is sampled. `vote` is the angle this contour offers to the frame consensus —
+/// present only when its edges agree *and* it is elongated enough to carry an axis.
+struct TiltMeasurement {
     angle: f32,
+    aspect: f32,
+    cx: f32,
+    cy: f32,
     vote: Option<f32>,
-    /// True only when the contour measured a visible, self-consistent tilt (edges agree *and*
-    /// the lean clears the visibility floor). A committed box owns its angle outright; an
-    /// uncommitted box adopts the consensus field at its position (see `resolve_box_angle`).
-    committed: bool,
 }
 
-impl TiltEstimate {
-    fn none() -> Self {
-        TiltEstimate {
+impl TiltMeasurement {
+    fn none(cx: f32, cy: f32) -> Self {
+        TiltMeasurement {
             angle: 0.0,
+            aspect: 0.0,
+            cx,
+            cy,
             vote: None,
-            committed: false,
         }
     }
 }
 
-/// Estimate a contour's horizontal tilt by regressing the top and bottom edges separately and
-/// only trusting a non-zero angle when both edges agree. The angle is in radians (+x ⇒ 0,
-/// downward-to-the-right ⇒ positive, image y points down).
+/// Oriented extents of a contour about its centroid, along `angle` (reading axis) and
+/// perpendicular to it. Tilt-invariant, unlike an axis-aligned bounding box.
+fn oriented_extents(contour: &[(f32, f32)], angle: f32, cx: f32, cy: f32) -> (f32, f32) {
+    let (ux, uy) = (angle.cos(), angle.sin());
+    let (vx, vy) = (-uy, ux);
+    let (mut u_min, mut u_max, mut v_min, mut v_max) = (
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    );
+    for &(x, y) in contour {
+        let (dx, dy) = (x - cx, y - cy);
+        let u = dx * ux + dy * uy;
+        let v = dx * vx + dy * vy;
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    (u_max - u_min, v_max - v_min)
+}
+
+/// Estimate a contour's reading-direction lean by regressing the top and bottom edges
+/// separately and only trusting an angle when both edges agree. The angle is in radians
+/// (+x ⇒ 0, downward-to-the-right ⇒ positive, image y points down).
 ///
 /// Algorithm:
 ///   1. Bin contour points by x.
@@ -2704,31 +2726,30 @@ impl TiltEstimate {
 ///   4. Linear-regress slope on the winsorized top points and on the winsorized bottom points.
 ///   5. If the two slopes differ by more than `TILT_AGREEMENT_SLOPE`, the contour is
 ///      content-asymmetric: report no usable angle and abstain from the consensus vote.
-///      Otherwise the average is the line's tilt and is offered as a vote.
-fn estimate_horizontal_tilt(contour: &[(f32, f32)]) -> TiltEstimate {
+///      Otherwise the average is the lean.
+///
+/// How far to *trust* that lean — against its own noise and against the frame — is not
+/// decided here: it is left to `length_confidence`/`angle_confidence` in `resolve_box_angle`,
+/// fed by the oriented `aspect` measured here. The contour votes into the frame consensus
+/// only when it is elongated enough to carry a reading axis at all.
+fn estimate_horizontal_tilt(contour: &[(f32, f32)]) -> TiltMeasurement {
+    let n = contour.len() as f32;
+    let (mut sum_x, mut sum_y) = (0.0f32, 0.0f32);
     let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
     let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
     for &(x, y) in contour {
-        if x < min_x {
-            min_x = x;
-        }
-        if x > max_x {
-            max_x = x;
-        }
-        if y < min_y {
-            min_y = y;
-        }
-        if y > max_y {
-            max_y = y;
-        }
+        sum_x += x;
+        sum_y += y;
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
     }
+    let (cx, cy) = (sum_x / n, sum_y / n);
     let width = max_x - min_x;
     let height = max_y - min_y;
     if width < 8.0 || height < 2.0 {
-        return TiltEstimate::none();
-    }
-    if width.max(height) < translator_raster::text_metrics::MIN_LINE_ASPECT * width.min(height) {
-        return TiltEstimate::none();
+        return TiltMeasurement::none(cx, cy);
     }
 
     let bin_w = width / TILT_X_BINS as f32;
@@ -2751,61 +2772,36 @@ fn estimate_horizontal_tilt(contour: &[(f32, f32)]) -> TiltEstimate {
     let top_pts: Vec<(f32, f32)> = top_per_bin.iter().filter_map(|p| *p).collect();
     let bot_pts: Vec<(f32, f32)> = bot_per_bin.iter().filter_map(|p| *p).collect();
     if top_pts.len() < 4 || bot_pts.len() < 4 {
-        return TiltEstimate::none();
+        return TiltMeasurement::none(cx, cy);
     }
 
     let tol = height * TILT_EDGE_OUTLIER_FRACTION;
     let top_slope = robust_regression_slope(&top_pts, tol);
     let bot_slope = robust_regression_slope(&bot_pts, tol);
     let diff = (top_slope - bot_slope).abs();
-    let (estimate, decision) = if diff > TILT_AGREEMENT_SLOPE {
+    if diff > TILT_AGREEMENT_SLOPE {
         // Content-asymmetric: the edges disagree about the lean, so this contour has no
-        // trustworthy angle of its own and abstains from the consensus vote.
-        (TiltEstimate::none(), "disagree → axis-align")
-    } else {
-        let avg = (top_slope + bot_slope) * 0.5;
-        let vote = avg.atan();
-        // Sub-visible tilt rejection: even when top and bot slopes "agree", if the resulting
-        // end-to-end y-deviation is small relative to the contour height, the agreement is
-        // probably just two same-direction regression biases (asymmetric cap on top + AA
-        // jitter on bottom) lining up — not a real lean. Demand a visible deviation before the
-        // box uses the angle on its own, but still vote (a near-zero `vote` is a valid "this
-        // box reads horizontally" sample for the frame consensus).
-        if avg.abs() * width < TILT_MIN_DEVIATION_FRACTION * height {
-            (
-                TiltEstimate {
-                    angle: 0.0,
-                    vote: Some(vote),
-                    committed: false,
-                },
-                "sub-visible → axis-align",
-            )
-        } else {
-            (
-                TiltEstimate {
-                    angle: vote,
-                    vote: Some(vote),
-                    committed: true,
-                },
-                "agree → use avg",
-            )
-        }
-    };
+        // trustworthy axis of its own — adopt the frame, abstain from the vote.
+        return TiltMeasurement::none(cx, cy);
+    }
+
+    let angle = ((top_slope + bot_slope) * 0.5).atan();
+    let (raw_u, raw_v) = oriented_extents(contour, angle, cx, cy);
+    let aspect = raw_u / raw_v.max(1.0);
+    let vote = (aspect >= translator_raster::text_metrics::MIN_LINE_ASPECT).then_some(angle);
     log::debug!(
-        "ppocr tilt: w={:.0} h={:.0} top_bins={} bot_bins={} \
-         top_slope={:.4} bot_slope={:.4} diff={:.4} (limit {:.4}) → {:.2}° ({})",
-        width,
-        height,
-        top_pts.len(),
-        bot_pts.len(),
-        top_slope,
-        bot_slope,
-        diff,
-        TILT_AGREEMENT_SLOPE,
-        estimate.angle.to_degrees(),
-        decision,
+        "ppocr tilt: w={width:.0} h={height:.0} aspect={aspect:.1} \
+         top_slope={top_slope:.4} bot_slope={bot_slope:.4} diff={diff:.4} → {:.2}° vote={}",
+        angle.to_degrees(),
+        vote.is_some(),
     );
-    estimate
+    TiltMeasurement {
+        angle,
+        aspect,
+        cx,
+        cy,
+        vote,
+    }
 }
 
 /// Two-pass OLS with a residual-based outlier filter. The first pass captures the dominant
@@ -2995,23 +2991,27 @@ fn fit_tilt_field(votes: &[TiltVote]) -> Option<TiltField> {
     Some(field)
 }
 
-/// Reconcile a box's own tilt with the frame consensus.
+/// Reconcile a box's own measured lean with the frame consensus by an adaptive clamp.
 ///
-/// - No consensus → the box's own measured angle stands.
-/// - Box did not commit to a tilt (edges disagreed, or the lean was sub-visible) → it has no
-///   opinion of its own, so it adopts the scene direction.
-/// - Committed box → keeps its own measured angle. The commitment gates (top/bottom edge
-///   agreement plus visible deviation) already filter content-asymmetric and sub-visible
-///   leans, and the oriented rect's height inflates by `width·tan(err)` for any angle error,
-///   so overriding a reliable per-box measurement with the field — fitted from those same
-///   votes, and only first-order — costs real geometry (5+ px of phantom height on a long
-///   line for a 0.2° nudge) to gain nothing. This is also what keeps a deliberately-skewed
-///   label and the per-line lean of a curved page (±5° across the frame) intact.
-fn resolve_box_angle(est: &TiltEstimate, consensus: Option<f32>) -> f32 {
-    if est.committed {
-        return est.angle;
+/// The measurement is kept whole — never blended — when there is enough evidence that it is
+/// real, and otherwise snapped to the frame. Evidence is the product of two confidences:
+/// `length_confidence(aspect)` (a square box carries no axis; a long line does) and
+/// `angle_confidence(|Δ|)` (a small deviation from the frame is likely noise; a large one is
+/// likely a genuine lean). So a short label clamps to the frame at any plausible angle, a long
+/// line honors even a fraction of a degree, and the middle keeps a lean only once it is large
+/// enough to clear its length's noise floor. With no consensus the frame is image-horizontal.
+///
+/// Only the in-axis lean is decided here; the ±90° reading-axis choice is `build_oriented_boxes`.
+fn resolve_box_angle(m: &TiltMeasurement, consensus: Option<f32>) -> f32 {
+    let frame = consensus.unwrap_or(0.0);
+    let delta = m.angle - frame;
+    let evidence = translator_raster::text_metrics::length_confidence(m.aspect)
+        * translator_raster::text_metrics::angle_confidence(delta.abs());
+    if evidence >= TILT_KEEP_EVIDENCE {
+        m.angle
+    } else {
+        frame
     }
-    consensus.unwrap_or(est.angle)
 }
 
 #[cfg(test)]
@@ -3022,7 +3022,9 @@ fn oriented_boxes_from_contour(contour: &[(f32, f32)]) -> Option<ContourBoxes> {
     // enu, so the top edge slopes down while the baseline stays flat, and PCA's covariance
     // splits the difference into a phantom tilt. The bottom edge is the baseline (stable for
     // most words), and demanding agreement with the top filters out asymmetric shapes.
-    build_oriented_boxes(contour, estimate_horizontal_tilt(contour).angle, 0.0)
+    // Standalone (no frame): the lean is clamped against image-horizontal by its own evidence.
+    let m = estimate_horizontal_tilt(contour);
+    build_oriented_boxes(contour, resolve_box_angle(&m, None), 0.0)
 }
 
 fn build_oriented_boxes(
@@ -3803,44 +3805,52 @@ mod tests {
         assert!(bow.abs() < 1.0, "expected flat spine, got {bow:.2} px bow");
     }
 
-    use super::{TiltEstimate, resolve_box_angle};
+    use super::{TiltMeasurement, resolve_box_angle};
 
-    fn committed(deg: f32) -> TiltEstimate {
+    fn measured(deg: f32, aspect: f32) -> TiltMeasurement {
         let a = deg.to_radians();
-        TiltEstimate {
+        TiltMeasurement {
             angle: a,
+            aspect,
+            cx: 0.0,
+            cy: 0.0,
             vote: Some(a),
-            committed: true,
         }
     }
 
     #[test]
-    fn box_without_a_committed_tilt_adopts_the_scene() {
-        // A content-asymmetric / sub-visible box (angle 0, no commitment) should follow the
-        // frame rather than snap to image-horizontal: in a 15° scene it becomes 15°.
+    fn short_box_adopts_the_scene() {
+        // A square / sub-confidence box (no axis of its own) follows the frame rather than
+        // snapping to image-horizontal: in a 15° scene it becomes 15°.
         let scene = 15.0f32.to_radians();
-        let abstain = TiltEstimate::none();
-        assert!((resolve_box_angle(&abstain, Some(scene)) - scene).abs() < 1e-6);
-        // With no consensus it keeps its own (0) angle.
-        assert_eq!(resolve_box_angle(&abstain, None), 0.0);
+        let short = measured(0.0, 1.5);
+        assert!((resolve_box_angle(&short, Some(scene)) - scene).abs() < 1e-6);
+        // With no consensus the frame is image-horizontal, so it clamps to 0.
+        assert_eq!(resolve_box_angle(&short, None), 0.0);
     }
 
     #[test]
-    fn committed_box_keeps_its_own_angle_against_the_scene() {
-        // A box that committed to a tilt is a breakaway: it keeps its measured angle
-        // regardless of the scene consensus. The commitment gates (top/bottom edge
-        // agreement plus a visible-deviation floor) already rejected the phantom and
-        // sub-visible leans upstream, so a committed angle is trusted and overriding
-        // it with the first-order field would only inflate the rect's height by
-        // width·tan(err). This holds for a small genuine lean and a large
-        // deliberate rotation alike — both must survive a flat scene.
+    fn long_line_keeps_its_lean_against_a_flat_scene() {
+        // A long line carries enough length confidence that its measured lean is kept whole
+        // against a flat frame — a small genuine lean and a large rotation alike.
         let scene = Some(0.0f32);
         for deg in [2.6f32, 5.0, 35.0] {
-            let est = committed(deg);
+            let est = measured(deg, 20.0);
             assert!(
                 (resolve_box_angle(&est, scene) - deg.to_radians()).abs() < 1e-6,
-                "committed {deg}° must survive a flat scene",
+                "long line at {deg}° must keep its lean against a flat scene",
             );
         }
+    }
+
+    #[test]
+    fn few_word_line_clamps_a_tiny_lean_but_keeps_a_real_one() {
+        // The crux: a ~3-word line (aspect ~8) treats a 1° read as noise (clamp to frame)
+        // but a 15° read as real (keep).
+        let scene = Some(0.0f32);
+        assert_eq!(resolve_box_angle(&measured(1.0, 8.0), scene), 0.0);
+        assert!(
+            (resolve_box_angle(&measured(15.0, 8.0), scene) - 15.0f32.to_radians()).abs() < 1e-6
+        );
     }
 }

@@ -57,6 +57,33 @@ const MIN_TILT_COLUMNS: usize = 8;
 /// detection tilt/long-axis decisions and the ink baseline fit here (where the short
 /// dimension is the x-height).
 pub const MIN_LINE_ASPECT: f32 = 3.0;
+/// Long:short extent ratio at which a line is trusted outright — its reading axis is
+/// honored regardless of how small its lean is. Between [`MIN_LINE_ASPECT`] and this,
+/// trust grows but the lean must be large enough to clear the noise floor.
+pub const TRUSTED_LINE_ASPECT: f32 = 30.0;
+/// Deviation from the frame at which a measured lean is taken as fully real rather
+/// than measurement noise. A small delta is likely noise; confidence in it being a
+/// genuine lean saturates here.
+pub const TRUSTED_TILT_DELTA: f32 = std::f32::consts::PI / 18.0; // 10°
+
+/// Confidence that a region's measured reading axis is real, from its oriented
+/// long:short extent ratio. Zero at [`MIN_LINE_ASPECT`] (square — a lone glyph, no
+/// axis), concave ramp to 1 at [`TRUSTED_LINE_ASPECT`]. Concave so a few-word line and
+/// a long line are kept distinct: the former honors only sizeable leans, the latter
+/// honors even a fraction of a degree.
+pub fn length_confidence(aspect: f32) -> f32 {
+    ((aspect - MIN_LINE_ASPECT) / (TRUSTED_LINE_ASPECT - MIN_LINE_ASPECT))
+        .clamp(0.0, 1.0)
+        .sqrt()
+}
+
+/// Confidence that a lean deviating from the frame is genuine rather than measurement
+/// noise, from its absolute size. Zero at no deviation, linear to 1 at
+/// [`TRUSTED_TILT_DELTA`] and flat beyond — past the in-axis lean regime more deviation
+/// is a different axis, not more confidence.
+pub fn angle_confidence(abs_delta_radians: f32) -> f32 {
+    (abs_delta_radians / TRUSTED_TILT_DELTA).clamp(0.0, 1.0)
+}
 /// Clamp on the recovered tilt. The matte was produced from a strip dewarped
 /// with the rough angle, so a real residual is small; a larger fit is a
 /// degenerate matte, not a steeper line.
