@@ -50,6 +50,13 @@ const MIN_SPAN_FRAC: f32 = 0.20;
 /// Minimum inked columns to attempt a baseline-tilt fit. Below this the slope
 /// is noise; report zero tilt and keep just the x-height.
 const MIN_TILT_COLUMNS: usize = 8;
+/// Minimum long:short extent ratio for a text region to carry a trustworthy reading
+/// axis. A squarer region is a lone glyph or symbol whose edges and extents trace
+/// letter shape, not a line direction, so no serious angle measurement can be taken
+/// from it. Shared across the angle measurements that must bail on short text: the
+/// detection tilt/long-axis decisions and the ink baseline fit here (where the short
+/// dimension is the x-height).
+pub const MIN_LINE_ASPECT: f32 = 3.0;
 /// Clamp on the recovered tilt. The matte was produced from a strip dewarped
 /// with the rough angle, so a real residual is small; a larger fit is a
 /// degenerate matte, not a steeper line.
@@ -787,6 +794,16 @@ pub fn baseline_angle_source(matte: &GrayImage, src_map: &[(f32, f32)]) -> Optio
         return None;
     }
     let (sup_top, sup_bottom) = central_band(&row_sum, peak as f32 * SUPPORT_FRAC, mh as usize)?;
+
+    let span_cov = column_span_coverage(data, mw_us, mh as usize, sup_top, sup_bottom);
+    let (xheight_top, baseline_row) = band_edges(&span_cov, sup_top, sup_bottom);
+    let x_height = (baseline_row - xheight_top).max(1.0);
+    let (col_left, col_right) = ink_column_span(data, mw_us, sup_top, sup_bottom);
+    let reading_span = (col_right - col_left + 1) as f32;
+    if reading_span < MIN_LINE_ASPECT * x_height {
+        return None;
+    }
+
     let mut pts: Vec<(f32, f32)> = Vec::new();
     for x in 0..mw_us {
         let Some(b) = column_baseline_row(data, mw_us, x, sup_top, sup_bottom) else {
@@ -794,9 +811,6 @@ pub fn baseline_angle_source(matte: &GrayImage, src_map: &[(f32, f32)]) -> Optio
         };
         let row = (b.round() as usize).min(mh as usize - 1);
         pts.push(src_map[row * mw_us + x]);
-    }
-    if pts.len() < MIN_TILT_COLUMNS {
-        return None;
     }
     robust_axis_angle(&pts)
 }

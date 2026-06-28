@@ -2727,6 +2727,9 @@ fn estimate_horizontal_tilt(contour: &[(f32, f32)]) -> TiltEstimate {
     if width < 8.0 || height < 2.0 {
         return TiltEstimate::none();
     }
+    if width.max(height) < translator_raster::text_metrics::MIN_LINE_ASPECT * width.min(height) {
+        return TiltEstimate::none();
+    }
 
     let bin_w = width / TILT_X_BINS as f32;
     let mut top_per_bin: [Option<(f32, f32)>; TILT_X_BINS] = [None; TILT_X_BINS];
@@ -3072,13 +3075,14 @@ fn build_oriented_boxes(
     // horizontal tilts; for text that's actually rotated ~90° (e.g.
     // phone held in portrait while shooting a landscape doc) it
     // returns 0 and the contour's y-extent is then the long side.
-    // Swap so the rect's long side is always the reading axis, with
-    // angle bumped by π/2.
-    let (final_width, final_height, final_angle) = if raw_v > raw_u {
-        (raw_v, raw_u, angle_radians + std::f32::consts::FRAC_PI_2)
-    } else {
-        (raw_u, raw_v, angle_radians)
-    };
+    // Swap so the rect's long side is the reading axis, with angle bumped
+    // by π/2.
+    let (final_width, final_height, final_angle) =
+        if raw_v > raw_u * translator_raster::text_metrics::MIN_LINE_ASPECT {
+            (raw_v, raw_u, angle_radians + std::f32::consts::FRAC_PI_2)
+        } else {
+            (raw_u, raw_v, angle_radians)
+        };
     if final_width < 4.0 || final_height < 2.0 {
         return None;
     }
