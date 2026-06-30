@@ -425,7 +425,7 @@ fn synthesize_pack_sample(
     let (samples, sample_rate) = match engine {
         "piper" => synthesize_piper(pack_key, pack, catalog, bucket_dir, text)?,
         "mimic3" => synthesize_mimic3(pack_key, pack, catalog, bucket_dir, text)?,
-        "mms" => synthesize_mms(pack_key, catalog, bucket_dir, text)?,
+        "mms" => synthesize_mms(pack_key, pack, catalog, bucket_dir, text)?,
         "coqui_vits" => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
         "cotovia_vits" => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
         "sherpa_vits" => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
@@ -606,10 +606,15 @@ fn synthesize_mimic3(
 
 fn synthesize_mms(
     pack_key: &str,
+    pack: &Pack,
     catalog: &Catalog,
     bucket_dir: &Path,
     text: &str,
 ) -> Result<(Vec<f32>, u32), String> {
+    let language = pack
+        .language
+        .as_deref()
+        .ok_or_else(|| format!("Pack `{pack_key}` is missing `language`"))?;
     let model_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
         file.name == "model.onnx"
     })?;
@@ -620,6 +625,7 @@ fn synthesize_mms(
     let mut model = MmsModel::new(
         &model_path.with_extension("mnn"),
         &tokens_path,
+        language,
         &Backend::Cpu,
     )
     .map_err(|err| format!("Failed to load MMS model `{pack_key}`: {err}"))?;

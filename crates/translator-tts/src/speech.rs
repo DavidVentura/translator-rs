@@ -492,9 +492,14 @@ fn load_speech_model(
             }
             Ok(SpeechModel::KokoroMnn(model))
         }
-        "mms" => MmsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
-            .map(SpeechModel::Mms)
-            .map_err(|err| format!("Failed to load MMS voice: {err}")),
+        "mms" => MmsModel::new(
+            Path::new(model_path),
+            Path::new(aux_path),
+            language_code,
+            &Backend::Cpu,
+        )
+        .map(SpeechModel::Mms)
+        .map_err(|err| format!("Failed to load MMS voice: {err}")),
         "coqui_vits" => CoquiVitsModel::new(
             Path::new(model_path),
             Path::new(aux_path),
