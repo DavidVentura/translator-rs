@@ -7,7 +7,7 @@ use crate::catalog::{
     PackInstallChecker, PackRecord, build_catalog_snapshot, plan_delete_superseded_files,
     plan_language_download,
 };
-use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades};
+use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair};
 use crate::language::Language;
 
 use super::model::{
@@ -644,6 +644,40 @@ fn lower_priority_alternative_keeps_pack_installed_and_offers_upgrade() {
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["ppocr/det_new.mnn"]);
     assert_eq!(upgrades.total_size, 40);
+}
+
+#[test]
+fn repair_plan_restores_partially_present_packs() {
+    let catalog = catalog_with_detector_alternatives();
+    // No detector model on disk (catalog change orphaned it / partial download)
+    // but the pack's classifier survives; the recognizer itself is complete and
+    // broken only through its dependency.
+    let checker = FakeInstallChecker::with_files(&["ppocr/pulc.mnn", "ppocr/latin.mnn"]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    let detector_status = &snapshot.pack_statuses["ocr-ppocr-detector"];
+    assert!(!detector_status.installed);
+    assert!(detector_status.any_file_present);
+    assert!(!snapshot.pack_statuses["ocr-ppocr-latin"].installed);
+
+    let plan = plan_repair(&snapshot);
+    let paths = plan
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["ppocr/det_new.mnn"]);
+    assert_eq!(plan.total_size, 40);
+}
+
+#[test]
+fn repair_plan_ignores_never_installed_packs() {
+    let snapshot = build_catalog_snapshot(
+        catalog_with_detector_alternatives(),
+        "/base".to_string(),
+        &FakeInstallChecker::with_files(&[]),
+    );
+    assert!(plan_repair(&snapshot).tasks.is_empty());
 }
 
 fn catalog_with_optional_ink() -> LanguageCatalog {

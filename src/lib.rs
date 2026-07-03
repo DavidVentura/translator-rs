@@ -116,9 +116,9 @@ pub use catalog::{
     FsPackInstallChecker, InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog,
     LanguageOverview, OcrEngine, OcrPack, PpocrScript, TtsSpeakerEntry, TtsVoicePickerRegion,
     available_ocr_engines_for_language, installed_ocr_engines_for_language,
-    installed_tts_voice_picker_regions, language_rows_in_snapshot, parse_and_validate_catalog,
-    plan_delete_superseded_files, plan_ocr_engine_download, plan_ocr_engine_downloads,
-    plan_ocr_engine_upgrades,
+    installed_tts_voice_picker_regions, language_rows_in_snapshot, ocr_engine_ready,
+    parse_and_validate_catalog, plan_delete_superseded_files, plan_ocr_engine_download,
+    plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{

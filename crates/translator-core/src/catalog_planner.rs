@@ -5,14 +5,19 @@ use crate::language::Language;
 
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole,
-    InstalledTtsPack, LangAvailability, LanguageCatalog, MigrationAction, MigrationJob, PackKind,
-    PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
+    InstalledTtsPack, LangAvailability, LanguageCatalog, MigrationAction, MigrationJob, OcrPack,
+    PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo,
+    TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackInstallStatus {
     pub pack_id: String,
     pub installed: bool,
+    /// At least one of the pack's own files is on disk. Together with
+    /// `!installed` this distinguishes a broken partial install (repairable)
+    /// from a pack that was simply never downloaded.
+    pub any_file_present: bool,
     pub missing_files: Vec<AssetFileV2>,
     pub missing_dependency_ids: Vec<String>,
     /// Improvement downloads that don't gate `installed`: higher-priority role
@@ -188,10 +193,13 @@ where
         let mut missing_files = Vec::new();
         let mut upgrade_files = Vec::new();
         let mut superseded_files = Vec::new();
+        let mut any_file_present = false;
         let mut role_groups: Vec<(&FileRole, Vec<&AssetFileV2>)> = Vec::new();
         for file in &pack.files {
             let Some(role) = &file.role else {
-                if !file_present(file) {
+                if file_present(file) {
+                    any_file_present = true;
+                } else {
                     missing_files.push(file.clone());
                 }
                 continue;
@@ -208,6 +216,7 @@ where
                 .filter(|file| file_present(file))
                 .copied()
                 .collect::<Vec<_>>();
+            any_file_present |= !present.is_empty();
             let Some(best_present) = present.first() else {
                 // No file of this role on disk. A required role gates the pack;
                 // an optional one is offered as an improvement upgrade instead so
@@ -234,6 +243,7 @@ where
         let status = PackInstallStatus {
             pack_id: pack_id.to_string(),
             installed: missing_files.is_empty() && missing_dependency_ids.is_empty(),
+            any_file_present,
             missing_files,
             missing_dependency_ids,
             upgrade_files,
@@ -382,6 +392,17 @@ pub fn installed_ocr_engines_for_language(
         .collect()
 }
 
+/// Whether the shared OCR foundation is usable at all: the ppocr detector pack
+/// is installed. Recognizers are per-language, but without the detector every
+/// OCR path fails outright — callers use this to refuse to start (with a
+/// user-visible message) instead of silently rendering nothing.
+pub fn ocr_engine_ready(snapshot: &CatalogSnapshot) -> bool {
+    snapshot.catalog.packs.iter().any(|(pack_id, pack)| {
+        matches!(&pack.kind, PackKind::Ocr(OcrPack::PpocrDetector))
+            && pack_installed_in_snapshot(snapshot, pack_id)
+    })
+}
+
 pub fn available_ocr_engines_for_language(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
@@ -514,6 +535,34 @@ pub fn plan_ocr_engine_upgrades(
         .collect::<Vec<_>>();
     let tasks = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
         status.upgrade_files.iter().collect()
+    })
+    .into_iter()
+    .filter_map(|item| {
+        let pack = snapshot.catalog.pack(&item.pack_id)?;
+        Some(download_task_for(pack, &item.file))
+    })
+    .collect::<Vec<_>>();
+    DownloadPlan {
+        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
+        tasks,
+    }
+}
+
+/// Downloads that restore packs the user already has to a working state: packs
+/// with some files on disk but missing required ones (a partial download, or a
+/// catalog change that orphaned the on-disk variant), plus whatever their
+/// dependency chain is missing. Packs with no files at all are not included —
+/// those were never installed, and this app never downloads unrequested content.
+pub fn plan_repair(snapshot: &CatalogSnapshot) -> DownloadPlan {
+    let mut broken_pack_ids = snapshot
+        .pack_statuses
+        .values()
+        .filter(|status| !status.installed && status.any_file_present)
+        .map(|status| status.pack_id.as_str())
+        .collect::<Vec<_>>();
+    broken_pack_ids.sort_unstable();
+    let tasks = status_files_in_snapshot(snapshot, broken_pack_ids, |status| {
+        status.missing_files.iter().collect()
     })
     .into_iter()
     .filter_map(|item| {
