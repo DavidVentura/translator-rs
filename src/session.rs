@@ -632,12 +632,14 @@ impl TranslatorSession {
         language_code: &str,
         text: &str,
         pack_id: Option<&str>,
+        read_urls_and_hashtags: bool,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
         self.tts.plan_speech_chunks(
             &self.snapshot(),
             &LanguageCode::from(language_code),
             text,
             pack_id,
+            read_urls_and_hashtags,
         )
     }
 

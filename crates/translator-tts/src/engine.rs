@@ -50,9 +50,17 @@ impl TtsEngine {
         language: &LanguageCode,
         text: &str,
         pack_id: Option<&str>,
+        read_urls_and_hashtags: bool,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
         let mut cache = self.cache.lock().expect("speech cache poisoned");
-        plan_speech_chunks_for_text_in_snapshot(snap, &mut cache, language, text, pack_id)
+        plan_speech_chunks_for_text_in_snapshot(
+            snap,
+            &mut cache,
+            language,
+            text,
+            pack_id,
+            read_urls_and_hashtags,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

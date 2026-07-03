@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -417,6 +418,7 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
     language_code: &LanguageCode,
     text: &str,
     pack_id: Option<&str>,
+    read_urls_and_hashtags: bool,
 ) -> Result<Vec<SpeechChunk>, TranslatorError> {
     let assets = resolve_speech_assets_for_pack(snapshot, language_code, pack_id)
         .ok_or_else(|| missing_tts_asset(language_code))?;
@@ -428,6 +430,7 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
         assets.support_data_root.as_deref(),
         &assets.language_code,
         text,
+        read_urls_and_hashtags,
     )
     .map_err(TranslatorError::tts)
 }
@@ -958,6 +961,18 @@ fn to_phoneme_chunk(chunk: PiperPhonemeChunk) -> PhonemeChunk {
     }
 }
 
+fn is_url(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.")
+}
+
+fn strip_urls_and_hashtags(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|word| !is_url(word) && !word.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn plan_speech_chunks_for_text(
     cache: &mut SpeechCache,
     engine: &str,
@@ -966,8 +981,14 @@ fn plan_speech_chunks_for_text(
     support_data_root: Option<&str>,
     language_code: &str,
     text: &str,
+    read_urls_and_hashtags: bool,
 ) -> Result<Vec<SpeechChunk>, String> {
-    let text = romanize_foreign_runs_for_voice(text, language_code);
+    let filtered = if read_urls_and_hashtags {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(strip_urls_and_hashtags(text))
+    };
+    let text = romanize_foreign_runs_for_voice(&filtered, language_code);
     plan_speech_chunks(&text, |chunk_text| {
         phonemize_chunks(
             cache,
@@ -980,4 +1001,28 @@ fn plan_speech_chunks_for_text(
         )
         .map(|chunks| chunks.into_iter().map(to_phoneme_chunk).collect::<Vec<_>>())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_urls_and_hashtags;
+
+    #[test]
+    fn strips_urls_and_hashtags_keeping_surrounding_words() {
+        let input = "Check https://example.com/path now #cool and www.foo.org too";
+        assert_eq!(strip_urls_and_hashtags(input), "Check now and too");
+    }
+
+    #[test]
+    fn keeps_plain_text_untouched() {
+        assert_eq!(
+            strip_urls_and_hashtags("just plain words"),
+            "just plain words"
+        );
+    }
+
+    #[test]
+    fn keeps_hash_only_when_not_leading() {
+        assert_eq!(strip_urls_and_hashtags("C# is fine"), "C# is fine");
+    }
 }
