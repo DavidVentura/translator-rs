@@ -1577,11 +1577,16 @@ impl LiveTrackerPipeline {
             if let Ok(mut store) = self.bold_profiles.lock() {
                 store.insert(anchor_id, bold_profiles);
             }
+            let model_colors: Vec<Option<translator_core::ocr::InkColor>> = ink_strips
+                .iter()
+                .map(|s| s.as_ref().and_then(|s| s.pooled_color()))
+                .collect();
             let strips = translator_raster::color_matting::mat_detections(
                 &rgb.to_rgba8(),
                 &scaled,
                 &ink_masks,
                 &ink_src_maps,
+                &model_colors,
             );
             // `mat_detections` returns only the boxes that matted (keyed by
             // `box_index`); the block grouping downstream indexes strips

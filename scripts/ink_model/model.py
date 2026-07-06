@@ -25,7 +25,8 @@ def conv_block(cin: int, cout: int) -> nn.Sequential:
 
 class InkUNet(nn.Module):
     def __init__(self, base: int = 16, levels: int = 2, bold_from: int = 1, detach_bold: bool = False,
-                 bold_head: str = "dilated", rule: bool = False, rule_head: str = "dilated"):
+                 bold_head: str = "dilated", rule: bool = False, rule_head: str = "dilated",
+                 color: bool = False):
         super().__init__()
         self.levels = levels
         self.bold_from = bold_from
@@ -33,6 +34,7 @@ class InkUNet(nn.Module):
         self.bold_head_kind = bold_head
         self.rule = rule
         self.rule_head_kind = rule_head
+        self.color = color
         self.enc1 = conv_block(3, base)
         self.enc2 = conv_block(base, base * 2)
         self.enc3 = conv_block(base * 2, base * 4)
@@ -80,6 +82,13 @@ class InkUNet(nn.Module):
                     nn.ReLU(inplace=True),
                     nn.Conv2d(base, 1, 1),
                 )
+        # Colour head (FBA-style joint prediction): 6 logit channels off full-res d1 —
+        # F = decontaminated ink RGB, B = background RGB, both sigmoid at the consumer.
+        # Predicting F directly (instead of estimating colour post-hoc from matte-selected
+        # pixels) is what keeps a matte over-marking failure from poisoning the colour.
+        # Optional so matte/bold/rule checkpoints still load strict.
+        if color:
+            self.color_head = nn.Conv2d(base, 6, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
@@ -105,6 +114,8 @@ class InkUNet(nn.Module):
         outs = [self.matte_head(d1), bold]
         if self.rule:
             outs.append(self.rule_head(d1))
+        if self.color:
+            outs.append(self.color_head(d1))
         return torch.cat(outs, dim=1)
 
 

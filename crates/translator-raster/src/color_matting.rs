@@ -44,7 +44,7 @@
 use image::imageops::FilterType;
 use image::{GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 
-use translator_core::ocr::DetectedTextBox;
+use translator_core::ocr::{DetectedTextBox, InkColor};
 
 /// Per-detection matting result, shared by the still-image and live-camera
 /// overlays. The `strip_rgba` is a rectified RGBA image — an opaque "pill": its
@@ -149,6 +149,7 @@ pub fn mat_detections(
     boxes: &[DetectedTextBox],
     ink_masks: &[Option<GrayImage>],
     src_maps: &[Option<Vec<(f32, f32)>>],
+    model_colors: &[Option<InkColor>],
 ) -> Vec<MattedStrip> {
     let (w, h) = rgba.dimensions();
     let mut union_ink = vec![false; (w as usize) * (h as usize)];
@@ -159,7 +160,8 @@ pub fn mat_detections(
             continue;
         };
         let src_map = src_maps.get(idx).and_then(|m| m.as_deref());
-        fg[idx] = project_box_ink(rgba, b, mask, src_map, w, h, &mut union_ink);
+        let model_color = model_colors.get(idx).copied().flatten();
+        fg[idx] = project_box_ink(rgba, b, mask, src_map, w, h, &mut union_ink, model_color);
     }
 
     boxes
@@ -185,7 +187,7 @@ pub fn union_ink_mask(
     for (idx, b) in boxes.iter().enumerate() {
         if let Some(Some(mask)) = ink_masks.get(idx) {
             let src_map = src_maps.get(idx).and_then(|m| m.as_deref());
-            let _ = project_box_ink(rgba, b, mask, src_map, w, h, &mut union);
+            let _ = project_box_ink(rgba, b, mask, src_map, w, h, &mut union, None);
         }
     }
     union
@@ -207,12 +209,13 @@ fn project_box_ink(
     w: u32,
     h: u32,
     union_ink: &mut [bool],
+    model_color: Option<InkColor>,
 ) -> Option<u32> {
     // Contour-dewarped strips carry a per-pixel source map (the strip is curl-straightened,
     // so there is no single affine inverse). Scatter the matte back through it; the sparse
     // hits a low-res strip leaves on large text are closed by the caller's fill dilation.
     if let Some(map) = src_map {
-        return scatter_box_ink(image, ink_mask, map, w, h, union_ink);
+        return scatter_box_ink(image, ink_mask, map, w, h, union_ink, model_color);
     }
     let o = detected.oriented_box;
     if o.width <= 1.0 || o.height <= 1.0 {
@@ -273,7 +276,7 @@ fn project_box_ink(
         }
     }
 
-    fg_from_samples(ink, bg_lumas)
+    fg_resolve(ink, bg_lumas, model_color)
 }
 
 /// Scatter a contour-strip matte into the image-space `union_ink` via its forward
@@ -288,6 +291,7 @@ fn scatter_box_ink(
     w: u32,
     h: u32,
     union_ink: &mut [bool],
+    model_color: Option<InkColor>,
 ) -> Option<u32> {
     let mw = ink_mask.width();
     let mh = ink_mask.height();
@@ -314,7 +318,22 @@ fn scatter_box_ink(
             }
         }
     }
-    fg_from_samples(ink, bg_lumas)
+    fg_resolve(ink, bg_lumas, model_color)
+}
+
+/// Resolve a box's foreground colour: the model-predicted ink colour when the strip has a
+/// colour head (only the WCAG legibility floor is applied to it, against the model's own
+/// pooled background luma), otherwise the sampled-pixel derivation ([`fg_from_samples`]).
+/// The `MIN_INK_PIXELS` gate applies either way — a box the matte found essentially no ink
+/// in renders with the default pill regardless of how its colour would be picked.
+fn fg_resolve(ink: Vec<Rgba<u8>>, bg_lumas: Vec<u8>, model_color: Option<InkColor>) -> Option<u32> {
+    if ink.len() < MIN_INK_PIXELS {
+        return None;
+    }
+    match model_color {
+        Some(c) => Some(enforce_contrast(c.fg_argb, c.bg_luma, FG_MIN_CONTRAST)),
+        None => fg_from_samples(ink, bg_lumas),
+    }
 }
 
 /// Reduce a box's gathered ink pixels + background lumas to a foreground colour. The three
@@ -356,6 +375,14 @@ pub(crate) fn fg_from_samples(ink: Vec<Rgba<u8>>, bg_lumas: Vec<u8>) -> Option<u
     bg.sort_unstable();
     let bg_luma = bg.get(bg.len() / 2).copied().unwrap_or(255);
     Some(ink_core_argb(ink, bg_luma))
+}
+
+/// Overlay colour for a model-predicted [`InkColor`]: the faithful predicted ink colour with
+/// only the WCAG legibility floor applied (against the model's pooled background luma). This
+/// is the whole colour derivation for colour-head models — no sampling, no luma-extreme core,
+/// no polarity guess; those exist only as the fallback for models without the colour head.
+pub fn model_fg_argb(c: InkColor) -> u32 {
+    enforce_contrast(c.fg_argb, c.bg_luma, FG_MIN_CONTRAST)
 }
 
 /// Still-path foreground colour over a box AABB: gather ink + between-stroke/margin background

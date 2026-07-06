@@ -264,6 +264,17 @@ fn style_kind_key(kind: StyleKind) -> (u8, u32) {
     }
 }
 
+/// Ink colour measured by the ink model's colour head (FBA-style F/B prediction):
+/// `fg_argb` is the α²-pooled predicted ink colour, `bg_luma` the pooled predicted
+/// background luma the overlay checks its contrast floor against. Predicted per pixel
+/// by the model rather than sampled from matte-selected image pixels, so a matte that
+/// grabs background does not poison the colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InkColor {
+    pub fg_argb: u32,
+    pub bg_luma: u8,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextLine {
     pub text: String,
@@ -284,6 +295,10 @@ pub struct TextLine {
     /// the ink rule channel (both paired with the line's CTC firings). Empty = plain text.
     /// Carried through grouping so the overlay renders mixed-weight/decorated lines.
     pub style_ranges: Vec<StyleRange>,
+    /// Model-predicted ink colour for this line (colour-head ink models only). `None` for
+    /// legacy models or too little ink — the overlay then falls back to sampling the colour
+    /// from matte-selected image pixels.
+    pub ink_color: Option<InkColor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1158,6 +1173,8 @@ fn merge_two_lines(a: TextLine, b: TextLine) -> TextLine {
         tight_box,
         word_rects,
         style_ranges,
+        // Merged CJK segments share one visual line; either segment's colour serves.
+        ink_color: a.ink_color.or(b.ink_color),
     }
 }
 
@@ -1475,6 +1492,7 @@ fn transpose_line(line: TextLine, frame_x: u32) -> TextLine {
             .map(|r| transpose_rect(r, frame_x))
             .collect(),
         style_ranges: line.style_ranges,
+        ink_color: line.ink_color,
     }
 }
 
@@ -1490,6 +1508,7 @@ fn untranspose_line(line: TextLine, frame_x: u32) -> TextLine {
             .map(|r| untranspose_rect(r, frame_x))
             .collect(),
         style_ranges: line.style_ranges,
+        ink_color: line.ink_color,
     }
 }
 
@@ -2502,6 +2521,7 @@ pub fn build_text_blocks(
                 tight_box: OrientedRect::axis_aligned(word.bounding_box),
                 word_rects: vec![word.bounding_box],
                 style_ranges: Vec::new(),
+                ink_color: None,
             });
         } else if let Some(line) = current_line.as_mut() {
             let delta = word.bounding_box.left.saturating_sub(last_right);
@@ -2521,6 +2541,7 @@ pub fn build_text_blocks(
                     tight_box: OrientedRect::axis_aligned(word.bounding_box),
                     word_rects: vec![word.bounding_box],
                     style_ranges: Vec::new(),
+                    ink_color: None,
                 };
                 if !lines.is_empty() {
                     blocks.push(TextBlock {
@@ -2671,6 +2692,7 @@ mod tests {
             tight_box: tight,
             word_rects: vec![rect],
             style_ranges: Vec::new(),
+            ink_color: None,
         }
     }
 
@@ -2698,6 +2720,7 @@ mod tests {
             tight_box: tight,
             word_rects: vec![rect],
             style_ranges: Vec::new(),
+            ink_color: None,
         }
     }
 
@@ -3229,6 +3252,7 @@ mod tests {
             },
             word_rects: vec![rect],
             style_ranges: Vec::new(),
+            ink_color: None,
         }
     }
 

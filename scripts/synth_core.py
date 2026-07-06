@@ -82,12 +82,21 @@ def apply_warp(arr: np.ndarray, sx: np.ndarray, sy: np.ndarray, border: float = 
                      borderMode=cv2.BORDER_CONSTANT, borderValue=border)
 
 
-def degrade(img: np.ndarray, rng: random.Random, native_h: int, log: dict | None = None) -> np.ndarray:
+def degrade(img: np.ndarray, rng: random.Random, native_h: int, log: dict | None = None,
+            photometric_aux: list[np.ndarray] | None = None) -> np.ndarray:
     """Camera/screen degradations applied to the composited image only.
 
     Blur scales with the native text height: a 1.8 px gaussian erases 12 px text
     outright but is realistic camera softness on 40 px text. Det/rec gate what
     reaches the ink model, so training must not contain text they would reject.
+
+    `photometric_aux`: HxWx3 label images (e.g. the ink/background colour fields)
+    updated *in place* (list slots reassigned) with only the colour-changing ops —
+    shade, hard shadow, contrast squeeze. Illumination genuinely changes the colour
+    the labels should carry, while blur/JPEG/noise are observation noise the model
+    must see through, so those leave the labels untouched. The photometric ops are
+    per-pixel affine, so applying them to the fields independently keeps the
+    compositing identity `img ≈ cov·F + (1−cov)·B` exact up to observation noise.
     """
     pil = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8))
     if rng.random() < 0.5:
@@ -132,8 +141,11 @@ def degrade(img: np.ndarray, rng: random.Random, native_h: int, log: dict | None
         angle = rng.uniform(0, 2 * np.pi)
         t = (np.cos(angle) * xx / w) + (np.sin(angle) * yy / h)
         t = (t - t.min()) / max(t.max() - t.min(), 1e-6)
-        shade = rng.uniform(0.55, 1.0) + t * rng.uniform(0.0, 0.45)
-        out = out * np.clip(shade, 0.4, 1.2)[..., None]
+        shade = np.clip(rng.uniform(0.55, 1.0) + t * rng.uniform(0.0, 0.45), 0.4, 1.2)
+        out = out * shade[..., None]
+        if photometric_aux is not None:
+            for i, aux in enumerate(photometric_aux):
+                photometric_aux[i] = aux * shade[..., None]
         if log is not None:
             log["shade"] = 1
     if rng.random() < 0.25:
@@ -147,6 +159,9 @@ def degrade(img: np.ndarray, rng: random.Random, native_h: int, log: dict | None
         edge = rng.uniform(proj.min(), proj.max())
         shadow = np.where(proj < edge, rng.uniform(0.4, 0.8), 1.0).astype(np.float32)
         out = out * shadow[..., None]
+        if photometric_aux is not None:
+            for i, aux in enumerate(photometric_aux):
+                photometric_aux[i] = aux * shadow[..., None]
         if log is not None:
             log["hardshadow"] = 1
     if rng.random() < 0.6:
@@ -159,8 +174,16 @@ def degrade(img: np.ndarray, rng: random.Random, native_h: int, log: dict | None
     if rng.random() < 0.3:
         lo, hi = rng.uniform(0.0, 0.08), rng.uniform(0.85, 1.0)
         out = out * (hi - lo) + lo
+        if photometric_aux is not None:
+            for i, aux in enumerate(photometric_aux):
+                photometric_aux[i] = aux * (hi - lo) + lo
         if log is not None:
             log["squeeze"] = round(hi - lo, 2)
+    if photometric_aux is not None:
+        # Shade's 1.2x ceiling can push a bright field past 1; the labels must stay in
+        # the sigmoid's range.
+        for i, aux in enumerate(photometric_aux):
+            photometric_aux[i] = np.clip(aux, 0, 1).astype(np.float32, copy=False)
     return np.clip(out, 0, 1)
 
 

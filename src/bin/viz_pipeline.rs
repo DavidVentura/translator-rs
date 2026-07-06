@@ -807,6 +807,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 | Stage::Deskewed
                 | Stage::CharFirings
                 | Stage::Rewrite
+                | Stage::Ink
         )
     });
     let mut boxes: Vec<DetectedTextBox> = Vec::new();
@@ -1159,12 +1160,35 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("  wrote {n}/{} ink masks", masks.len());
                     index.insert("ink_count".into(), serde_json::json!(n));
 
-                    // Three full-page overlays, each from the real prod constants/functions:
+                    // Full-page overlays, each from the real prod constants/functions:
                     //   raw   = the model's matte (every texel ≥ INK_CUT), no scatter loss
-                    //   core  = the FG_INK_FRACTION luma-extreme the colour picker samples
+                    //   core  = the FG_INK_FRACTION luma-extreme the *fallback* colour picker
+                    //           samples (colour-head models don't use it for colour; it still
+                    //           feeds bold pooling)
                     //   erase = union_ink_mask (prod) + the per-box fill dilation the erase applies
+                    //   color = the matte repainted in each box's *resolved* overlay colour on a
+                    //           neutral canvas — shows whether the picked ink colour is right,
+                    //           which the red mask overlays can't
                     let rgba = image.to_rgba8();
                     let (iw, ih) = (rgba.width(), rgba.height());
+                    let model_colors: Vec<Option<translator::ocr::InkColor>> = ink_strips
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.pooled_color()))
+                        .collect();
+                    let strips = translator::color_matting::mat_detections(
+                        &rgba,
+                        &boxes,
+                        &masks,
+                        &src_maps,
+                        &model_colors,
+                    );
+                    // The colour each box's overlay text will actually use (model colour when
+                    // the strip has the colour head, sampled fallback otherwise, WCAG floor
+                    // applied either way — mat_detections resolves all of that).
+                    let mut box_fg: Vec<Option<u32>> = vec![None; boxes.len()];
+                    for s in &strips {
+                        box_fg[s.box_index] = Some(s.fg_argb);
+                    }
                     let src_luma = |x: u32, y: u32| {
                         let p = rgba.get_pixel(x, y).0;
                         (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000
@@ -1172,11 +1196,15 @@ fn run(cli: Cli) -> Result<(), String> {
                     let cut = translator::text_metrics::INK_CUT as u8;
                     let mut raw = vec![0u8; (iw * ih) as usize]; // image-space matte value
                     let mut core = vec![false; (iw * ih) as usize];
+                    // Neutral mid-gray canvas so both dark and light inks stay visible.
+                    let mut colorimg =
+                        image::RgbaImage::from_pixel(iw, ih, image::Rgba([200, 200, 200, 255]));
 
-                    for (mask, sm) in masks.iter().zip(src_maps.iter()) {
+                    for (bi, (mask, sm)) in masks.iter().zip(src_maps.iter()).enumerate() {
                         let (Some(mask), Some(sm)) = (mask, sm) else {
                             continue;
                         };
+                        let fg_rgb = box_fg[bi].map(|c| c.to_be_bytes());
                         let (mw, mh) = mask.dimensions();
                         // dense sub-texel walk: bilinear src position so the 48px strip maps onto
                         // the page with no scatter holes (this is for *visualising the model's matte*;
@@ -1216,6 +1244,16 @@ fn run(cli: Cli) -> Result<(), String> {
                                 let idx = (sy as u32 * iw + sx as u32) as usize;
                                 if a > raw[idx] {
                                     raw[idx] = a;
+                                    if let Some([_, r, g, b]) = fg_rgb {
+                                        let t = a as f32 / 255.0;
+                                        let blend =
+                                            |fgc: u8| (fgc as f32 * t + 200.0 * (1.0 - t)) as u8;
+                                        colorimg.put_pixel(
+                                            idx as u32 % iw,
+                                            idx as u32 / iw,
+                                            image::Rgba([blend(r), blend(g), blend(b), 255]),
+                                        );
+                                    }
                                 }
                                 if a >= cut {
                                     ink_px.push((idx, src_luma(sx as u32, sy as u32) as u8));
@@ -1291,12 +1329,8 @@ fn run(cli: Cli) -> Result<(), String> {
                     });
                     paint("ink-core.png", &|i| core[i].then_some(0.85));
                     paint("ink-erase.png", &|i| erase[i].then_some(0.7));
-                    println!("  wrote ink-raw.png / ink-core.png / ink-erase.png");
-                    // Per-box foreground colour the matting algo picks, plus the
-                    // inpainted strip, so we can see whether a light fg is the
-                    // colour algo or a bad/misregistered matte.
-                    let strips =
-                        translator::color_matting::mat_detections(&rgba, &boxes, &masks, &src_maps);
+                    let _ = colorimg.save(dir.join("ink-color.png"));
+                    println!("  wrote ink-raw.png / ink-core.png / ink-erase.png / ink-color.png");
                     // Label each box's fg with its recognised text (so STRONGER etc. are findable);
                     // match recognised lines to boxes by rect-centre proximity.
                     let rec_lines = recognize(engine, &image, &gray, &boxes, cli.script, true)
@@ -1331,8 +1365,15 @@ fn run(cli: Cli) -> Result<(), String> {
                             .collect();
                         bgl.sort_unstable();
                         let bg = bgl.get(bgl.len() / 2).copied().unwrap_or(255);
+                        let model = match model_colors[s.box_index] {
+                            Some(c) => {
+                                let [_, mr, mg, mb] = c.fg_argb.to_be_bytes();
+                                format!("model=#{mr:02x}{mg:02x}{mb:02x} mbg={:3}", c.bg_luma)
+                            }
+                            None => "model=none (sampled fallback)".to_string(),
+                        };
                         println!(
-                            "  box {:03}: fg=#{r:02x}{g:02x}{b:02x} bg_luma={bg:3}  {:?}",
+                            "  box {:03}: fg=#{r:02x}{g:02x}{b:02x} bg_luma={bg:3}  {model}  {:?}",
                             s.box_index,
                             text_for(s.box_index)
                         );
@@ -1601,17 +1642,32 @@ fn run_rewrite_stage(
                 }),
             );
         }
-        if let Some((s, src_map)) = strip.and_then(|s| Some((s, s.src_map.as_ref()?))) {
+        if let Some(s) = strip {
+            let spans = match s.fg.as_ref() {
+                Some(fg) => translator::text_metrics::word_emphasis_colors_model(
+                    &line.text,
+                    &firings,
+                    s.color_pool_alpha(),
+                    fg,
+                ),
+                None => s
+                    .src_map
+                    .as_ref()
+                    .map(|m| {
+                        translator::text_metrics::word_emphasis_colors(
+                            &line.text, &firings, &s.matte, m, &src_rgba,
+                        )
+                    })
+                    .unwrap_or_default(),
+            };
             style.extend(
-                translator::text_metrics::word_emphasis_colors(
-                    &line.text, &firings, &s.matte, src_map, &src_rgba,
-                )
-                .into_iter()
-                .map(|(start, end, argb)| translator::ocr::StyleRange {
-                    start,
-                    end,
-                    kind: translator::ocr::StyleKind::Color(argb),
-                }),
+                spans
+                    .into_iter()
+                    .map(|(start, end, argb)| translator::ocr::StyleRange {
+                        start,
+                        end,
+                        kind: translator::ocr::StyleKind::Color(argb),
+                    }),
             );
         }
         blocks.push(TextBlock {
@@ -1622,6 +1678,7 @@ fn run_rewrite_stage(
                 tight_box: line.oriented_box,
                 word_rects: Vec::new(),
                 style_ranges: style.clone(),
+                ink_color: strip.and_then(|s| s.pooled_color()),
             }],
         });
         translated.push(line.text.clone());

@@ -2861,6 +2861,7 @@ pub fn group_surface_lines_into_blocks_in_quadrant(
             tight_box: l.bbox.clone(),
             word_rects: Vec::new(),
             style_ranges: Vec::new(),
+            ink_color: None,
         })
         .collect();
     let blocks = translator_core::ocr::group_live_lines_into_blocks_in_quadrant(

@@ -87,7 +87,8 @@ def load_ink_model(ckpt: str) -> InkUNet:
     state = torch.load(ckpt, map_location="cpu")
     model = InkUNet(base=state.get("base", 16), levels=state.get("levels", 2),
                     bold_from=state.get("bold_from", 1), bold_head=state.get("bold_head", "dilated"),
-                    rule=state.get("rule", False), rule_head=state.get("rule_head", "dilated"))
+                    rule=state.get("rule", False), rule_head=state.get("rule_head", "dilated"),
+                    color=state.get("color", False))
     model.load_state_dict(state["model"])
     model.eval()
     return model

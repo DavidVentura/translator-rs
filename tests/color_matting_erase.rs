@@ -143,7 +143,7 @@ fn run_case(image_path: &str, case: &str) {
     let full = DynamicImage::ImageRgba8(rgba.clone());
     let t_mat = Instant::now();
     let ink_masks = engine.ink_masks(&full, &boxes, None);
-    let strips = mat_detections(&rgba, &boxes, &ink_masks, &[]);
+    let strips = mat_detections(&rgba, &boxes, &ink_masks, &[], &[]);
     let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
 
     let matted: Vec<(usize, &MattedStrip)> = strips.iter().map(|s| (s.box_index, s)).collect();
@@ -513,6 +513,7 @@ fn overlay_case(image_path: &str, case: &str) {
                 tight_box: b.tight_box,
                 word_rects: vec![b.rect],
                 style_ranges: Vec::new(),
+                ink_color: None,
             }],
         })
         .collect();

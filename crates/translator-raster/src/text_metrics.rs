@@ -623,13 +623,68 @@ pub fn word_emphasis_colors(
     src_map: &[(f32, f32)],
     source: &RgbaImage,
 ) -> Vec<(u32, u32, u32)> {
+    let core = stroke_core_cut(matte.iter().copied().max().unwrap_or(0));
+    word_emphasis_spans(text, firings, matte.width(), &|lo, hi| {
+        window_ink_color(matte, src_map, source, core, lo, hi)
+    })
+}
+
+/// [`word_emphasis_colors`] reading the ink model's predicted F field instead of sampling
+/// source pixels: per window, the α²-weighted mean of F. F is the decontaminated per-pixel
+/// ink colour, so a matte that spills onto background can't drag a word's colour reading —
+/// and no `src_map`/source image is needed at all.
+pub fn word_emphasis_colors_model(
+    text: &str,
+    firings: &[(char, f32)],
+    matte: &GrayImage,
+    fg: &image::RgbImage,
+) -> Vec<(u32, u32, u32)> {
+    word_emphasis_spans(text, firings, matte.width(), &|lo, hi| {
+        window_ink_color_model(matte, fg, lo, hi)
+    })
+}
+
+/// α²-weighted mean of the predicted F field over a reading-axis window. The α² weight
+/// concentrates the estimate on confident stroke cores without a hard cut.
+fn window_ink_color_model(
+    matte: &GrayImage,
+    fg: &image::RgbImage,
+    lo: f32,
+    hi: f32,
+) -> Option<u32> {
+    let (mw, mh) = matte.dimensions();
+    let x0 = (lo * mw as f32).floor().clamp(0.0, mw as f32) as u32;
+    let x1 = (hi * mw as f32).ceil().clamp(0.0, mw as f32) as u32;
+    let (mut w, mut sum) = (0f64, [0f64; 3]);
+    for y in 0..mh {
+        for x in x0..x1 {
+            let a = matte.get_pixel(x, y)[0] as f64 / 255.0;
+            let wa = a * a;
+            let p = fg.get_pixel(x, y);
+            w += wa;
+            for c in 0..3 {
+                sum[c] += wa * p[c] as f64;
+            }
+        }
+    }
+    (w >= EMPHASIS_MIN_PX as f64).then(|| {
+        let ch = |c: usize| (sum[c] / w).round().clamp(0.0, 255.0) as u8;
+        argb(ch(0), ch(1), ch(2))
+    })
+}
+
+fn word_emphasis_spans(
+    text: &str,
+    firings: &[(char, f32)],
+    matte_width: u32,
+    color_of: &dyn Fn(f32, f32) -> Option<u32>,
+) -> Vec<(u32, u32, u32)> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
-    if matte.width() == 0 || firings.len() != n || n == 0 {
+    if matte_width == 0 || firings.len() != n || n == 0 {
         return Vec::new();
     }
-    let core = stroke_core_cut(matte.iter().copied().max().unwrap_or(0));
-    let Some(line_color) = window_ink_color(matte, src_map, source, core, 0.0, 1.0) else {
+    let Some(line_color) = color_of(0.0, 1.0) else {
         return Vec::new();
     };
     // Char `i` spans reading-axis fraction `[edge[i], edge[i+1])` (a firing sits at its glyph's
@@ -644,8 +699,7 @@ pub fn word_emphasis_colors(
         .collect();
     let is_outlier = |i: usize| {
         let (lo, hi) = (edge[i].min(edge[i + 1]), edge[i].max(edge[i + 1]));
-        window_ink_color(matte, src_map, source, core, lo, hi)
-            .is_some_and(|c| chromatic_dist(c, line_color) > EMPHASIS_CHROMA_DIST)
+        color_of(lo, hi).is_some_and(|c| chromatic_dist(c, line_color) > EMPHASIS_CHROMA_DIST)
     };
     let mut out = Vec::new();
     let mut i = 0;
@@ -660,7 +714,7 @@ pub fn word_emphasis_colors(
         }
         // The run's colour from one pooled window over its whole extent (robust to per-char noise),
         // confirmed chromatic against the line dominant so a brightness-only run never slips through.
-        if let Some(rc) = window_ink_color(matte, src_map, source, core, edge[start], edge[i + 1]) {
+        if let Some(rc) = color_of(edge[start], edge[i + 1]) {
             if chromatic_dist(rc, line_color) > EMPHASIS_CHROMA_DIST {
                 out.push((byte[start] as u32, byte[i + 1] as u32, rc));
             }

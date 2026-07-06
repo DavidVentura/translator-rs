@@ -146,14 +146,20 @@ impl OcrEngine {
                 return Ok(Arc::clone(engine));
             }
         }
-        let engine = Arc::new(PpocrEngine::load(
+        let mut engine = PpocrEngine::load(
             &det_path,
             classifier_path.as_deref(),
             textline_orientation_path.as_deref(),
             specs,
             4,
             ink_path.as_deref(),
-        )?);
+        )?;
+        // App snapshot/camera buffers store bytes as B,G,R,A and the pipeline consumes them
+        // verbatim (see `PpocrEngine::bgr_input`); the ink colour head is the one consumer
+        // that needs channel identity restored. Direct `PpocrEngine::load` users (viz, bins)
+        // feed image-crate RGB and keep the default.
+        engine.set_bgr_input(true);
+        let engine = Arc::new(engine);
         *cache = Some((key, Arc::clone(&engine)));
         Ok(engine)
     }

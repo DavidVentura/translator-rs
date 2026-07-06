@@ -74,36 +74,44 @@ class SyntheticStrips(IterableDataset):
         real_files = (sorted(glob.glob(os.path.join(self.real_dir, "*.matte.png")))
                       if self.real_dir and self.real_frac > 0 else [])
         while True:
-            imgs, covs, bolds, rules, reals, nhs = [], [], [], [], [], []
+            imgs, covs, bolds, rules, fcols, bcols, reals, nhs = [], [], [], [], [], [], [], []
             for _ in range(self.batch):
                 if real_files and rng.random() < self.real_frac:
                     img, cov = load_real_strip(rng.choice(real_files), self.width, rng)
-                    bold = np.zeros_like(cov)  # no bold/rule label on real — masked in the loss
+                    bold = np.zeros_like(cov)  # no bold/rule/colour label on real — masked in the loss
                     rule = np.zeros_like(cov)
+                    fcol = np.zeros_like(img)
+                    bcol = np.zeros_like(img)
                     native_h, is_real = float(cov.shape[0]), 1.0
                 else:
-                    img, cov, bold, rule, native_h = next(gen)
+                    img, cov, bold, rule, fcol, bcol, native_h = next(gen)
                     is_real = 0.0
                 imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
                 covs.append(torch.from_numpy(cov[None]))
                 bolds.append(torch.from_numpy(bold[None]))
                 rules.append(torch.from_numpy(rule[None]))
+                fcols.append(torch.from_numpy(np.ascontiguousarray(fcol.transpose(2, 0, 1))))
+                bcols.append(torch.from_numpy(np.ascontiguousarray(bcol.transpose(2, 0, 1))))
                 reals.append(is_real)
                 nhs.append(native_h)
             yield (torch.stack(imgs), torch.stack(covs), torch.stack(bolds), torch.stack(rules),
+                   torch.stack(fcols), torch.stack(bcols),
                    torch.tensor(reals, dtype=torch.float32), torch.tensor(nhs, dtype=torch.float32))
 
 
 def validation_batch(n: int = 32, width: int = 320, seed: int = 1234):
     rng = random.Random(seed)
-    imgs, covs, bolds, rules = [], [], [], []
+    imgs, covs, bolds, rules, fcols, bcols = [], [], [], [], [], []
     for _ in range(n):
-        img, cov, bold, rule = sample(rng, width=width)
+        img, cov, bold, rule, fcol, bcol = sample(rng, width=width)
         imgs.append(torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))))
         covs.append(torch.from_numpy(cov[None]))
         bolds.append(torch.from_numpy(bold[None]))
         rules.append(torch.from_numpy(rule[None]))
-    return torch.stack(imgs), torch.stack(covs), torch.stack(bolds), torch.stack(rules)
+        fcols.append(torch.from_numpy(np.ascontiguousarray(fcol.transpose(2, 0, 1))))
+        bcols.append(torch.from_numpy(np.ascontiguousarray(bcol.transpose(2, 0, 1))))
+    return (torch.stack(imgs), torch.stack(covs), torch.stack(bolds), torch.stack(rules),
+            torch.stack(fcols), torch.stack(bcols))
 
 
 # Confident-margin band: targets at/above CONF_BOLD_T are clearly bold, at/below CONF_NORM_T
@@ -125,7 +133,8 @@ MATTE_TVERSKY_BETA = 0.7
 
 def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
                bold_asym_t0=0.15, bold_margin=0.0, matte_tversky=0.0,
-               rule=None, rule_weight=1.0, rule_tversky=0.5, real_mask=None):
+               rule=None, rule_weight=1.0, rule_tversky=0.5, real_mask=None,
+               fcol=None, bcol=None, color_weight=0.25):
     """Matte BCE over the whole strip + asymmetric bold L1 *masked to ink*. `bold` is the
     continuous per-pixel stroke-width target in [0,1] (gen_data `_font_stroke_ratio` through
     the logistic `_target_q`), not a binary class: the head regresses how thick the ink is so
@@ -146,8 +155,16 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
     model has a rule head (3rd channel); its loss is BCE plus the same recall-biased Tversky
     as the matte, since a missed rule leaves residual ink. `None`/2-channel model disables it.
 
+    `fcol`/`bcol` (B,3,H,W) are the ink/background colour fields for the colour head
+    (last 6 logit channels; FBA Matting recipe): L1 on F and B everywhere, both
+    compositing losses against the photometric-clean composite `cov·F + (1−cov)·B`
+    (predicted α with GT colours trains the matte where colour contrast exists;
+    predicted colours with GT α trains decontamination), plus the gradient-exclusion
+    term that penalises background texture leaking into F. Real samples carry no
+    colour GT, so the colour loss uses `sw` like bold/rule. `None` disables.
+
     `strip_w` (B,) is the per-strip legibility weight (illegible strips contribute zero);
-    None = all ones. Returns (total, matte, bold, margin, rule) for logging."""
+    None = all ones. Returns (total, matte, bold, margin, rule, color) for logging."""
     matte_logit, bold_logit = logits[:, :1], logits[:, 1:2]
     if strip_w is None:
         strip_w = torch.ones(logits.shape[0], device=logits.device)
@@ -190,10 +207,47 @@ def ink_losses(logits, cov, bold, bold_weight=1.5, strip_w=None, bold_asym=1.5,
             tv_r = 1.0 - (tpr + 1.0) / (tpr + MATTE_TVERSKY_ALPHA * fpr + MATTE_TVERSKY_BETA * fnr + 1.0)
             loss_rule = loss_rule + rule_tversky * tv_r
 
+    loss_color = logits.new_zeros(())
+    if fcol is not None:
+        coff = logits.shape[1] - 6
+        f_hat = torch.sigmoid(logits[:, coff:coff + 3])
+        b_hat = torch.sigmoid(logits[:, coff + 3:coff + 6])
+        comp = cov * fcol + (1.0 - cov) * bcol
+        alpha = torch.sigmoid(matte_logit)
+
+        def wmean(term):
+            return (term * sw).sum() / sw.expand_as(term).sum().clamp_min(1.0)
+
+        l1_f = wmean((f_hat - fcol).abs())
+        l1_b = wmean((b_hat - bcol).abs())
+        lc_alpha = wmean((alpha * fcol + (1.0 - alpha) * bcol - comp).abs())
+        lc_fb = wmean((cov * f_hat + (1.0 - cov) * b_hat - comp).abs())
+        excl = (wmean((f_hat[..., 1:] - f_hat[..., :-1]).abs()
+                      * (b_hat[..., 1:] - b_hat[..., :-1]).abs())
+                + wmean((f_hat[..., 1:, :] - f_hat[..., :-1, :]).abs()
+                        * (b_hat[..., 1:, :] - b_hat[..., :-1, :]).abs()))
+        loss_color = l1_f + l1_b + lc_alpha + lc_fb + 0.25 * excl
+
     total = (loss_matte + matte_tversky * loss_tversky
              + bold_weight * loss_bold + bold_margin * loss_margin
-             + rule_weight * loss_rule)
-    return total, loss_matte, loss_bold, loss_margin, loss_rule
+             + rule_weight * loss_rule + color_weight * loss_color)
+    return total, loss_matte, loss_bold, loss_margin, loss_rule, loss_color
+
+
+def swatch_error(logits, cov, fcol) -> float:
+    """Per-strip pooled ink-colour error — the runtime-facing colour metric.
+
+    Runtime recovers a line's ink colour as the α²-weighted mean of predicted F over the
+    strip (α² so confident-core pixels dominate, mirroring how the erase/render consumes
+    it); GT is the cov²-weighted mean of the GT ink field. Mean |Δ| over RGB and batch,
+    in 0..1 (0.05 ≈ 13/255 per channel)."""
+    alpha = torch.sigmoid(logits[:, :1])
+    f_hat = torch.sigmoid(logits[:, -6:-3])
+    w_hat = (alpha * alpha).clamp_min(1e-6)
+    w_gt = (cov * cov).clamp_min(1e-6)
+    pred = (w_hat * f_hat).sum(dim=(2, 3)) / w_hat.sum(dim=(2, 3))
+    gt = (w_gt * fcol).sum(dim=(2, 3)) / w_gt.sum(dim=(2, 3))
+    return (pred - gt).abs().mean().item()
 
 
 def main():
@@ -250,7 +304,14 @@ def main():
                     help="weight on the recall-biased rule Tversky term (FN>FP); 0 = plain BCE")
     ap.add_argument("--rule-head", choices=["dilated", "1x1"], default="dilated",
                     help="rule head: dilated 3×3 (default, wide RF for thin rules) or cheap 1×1")
+    ap.add_argument("--color", action="store_true",
+                    help="add the FBA-style colour head (F ink RGB + B background RGB, 6 channels)")
+    ap.add_argument("--color-weight", type=float, default=0.25,
+                    help="weight on the colour loss bundle (L1 F/B + compositing + exclusion)")
     args = ap.parse_args()
+    if args.color and args.gpu_degrade:
+        ap.error("--color needs CPU degrade: the GPU degrade path does not photometric-transform "
+                 "the F/B colour labels, so they would go stale under shade/shadow/squeeze")
 
     # spawn (not fork) workers: plain fork inherits the parent's cv2/fontconfig/freetype +
     # CUDA state, and with a broad font set the workers deterministically hit a poisoned
@@ -263,11 +324,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = InkUNet(base=args.base, levels=args.levels, bold_from=args.bold_from,
                     detach_bold=args.detach_bold, bold_head=args.bold_head,
-                    rule=args.rule, rule_head=args.rule_head).to(device)
+                    rule=args.rule, rule_head=args.rule_head, color=args.color).to(device)
     print(f"device={device} base={args.base} levels={args.levels} bold_from={args.bold_from} "
           f"detach_bold={args.detach_bold} bold_head={args.bold_head} rule={args.rule} "
-          f"rule_head={args.rule_head} real_frac={args.real_frac} real_dir={args.real_dir} "
-          f"params={param_count(model):,}")
+          f"rule_head={args.rule_head} color={args.color} real_frac={args.real_frac} "
+          f"real_dir={args.real_dir} params={param_count(model):,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     start_step = 0
     if args.resume:
@@ -301,9 +362,11 @@ def main():
         pin_memory=args.pin_memory,
         multiprocessing_context=mp_ctx,
     )
-    val_img, val_cov, val_bold, val_rule = validation_batch(n=args.val_batch, width=args.width)
-    val_img, val_cov, val_bold, val_rule = (val_img.to(device), val_cov.to(device),
-                                            val_bold.to(device), val_rule.to(device))
+    val_img, val_cov, val_bold, val_rule, val_fcol, val_bcol = validation_batch(
+        n=args.val_batch, width=args.width)
+    val_img, val_cov, val_bold, val_rule, val_fcol, val_bcol = (
+        val_img.to(device), val_cov.to(device), val_bold.to(device), val_rule.to(device),
+        val_fcol.to(device), val_bcol.to(device))
 
     # GPU degrade state: a device RNG (augmentation randomness) + the cached DCT matrix.
     degrade_gen = torch.Generator(device=device).manual_seed(0)
@@ -313,13 +376,15 @@ def main():
     model.train()
     t0 = time.time()
     running = 0.0
-    for step, (img, cov, bold, rule, real, native_h) in enumerate(loader, start=start_step + 1):
+    for step, (img, cov, bold, rule, fcol, bcol, real, native_h) in enumerate(loader, start=start_step + 1):
         if step > args.steps:
             break
         img = img.to(device, non_blocking=device == "cuda")
         cov = cov.to(device, non_blocking=device == "cuda")
         bold = bold.to(device, non_blocking=device == "cuda")
         rule = rule.to(device, non_blocking=device == "cuda")
+        fcol = fcol.to(device, non_blocking=device == "cuda")
+        bcol = bcol.to(device, non_blocking=device == "cuda")
         real = real.to(device, non_blocking=device == "cuda")
         native_h = native_h.to(device, non_blocking=device == "cuda")
         # GPU degrade path (experimental): degrade + legibility batched on the GPU, illegible
@@ -331,11 +396,14 @@ def main():
                 strip_w = gpu_degrade.legible_mask(img, cov, native_h).float()
         with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits = train_model(img)
-            loss, _, _, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
-                                          bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
-                                          bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
-                                          rule=rule if args.rule else None, rule_weight=args.rule_weight,
-                                          rule_tversky=args.rule_tversky, real_mask=real)
+            loss, _, _, _, _, _ = ink_losses(logits, cov, bold, args.bold_weight, strip_w=strip_w,
+                                             bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
+                                             bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
+                                             rule=rule if args.rule else None, rule_weight=args.rule_weight,
+                                             rule_tversky=args.rule_tversky, real_mask=real,
+                                             fcol=fcol if args.color else None,
+                                             bcol=bcol if args.color else None,
+                                             color_weight=args.color_weight)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -353,20 +421,27 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
-                vl, vm, vb, vg, vr = ink_losses(train_model(val_img), val_cov, val_bold, args.bold_weight,
-                                                bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
-                                                bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
-                                                rule=val_rule if args.rule else None, rule_weight=args.rule_weight,
-                                                rule_tversky=args.rule_tversky)
+                val_logits = train_model(val_img)
+                vl, vm, vb, vg, vr, vc = ink_losses(val_logits, val_cov, val_bold, args.bold_weight,
+                                                    bold_asym=args.bold_asym, bold_asym_t0=args.bold_asym_t0,
+                                                    bold_margin=args.bold_margin, matte_tversky=args.matte_tversky,
+                                                    rule=val_rule if args.rule else None, rule_weight=args.rule_weight,
+                                                    rule_tversky=args.rule_tversky,
+                                                    fcol=val_fcol if args.color else None,
+                                                    bcol=val_bcol if args.color else None,
+                                                    color_weight=args.color_weight)
+                swatch = swatch_error(val_logits, val_cov, val_fcol) if args.color else None
             model.train()
             print(
                 f"step {step:>6}  VAL loss {vl.item():.4f} (matte {vm.item():.4f} bold {vb.item():.4f} "
-                f"margin {vg.item():.4f} rule {vr.item():.4f})",
+                f"margin {vg.item():.4f} rule {vr.item():.4f} color {vc.item():.4f}"
+                + (f" swatch {swatch:.4f}" if swatch is not None else "") + ")",
                 flush=True,
             )
             state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                      "base": args.base, "levels": args.levels, "bold_from": args.bold_from,
-                     "bold_head": args.bold_head, "rule": args.rule, "rule_head": args.rule_head}
+                     "bold_head": args.bold_head, "rule": args.rule, "rule_head": args.rule_head,
+                     "color": args.color}
             torch.save(state, os.path.join(args.out, "ink-latest.pt"))
     print("done")
 

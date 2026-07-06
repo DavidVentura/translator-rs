@@ -37,7 +37,7 @@ def main():
     bold_from, bold_head = state.get("bold_from", 1), state.get("bold_head", "dilated")
     rule, rule_head = state.get("rule", False), state.get("rule_head", "dilated")
     model = InkUNet(base=base, levels=levels, bold_from=bold_from, bold_head=bold_head,
-                    rule=rule, rule_head=rule_head)
+                    rule=rule, rule_head=rule_head, color=state.get("color", False))
     model.load_state_dict(state["model"])
     model.eval()
     params = sum(p.numel() for p in model.parameters())

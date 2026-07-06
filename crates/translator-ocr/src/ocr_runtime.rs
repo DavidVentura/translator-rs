@@ -183,6 +183,10 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
                 .map(|p| p >= translator_raster::text_metrics::MODEL_BOLD_THRESHOLD)
         })
         .collect();
+    let model_colors: Vec<Option<translator_core::ocr::InkColor>> = ink_strips
+        .iter()
+        .map(|s| s.as_ref().and_then(|s| s.pooled_color()))
+        .collect();
     let bold_pool_ms = t_bold_pool.elapsed().as_secs_f32() * 1000.0;
     let t_box_metrics = std::time::Instant::now();
     let text_metrics = box_line_metrics(&det_boxes, &ink_masks);
@@ -273,6 +277,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         lines,
         &text_metrics,
         &line_style_ranges,
+        &model_colors,
         min_confidence,
         reading_order,
     );
@@ -435,6 +440,7 @@ fn still_ppocr_lines_to_blocks(
     lines: Vec<RecognizedTextLine>,
     text_metrics: &[Option<LineMetrics>],
     line_style_ranges: &[Vec<translator_core::ocr::StyleRange>],
+    model_colors: &[Option<translator_core::ocr::InkColor>],
     min_confidence: u32,
     reading_order: ReadingOrder,
 ) -> Vec<TextBlock> {
@@ -447,8 +453,11 @@ fn still_ppocr_lines_to_blocks(
         .zip(lines.into_iter())
         .zip(text_metrics.iter())
         .zip(line_style_ranges.iter())
-        .filter(|(((_, line), _), _)| !line.text.trim().is_empty() && line.confidence >= min_score)
-        .map(|(((b, line), metrics), style_ranges)| {
+        .zip(model_colors.iter())
+        .filter(|((((_, line), _), _), _)| {
+            !line.text.trim().is_empty() && line.confidence >= min_score
+        })
+        .map(|((((b, line), metrics), style_ranges), ink_color)| {
             // Line orientation is the detection reading frame — its adaptive clamp already
             // keeps a genuine lean and snaps short labels to the frame. The ink matte resolves
             // typography (x-height, centre, decoration, bold) but no longer re-decides the angle.
@@ -472,6 +481,7 @@ fn still_ppocr_lines_to_blocks(
                 tight_box,
                 word_rects: vec![line.rect],
                 style_ranges: style_ranges.clone(),
+                ink_color: *ink_color,
             }
         })
         .collect();
@@ -789,31 +799,43 @@ fn finalize_image_overlay(
 type BlockStyles = Vec<translator_core::ocr::StyleRange>;
 
 /// Emphasis colour ranges for one line: a `Color` [`StyleRange`] for each word whose ink colour is
-/// an outlier from the line's dominant ink. `None` `src_map` (oriented-box fallback) yields nothing
-/// — no mapping back to source pixels to read colour from.
+/// an outlier from the line's dominant ink. Colour-head models read the predicted F field
+/// directly (per-word α²-pooled, in strip space — no source mapping needed); legacy models
+/// sample source pixels through `src_map`, so `None` `src_map` yields nothing there.
 fn line_emphasis_colors(
     strip: &crate::ppocr::InkStrip,
     source: &image::RgbaImage,
     text: &str,
     firings: &[(char, f32)],
 ) -> Vec<translator_core::ocr::StyleRange> {
-    let Some(src_map) = strip.src_map.as_ref() else {
-        return Vec::new();
+    let spans = match strip.fg.as_ref() {
+        Some(fg) => translator_raster::text_metrics::word_emphasis_colors_model(
+            text,
+            firings,
+            strip.color_pool_alpha(),
+            fg,
+        ),
+        None => {
+            let Some(src_map) = strip.src_map.as_ref() else {
+                return Vec::new();
+            };
+            translator_raster::text_metrics::word_emphasis_colors(
+                text,
+                firings,
+                &strip.matte,
+                src_map,
+                source,
+            )
+        }
     };
-    translator_raster::text_metrics::word_emphasis_colors(
-        text,
-        firings,
-        &strip.matte,
-        src_map,
-        source,
-    )
-    .into_iter()
-    .map(|(start, end, argb)| translator_core::ocr::StyleRange {
-        start,
-        end,
-        kind: translator_core::ocr::StyleKind::Color(argb),
-    })
-    .collect()
+    spans
+        .into_iter()
+        .map(|(start, end, argb)| translator_core::ocr::StyleRange {
+            start,
+            end,
+            kind: translator_core::ocr::StyleKind::Color(argb),
+        })
+        .collect()
 }
 
 /// Remap a block's source style ranges onto its translation, one [`StyleKind`] at a time so the

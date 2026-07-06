@@ -271,6 +271,17 @@ pub struct InkStrip {
     pub matte: GrayImage,
     pub bold: Option<GrayImage>,
     pub rule: Option<GrayImage>,
+    /// Predicted per-pixel ink colour F (colour-head models: the trailing 6 channels are
+    /// F rgb + B rgb, trained FBA-style with a compositing loss). `None` for older models.
+    pub fg: Option<RgbImage>,
+    /// Predicted per-pixel background colour B. `None` for older models.
+    pub bg: Option<RgbImage>,
+    /// Fully α-re-solved matte (min of model matte and the F–B projection at every pixel,
+    /// no kill threshold) — the *colour-pooling* weight. Erase keeps the kill-switch `matte`
+    /// (recall: full re-solve washes glyph cores to ~0.75 and translucent erase misses ink),
+    /// while colour pooling wants precision: a spill pixel whose observed colour sits midway
+    /// to background projects low here and stops dragging the pooled ink colour.
+    pub color_alpha: Option<GrayImage>,
     /// Source-image `(x, y)` each matte/bold column-row sampled, row-major over
     /// the strip's own `matte.width() × matte.height()`. Lets the matting scatter
     /// the strip back into image space (the strip is a curl-straightened contour
@@ -306,6 +317,27 @@ impl InkStrip {
         // Exclude rule (under/strike/over) pixels: they're non-glyph ink, so their stroke-width
         // reading is meaningless and would drag the per-line bold estimate.
         let rule = self.rule.as_ref().map(|r| r.as_raw());
+        // Enough-ink gate on the matte core either way — it asks "did the model find text",
+        // separate from which pixels are trustworthy for pooling.
+        let n_core = self.matte.iter().filter(|&&m| m >= core).count() as u64;
+        if n_core < translator_raster::text_metrics::INK_BOLD_MIN_PX {
+            return None;
+        }
+        // Colour-head models: weight by the re-solved alpha squared — the principled form of
+        // the core cut. Spill projects near 0, the anti-aliased rim at its fractional
+        // coverage, solid ink high, so rim/spill dilution falls out without a threshold.
+        if let Some(ca) = self.color_alpha.as_ref() {
+            let (mut sum, mut wsum) = (0f64, 0f64);
+            for (i, (a, b)) in ca.iter().zip(bold.iter()).enumerate() {
+                if rule.is_some_and(|r| r[i] > 127) {
+                    continue;
+                }
+                let w = (*a as f64 / 255.0) * (*a as f64 / 255.0);
+                sum += w * *b as f64;
+                wsum += w;
+            }
+            return (wsum > 0.0).then(|| (sum / wsum / 255.0) as f32);
+        }
         let (mut sum, mut n) = (0u64, 0u64);
         for (i, (m, b)) in self.matte.iter().zip(bold.iter()).enumerate() {
             if *m >= core && rule.map_or(true, |r| r[i] <= 127) {
@@ -313,8 +345,7 @@ impl InkStrip {
                 n += 1;
             }
         }
-        (n >= translator_raster::text_metrics::INK_BOLD_MIN_PX)
-            .then(|| sum as f32 / n as f32 / 255.0)
+        (n > 0).then(|| sum as f32 / n as f32 / 255.0)
     }
 
     /// Reduce the strip's bold + matte channels to a per-reading-axis-column
@@ -329,6 +360,57 @@ impl InkStrip {
     /// when there is no rule channel (legacy matte-only / bold-only models).
     pub fn rule_profile(&self) -> Option<translator_raster::text_metrics::RuleProfile> {
         translator_raster::text_metrics::RuleProfile::from_strip(self.rule.as_ref()?, &self.matte)
+    }
+
+    /// The α field colour estimation should weight by: the fully re-solved alpha when the
+    /// colour head produced one, else the matte.
+    pub fn color_pool_alpha(&self) -> &GrayImage {
+        self.color_alpha.as_ref().unwrap_or(&self.matte)
+    }
+
+    /// Pool the predicted colour fields to one line colour: fg = α²-weighted mean of F
+    /// (α² so confident stroke cores dominate over the anti-aliased rim), bg luma =
+    /// (1−α)²-weighted mean luma of B. `None` without the colour head or with too little
+    /// ink to trust. The colour comes from the model's F prediction, not from image pixels
+    /// gated by the matte, so matte over-marking cannot drag it toward the background.
+    pub fn pooled_color(&self) -> Option<translator_core::ocr::InkColor> {
+        let fg = self.fg.as_ref()?;
+        let bg = self.bg.as_ref()?;
+        let ink_px = self
+            .matte
+            .iter()
+            .filter(|&&m| m >= translator_raster::text_metrics::INK_CUT as u8)
+            .count();
+        if ink_px < 6 {
+            return None;
+        }
+        // F pools over the fully re-solved alpha (spill pixels project low and stop
+        // dragging the colour); the background term keeps the erase matte — a washed
+        // glyph core must not count as background.
+        let pool = self.color_pool_alpha();
+        let (mut fw, mut fsum) = (0f64, [0f64; 3]);
+        let (mut bw, mut bsum) = (0f64, 0f64);
+        for (i, (&m, &pa)) in self.matte.iter().zip(pool.iter()).enumerate() {
+            let a = m as f64 / 255.0;
+            let f = fg.get_pixel(i as u32 % fg.width(), i as u32 / fg.width());
+            let b = bg.get_pixel(i as u32 % bg.width(), i as u32 / bg.width());
+            let wa = (pa as f64 / 255.0) * (pa as f64 / 255.0);
+            fw += wa;
+            for c in 0..3 {
+                fsum[c] += wa * f[c] as f64;
+            }
+            let wb = (1.0 - a) * (1.0 - a);
+            bw += wb;
+            bsum += wb * (b[0] as f64 * 0.299 + b[1] as f64 * 0.587 + b[2] as f64 * 0.114);
+        }
+        if fw <= 0.0 || bw <= 0.0 {
+            return None;
+        }
+        let ch = |c: usize| (fsum[c] / fw).round().clamp(0.0, 255.0) as u32;
+        Some(translator_core::ocr::InkColor {
+            fg_argb: 0xff00_0000 | (ch(0) << 16) | (ch(1) << 8) | ch(2),
+            bg_luma: (bsum / bw).round().clamp(0.0, 255.0) as u8,
+        })
     }
 }
 
@@ -389,6 +471,12 @@ pub struct PpocrEngine {
     textline_orientation: Option<PpocrTextlineOrientationClassifier>,
     recognizers: HashMap<PpocrScript, PpocrRecognizerSlot>,
     ink: Option<PpocrInkModel>,
+    /// App canvases store bytes as B,G,R,A (little-endian ARGB), and `build_rgb_full` copies
+    /// bytes verbatim, so on those paths every "RgbImage" in the pipeline is actually BGR.
+    /// Det/rec never cared, but the ink colour head predicts *channel-identified* F/B, so the
+    /// ink input planes (and the α re-solve's observed pixel) must be swapped back to true
+    /// RGB. False for image-crate-loaded inputs (viz, bins), set by the app engine path.
+    bgr_input: bool,
 }
 
 impl PpocrEngine {
@@ -429,7 +517,12 @@ impl PpocrEngine {
             textline_orientation,
             recognizers,
             ink,
+            bgr_input: false,
         })
+    }
+
+    pub fn set_bgr_input(&mut self, bgr: bool) {
+        self.bgr_input = bgr;
     }
 
     pub fn has_classifier(&self) -> bool {
@@ -569,14 +662,17 @@ impl PpocrEngine {
                 let bw = *bw;
                 let plane = (h * bw) as usize;
                 let nb = idxs.len();
+                // `chan` maps the model's true-RGB channel index to the strip's storage
+                // channel — identity for RGB inputs, R↔B swap for BGR canvases.
+                let chan: [usize; 3] = if self.bgr_input { [2, 1, 0] } else { [0, 1, 2] };
                 let mut input = vec![0f32; nb * 3 * plane];
                 for (slot, &j) in idxs.iter().enumerate() {
                     let base = slot * 3 * plane;
                     for (x, y, px) in prepared[j].1.enumerate_pixels() {
                         let idx = (y * bw + x) as usize;
-                        input[base + idx] = px[0] as f32 / 255.0;
-                        input[base + plane + idx] = px[1] as f32 / 255.0;
-                        input[base + 2 * plane + idx] = px[2] as f32 / 255.0;
+                        input[base + idx] = px[chan[0]] as f32 / 255.0;
+                        input[base + plane + idx] = px[chan[1]] as f32 / 255.0;
+                        input[base + 2 * plane + idx] = px[chan[2]] as f32 / 255.0;
                     }
                 }
                 let slot = rayon::current_thread_index().unwrap_or(0) % ink.sessions.len();
@@ -589,9 +685,13 @@ impl PpocrEngine {
                     return Vec::new();
                 }
                 // Output is [nb, chans, h, bw]: chans=1 legacy matte-only, 2 = +bold (ch1),
-                // 3 = +rule (ch2, under/strike/over). Each strip's planes are contiguous, so a
-                // strip's ch0 starts at slot*chans*plane and chan c at +c*plane.
+                // 3 = +rule (ch2, under/strike/over); a colour-head model appends 6 more
+                // (F rgb + B rgb), so 8 = matte+bold+colour and 9 = matte+bold+rule+colour.
+                // Each strip's planes are contiguous, so a strip's ch0 starts at
+                // slot*chans*plane and chan c at +c*plane.
                 let chans = o.len() / (nb * plane);
+                let has_rule = chans == 3 || chans == 9;
+                let has_color = chans >= 8;
                 idxs.iter()
                     .enumerate()
                     .filter_map(|(slot, &j)| {
@@ -599,7 +699,10 @@ impl PpocrEngine {
                         let sbase = slot * chans * plane;
                         let mut matte = vec![0u8; (h * tw) as usize];
                         let mut bold = (chans >= 2).then(|| vec![0u8; (h * tw) as usize]);
-                        let mut rule = (chans >= 3).then(|| vec![0u8; (h * tw) as usize]);
+                        let mut rule = has_rule.then(|| vec![0u8; (h * tw) as usize]);
+                        let mut fg = has_color.then(|| vec![0u8; (h * tw * 3) as usize]);
+                        let mut bg = has_color.then(|| vec![0u8; (h * tw * 3) as usize]);
+                        let f0 = (chans - 6) * plane;
                         for y in 0..h {
                             for x in 0..tw {
                                 let i = (y * bw + x) as usize;
@@ -611,11 +714,65 @@ impl PpocrEngine {
                                 if let Some(r) = rule.as_mut() {
                                     r[o_i] = sigmoid_u8(o[sbase + 2 * plane + i]);
                                 }
+                                if let Some(f) = fg.as_mut() {
+                                    for c in 0..3 {
+                                        f[o_i * 3 + c] = sigmoid_u8(o[sbase + f0 + c * plane + i]);
+                                    }
+                                }
+                                if let Some(bgb) = bg.as_mut() {
+                                    for c in 0..3 {
+                                        bgb[o_i * 3 + c] =
+                                            sigmoid_u8(o[sbase + f0 + (3 + c) * plane + i]);
+                                    }
+                                }
                             }
+                        }
+                        // Closed-form α re-solve (the FBA fusion step): project the observed
+                        // pixel onto the predicted F–B colour line, α = ((I−B)·(F−B))/‖F−B‖².
+                        // Used strictly as a background KILL-SWITCH: a matte pixel that grabbed
+                        // background has I≈B so its projection lands near 0, and only those
+                        // clearly-background pixels (below RESOLVE_KILL) get their matte pulled
+                        // down. Above the cut the model matte stands — real stroke interiors
+                        // project at ~0.7–0.8 (observed ink is never as extreme as the predicted
+                        // flat F under blur/texture), and min()-ing them washed out glyph cores.
+                        // Where F≈B the projection is numerically meaningless; matte stands.
+                        let mut color_alpha = None;
+                        if let (Some(f), Some(bgc)) = (fg.as_ref(), bg.as_ref()) {
+                            const MIN_FB_DIST2: i32 = 32 * 32;
+                            const RESOLVE_KILL: u8 = 102;
+                            let src = prepared[j].1;
+                            let mut ca = matte.clone();
+                            for y in 0..h {
+                                for x in 0..tw {
+                                    let o_i = (y * tw + x) as usize;
+                                    let p = src.get_pixel(x, y);
+                                    let (mut dot, mut n2) = (0i32, 0i32);
+                                    for c in 0..3 {
+                                        let d = f[o_i * 3 + c] as i32 - bgc[o_i * 3 + c] as i32;
+                                        // F/B are true RGB; read the observed pixel through the
+                                        // same channel map as the model input.
+                                        dot += (p[chan[c]] as i32 - bgc[o_i * 3 + c] as i32) * d;
+                                        n2 += d * d;
+                                    }
+                                    if n2 < MIN_FB_DIST2 {
+                                        continue;
+                                    }
+                                    let a = ((dot as f32 / n2 as f32).clamp(0.0, 1.0) * 255.0)
+                                        .round() as u8;
+                                    ca[o_i] = ca[o_i].min(a);
+                                    if a < RESOLVE_KILL {
+                                        matte[o_i] = matte[o_i].min(a);
+                                    }
+                                }
+                            }
+                            color_alpha = Some(ca);
                         }
                         let matte = GrayImage::from_raw(tw, h, matte)?;
                         let bold = bold.and_then(|b| GrayImage::from_raw(tw, h, b));
                         let rule = rule.and_then(|r| GrayImage::from_raw(tw, h, r));
+                        let fg = fg.and_then(|f| RgbImage::from_raw(tw, h, f));
+                        let bg = bg.and_then(|b| RgbImage::from_raw(tw, h, b));
+                        let color_alpha = color_alpha.and_then(|c| GrayImage::from_raw(tw, h, c));
                         let src_map = prepared[j].2.cloned();
                         Some((
                             box_idx,
@@ -623,6 +780,9 @@ impl PpocrEngine {
                                 matte,
                                 bold,
                                 rule,
+                                fg,
+                                bg,
+                                color_alpha,
                                 src_map,
                             },
                         ))

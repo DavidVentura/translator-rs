@@ -653,16 +653,16 @@ def sample(rng: random.Random | None = None, width: int | None = None):
     width = width or rng.choice(WIDTHS)
     for _attempt in range(8):
         cov, fill, bold, rule, native_h, native_w = _render_once(rng, width)
-        img, cov_out, bold_out, rule_out, ok = _composite_once(
+        img, cov_out, bold_out, rule_out, fcol, bcol, ok = _composite_once(
             rng, cov, fill, bold, rule, native_h, native_w, width
         )
         if ok:
             break
-    return img, cov_out, bold_out, rule_out
+    return img, cov_out, bold_out, rule_out, fcol, bcol
 
 
 def stream(rng: random.Random, width: int, reuse: int = 1, apply_degrade: bool = True):
-    """Infinite (img, cov, bold, rule, native_h) pairs with glyph-raster reuse.
+    """Infinite (img, cov, bold, rule, fcol, bcol, native_h) pairs with glyph-raster reuse.
 
     Rasterizing text dominates generation cost, so each rendered coverage is reused
     across `reuse` composites with fresh background/ink/degradation — dividing the
@@ -675,14 +675,14 @@ def stream(rng: random.Random, width: int, reuse: int = 1, apply_degrade: bool =
     while True:
         cov, fill, bold, rule, native_h, native_w = _render_once(rng, width)
         for _ in range(reuse):
-            img = cov_out = bold_out = rule_out = None
+            img = cov_out = bold_out = rule_out = fcol = bcol = None
             for _try in range(3):
-                img, cov_out, bold_out, rule_out, ok = _composite_once(
+                img, cov_out, bold_out, rule_out, fcol, bcol, ok = _composite_once(
                     rng, cov, fill, bold, rule, native_h, native_w, width, apply_degrade=apply_degrade
                 )
                 if ok:
                     break
-            yield img, cov_out, bold_out, rule_out, native_h
+            yield img, cov_out, bold_out, rule_out, fcol, bcol, native_h
 
 
 def _render_once(rng: random.Random, width: int, log: dict | None = None):
@@ -731,7 +731,7 @@ def _composite_once(rng: random.Random, cov, fill, bold, rule, native_h: int, na
         # Gradient ink: lerp between two ink colors across the strip.
         ink2 = random_color(rng)
         t = np.linspace(0, 1, native_w, dtype=np.float32)[None, :, None]
-        ink_field = t * ink2 + (1 - t) * ink
+        ink_field = np.broadcast_to(t * ink2 + (1 - t) * ink, (native_h, native_w, 3)).copy()
     else:
         ink_field = np.broadcast_to(ink, (native_h, native_w, 3)).copy()
     ring = np.clip(cov - fill, 0.0, 1.0)
@@ -743,10 +743,17 @@ def _composite_once(rng: random.Random, cov, fill, bold, rule, native_h: int, na
         if log is not None:
             log["outline"] = 1
     img = cov[..., None] * ink_field + (1 - cov[..., None]) * bg
+    # F/B colour labels for the colour head: F is the ink colour field the glyphs were
+    # composited with (defined over the whole strip — FBA-style everywhere-supervision),
+    # B is the background render (incl. drop shadow, which is background, not ink).
+    fcol = np.ascontiguousarray(ink_field, dtype=np.float32)
+    bcol = np.ascontiguousarray(bg, dtype=np.float32)
     # Training skips this: degrade + the legibility gate run batched on the GPU instead
     # (the legibility result becomes a per-strip loss mask, not a reject-and-retry).
     if apply_degrade:
-        img = degrade(img, rng, native_h, log)
+        aux = [fcol, bcol]
+        img = degrade(img, rng, native_h, log, photometric_aux=aux)
+        fcol, bcol = aux
         ok = legible(img, cov, native_h)
     else:
         ok = True
@@ -757,12 +764,17 @@ def _composite_once(rng: random.Random, cov, fill, bold, rule, native_h: int, na
             log["contrast"] = round(float(d.max()), 2)
         log["ok"] = ok
     if native_h != HEIGHT:
-        img = np.asarray(
-            Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8)).resize(
-                (width, HEIGHT), Image.BILINEAR
-            ),
-            dtype=np.float32,
-        ) / 255.0
+        def rgb_resize(a: np.ndarray) -> np.ndarray:
+            return np.asarray(
+                Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8)).resize(
+                    (width, HEIGHT), Image.BILINEAR
+                ),
+                dtype=np.float32,
+            ) / 255.0
+
+        img = rgb_resize(img)
+        fcol = rgb_resize(fcol)
+        bcol = rgb_resize(bcol)
         cov = np.asarray(
             Image.fromarray(cov, mode="F").resize((width, HEIGHT), Image.BILINEAR),
             dtype=np.float32,
@@ -780,6 +792,8 @@ def _composite_once(rng: random.Random, cov, fill, bold, rule, native_h: int, na
         np.clip(cov, 0.0, 1.0).astype(np.float32, copy=False),
         np.clip(bold, 0.0, 1.0).astype(np.float32, copy=False),
         np.clip(rule, 0.0, 1.0).astype(np.float32, copy=False),
+        fcol.astype(np.float32, copy=False),
+        bcol.astype(np.float32, copy=False),
         ok,
     )
 
@@ -797,24 +811,27 @@ def main():
         # Replicate sample() but capture the per-sample params into `log`. Fresh log
         # per attempt — optional fields would otherwise leak from a failed retry.
         width = rng.choice(WIDTHS)
-        img = cov = bold = rule = None
+        img = cov = bold = rule = fcol = bcol = None
         log: dict = {}
         for _ in range(8):
             log = {}
             c, fl, bl, rl, nh, nw = _render_once(rng, width, log)
-            img, cov, bold, rule, ok = _composite_once(rng, c, fl, bl, rl, nh, nw, width, log)
+            img, cov, bold, rule, fcol, bcol, ok = _composite_once(rng, c, fl, bl, rl, nh, nw, width, log)
             if ok:
                 break
         h, w = cov.shape
         ink = cov > 0.5
         bmu = float(bold[ink].mean()) if ink.any() else 0.0  # mean stroke target over ink
         band = 26
-        # Four stacked rows: composited image, matte label, bold label, rule label.
-        sheet = np.ones((band + h * 4 + 12, max(w, 360), 3), dtype=np.float32)
+        # Six stacked rows: composited image, matte, bold, rule, then the F (ink colour)
+        # and B (background colour) fields for the colour head.
+        sheet = np.ones((band + h * 6 + 20, max(w, 360), 3), dtype=np.float32)
         sheet[band : band + h, :w] = img
         sheet[band + h + 4 : band + h * 2 + 4, :w] = cov[..., None]
         sheet[band + h * 2 + 8 : band + h * 3 + 8, :w] = bold[..., None]
-        sheet[band + h * 3 + 12 :, :w] = rule[..., None]
+        sheet[band + h * 3 + 12 : band + h * 4 + 12, :w] = rule[..., None]
+        sheet[band + h * 4 + 16 : band + h * 5 + 16, :w] = fcol
+        sheet[band + h * 5 + 20 :, :w] = bcol
         pim = Image.fromarray((sheet * 255).astype(np.uint8))
         deg = " ".join(
             f"{kk}{log[kk]}" for kk in ("blur", "downsample", "jpeg", "noise", "squeeze",

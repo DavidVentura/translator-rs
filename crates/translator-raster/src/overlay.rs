@@ -7,7 +7,11 @@ use translator_core::ocr::{
     argb, channel_b, channel_g, channel_r, clamp_rect,
 };
 
-use crate::color_matting::{BG_BLOCK, background_field, dilate, fill_radius, still_fg_argb};
+use translator_core::ocr::InkColor;
+
+use crate::color_matting::{
+    BG_BLOCK, background_field, dilate, fill_radius, model_fg_argb, still_fg_argb,
+};
 
 fn overlay_layout_hints(block: &TextBlock, reading_order: ReadingOrder) -> OverlayLayoutHints {
     let layout_mode = match reading_order {
@@ -63,6 +67,7 @@ fn erase_text_region(
     oriented: OrientedRect,
     background_mode: BackgroundMode,
     ink_mask: Option<&[bool]>,
+    ink_color: Option<InkColor>,
 ) -> (OverlayColors, ErasePatch) {
     // The oriented rect carries the same DB-unclip + DET_BOX_BORDER inflation the AABB path
     // applies (see `oriented_rect_from_contour`), so it reliably covers ascenders/descenders
@@ -89,7 +94,7 @@ fn erase_text_region(
             // foreground, the same derivation the live overlay uses. Lines the
             // model couldn't matte fall back to a flat white-on-black pill.
             if let Some(mask) = ink_mask {
-                if let Some((fg, writes)) = matte_erase_oriented(view, oriented, mask) {
+                if let Some((fg, writes)) = matte_erase_oriented(view, oriented, mask, ink_color) {
                     return (
                         OverlayColors {
                             background_argb: argb(0, 0, 0),
@@ -120,6 +125,7 @@ fn matte_erase_oriented(
     view: &RasterImage,
     oriented: OrientedRect,
     ink_mask: &[bool],
+    ink_color: Option<InkColor>,
 ) -> Option<(u32, Vec<(usize, [u8; 4])>)> {
     let aabb = clamp_rect(oriented.to_aabb(), view.width, view.height)?;
     let aw = aabb.right - aabb.left;
@@ -140,10 +146,19 @@ fn matte_erase_oriented(
         }
     }
 
-    // Foreground colour via the shared still-path derivation (between-stroke/margin background
-    // + fg_from_samples), so still and live colour text identically and the decision is
-    // reproducible outside the erase.
-    let fg = still_fg_argb(&pixels, &sub, aw, ah)?;
+    // Foreground colour: the model-predicted line colour when the ink model has the colour
+    // head (only the WCAG floor applied — see `model_fg_argb`), otherwise the shared sampled
+    // derivation (between-stroke/margin background + fg_from_samples). Still and live resolve
+    // through the same pair of paths, so both colour text identically.
+    let fg = match ink_color {
+        Some(c) => {
+            if sub.iter().filter(|&&s| s).count() < 6 {
+                return None;
+            }
+            model_fg_argb(c)
+        }
+        None => still_fg_argb(&pixels, &sub, aw, ah)?,
+    };
 
     // Grow the fill set by a height-proportional radius so the original ink's
     // anti-aliased rim is replaced too (the matte edge sits just inside it).
@@ -202,6 +217,7 @@ pub fn prepare_overlay_image(
                                 line.oriented_box,
                                 background_mode,
                                 ink_mask,
+                                line.ink_color,
                             );
                             patches.push(patch);
                             prepared_lines.push(PreparedTextLine {
@@ -235,12 +251,14 @@ pub fn prepare_overlay_image(
                     ReadingOrder::TopToBottomRightToLeft => {
                         // Block-rect (CJK vertical) layout: the per-block region is the union of
                         // possibly differently-rotated lines, so rotation doesn't carry up. Erase the
-                        // block AABB unrotated.
+                        // block AABB unrotated. The block erases as one region, so it takes the first
+                        // line colour the model resolved.
                         let (colors, patch) = erase_text_region(
                             &view,
                             OrientedRect::axis_aligned(block_bounds),
                             background_mode,
                             ink_mask,
+                            block.lines.iter().find_map(|l| l.ink_color),
                         );
                         let prepared_lines = block
                             .lines
@@ -340,6 +358,7 @@ mod tests {
                     tight_box: translator_core::ocr::OrientedRect::axis_aligned(top_rect),
                     word_rects: vec![top_rect],
                     style_ranges: Vec::new(),
+                    ink_color: None,
                 },
                 TextLine {
                     text: "bottom".to_string(),
@@ -348,6 +367,7 @@ mod tests {
                     tight_box: translator_core::ocr::OrientedRect::axis_aligned(bottom_rect),
                     word_rects: vec![bottom_rect],
                     style_ranges: Vec::new(),
+                    ink_color: None,
                 },
             ],
         }];
@@ -410,6 +430,7 @@ mod tests {
                 tight_box: translator_core::ocr::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
                 style_ranges: Vec::new(),
+                ink_color: None,
             }],
         };
         let blocks = vec![make(), make()];
@@ -468,6 +489,7 @@ mod tests {
                 tight_box: translator_core::ocr::OrientedRect::axis_aligned(rect),
                 word_rects: vec![rect],
                 style_ranges: Vec::new(),
+                ink_color: None,
             }],
         }];
 
