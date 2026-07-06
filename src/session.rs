@@ -16,6 +16,7 @@ use crate::routing::MixedTextTranslationResult;
 #[cfg(feature = "ppocr")]
 use crate::settings::BackgroundMode;
 use crate::translate::TranslationWithAlignment;
+use crate::translate::TranslationWithAlternatives;
 use crate::translate::Translator;
 
 #[cfg(feature = "dictionary")]
@@ -221,6 +222,38 @@ impl TranslatorSession {
             &LanguageCode::from(from_code),
             &LanguageCode::from(to_code),
             text,
+        )
+    }
+
+    pub fn translate_text_with_alternatives(
+        &self,
+        from_code: &str,
+        to_code: &str,
+        text: &str,
+    ) -> Result<TranslationWithAlternatives, TranslatorError> {
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap).translate_text_with_alternatives(
+            &LanguageCode::from(from_code),
+            &LanguageCode::from(to_code),
+            text,
+        )
+    }
+
+    pub fn steer(
+        &self,
+        from_code: &str,
+        to_code: &str,
+        source: &str,
+        forced_prefix: &str,
+    ) -> Result<TranslationWithAlternatives, TranslatorError> {
+        let snap = self.snapshot();
+        let mut engine = self.engine().lock().expect("engine lock poisoned");
+        Translator::new(&mut engine, &snap).steer_text(
+            &LanguageCode::from(from_code),
+            &LanguageCode::from(to_code),
+            source,
+            forced_prefix,
         )
     }
 

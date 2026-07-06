@@ -77,6 +77,118 @@ impl<'a> Translator<'a> {
         Ok(merged.join("\n"))
     }
 
+    /// Translate one text and surface per-word alternatives. Only direct (non
+    /// pivoted) language pairs carry alternatives; pivoted pairs translate
+    /// normally with an empty alternatives list.
+    pub fn translate_text_with_alternatives(
+        &mut self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+        text: &str,
+    ) -> Result<TranslationWithAlternatives, TranslatorError> {
+        let normalized = text.trim();
+        if normalized.is_empty() || from_code == to_code {
+            return Ok(TranslationWithAlternatives {
+                source_text: text.to_string(),
+                translated_text: normalized.to_string(),
+                alternatives: Vec::new(),
+            });
+        }
+        let plan = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        )
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "translation pack not installed for {}->{}",
+                from_code.as_str(),
+                to_code.as_str()
+            ))
+        })?;
+        ensure_plan_loaded(self.engine, &plan).map_err(TranslatorError::translation)?;
+        let inputs = vec![normalized.to_string()];
+        match plan.steps.as_slice() {
+            [step] => self
+                .engine
+                .translate_multiple_with_alternatives(&inputs, &step.cache_key)
+                .map_err(TranslatorError::translation)
+                .map(|mut v| v.pop().expect("one input yields one result")),
+            // Pivot (e.g. nl->en->es): translate the first hop plainly, then run
+            // the final hop with alternatives so the offered swaps are in the
+            // target language. `source_text` stays the original input so a later
+            // steer re-derives the pivot intermediate.
+            [first, second] => {
+                let intermediate = self
+                    .engine
+                    .translate_multiple(&inputs, &first.cache_key)
+                    .map_err(TranslatorError::translation)?;
+                let mut out = self
+                    .engine
+                    .translate_multiple_with_alternatives(&intermediate, &second.cache_key)
+                    .map_err(TranslatorError::translation)?;
+                let mut result = out.pop().expect("one input yields one result");
+                result.source_text = text.to_string();
+                Ok(result)
+            }
+            _ => Ok(TranslationWithAlternatives {
+                source_text: text.to_string(),
+                translated_text: normalized.to_string(),
+                alternatives: Vec::new(),
+            }),
+        }
+    }
+
+    /// Re-translate `source` forcing `forced_prefix` (confirmed target text up
+    /// to and including a swapped word). For pivoted pairs the forcing applies
+    /// to the final hop only.
+    pub fn steer_text(
+        &mut self,
+        from_code: &LanguageCode,
+        to_code: &LanguageCode,
+        source: &str,
+        forced_prefix: &str,
+    ) -> Result<TranslationWithAlternatives, TranslatorError> {
+        let plan = resolve_translation_plan_in_snapshot(
+            self.snapshot,
+            from_code.as_str(),
+            to_code.as_str(),
+        )
+        .ok_or_else(|| {
+            TranslatorError::missing_asset(format!(
+                "translation pack not installed for {}->{}",
+                from_code.as_str(),
+                to_code.as_str()
+            ))
+        })?;
+        ensure_plan_loaded(self.engine, &plan).map_err(TranslatorError::translation)?;
+        match plan.steps.as_slice() {
+            [step] => self
+                .engine
+                .steer(source, forced_prefix, &step.cache_key)
+                .map_err(TranslatorError::translation),
+            // Pivot: re-derive the intermediate (nl->en), then force the target
+            // prefix on the final hop (en->es). Keep the original `source` so a
+            // follow-up steer routes the same way.
+            [first, second] => {
+                let intermediate = self
+                    .engine
+                    .translate_multiple(&[source.to_string()], &first.cache_key)
+                    .map_err(TranslatorError::translation)?;
+                let pivot = intermediate.into_iter().next().unwrap_or_default();
+                let mut result = self
+                    .engine
+                    .steer(&pivot, forced_prefix, &second.cache_key)
+                    .map_err(TranslatorError::translation)?;
+                result.source_text = source.to_string();
+                Ok(result)
+            }
+            _ => Err(TranslatorError::translation(
+                "cannot steer an empty translation plan",
+            )),
+        }
+    }
+
     pub fn translate_texts(
         &mut self,
         from_code: &LanguageCode,
@@ -236,6 +348,33 @@ pub struct TranslationWithAlignment {
     pub source_text: String,
     pub translated_text: String,
     pub alignments: Vec<TokenAlignment>,
+}
+
+/// A whole-word substitute the model would accept for a chosen target word.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct WordAlternative {
+    pub text: String,
+    pub prob: f32,
+}
+
+/// A low-confidence target word with the alternatives worth offering.
+/// `tgt_begin`/`tgt_end` are char offsets into `TranslationWithAlternatives::translated_text`.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct WordAlternatives {
+    pub tgt_begin: u64,
+    pub tgt_end: u64,
+    pub confidence: f32,
+    pub options: Vec<WordAlternative>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TranslationWithAlternatives {
+    pub source_text: String,
+    pub translated_text: String,
+    pub alternatives: Vec<WordAlternatives>,
 }
 
 /// Byte offset of each char in `s`, plus a trailing `s.len()` sentinel — index by char

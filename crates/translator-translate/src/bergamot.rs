@@ -4,12 +4,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use slimt_sys::{
-    BlockingService, TranslationModel as SlimtModel,
+    AlternativesOptions, BlockingService, TranslationModel as SlimtModel,
     TranslationWithAlignment as SlimtTranslationWithAlignment,
+    TranslationWithAlternatives as SlimtTranslationWithAlternatives,
 };
 
 use crate::sentence_split::split_sentences;
-use crate::translate::{TokenAlignment, TranslationWithAlignment};
+use crate::translate::{
+    TokenAlignment, TranslationWithAlignment, TranslationWithAlternatives, WordAlternative,
+    WordAlternatives,
+};
 
 /// Per-call cancellation + progress, plumbed from the document layer down to
 /// the single slimt call. `cancel` is polled by slimt worker threads, which
@@ -26,6 +30,14 @@ pub struct TranslateCtx<'a> {
 
 const DEFAULT_CACHE_SIZE: usize = 8192;
 const DEFAULT_WORKERS: usize = 4;
+
+/// Alternatives harvesting knobs. `gate` is the minimum probability a candidate
+/// needs to be offered — lower surfaces more (noisier) words. There is a genuine
+/// floor: on confident words there simply is no meaningful alternative.
+const ALT_OPTS: AlternativesOptions = AlternativesOptions {
+    max_alternatives: 3,
+    gate: 0.02,
+};
 
 /// Filesystem locations for a single translation direction's model assets.
 ///
@@ -133,6 +145,45 @@ impl BergamotEngine {
                 Some(self.service.translate_with_alignment(model, sentences))
             })?
             .expect("uncancellable translate cannot return None"))
+    }
+
+    pub fn translate_multiple_with_alternatives(
+        &self,
+        inputs: &[String],
+        key: &str,
+    ) -> Result<Vec<TranslationWithAlternatives>, String> {
+        let model = self.model(key)?;
+        let opts = ALT_OPTS;
+        Ok(self
+            .translate_split_with_alternatives(inputs, |sentences| {
+                Some(
+                    self.service
+                        .translate_with_alternatives(model, sentences, opts),
+                )
+            })?
+            .expect("uncancellable translate cannot return None"))
+    }
+
+    /// Re-translate one source sentence forcing `forced_prefix` (the confirmed
+    /// target text up to and including a swapped word), then free-run the tail.
+    pub fn steer(
+        &self,
+        source: &str,
+        forced_prefix: &str,
+        key: &str,
+    ) -> Result<TranslationWithAlternatives, String> {
+        let model = self.model(key)?;
+        let opts = ALT_OPTS;
+        let raw = catch_slimt_panic(|| {
+            Ok(Some(self.service.translate_with_prefix(
+                model,
+                source,
+                forced_prefix,
+                opts,
+            )))
+        })?
+        .expect("uncancellable steer cannot return None");
+        Ok(map_alternatives(source, raw))
     }
 
     /// Cancellable, progress-reporting [`Self::translate_multiple_with_alignment`].
@@ -286,6 +337,29 @@ impl BergamotEngine {
         Ok(raw.map(|r| plan.recombine_with_alignment(inputs, r)))
     }
 
+    fn translate_split_with_alternatives(
+        &self,
+        inputs: &[String],
+        translate: impl FnOnce(&[&str]) -> Option<Vec<SlimtTranslationWithAlternatives>>,
+    ) -> Result<Option<Vec<TranslationWithAlternatives>>, String> {
+        let plan = SplitPlan::build(inputs);
+        if plan.sentences.is_empty() {
+            return Ok(Some(
+                inputs
+                    .iter()
+                    .map(|s| TranslationWithAlternatives {
+                        source_text: s.clone(),
+                        translated_text: String::new(),
+                        alternatives: Vec::new(),
+                    })
+                    .collect(),
+            ));
+        }
+        let refs: Vec<&str> = plan.sentences.iter().map(String::as_str).collect();
+        let raw = catch_slimt_panic(|| Ok(translate(&refs)))?;
+        Ok(raw.map(|r| plan.recombine_with_alternatives(inputs, r)))
+    }
+
     pub fn clear(&mut self) {
         self.models.clear();
     }
@@ -414,6 +488,58 @@ impl SplitPlan {
             })
             .collect()
     }
+
+    fn recombine_with_alternatives(
+        &self,
+        inputs: &[String],
+        raw: Vec<SlimtTranslationWithAlternatives>,
+    ) -> Vec<TranslationWithAlternatives> {
+        self.inputs
+            .iter()
+            .zip(inputs.iter())
+            .map(|(input, original)| {
+                if input.range.is_empty() {
+                    return TranslationWithAlternatives {
+                        source_text: original.clone(),
+                        translated_text: String::new(),
+                        alternatives: Vec::new(),
+                    };
+                }
+                let mut combined_target = String::new();
+                let mut alternatives = Vec::new();
+                let mut tgt_char_cursor: u64 = 0;
+                for (i, slimt_idx) in input.range.clone().enumerate() {
+                    let res = &raw[slimt_idx];
+                    if i > 0 {
+                        combined_target.push(' ');
+                        tgt_char_cursor += 1;
+                    }
+                    combined_target.push_str(&res.target);
+                    for wa in &res.alternatives {
+                        alternatives.push(WordAlternatives {
+                            tgt_begin: tgt_char_cursor + wa.tgt_begin as u64,
+                            tgt_end: tgt_char_cursor + wa.tgt_end as u64,
+                            confidence: wa.confidence,
+                            options: wa
+                                .options
+                                .iter()
+                                .map(|o| WordAlternative {
+                                    text: o.text.clone(),
+                                    prob: o.prob,
+                                })
+                                .collect(),
+                        });
+                    }
+                    tgt_char_cursor += res.target.chars().count() as u64;
+                }
+                TranslationWithAlternatives {
+                    source_text: original.clone(),
+                    translated_text: combined_target,
+                    alternatives,
+                }
+            })
+            .collect()
+    }
 }
 
 fn catch_slimt_panic<T, F>(f: F) -> Result<T, String>
@@ -421,6 +547,36 @@ where
     F: FnOnce() -> Result<T, String>,
 {
     catch_unwind(AssertUnwindSafe(f)).map_err(panic_to_string)?
+}
+
+/// Map a single-sentence slimt result (steer output) to the crate type. slimt
+/// already reports char offsets into its own target, so no recombination is
+/// needed for a lone sentence.
+fn map_alternatives(
+    source: &str,
+    raw: SlimtTranslationWithAlternatives,
+) -> TranslationWithAlternatives {
+    TranslationWithAlternatives {
+        source_text: source.to_string(),
+        translated_text: raw.target,
+        alternatives: raw
+            .alternatives
+            .into_iter()
+            .map(|wa| WordAlternatives {
+                tgt_begin: wa.tgt_begin as u64,
+                tgt_end: wa.tgt_end as u64,
+                confidence: wa.confidence,
+                options: wa
+                    .options
+                    .into_iter()
+                    .map(|o| WordAlternative {
+                        text: o.text,
+                        prob: o.prob,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {

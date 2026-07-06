@@ -128,5 +128,8 @@ pub use ocr::{
 pub use routing::MixedTextTranslationResult;
 pub use session::{Feature, TranslatorSession};
 pub use settings::BackgroundMode;
-pub use translate::{TokenAlignment, TranslationWithAlignment};
+pub use translate::{
+    TokenAlignment, TranslationWithAlignment, TranslationWithAlternatives, WordAlternative,
+    WordAlternatives,
+};
 pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};
