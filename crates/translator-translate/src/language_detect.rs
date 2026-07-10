@@ -1,5 +1,6 @@
 use cld2::{Format, Hints, Reliable, detect_language_ext};
 use translator_core::api::LanguageCode;
+use translator_core::script::Script;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -39,9 +40,29 @@ pub fn detect_language_robust_code(
         return None;
     }
 
+    // cld2 confuses same-script languages on short input (सुप्रभात scores as
+    // Sanskrit, धन्यवाद as Marathi, नमस्ते as nothing), and hinting only echoes
+    // whatever hint it is given, so it can't disambiguate. The text's own script
+    // narrows the candidates to the supported languages that use it; when exactly
+    // one does, that is the answer regardless of what cld2 thinks.
+    let candidates: Vec<&LanguageCode> = match Script::dominant(text) {
+        None => available_language_codes.iter().collect(),
+        Some(script) => {
+            let same_script: Vec<&LanguageCode> = available_language_codes
+                .iter()
+                .filter(|code| Script::from_bcp47(code.as_str()) == script)
+                .collect();
+            match same_script.len() {
+                0 => return None,
+                1 => return Some(same_script[0].clone()),
+                _ => same_script,
+            }
+        }
+    };
+
     if let Some(detected) = detect_language(text, hint) {
         if detected.is_reliable
-            && available_language_codes
+            && candidates
                 .iter()
                 .any(|code| code.as_str() == detected.language)
         {
@@ -49,7 +70,7 @@ pub fn detect_language_robust_code(
         }
     }
 
-    for code in available_language_codes {
+    for code in candidates {
         if hint == Some(code) {
             continue;
         }
@@ -62,4 +83,69 @@ pub fn detect_language_robust_code(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn codes(list: &[&str]) -> Vec<LanguageCode> {
+        list.iter().map(|c| LanguageCode::from(*c)).collect()
+    }
+
+    fn detect(text: &str, available: &[&str]) -> Option<String> {
+        detect_language_robust_code(text, None, &codes(available)).map(|c| c.as_str().to_string())
+    }
+
+    #[test]
+    fn single_script_language_wins_over_cld2_guess() {
+        // cld2 alone scores these as Sanskrit / Marathi / nothing; Devanagari maps
+        // to only `hi` among the supported languages, so the script decides.
+        let available = ["en", "es", "hi", "fr"];
+        assert_eq!(detect("सुप्रभात", &available).as_deref(), Some("hi"));
+        assert_eq!(detect("धन्यवाद", &available).as_deref(), Some("hi"));
+        assert_eq!(detect("नमस्ते", &available).as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn other_single_script_languages() {
+        let available = ["en", "hi", "bn", "el", "he", "th", "ko"];
+        assert_eq!(detect("ধন্যবাদ", &available).as_deref(), Some("bn"));
+        assert_eq!(detect("ευχαριστώ", &available).as_deref(), Some("el"));
+        assert_eq!(detect("תודה", &available).as_deref(), Some("he"));
+        assert_eq!(detect("ขอบคุณ", &available).as_deref(), Some("th"));
+        assert_eq!(detect("고맙습니다", &available).as_deref(), Some("ko"));
+    }
+
+    #[test]
+    fn japanese_kana_beats_han_collision() {
+        // Kanji outnumber kana here, but any kana marks it Japanese rather than
+        // colliding with Chinese on the shared Han script.
+        let available = ["en", "ja", "zh"];
+        assert_eq!(
+            detect("日本語を話します", &available).as_deref(),
+            Some("ja")
+        );
+    }
+
+    #[test]
+    fn unsupported_script_returns_none() {
+        // Devanagari text but `hi` is not installed: nothing to route it to.
+        assert_eq!(detect("सुप्रभात", &["en", "es"]), None);
+    }
+
+    #[test]
+    fn multi_language_script_defers_to_cld2() {
+        // Latin and Cyrillic each cover several supported languages, so cld2's
+        // ranking still decides within the script.
+        let available = ["en", "es", "fr", "de", "ru", "uk"];
+        assert_eq!(
+            detect("The quick brown fox jumps over the lazy dog", &available).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            detect("Съешь же ещё этих мягких французских булочек", &available).as_deref(),
+            Some("ru")
+        );
+    }
 }

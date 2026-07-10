@@ -121,6 +121,40 @@ impl Script {
 }
 
 #[cfg(feature = "script-from-unicode")]
+impl Script {
+    pub fn of_char(ch: char) -> Self {
+        use unicode_script::UnicodeScript;
+        Script::from(ch.script())
+    }
+
+    /// The script that best identifies the text, aligned with [`Script::from_bcp47`]'s
+    /// buckets so a detected script can be matched against supported languages.
+    ///
+    /// Kana is a definitive Japanese marker, so any Hiragana/Katakana wins outright —
+    /// otherwise a kanji-heavy Japanese sentence would count as Han and collide with
+    /// Chinese. Han without kana stays Han (Chinese vs. traditional is cld2's job).
+    /// Otherwise it is the most frequent concrete script; `None` when the text carries
+    /// no concrete-script characters (digits, punctuation, whitespace only).
+    pub fn dominant(text: &str) -> Option<Self> {
+        let mut counts: std::collections::HashMap<Script, usize> = std::collections::HashMap::new();
+        for ch in text.chars() {
+            let script = Script::of_char(ch);
+            if matches!(script, Script::Hiragana | Script::Katakana) {
+                return Some(Script::Hiragana);
+            }
+            if matches!(script, Script::Common | Script::Inherited | Script::Other) {
+                continue;
+            }
+            *counts.entry(script).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(script, _)| script)
+    }
+}
+
+#[cfg(feature = "script-from-unicode")]
 impl From<unicode_script::Script> for Script {
     fn from(s: unicode_script::Script) -> Self {
         use unicode_script::Script as U;

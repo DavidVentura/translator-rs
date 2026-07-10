@@ -9,7 +9,7 @@ name = "translator_translate"
 path = "src/lib.rs"
 
 [dependencies]
-translator-core = { path = "../translator-core" }
+translator-core = { path = "../translator-core", features = ["script-from-unicode"] }
 slimt-sys = { git = "https://github.com/DavidVentura/slimt-sys" }
 cld2 = { git = "https://github.com/DavidVentura/rust-cld2" }
 regex = "1"
