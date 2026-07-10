@@ -1538,7 +1538,14 @@ impl LiveTrackerPipeline {
             let ink_strips = self
                 .host
                 .ppocr_engine()
-                .map(|ppocr| ppocr.ink_strips(rgb, &scaled, canonical_quadrant))
+                .map(|ppocr| {
+                    ppocr.ink_strips(
+                        rgb,
+                        &scaled,
+                        canonical_quadrant,
+                        translator_ocr::ppocr::InkChannelOrder::Rgb,
+                    )
+                })
                 .unwrap_or_default();
             // Bold column profile per box from the model's ch1, parallel to `detected`;
             // pooled per word against CTC firings at rec time. `None` per box when the model

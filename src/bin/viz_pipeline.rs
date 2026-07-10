@@ -952,7 +952,12 @@ fn run(cli: Cli) -> Result<(), String> {
                         "  no ink model (pass --ink or put ink.mnn in the model dir); skipping"
                     );
                 } else {
-                    let strips = engine.ink_strips(&image, &boxes, None);
+                    let strips = engine.ink_strips(
+                        &image,
+                        &boxes,
+                        None,
+                        translator::ppocr::InkChannelOrder::Rgb,
+                    );
                     let lines = recognize(engine, &image, &gray, &boxes, cli.script, true)
                         .map_err(|e| format!("recognize: {e:?}"))?;
                     let mut canvas = rgba.clone();
@@ -1135,7 +1140,12 @@ fn run(cli: Cli) -> Result<(), String> {
                         "  no ink model (pass --ink or put ink.mnn in the model dir); skipping"
                     );
                 } else {
-                    let ink_strips = engine.ink_strips(&image, &boxes, None);
+                    let ink_strips = engine.ink_strips(
+                        &image,
+                        &boxes,
+                        None,
+                        translator::ppocr::InkChannelOrder::Rgb,
+                    );
                     let masks: Vec<_> = ink_strips
                         .iter()
                         .map(|s| s.as_ref().map(|s| s.matte.clone()))
@@ -1578,7 +1588,7 @@ fn run_rewrite_stage(
     // per-word box geometry is most easily wrong.
     let strips = engine
         .has_ink()
-        .then(|| engine.ink_strips(image, boxes, None));
+        .then(|| engine.ink_strips(image, boxes, None, translator::ppocr::InkChannelOrder::Rgb));
 
     // One PerLine block per recognized line; the recognized text is fed back as the "translated"
     // text so we exercise the render path without translating. Per-word bold comes from the ink

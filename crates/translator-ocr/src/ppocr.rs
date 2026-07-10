@@ -465,18 +465,34 @@ struct PpocrRecognizerSlot {
     loaded: OnceLock<Arc<PpocrRecognizer>>,
 }
 
+/// Byte order of the RGB image handed to the ink colour head. Det/rec are channel-agnostic,
+/// but the colour head predicts *channel-identified* F/B, so the ink input planes (and the α
+/// re-solve's observed pixel) must be true RGB. The app's still + PDF paths carry pixels as
+/// B,G,R,A (little-endian ARGB) — `build_rgb_full` copies verbatim so their "RgbImage" is
+/// actually BGR — and pass [`Bgr`](Self::Bgr) to swap the planes back. True-RGB sources (the
+/// live/screen GL readback, image-crate loads in viz/bins) pass [`Rgb`](Self::Rgb).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InkChannelOrder {
+    Rgb,
+    Bgr,
+}
+
+impl InkChannelOrder {
+    /// Maps the model's true-RGB channel index to the strip's storage channel.
+    fn chan(self) -> [usize; 3] {
+        match self {
+            InkChannelOrder::Rgb => [0, 1, 2],
+            InkChannelOrder::Bgr => [2, 1, 0],
+        }
+    }
+}
+
 pub struct PpocrEngine {
     detector: PpocrDetector,
     classifier: Option<PpocrScriptClassifier>,
     textline_orientation: Option<PpocrTextlineOrientationClassifier>,
     recognizers: HashMap<PpocrScript, PpocrRecognizerSlot>,
     ink: Option<PpocrInkModel>,
-    /// App canvases store bytes as B,G,R,A (little-endian ARGB), and `build_rgb_full` copies
-    /// bytes verbatim, so on those paths every "RgbImage" in the pipeline is actually BGR.
-    /// Det/rec never cared, but the ink colour head predicts *channel-identified* F/B, so the
-    /// ink input planes (and the α re-solve's observed pixel) must be swapped back to true
-    /// RGB. False for image-crate-loaded inputs (viz, bins), set by the app engine path.
-    bgr_input: bool,
 }
 
 impl PpocrEngine {
@@ -517,12 +533,7 @@ impl PpocrEngine {
             textline_orientation,
             recognizers,
             ink,
-            bgr_input: false,
         })
-    }
-
-    pub fn set_bgr_input(&mut self, bgr: bool) {
-        self.bgr_input = bgr;
     }
 
     pub fn has_classifier(&self) -> bool {
@@ -544,8 +555,9 @@ impl PpocrEngine {
         image: &DynamicImage,
         boxes: &[translator_core::ocr::DetectedTextBox],
         canonical_quadrant: Option<translator_core::coords::Quadrant>,
+        order: InkChannelOrder,
     ) -> Vec<Option<GrayImage>> {
-        self.ink_strips(image, boxes, canonical_quadrant)
+        self.ink_strips(image, boxes, canonical_quadrant, order)
             .into_iter()
             .map(|s| s.map(|s| s.matte))
             .collect()
@@ -558,6 +570,7 @@ impl PpocrEngine {
         image: &DynamicImage,
         boxes: &[translator_core::ocr::DetectedTextBox],
         canonical_quadrant: Option<translator_core::coords::Quadrant>,
+        order: InkChannelOrder,
     ) -> Vec<Option<InkStrip>> {
         if self.ink.is_none() {
             return boxes.iter().map(|_| None).collect();
@@ -565,7 +578,7 @@ impl PpocrEngine {
         let t_pre = Instant::now();
         let strips = self.dewarp_strips(image, boxes, canonical_quadrant);
         let pre_us = t_pre.elapsed().as_micros();
-        self.ink_strips_from(&strips, pre_us)
+        self.ink_strips_from(&strips, order, pre_us)
     }
 
     pub fn dewarp_strips(
@@ -627,6 +640,7 @@ impl PpocrEngine {
     pub fn ink_strips_from(
         &self,
         strips: &[Option<DewarpedStrip>],
+        order: InkChannelOrder,
         pre_us: u128,
     ) -> Vec<Option<InkStrip>> {
         let Some(ink) = &self.ink else {
@@ -662,9 +676,7 @@ impl PpocrEngine {
                 let bw = *bw;
                 let plane = (h * bw) as usize;
                 let nb = idxs.len();
-                // `chan` maps the model's true-RGB channel index to the strip's storage
-                // channel — identity for RGB inputs, R↔B swap for BGR canvases.
-                let chan: [usize; 3] = if self.bgr_input { [2, 1, 0] } else { [0, 1, 2] };
+                let chan = order.chan();
                 let mut input = vec![0f32; nb * 3 * plane];
                 for (slot, &j) in idxs.iter().enumerate() {
                     let base = slot * 3 * plane;

@@ -2,7 +2,9 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
-use crate::ppocr::{PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction};
+use crate::ppocr::{
+    InkChannelOrder, PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction,
+};
 use translator_core::api::{LanguageCode, TranslatorError};
 use translator_core::catalog::CatalogSnapshot;
 use translator_core::catalog::{OcrPack, PackKind, PpocrScript};
@@ -143,7 +145,8 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     // recovery, applied to each line before it groups) and the overlay erase
     // (the union ink mask). Compute them once, here, before grouping needs them.
     let (ink_strips, ink_rgba) = if ppocr.has_ink() {
-        let ink_strips = ppocr.ink_strips_from(&strips, (dewarp_ms * 1000.0) as u128);
+        let ink_strips =
+            ppocr.ink_strips_from(&strips, InkChannelOrder::Bgr, (dewarp_ms * 1000.0) as u128);
         let t_ink_copy = std::time::Instant::now();
         let rgba = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
             .expect("rgba image from caller-owned bytes");
