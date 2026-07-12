@@ -13,3 +13,4 @@ viz-out/
 *.mp4
 *.bin
 *.map
+*.jsonl
