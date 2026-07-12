@@ -1,0 +1,18 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git ca-certificates \
+    libboost-all-dev \
+    libprotobuf-dev protobuf-compiler \
+    libopenblas-dev \
+    zlib1g-dev libbz2-dev liblzma-dev \
+    libicu-dev pkg-config \
+    python3 python3-numpy \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt
+RUN git clone https://github.com/browsermt/marian-dev.git \
+ && cd marian-dev \
+ && git submodule update --init --recursive
+RUN cd marian-dev && mkdir build && cd build \
+ && cmake .. -DCOMPILE_CUDA=off -DCOMPILE_CPU=on -DUSE_SENTENCEPIECE=on -DCMAKE_BUILD_TYPE=Release
+RUN cd marian-dev/build && make -j"$(nproc)"

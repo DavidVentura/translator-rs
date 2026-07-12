@@ -1,0 +1,6 @@
+transformers>=4.40
+torch>=2.2
+sentencepiece>=0.2
+sacremoses>=0.1
+sacrebleu>=2.4
+opustrainer>=0.2
