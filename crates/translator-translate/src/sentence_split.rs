@@ -30,18 +30,18 @@ fn boundary_regex() -> &'static Regex {
         // sentence just ended (`wake!”`, `(done.)`), then whitespace, then the
         // start of the next sentence: any run of *opening* delimiters
         // (straight/curly quotes, parens, brackets, Spanish `¿`/`¡`,
-        // guillemets) followed by a Unicode uppercase letter (covers accented
-        // Spanish/French/etc. and full-width CJK Latin).
+        // guillemets) and then the first non-space character (group 3).
         //
-        // The trailing uppercase letter is the load-bearing guard against
-        // false splits on the overloaded `.` (decimals `3.14`, `e.g.`,
-        // lowercase parentheticals `(or so I thought)`). The delimiter runs
-        // only let quotes/brackets sit around the boundary, so dialogue like
-        // `tomahawk! “Queequeg!” At length…` splits while `it. (or so…)` does
-        // not. Group 1 ends after the closing delimiters (they stay with the
-        // current sentence); group 2 starts at the first opening delimiter, so
-        // it joins the next sentence.
-        Regex::new(r#"([.!?]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*\p{Lu})"#)
+        // Whether group 3 must be uppercase is decided in `split_sentences`,
+        // not here: `!`/`?` split regardless of case (casual lowercase input
+        // like "how are you? i'm fine" is common), while a lone `.`/ellipsis
+        // stays guarded by an uppercase requirement against false splits on
+        // the overloaded `.` (decimals `3.14`, `e.g.`, `(or so I thought)`).
+        // The delimiter runs only let quotes/brackets sit around the boundary.
+        // Group 1 ends after the closing delimiters (they stay with the current
+        // sentence); group 2 is the opening-delimiter run and group 3 the first
+        // real character — the next sentence begins at group 2's start.
+        Regex::new(r#"([.!?]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*)(\S)"#)
             .expect("valid sentence-boundary regex")
     })
 }
@@ -103,18 +103,34 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
     let mut last_end = 0usize;
     for caps in boundary_regex().captures_iter(text) {
         let punct = caps.get(1).expect("group 1 always present");
-        let next = caps.get(2).expect("group 2 always present");
-        // Abbreviation guard: only a lone `.` can belong to a title or
-        // initial — `!`, `?`, ellipses, or punctuation followed by a closing
-        // quote always end a sentence.
-        if punct.as_str() == "." && is_nonbreaking_prefix(&text[..punct.start()]) {
-            continue;
+        let openers = caps.get(2).expect("group 2 always present");
+        let first = caps.get(3).expect("group 3 always present");
+        // `!` and `?` are unambiguous terminators: split regardless of the next
+        // sentence's case ("how are you? i'm fine" — casual lowercase input is
+        // common and must split). A lone `.`/ellipsis stays conservative: only
+        // split before an uppercase letter (guards decimals `3.14`, `e.g.`,
+        // lowercase parentheticals `(or so I thought)`) and never after a
+        // title/initial abbreviation.
+        let strong = punct.as_str().contains('!') || punct.as_str().contains('?');
+        if !strong {
+            if punct.as_str() == "." && is_nonbreaking_prefix(&text[..punct.start()]) {
+                continue;
+            }
+            if !first
+                .as_str()
+                .chars()
+                .next()
+                .expect("group 3 is one character")
+                .is_uppercase()
+            {
+                continue;
+            }
         }
         let piece = &text[last_end..punct.end()];
         if !piece.trim().is_empty() {
             out.push(piece);
         }
-        last_end = next.start();
+        last_end = openers.start();
     }
     if last_end < text.len() {
         let tail = &text[last_end..];
@@ -182,6 +198,29 @@ mod tests {
         let p = "Really?! No way. Yes.";
         let parts = split_sentences(p);
         assert_eq!(parts, vec!["Really?!", "No way.", "Yes."]);
+    }
+
+    #[test]
+    fn lowercase_after_bang_or_question_splits() {
+        // `?` / `!` are unambiguous terminators — split even before a lowercase
+        // next word (casual typing: "how are you? i'm fine").
+        assert_eq!(
+            split_sentences("hello, how are you? i am fine, thanks."),
+            vec!["hello, how are you?", "i am fine, thanks."]
+        );
+        assert_eq!(
+            split_sentences("wait! it works now."),
+            vec!["wait!", "it works now."]
+        );
+        // A lone `.` / ellipsis stays conservative: lowercase next → no split.
+        assert_eq!(
+            split_sentences("wait. it happened."),
+            vec!["wait. it happened."]
+        );
+        assert_eq!(
+            split_sentences("wait... it happened."),
+            vec!["wait... it happened."]
+        );
     }
 
     #[test]
