@@ -22,7 +22,6 @@ import argparse
 import gzip
 import subprocess
 import sys
-from collections import deque
 from pathlib import Path
 
 import ctranslate2
@@ -47,7 +46,9 @@ def main() -> None:
     ap.add_argument("--ct2-dir", default="")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--compute-type", default="int8")
-    ap.add_argument("--batch", type=int, default=1024)
+    ap.add_argument("--batch", type=int, default=1024, help="lines submitted per async task (CPU tokenization unit)")
+    ap.add_argument("--max-batch-tokens", type=int, default=2048,
+                    help="cap GPU compute batch by source tokens (batch_type=tokens); bounds VRAM on long sentences")
     ap.add_argument("--beam", type=int, default=4)
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--inter-threads", type=int, default=2)
@@ -75,45 +76,39 @@ def main() -> None:
     )
 
     n = 0
-    # Submit each tokenized batch asynchronously so the GPU works on in-flight
-    # batches while the next one is being tokenized/decoded on the CPU. Results
-    # are drained in submission order, so output stays aligned with input.
-    pending: deque = deque()
 
-    def submit(lines: list[str]):
-        # Cap source length to the model's max position encodings (512); an
-        # over-long line otherwise crashes CT2 with a position-encoding error.
-        toks = [tok.convert_ids_to_tokens(tok.encode(x, truncation=True, max_length=512)) for x in lines]
-        kwargs = {"target_prefix": [target_prefix] * len(lines)} if target_prefix else {}
-        return translator.translate_batch(
-            toks, beam_size=args.beam, max_decoding_length=args.max_len, asynchronous=True, **kwargs,
-        )
+    # translate_iterable streams the whole file through CT2's own batching
+    # (bounded by max_batch_size tokens) with in-order output. Repeated
+    # translate_batch calls accumulate GPU memory and OOM on a 600M teacher;
+    # letting CT2 own the stream keeps VRAM flat. Cap source length to the
+    # model's 512 position encodings so a long line can't crash the encoder.
+    def sources():
+        with opener(args.src) as fin:
+            for line in fin:
+                yield tok.convert_ids_to_tokens(tok.encode(line.rstrip("\n"), truncation=True, max_length=512))
 
-    def drain(fout) -> None:
-        nonlocal n
-        for r in pending.popleft():
-            hyp = r.result().hypotheses[0]
+    def prefixes():
+        # Must be the SAME length as sources() (translate_iterable zips them and
+        # pads the shorter with None), so re-read the file rather than repeat().
+        with opener(args.src) as fin:
+            for _ in fin:
+                yield [args.tgt_lang]
+
+    kwargs = {"target_prefix": prefixes()} if target_prefix else {}
+    with writer(args.out) as fout:
+        for r in translator.translate_iterable(
+            sources(), beam_size=args.beam, max_decoding_length=args.max_len,
+            max_batch_size=args.max_batch_tokens, batch_type="tokens", **kwargs,
+        ):
+            hyp = r.hypotheses[0]
             # NLLB decodes the target-language prefix token back out first; drop it.
             if target_prefix and hyp and hyp[0] == args.tgt_lang:
                 hyp = hyp[1:]
-            out = tok.decode(tok.convert_tokens_to_ids(hyp), skip_special_tokens=True)
-            fout.write(out.replace("\n", " ") + "\n")
+            decoded = tok.decode(tok.convert_tokens_to_ids(hyp), skip_special_tokens=True)
+            fout.write(decoded.replace("\n", " ") + "\n")
             n += 1
-        print(f"  {n}", end="\r", file=sys.stderr)
-
-    with opener(args.src) as fin, writer(args.out) as fout:
-        batch: list[str] = []
-        for line in fin:
-            batch.append(line.rstrip("\n"))
-            if len(batch) >= args.batch:
-                pending.append(submit(batch))
-                batch = []
-                if len(pending) >= args.queue_depth:
-                    drain(fout)
-        if batch:
-            pending.append(submit(batch))
-        while pending:
-            drain(fout)
+            if n % 20000 == 0:
+                print(f"  {n}", end="\r", file=sys.stderr)
     print(f"\nDONE {n} lines -> {args.out}", file=sys.stderr)
 
 
