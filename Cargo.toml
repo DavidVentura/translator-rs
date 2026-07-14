@@ -17,6 +17,11 @@ path = "src/bin/bucket_samples.rs"
 required-features = ["tts"]
 
 [[bin]]
+name = "onnx_to_mnn"
+path = "src/bin/onnx_to_mnn.rs"
+required-features = ["model-convert"]
+
+[[bin]]
 name = "bloat_probe"
 path = "src/bin/bloat_probe.rs"
 required-features = ["odt", "tts", "dictionary", "ppocr", "transliterate", "pdf"]
