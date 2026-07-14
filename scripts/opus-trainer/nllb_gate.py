@@ -41,10 +41,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=100)
     ap.add_argument("--beam", type=int, default=4)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--device", default="cpu", help="cpu or cuda; use cuda on a rented GPU box")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model).eval()
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model).eval().to(args.device)
 
     for pair in args.pairs.split(","):
         src_code, tgt_code = pair.split("-")
@@ -55,7 +56,7 @@ def main() -> None:
         hyps: list[str] = []
         with torch.no_grad():
             for i in range(0, len(src), args.batch):
-                enc = tok(src[i : i + args.batch], return_tensors="pt", padding=True, truncation=True, max_length=256)
+                enc = tok(src[i : i + args.batch], return_tensors="pt", padding=True, truncation=True, max_length=256).to(args.device)
                 gen = model.generate(**enc, forced_bos_token_id=bos, num_beams=args.beam, max_length=256)
                 hyps.extend(tok.batch_decode(gen, skip_special_tokens=True))
                 print(f"  {pair}: {min(i + args.batch, len(src))}/{len(src)}", end="\r", file=sys.stderr)
