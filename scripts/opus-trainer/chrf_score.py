@@ -3,12 +3,27 @@
 the teacher gates (chrF++ word_order=2, spBLEU flores200 tokenizer), so student
 numbers line up directly against nllb_gate.py / hy_mt2_gate.py output.
 
-    python chrf_score.py <label> <hyp> <ref>
+Pass the SOURCE file as a 4th arg to also get COMET22 (wmt22-comet-da, x100).
+chrF/ce are blind to confident content-word errors ("rain of rain" costs ~2
+chrF); COMET is a neural adequacy metric that catches them — this is the
+brittleness blind-angle fix, use it whenever the source file is available.
+
+    python chrf_score.py <label> <hyp> <ref> [src]
 """
 
 import sys
 
 import sacrebleu
+
+
+def comet22(srcs: list[str], hyps: list[str], refs: list[str]) -> float:
+    import torch
+    from comet import download_model, load_from_checkpoint
+
+    model = load_from_checkpoint(download_model("Unbabel/wmt22-comet-da"))
+    data = [{"src": s, "mt": h, "ref": r} for s, h, r in zip(srcs, hyps, refs)]
+    gpus = 1 if torch.cuda.is_available() else 0
+    return 100 * model.predict(data, batch_size=32, gpus=gpus).system_score
 
 
 def main() -> None:
@@ -19,7 +34,13 @@ def main() -> None:
         sys.exit(f"{label}: line-count mismatch hyp={len(hyps)} ref={len(refs)}")
     chrf = sacrebleu.corpus_chrf(hyps, [refs], word_order=2)
     bleu = sacrebleu.corpus_bleu(hyps, [refs], tokenize="flores200")
-    print(f"{label}: chrF++ {chrf.score:.2f}  spBLEU {bleu.score:.2f}  (n={len(hyps)})")
+    line = f"{label}: chrF++ {chrf.score:.2f}  spBLEU {bleu.score:.2f}"
+    if len(sys.argv) > 4:
+        srcs = open(sys.argv[4], encoding="utf-8").read().splitlines()
+        if len(srcs) != len(hyps):
+            sys.exit(f"{label}: line-count mismatch src={len(srcs)} hyp={len(hyps)}")
+        line += f"  COMET22 {comet22(srcs, hyps, refs):.2f}"
+    print(f"{line}  (n={len(hyps)})")
 
 
 if __name__ == "__main__":

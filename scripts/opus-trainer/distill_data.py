@@ -16,6 +16,15 @@ the tokenizer source language and a target-language prefix token for the decoder
     python distill_data.py --model facebook/nllb-200-distilled-600M \
         --src-lang tgl_Latn --tgt-lang eng_Latn \
         --src kd.tl.gz --out kd.tl2en.en.gz            # tl->en student targets (NLLB)
+
+With --nbest N (requires --beam >= N) each output line is an N-column TSV of
+hypotheses, best-first, at the same decode cost as 1-best for a given beam.
+Feed that to extract_best.py (same box, right after) to pick the training
+target per line against the human reference.
+
+    python distill_data.py --model facebook/nllb-200-distilled-600M \
+        --src-lang swh_Latn --tgt-lang eng_Latn --beam 8 --nbest 8 \
+        --src shard.sw.gz --out shard.nbest.tsv.gz
 """
 
 import argparse
@@ -50,6 +59,8 @@ def main() -> None:
     ap.add_argument("--max-batch-tokens", type=int, default=2048,
                     help="cap GPU compute batch by source tokens (batch_type=tokens); bounds VRAM on long sentences")
     ap.add_argument("--beam", type=int, default=4)
+    ap.add_argument("--nbest", type=int, default=1,
+                    help="emit the top N beam hypotheses as an N-column TSV (for extract_best.py)")
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--inter-threads", type=int, default=2)
     ap.add_argument("--queue-depth", type=int, default=3, help="batches kept in flight to keep the GPU fed")
@@ -58,6 +69,8 @@ def main() -> None:
     nllb = bool(args.src_lang or args.tgt_lang)
     if nllb and not (args.src_lang and args.tgt_lang):
         ap.error("NLLB mode needs both --src-lang and --tgt-lang")
+    if args.nbest > args.beam:
+        ap.error(f"--nbest {args.nbest} needs --beam >= {args.nbest}")
 
     ct2_dir = args.ct2_dir or "ct2_" + args.model.split("/")[-1].replace("-", "_")
     if not Path(ct2_dir).exists():
@@ -94,18 +107,21 @@ def main() -> None:
             for _ in fin:
                 yield [args.tgt_lang]
 
+    def detok(hyp) -> str:
+        # NLLB decodes the target-language prefix token back out first; drop it.
+        if target_prefix and hyp and hyp[0] == args.tgt_lang:
+            hyp = hyp[1:]
+        decoded = tok.decode(tok.convert_tokens_to_ids(hyp), skip_special_tokens=True)
+        return decoded.replace("\n", " ").replace("\t", " ")
+
     kwargs = {"target_prefix": prefixes()} if target_prefix else {}
     with writer(args.out) as fout:
         for r in translator.translate_iterable(
-            sources(), beam_size=args.beam, max_decoding_length=args.max_len,
+            sources(), beam_size=args.beam, num_hypotheses=args.nbest,
+            max_decoding_length=args.max_len,
             max_batch_size=args.max_batch_tokens, batch_type="tokens", **kwargs,
         ):
-            hyp = r.hypotheses[0]
-            # NLLB decodes the target-language prefix token back out first; drop it.
-            if target_prefix and hyp and hyp[0] == args.tgt_lang:
-                hyp = hyp[1:]
-            decoded = tok.decode(tok.convert_tokens_to_ids(hyp), skip_special_tokens=True)
-            fout.write(decoded.replace("\n", " ") + "\n")
+            fout.write("\t".join(detok(h) for h in r.hypotheses[:args.nbest]) + "\n")
             n += 1
             if n % 20000 == 0:
                 print(f"  {n}", end="\r", file=sys.stderr)

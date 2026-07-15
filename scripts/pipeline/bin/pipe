@@ -1,0 +1,24 @@
+#!/bin/bash
+# Laptop-side wrapper. The orchestrator runs on the CPU hub -- this rsyncs the
+# working tree up and runs it there, so the repo stays the source of truth and
+# iterating on the framework needs no deploy step.
+#
+# Required, and deliberately without defaults so no one's environment ends up
+# baked into the repo:
+#   PIPE_REMOTE  ssh destination of the hub, e.g. user@host
+#   PIPE_ROOT    store root on the hub; holds code/, runs/, leases/
+set -euo pipefail
+: "${PIPE_REMOTE:?set PIPE_REMOTE to the orchestrator ssh destination, e.g. user@host}"
+: "${PIPE_ROOT:?set PIPE_ROOT to the store root on \$PIPE_REMOTE, e.g. /srv/pipe}"
+
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+DEST="$PIPE_ROOT/code"
+
+ssh "$PIPE_REMOTE" mkdir -p "$DEST/pipeline" "$DEST/opus-trainer"
+rsync -a --delete --exclude '__pycache__' --exclude '.venv' \
+  "$HERE/" "$PIPE_REMOTE:$DEST/pipeline/"
+rsync -a --delete --exclude '__pycache__' --exclude 'venv' --exclude '.cache' \
+  "$HERE/../opus-trainer/" "$PIPE_REMOTE:$DEST/opus-trainer/"
+
+ssh "$PIPE_REMOTE" "cd $(printf '%q' "$DEST/pipeline") && ~/.local/bin/uv run --quiet \
+  python -m pipe.cli --root $(printf '%q' "$PIPE_ROOT") $(printf '%q ' "$@")"

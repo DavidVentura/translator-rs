@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--vocab", required=True)
     ap.add_argument("--shortlist", default="none")
     ap.add_argument("--bin", default=str(REPO / "target" / "debug" / "slimt_load_test"))
+    ap.add_argument("--no-comet", action="store_true", help="skip COMET22 (first run downloads a ~2.3GB model)")
     args = ap.parse_args()
 
     code = FLORES[args.lang]
@@ -66,8 +67,13 @@ def main() -> None:
     n = min(len(hyps), len(ref))
     chrf = sacrebleu.corpus_chrf(hyps[:n], [ref[:n]], word_order=2)
     bleu = sacrebleu.corpus_bleu(hyps[:n], [ref[:n]])
+    comet = ""
+    if not args.no_comet:
+        from chrf_score import comet22
+
+        comet = f"  COMET22 {comet22(src[:n], hyps[:n], ref[:n]):.2f}"
     direction = f"{args.src}->{args.lang}" if args.src == "en" else f"{args.lang}->en"
-    print(f"{direction}: chrF++ {chrf.score:.2f}  BLEU {bleu.score:.2f}  (n={n}, shortlist={args.shortlist})")
+    print(f"{direction}: chrF++ {chrf.score:.2f}  BLEU {bleu.score:.2f}{comet}  (n={n}, shortlist={args.shortlist})")
 
 
 if __name__ == "__main__":

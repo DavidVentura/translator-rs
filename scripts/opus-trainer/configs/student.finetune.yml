@@ -5,7 +5,7 @@ clip-norm: 0
 cost-type: ce-mean-words
 disp-first: 10
 disp-freq: 100
-early-stopping: 20
+early-stopping: 4
 exponential-smoothing: True
 learn-rate: 0.0003
 lr-decay-inv-sqrt: 32000

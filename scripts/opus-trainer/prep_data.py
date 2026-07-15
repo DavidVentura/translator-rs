@@ -37,10 +37,14 @@ from pathlib import Path
 import fasttext
 
 # corpora worth keeping for MT (skip Ubuntu/GNOME/translatewiki/ELRC*: localization
-# junk; XLEnt: entity pairs; ParaCrawl-Bonus: dup of ParaCrawl)
+# junk; ParaCrawl-Bonus: dup of ParaCrawl). XLEnt/WikiTitles are entity/title
+# pairs — useless as sentences, but without them the model has almost no 1-2
+# word training pairs and free-runs on short inputs ("hallo" -> "Hello in the
+# hello"); mozilla's short-sentences fix is exactly these datasets.
 ALLOWLIST = {
     "NLLB", "CCAligned", "CCMatrix", "OpenSubtitles", "ParaCrawl", "WikiMatrix",
     "wikimedia", "bible-uedin", "TED2020", "tico-19", "Tatoeba", "QED",
+    "XLEnt", "WikiTitles", "LinguaTools-WikiTitles",
 }
 URL_RE = re.compile(r"(https://\S+/OPUS-([^/]+)/\S+/moses/\S+\.txt\.zip)")
 
@@ -217,7 +221,15 @@ def _clean_batch(task: tuple[str, list]) -> tuple[str, int, list[str]]:
         tl, tp = _LID.predict(tgt_buf)
         want_s, want_t = "__label__" + args.src, "__label__" + args.lang
         for s, t, slab, spr, tlab, tpr in zip(src_buf, tgt_buf, sl, sp, tl, tp):
-            if slab[0] == want_s and tlab[0] == want_t and spr[0] >= args.min_lid and tpr[0] >= args.min_lid:
+            # fastText LID is unreliable on 1-2 word lines and silently drops
+            # nearly all of them, which is what starves the model of short-input
+            # coverage; pass short pairs through on the non-LID filters alone.
+            short = (
+                args.lid_bypass_tokens > 0
+                and len(s.split()) <= args.lid_bypass_tokens
+                and len(t.split()) <= args.lid_bypass_tokens
+            )
+            if short or (slab[0] == want_s and tlab[0] == want_t and spr[0] >= args.min_lid and tpr[0] >= args.min_lid):
                 kept.append(f"{s}\t{t}")
     return name, len(rows), kept
 
@@ -259,6 +271,8 @@ def main() -> None:
     ap.add_argument("--alpha-ratio", type=float, default=0.4, help="min fraction of non-space chars that are letters")
     ap.add_argument("--num-ratio", type=float, default=1.0, help="min numbers-overlap/mismatch ratio between sides")
     ap.add_argument("--min-lid", type=float, default=0.5)
+    ap.add_argument("--lid-bypass-tokens", type=int, default=2,
+                    help="skip the LID filter when both sides have <= this many tokens (0 disables)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="clean worker processes")
     ap.add_argument("--skip-spm", action="store_true", help="skip joint SPM training (reuse an existing vocab)")
     ap.add_argument("--vocab-size", type=int, default=32000)
