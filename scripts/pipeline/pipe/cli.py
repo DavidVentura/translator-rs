@@ -33,6 +33,18 @@ def _open(run: str, cfg: Config) -> Run:
     return Run(id=rid, store=store, ledger=Ledger(store.ledger_path(rid)), scripts=cfg.scripts)
 
 
+def cmd_adopt(a: argparse.Namespace) -> int:
+    r = _open(a.run)
+    try:
+        r.ledger.adopt(a.step, a.key)
+    except (KeyError, ValueError) as e:
+        _emit({"ok": False, "error": str(e)})
+        return 1
+    _emit({"ok": True, "run": a.run, "step": a.step, "adopt_from": a.key,
+           "note": "next run of this step reuses these outputs instead of re-running"})
+    return 0
+
+
 def cmd_put(a: argparse.Namespace) -> int:
     r = _open(a.run, a.cfg)
     art = r.store.put(r.id, Name(a.name), Path(a.path), Kind(a.kind))
@@ -239,6 +251,14 @@ def main() -> int:
     p = argparse.ArgumentParser(prog="pipe")
     p.add_argument("--run", default="adhoc")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser(
+        "adopt",
+        help="reuse a done step's outputs under its next key (for a no-op script edit)",
+    )
+    sp.add_argument("step", help="step name, e.g. kd_decode")
+    sp.add_argument("key", help="existing done key whose outputs to reuse, e.g. kd_decode@1f2d60292ddb")
+    sp.set_defaults(fn=cmd_adopt)
 
     sp = sub.add_parser("put", help="promote a file into the store under a name")
     sp.add_argument("name")

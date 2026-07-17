@@ -81,6 +81,15 @@ class Run:
         if cached is not None and cached.status is Status.DONE:
             return cached.outputs
 
+        # An operator asserted (via `pipe adopt`) that the edit which changed this
+        # key cannot change the output, so reuse the previous run's artifacts rather
+        # than pay for the step again. Recorded with provenance, never silent.
+        inherited = self.ledger.take_adoption(defn.name)
+        if inherited is not None:
+            self.ledger.begin(key, defn.name, inherited.log, inherited.job)
+            self.ledger.finish(key, Status.DONE, inherited.outputs, adopted_from=inherited.key)
+            return inherited.outputs
+
         local_out = self.store.run_dir(self.id) / "out" / key
         in_paths = {name: art.path for name, art in inputs.items()}
 
