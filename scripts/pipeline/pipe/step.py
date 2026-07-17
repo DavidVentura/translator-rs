@@ -74,44 +74,49 @@ class Run:
         **inputs: Artifact,
     ) -> dict[str, Artifact]:
         args = args or {}
+        # Before open(): a memoized step must not rent a box to find out it has nothing to do.
         key = self._key(defn, inputs, args)
 
         cached = self.ledger.get(key)
         if cached is not None and cached.status is Status.DONE:
             return cached.outputs
 
-        host = defn.target.host()
-        job_dir = self.store.jobs_dir(self.id) / key
-        out_dir = self.store.run_dir(self.id) / "out" / key
+        local_out = self.store.run_dir(self.id) / "out" / key
         in_paths = {name: art.path for name, art in inputs.items()}
 
-        job = Job(host=host, ref=JobRef(host.name, job_dir), name=Name(defn.name))
-        status = job.status()
-        if status.state is JobState.EXITED and not status.ok:
-            # An EXITED-ok job here means we died before collecting; that one must not relaunch.
-            job.reset()
+        session = defn.target.open(
+            run=str(self.id), step=defn.name, key=key, image=defn.image, root=self.store.root
+        )
+        ok = False
+        try:
+            job = Job(
+                host=session.host,
+                ref=JobRef(session.host.name, session.job_dir(key), session.ssh_info()),
+                name=Name(defn.name),
+            )
             status = job.status()
-        if status.state is JobState.ABSENT:
-            defn.target.materialize(in_paths, out_dir)
-            payload = defn.fn(Ctx(script=SCRIPTS_DIR / defn.script, out_dir=OUT_DIR))
-            exec_sh = defn.target.exec_sh(
-                image=defn.image,
-                job_dir=job_dir,
-                scripts=self.scripts,
-                inputs=in_paths,
-                out_dir=out_dir,
-            )
-            self.ledger.begin(key, defn.name, job_dir / "log", job.ref)
-            job.launch(exec_sh, [str(p) for p in payload], args)
+            if status.state is JobState.EXITED and not status.ok:
+                # An EXITED-ok job here means we died before collecting; that must not relaunch.
+                job.reset()
+                status = job.status()
+            if status.state is JobState.ABSENT:
+                session.prepare(key, in_paths, self.scripts)
+                payload = defn.fn(Ctx(script=SCRIPTS_DIR / defn.script, out_dir=OUT_DIR))
+                self.ledger.begin(key, defn.name, local_out / "job.log", job.ref)
+                job.launch(session.exec_sh(defn.image, key), [str(p) for p in payload], args)
 
-        status = job.wait(timeout=timeout)
-        if not status.ok:
-            self.ledger.finish(key, Status.FAILED, {})
-            raise RuntimeError(
-                f"step {defn.name} exited {status.exit_code}; log: {job_dir / 'log'}"
-            )
+            status = job.wait(timeout=timeout)
+            session.collect(key, local_out)
+            if not status.ok:
+                self.ledger.finish(key, Status.FAILED, {})
+                raise RuntimeError(
+                    f"step {defn.name} exited {status.exit_code}; log: {local_out / 'job.log'}"
+                )
+            produced = self._collect(defn, local_out)
+            ok = True
+        finally:
+            session.close(ok)
 
-        produced = self._collect(defn, out_dir)
         self.ledger.finish(key, Status.DONE, produced)
         return produced
 

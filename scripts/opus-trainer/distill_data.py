@@ -34,7 +34,8 @@ import sys
 from pathlib import Path
 
 import ctranslate2
-from transformers import AutoTokenizer
+
+from hf_offline import load_tokenizer
 
 
 def opener(p: str):
@@ -80,9 +81,7 @@ def main() -> None:
              "--output_dir", ct2_dir, "--quantization", args.compute_type],
             check=True,
         )
-    tok = AutoTokenizer.from_pretrained(args.model)
-    if nllb:
-        tok.src_lang = args.src_lang
+    tok = load_tokenizer(args.model, args.src_lang if nllb else None)
     target_prefix = [args.tgt_lang] if nllb else None
     translator = ctranslate2.Translator(
         ct2_dir, device=args.device, compute_type=args.compute_type, inter_threads=args.inter_threads,

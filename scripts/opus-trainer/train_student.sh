@@ -25,8 +25,13 @@ set -euo pipefail
 
 TSV=$1; VOCAB=$2; VALID=$3; OUT=$4; DEVICES=${5:-}
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MARIAN=${MARIAN:-/root/marian-dev/build/marian}
+MARIAN=${MARIAN:-$(command -v marian || echo /root/marian-dev/build/marian)}
 mkdir -p "$(dirname "$OUT")"
+# marian detects SentencePiece vocabs by the .spm extension; pipe materializes
+# inputs under bare names, so re-expose the vocab with its extension.
+if [[ "$VOCAB" != *.spm ]]; then
+  ln -sf "$VOCAB" "$(dirname "$OUT")/vocab.spm" && VOCAB="$(dirname "$OUT")/vocab.spm"
+fi
 
 if [ -n "$DEVICES" ]; then
   DEV=(--devices $DEVICES --workspace 9000)

@@ -23,6 +23,7 @@ distill_data.py --nbest, while the box is still up.
 import argparse
 import gzip
 import sys
+from collections import Counter
 from itertools import islice, zip_longest
 from multiprocessing import Pool
 
@@ -44,20 +45,21 @@ def _init_worker() -> None:
     _CHRF = CHRF()
 
 
-def _pick_batch(rows: list[tuple[str, str, bool]]) -> tuple[list[str], int, int]:
-    out = []
-    selected = moved = 0
+def _pick_batch(rows: list[tuple[str, str, bool]]) -> tuple[list[str], list[int]]:
+    """Returns the picked targets and the winning beam RANK of each gated line
+    (rank 0 = the teacher's own favorite). Ranks are the histogram's raw material."""
+    out: list[str] = []
+    ranks: list[int] = []
     for nbest_line, ref, gated in rows:
         hyps = nbest_line.split("\t")
         if gated and ref and len(hyps) > 1:
             scores = [_CHRF.sentence_score(h, [ref]).score for h in hyps]
             best = scores.index(max(scores))
             out.append(hyps[best])
-            selected += 1
-            moved += best != 0
+            ranks.append(best)
         else:
             out.append(hyps[0])
-    return out, selected, moved
+    return out, ranks
 
 
 def rows(args):
@@ -88,22 +90,34 @@ def main() -> None:
     args = ap.parse_args()
 
     it = rows(args)
-    n = selected = moved = 0
+    n = 0
+    hist: Counter[int] = Counter()
     with writer(args.out) as fout, Pool(args.jobs, initializer=_init_worker) as pool:
         batches = iter(lambda: list(islice(it, args.batch)), [])
-        for picked, sel, mov in pool.imap(_pick_batch, batches, chunksize=1):
+        for picked, ranks in pool.imap(_pick_batch, batches, chunksize=1):
             for line in picked:
                 fout.write(line + "\n")
             n += len(picked)
-            selected += sel
-            moved += mov
+            hist.update(ranks)
             if n % 100000 < args.batch:
                 print(f"  {n}", end="\r", file=sys.stderr)
+    selected = sum(hist.values())
+    moved = selected - hist[0]
     print(
         f"\nDONE {n} lines -> {args.out}: {selected} gated-in ({selected / max(n, 1):.1%}), "
         f"{moved} picked a non-rank-1 hypothesis ({moved / max(selected, 1):.1%} of gated)",
         file=sys.stderr,
     )
+    # The rank histogram decides the next campaign's beam: sw→en at beam 8 came
+    # back NEAR-UNIFORM (rank-1 18.1%, ranks 2-8 9.4-14.3% each), meaning the
+    # 600M's beam differed in surface rather than content and the extra 2.4x
+    # decode bought noise -> the beam 4 / n-best 4 standing rule. A CONCENTRATED
+    # histogram (rank-1 dominant, a real tail) is what re-justifies beam 8.
+    if selected:
+        share = "  ".join(
+            f"rank{r + 1} {hist[r] / selected:.1%}" for r in sorted(hist)
+        )
+        print(f"rank histogram (share of gated selections): {share}", file=sys.stderr)
 
 
 if __name__ == "__main__":

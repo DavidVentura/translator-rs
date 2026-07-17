@@ -13,8 +13,10 @@ RUN apt-get update && apt-get install -y \
     libsparsehash-dev \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt
+# This fork is the anchor of the train->convert->slimt-load chain.
 RUN git clone https://github.com/browsermt/marian-dev.git \
  && cd marian-dev \
+ && git checkout 2781d735d4a10dca876d61be587afdab2726293c \
  && git submodule update --init --recursive
 RUN cd marian-dev && mkdir build && cd build \
  && cmake .. -DCOMPILE_CUDA=off -DCOMPILE_CPU=on -DUSE_SENTENCEPIECE=on -DCMAKE_BUILD_TYPE=Release

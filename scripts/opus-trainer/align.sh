@@ -19,8 +19,19 @@ FA="$TOOLS/fast_align/build"
 mkdir -p "$OUT"
 
 paste <(tr '\t' ' ' < "$SRC") <(tr '\t' ' ' < "$TRG") | sed 's/\t/ ||| /' > "$OUT/fa_in"
-"$FA/fast_align" -i "$OUT/fa_in" -d -o -v      > "$OUT/fwd" 2>/dev/null
-"$FA/fast_align" -i "$OUT/fa_in" -d -o -v -r   > "$OUT/rev" 2>/dev/null
+# stderr must stay visible: a swallowed fast_align failure produced a 100%-empty
+# rev file that atools silently degraded to forward-only alignments (en-sw,
+# 2026-07-15) while this script still reported success.
+"$FA/fast_align" -i "$OUT/fa_in" -d -o -v      > "$OUT/fwd"
+"$FA/fast_align" -i "$OUT/fa_in" -d -o -v -r   > "$OUT/rev"
+total=$(wc -l < "$OUT/fa_in")
+for f in fwd rev; do
+  empty=$(grep -c "^$" "$OUT/$f") || true
+  if [ $((empty * 100)) -gt "$total" ]; then
+    echo "align.sh: $f is ${empty}/${total} empty lines (>1%) -- fast_align failed" >&2
+    exit 1
+  fi
+done
 "$FA/atools" -i "$OUT/fwd" -j "$OUT/rev" -c grow-diag-final-and > "$OUT/sym"
 
 paste <(tr '\t' ' ' < "$SRC") <(tr '\t' ' ' < "$TRG") "$OUT/sym" > "$OUT/train.tsv"

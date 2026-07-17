@@ -24,8 +24,14 @@ set -euo pipefail
 
 TSV=$1; VOCAB=$2; PRE=$3; VALID=$4; OUT=$5; DEVICES=${6:-0}
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MARIAN=${MARIAN:-/root/marian-dev/build/marian}
+MARIAN=${MARIAN:-$(command -v marian || echo /root/marian-dev/build/marian)}
 mkdir -p "$(dirname "$OUT")"
+if [[ "$VOCAB" != *.spm ]]; then
+  ln -sf "$VOCAB" "$(dirname "$OUT")/vocab.spm" && VOCAB="$(dirname "$OUT")/vocab.spm"
+fi
+if [[ "$PRE" != *.npz && "$PRE" != *.bin ]]; then
+  ln -sf "$PRE" "$(dirname "$OUT")/pretrained.npz" && PRE="$(dirname "$OUT")/pretrained.npz"
+fi
 
 OT_CFG="$(dirname "$OUT")/config.opustrainer.finetune.yml"
 sed "s|__TSV__|$TSV|g" "$HERE/configs/opustrainer.student.yml" > "$OT_CFG"

@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 import zipfile
 from collections import deque
@@ -47,9 +48,11 @@ ALLOWLIST = {
     "XLEnt", "WikiTitles", "LinguaTools-WikiTitles",
 }
 URL_RE = re.compile(r"(https://\S+/OPUS-([^/]+)/\S+/moses/\S+\.txt\.zip)")
+# opus_get prints this to stdout and exits 0 when the API call fails.
+API_FAIL = "Unable to retrieve the data from"
 
 
-def resolve_urls(venv_bin: Path, src: str, tgt: str) -> list[tuple[str, str]]:
+def _opus_list(venv_bin: Path, src: str, tgt: str) -> tuple[dict[str, str], bool]:
     out = subprocess.run(
         [str(venv_bin / "opus_get"), "-s", src, "-t", tgt, "-p", "moses", "-l"],
         capture_output=True, text=True,
@@ -62,7 +65,40 @@ def resolve_urls(venv_bin: Path, src: str, tgt: str) -> list[tuple[str, str]]:
         url, name = m.group(1), m.group(2)
         if name in ALLOWLIST and name not in seen:
             seen[name] = url
-    return list(seen.items())
+    return seen, API_FAIL in out.stdout
+
+
+def resolve_urls(venv_bin: Path, src: str, tgt: str, tries: int = 25, wait: int = 45) -> list[tuple[str, str]]:
+    """Allowlisted (name, url) pairs for a pair, or [] if OPUS genuinely has none.
+
+    opus.nlpl.eu's API is intermittently overloaded: it serves a request now and
+    then and RESETs the connection otherwise (measured 2026-07-16 — ~2 successes
+    in ~12 calls over 45min, from both a container and the host, TLS completing
+    before the reset). opus_get reports that failure on STDOUT and still exits 0,
+    so a reset and a pair with no corpora both arrive here as an empty list —
+    which is how a transient failure became "no OPUS moses corpora resolved for
+    en-ug" and killed a prep run 135s in.
+
+    Retries are a FIXED interval, not exponential backoff: the failure is not a
+    cooldown we can wait out (a 30-min quiet gap still failed), it is a per-call
+    coin flip, so what matters is the NUMBER of independent attempts, not the
+    spacing. Only the distinguishable failure is retried, and an exhausted retry
+    raises rather than returning a misleading [].
+    """
+    for attempt in range(tries):
+        urls, api_failed = _opus_list(venv_bin, src, tgt)
+        if urls:
+            return list(urls.items())
+        if not api_failed:
+            return []  # the API answered; this pair really has nothing allowlisted
+        if attempt < tries - 1:
+            print(f"opus API unavailable; retry {attempt + 1}/{tries - 1} in {wait}s",
+                  file=sys.stderr)
+            time.sleep(wait)
+    raise RuntimeError(
+        f"opus API kept failing for {src}-{tgt} across {tries} tries / ~{tries * wait // 60}min; "
+        "this is NOT the same as the pair having no corpora"
+    )
 
 
 def members(zf: zipfile.ZipFile, ext: str) -> str:
