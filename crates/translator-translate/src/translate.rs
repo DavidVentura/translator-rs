@@ -51,30 +51,11 @@ impl<'a> Translator<'a> {
             return Ok(normalized.to_string());
         }
 
-        let lines = normalized
-            .split('\n')
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        let non_empty_indices = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| (!line.trim().is_empty()).then_some(index))
-            .collect::<Vec<_>>();
-        if non_empty_indices.is_empty() {
-            return Ok(String::new());
-        }
-
-        let texts_to_translate = non_empty_indices
-            .iter()
-            .map(|&index| lines[index].clone())
-            .collect::<Vec<_>>();
-        let translated = self.translate_texts(from_code, to_code, &texts_to_translate)?;
-
-        let mut merged = lines;
-        for (index, translated_text) in non_empty_indices.into_iter().zip(translated.into_iter()) {
-            merged[index] = translated_text;
-        }
-        Ok(merged.join("\n"))
+        let merged = translate_lines_preserving(normalized, |inputs| {
+            self.translate_texts(from_code, to_code, &inputs)
+                .map(|texts| texts.into_iter().map(plain_translation).collect())
+        })?;
+        Ok(merged.translated_text)
     }
 
     /// Translate one text and surface per-word alternatives. Only direct (non
@@ -107,36 +88,30 @@ impl<'a> Translator<'a> {
             ))
         })?;
         ensure_plan_loaded(self.engine, &plan).map_err(TranslatorError::translation)?;
-        let inputs = vec![normalized.to_string()];
-        match plan.steps.as_slice() {
-            [step] => self
-                .engine
-                .translate_multiple_with_alternatives(&inputs, &step.cache_key)
-                .map_err(TranslatorError::translation)
-                .map(|mut v| v.pop().expect("one input yields one result")),
-            // Pivot (e.g. nl->en->es): translate the first hop plainly, then run
-            // the final hop with alternatives so the offered swaps are in the
-            // target language. `source_text` stays the original input so a later
-            // steer re-derives the pivot intermediate.
-            [first, second] => {
-                let intermediate = self
+        let mut result = translate_lines_preserving(normalized, |inputs| {
+            match plan.steps.as_slice() {
+                [step] => self
                     .engine
-                    .translate_multiple(&inputs, &first.cache_key)
-                    .map_err(TranslatorError::translation)?;
-                let mut out = self
-                    .engine
-                    .translate_multiple_with_alternatives(&intermediate, &second.cache_key)
-                    .map_err(TranslatorError::translation)?;
-                let mut result = out.pop().expect("one input yields one result");
-                result.source_text = text.to_string();
-                Ok(result)
+                    .translate_multiple_with_alternatives(&inputs, &step.cache_key)
+                    .map_err(TranslatorError::translation),
+                // Pivot (e.g. nl->en->es): translate the first hop plainly, then
+                // run the final hop with alternatives so the offered swaps are in
+                // the target language.
+                [first, second] => {
+                    let intermediate = self
+                        .engine
+                        .translate_multiple(&inputs, &first.cache_key)
+                        .map_err(TranslatorError::translation)?;
+                    self.engine
+                        .translate_multiple_with_alternatives(&intermediate, &second.cache_key)
+                        .map_err(TranslatorError::translation)
+                }
+                _ => Ok(inputs.into_iter().map(plain_translation).collect()),
             }
-            _ => Ok(TranslationWithAlternatives {
-                source_text: text.to_string(),
-                translated_text: normalized.to_string(),
-                alternatives: Vec::new(),
-            }),
-        }
+        })?;
+        // `source_text` stays the original input so a later steer re-derives it.
+        result.source_text = text.to_string();
+        Ok(result)
     }
 
     /// Re-translate `source` forcing `forced_prefix` (confirmed target text up
@@ -375,6 +350,72 @@ pub struct TranslationWithAlternatives {
     pub source_text: String,
     pub translated_text: String,
     pub alternatives: Vec<WordAlternatives>,
+}
+
+fn plain_translation(text: String) -> TranslationWithAlternatives {
+    TranslationWithAlternatives {
+        source_text: String::new(),
+        translated_text: text,
+        alternatives: Vec::new(),
+    }
+}
+
+/// Translate `text` while preserving its line structure. The input is split on
+/// '\n'; only non-blank lines are handed to `translate` (which returns one
+/// result per input line, in order), and blank lines are kept verbatim. The
+/// engine collapses inter-sentence whitespace, so translating a multi-line
+/// string as one input would flatten every paragraph break into a single space
+/// — splitting here keeps the line breaks. Results are rejoined on '\n' and each
+/// line's alternative char offsets are rebased into the joined output.
+/// `source_text` is left empty for the caller to fill in.
+fn translate_lines_preserving<E>(
+    text: &str,
+    translate: impl FnOnce(Vec<String>) -> Result<Vec<TranslationWithAlternatives>, E>,
+) -> Result<TranslationWithAlternatives, E> {
+    let mut lines: Vec<String> = text.split('\n').map(ToOwned::to_owned).collect();
+    let non_empty: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (!line.trim().is_empty()).then_some(index))
+        .collect();
+    let inputs = non_empty
+        .iter()
+        .map(|&index| lines[index].clone())
+        .collect();
+    let translated = translate(inputs)?;
+
+    for (&index, piece) in non_empty.iter().zip(translated.iter()) {
+        lines[index] = piece.translated_text.clone();
+    }
+    let mut line_start = Vec::with_capacity(lines.len());
+    let mut cursor = 0u64;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            cursor += 1; // the rejoined '\n'
+        }
+        line_start.push(cursor);
+        cursor += line.chars().count() as u64;
+    }
+    let alternatives = non_empty
+        .iter()
+        .zip(translated)
+        .flat_map(|(&index, piece)| {
+            let base = line_start[index];
+            piece
+                .alternatives
+                .into_iter()
+                .map(move |alt| WordAlternatives {
+                    tgt_begin: alt.tgt_begin + base,
+                    tgt_end: alt.tgt_end + base,
+                    ..alt
+                })
+        })
+        .collect();
+    Ok(TranslationWithAlternatives {
+        source_text: String::new(),
+        translated_text: lines.join("\n"),
+        alternatives,
+    })
 }
 
 /// Byte offset of each char in `s`, plus a trailing `s.len()` sentinel — index by char
@@ -632,4 +673,54 @@ fn ensure_plan_loaded(engine: &mut BergamotEngine, plan: &TranslationPlan) -> Re
         engine.load_model_into_cache(&step.paths, &step.cache_key)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_with_leading_alternative(text: &str, len: u64) -> TranslationWithAlternatives {
+        TranslationWithAlternatives {
+            source_text: text.to_string(),
+            translated_text: text.to_string(),
+            alternatives: vec![WordAlternatives {
+                tgt_begin: 0,
+                tgt_end: len,
+                confidence: 1.0,
+                options: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn preserves_blank_paragraph_breaks() {
+        let out = translate_lines_preserving::<()>("First para.\n\nSecond para.", |inputs| {
+            Ok(inputs.into_iter().map(plain_translation).collect())
+        })
+        .unwrap();
+        assert_eq!(out.translated_text, "First para.\n\nSecond para.");
+    }
+
+    #[test]
+    fn rebases_alternative_offsets_across_lines() {
+        // Two non-blank lines separated by a blank line; each line's translation
+        // carries an alternative over its first five chars.
+        let out = translate_lines_preserving::<()>("Hello world.\n\nSecond line.", |inputs| {
+            Ok(inputs
+                .into_iter()
+                .map(|line| line_with_leading_alternative(&line, 5))
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(out.translated_text, "Hello world.\n\nSecond line.");
+        let spans: Vec<(u64, u64)> = out
+            .alternatives
+            .iter()
+            .map(|a| (a.tgt_begin, a.tgt_end))
+            .collect();
+        // Line one starts at char 0; line two starts after "Hello world." (12) +
+        // two '\n' separators = char 14.
+        assert_eq!(spans, vec![(0, 5), (14, 19)]);
+    }
 }
