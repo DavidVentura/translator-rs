@@ -10,6 +10,56 @@ fn make_transliterator(source_script: &str) -> Option<Transliterator> {
     Transliterator::try_new(&locale).ok()
 }
 
+/// Malayalam dependent vowel signs that CLDR's `Malayalam-InterIndic` has no
+/// rules for, so `und-Latn-t-und-mlym` romanizes them wrongly: `ൊ ോ ൌ` are
+/// canonically decomposed by the transform's `::NFD;` step and then matched in
+/// halves (`ൊ` → `eā`), while `ൄ ൢ ൣ` are not even admitted by its filter and
+/// survive into the Latin output verbatim. Reported as CLDR-19646; drop this
+/// once the rules land upstream.
+///
+/// Each entry is (vowel sign as it may appear in the input, marker, correct
+/// romanization). Both the composed and NFD forms are listed for the three
+/// decomposable signs, since either may reach us.
+const MLYM_UNMAPPED_VOWEL_SIGNS: &[(&str, char, &str)] = &[
+    ("\u{0D4A}", '\u{F8F0}', "o"),
+    ("\u{0D46}\u{0D3E}", '\u{F8F0}', "o"),
+    ("\u{0D4B}", '\u{F8F1}', "\u{014D}"),
+    ("\u{0D47}\u{0D3E}", '\u{F8F1}', "\u{014D}"),
+    ("\u{0D4C}", '\u{F8F2}', "au"),
+    ("\u{0D46}\u{0D57}", '\u{F8F2}', "au"),
+    ("\u{0D44}", '\u{F8F3}', "r\u{0325}\u{0304}"),
+    ("\u{0D62}", '\u{F8F4}', "l\u{0325}"),
+    ("\u{0D63}", '\u{F8F5}', "l\u{0325}\u{0304}"),
+];
+
+/// Stands in for an unmapped sign while the transform runs. A Malayalam vowel
+/// sign rather than the Latin vowel itself, because a consonant carries an
+/// inherent `a` that only a vowel sign displaces — dropping the sign entirely
+/// would romanize `മൊഴി` as `maoḻi` instead of `moḻi`.
+const MLYM_STAND_IN_SIGN: char = '\u{0D3F}';
+const MLYM_STAND_IN_LATIN: &str = "i";
+
+fn mask_malayalam_vowel_signs(text: &str) -> String {
+    let stripped: String = text
+        .chars()
+        .filter(|ch| !MLYM_UNMAPPED_VOWEL_SIGNS.iter().any(|(_, m, _)| ch == m))
+        .collect();
+
+    MLYM_UNMAPPED_VOWEL_SIGNS
+        .iter()
+        .fold(stripped, |acc, (sign, marker, _)| {
+            acc.replace(sign, &format!("{MLYM_STAND_IN_SIGN}{marker}"))
+        })
+}
+
+fn restore_malayalam_vowel_signs(romanized: String) -> String {
+    MLYM_UNMAPPED_VOWEL_SIGNS
+        .iter()
+        .fold(romanized, |acc, (_, marker, latin)| {
+            acc.replace(&format!("{MLYM_STAND_IN_LATIN}{marker}"), latin)
+        })
+}
+
 fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
     match source_script.as_str() {
         "Jpan" => {
@@ -17,6 +67,11 @@ fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
             let hira = make_transliterator("Hira")?;
             let result = kana.transliterate(text.to_string());
             Some(hira.transliterate(result))
+        }
+        "Mlym" => {
+            let t = make_transliterator("Mlym")?;
+            let masked = mask_malayalam_vowel_signs(text);
+            Some(restore_malayalam_vowel_signs(t.transliterate(masked)))
         }
         _ => {
             let t = make_transliterator(source_script.as_str())?;
@@ -231,6 +286,64 @@ mod tests {
     #[test]
     fn test_telugu() {
         assert_eq!(translit("Telu", "నమస్కారం"), "namaskāraṁ");
+    }
+
+    #[test]
+    fn test_malayalam() {
+        assert_eq!(translit("Mlym", "നമസ്കാരം"), "namaskāraṁ");
+        assert_eq!(translit("Mlym", "മലയാളം"), "malayāḷaṁ");
+    }
+
+    #[test]
+    fn test_malayalam_unmapped_vowel_signs() {
+        assert_eq!(translit("Mlym", "മൊഴി"), "moḻi");
+        assert_eq!(translit("Mlym", "മൊ"), "mo");
+        assert_eq!(translit("Mlym", "മോ"), "mō");
+        assert_eq!(translit("Mlym", "മൌ"), "mau");
+        assert_eq!(translit("Mlym", "മൄ"), "mr̥̄");
+        assert_eq!(translit("Mlym", "മൢ"), "ml̥");
+        assert_eq!(translit("Mlym", "മൣ"), "ml̥̄");
+    }
+
+    #[test]
+    fn test_malayalam_decomposed_input_matches_composed() {
+        assert_eq!(
+            translit("Mlym", "\u{0D2E}\u{0D46}\u{0D3E}"),
+            translit("Mlym", "\u{0D2E}\u{0D4A}")
+        );
+        assert_eq!(
+            translit("Mlym", "\u{0D2E}\u{0D47}\u{0D3E}"),
+            translit("Mlym", "\u{0D2E}\u{0D4B}")
+        );
+    }
+
+    #[test]
+    fn test_malayalam_working_vowel_signs_untouched() {
+        assert_eq!(translit("Mlym", "മാ"), "mā");
+        assert_eq!(translit("Mlym", "മി"), "mi");
+        assert_eq!(translit("Mlym", "മെ"), "me");
+        assert_eq!(translit("Mlym", "മേ"), "mē");
+        assert_eq!(translit("Mlym", "മൈ"), "mai");
+        assert_eq!(translit("Mlym", "മൃ"), "mr̥");
+    }
+
+    #[test]
+    fn test_malayalam_independent_vowels_untouched() {
+        assert_eq!(translit("Mlym", "ഒരു"), "oru");
+        assert_eq!(translit("Mlym", "ഓട്ടം"), "ōṭṭaṁ");
+    }
+
+    #[test]
+    fn test_mixed_malayalam_in_latin_sentence() {
+        assert_eq!(
+            transliterate_mixed_to_latin("the word മൊഴി means speech"),
+            "the word moḻi means speech"
+        );
+    }
+
+    #[test]
+    fn test_malayalam_marker_in_input_does_not_leak() {
+        assert_eq!(translit("Mlym", "മൊ\u{F8F0}ഴി"), "moḻi");
     }
 
     #[test]
