@@ -21,6 +21,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BMT=/opt/marian-dev/build
 mkdir -p "$OUT"
 
+# marian detects SentencePiece vocabs by the .spm extension; pipe materializes
+# inputs under bare names, so re-expose the vocab with its extension.
+if [[ "$VOCAB" != *.spm ]]; then
+  ln -sf "$VOCAB" "$OUT/vocab.spm" && VOCAB="$OUT/vocab.spm"
+fi
+
 # 1) collect typical quantization multipliers by decoding a sample (beam 1)
 "$BMT/marian-decoder" --models "$MODEL" --vocabs "$VOCAB" "$VOCAB" \
   --config "$HERE/configs/quantize.decoder.yml" \

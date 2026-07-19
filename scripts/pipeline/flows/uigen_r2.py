@@ -45,9 +45,11 @@ Prerequisites (hub, one time):
     pipe put r2_hplt_src     /nvme2/prom/uig/r2/hplt.src     --kind lines
     pipe put r2_vocab        /nvme2/prom/uig/r2/vocab.spm    --kind blob
     pipe put r2_valid        /nvme2/prom/uig/valid.ugen.tsv  --kind blob
+    pipe put r2_devtest /nvme2/prom/flores/flores200_dataset/devtest/uig_Arab.devtest --kind lines
 
     pipe --run uigr2 run uigen_r2 decode        # decode only, before committing to train
-    pipe --run uigr2 run uigen_r2               # the whole thing
+    pipe --run uigr2 run uigen_r2               # up to the trained student
+    pipe --run uigr2 run uigen_r2 pack          # + quantize/shortlist/pack -> slimt bucket pack
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from flows.pack import build_pack
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver, Vast
 from pipe.types import Artifact, Kind
@@ -159,12 +162,19 @@ def align(ctx: Ctx) -> list[str]:
 
 @step(
     image=CUDA,
-    target=Vast(gpu="RTX_4090", max_hours=10, tries=8, geo=EU),
+    target=Vast(gpu="RTX_4090", max_hours=10, disk_gb=60, tries=8, geo=EU, min_cuda=11.8),
     script="train_student.sh",
     outputs={"model": Output(rel="model/model.npz.best-ce-mean-words.npz", kind=Kind.BLOB)},
 )
 def train(ctx: Ctx) -> list[str]:
-    return [ctx.script, ctx.inp("train_tsv"), ctx.inp("vocab"), ctx.inp("valid"), ctx.out("model")]
+    # ctx.out("model/model.npz"), not ctx.out("model"): marian validates the --model
+    # extension and aborts on a path without .npz/.bin. The trailing "0" is DEVICES
+    # (GPU 0); train_student.sh treats a missing devices arg as CPU, which would run
+    # for days on 8M lines.
+    return [
+        ctx.script, ctx.inp("train_tsv"), ctx.inp("vocab"), ctx.inp("valid"),
+        ctx.out("model/model.npz"), "0",
+    ]
 
 
 def _decode_source(run: Run, name: str, split_step, gather_step, src: Artifact, k: int) -> Artifact:
@@ -200,8 +210,8 @@ def _decode_source(run: Run, name: str, split_step, gather_step, src: Artifact, 
 def main(run: Run, argv: list[str]) -> dict:
     a = run.ledger.artifact
     stage = argv[0] if argv else "all"
-    if stage not in ("decode", "all"):
-        raise SystemExit(f"unknown stage {stage!r}; want 'decode' or nothing")
+    if stage not in ("decode", "all", "pack"):
+        raise SystemExit(f"unknown stage {stage!r}; want 'decode', 'pack' or nothing")
 
     existing_src, existing_tgt = a("r2_existing_src"), a("r2_existing_tgt")
     hplt_src = a("r2_hplt_src")
@@ -228,7 +238,16 @@ def main(run: Run, argv: list[str]) -> dict:
         train, timeout=10 * 3600,
         train_tsv=aligned, vocab=a("r2_vocab"), valid=a("r2_valid"),
     )["model"]
-    return {
+    result = {
         "hplt_tgt": hplt_tgt.to_json(),
         "train_tsv": aligned.to_json(), "model": model.to_json(),
     }
+
+    if stage == "pack":
+        packed = build_pack(
+            run, model=model, vocab=a("r2_vocab"),
+            src=pairs["src"], tgt=pairs["tgt"], devtest=a("r2_devtest"), infix="ugen",
+        )
+        result["pack"] = {name: art.to_json() for name, art in packed.items()}
+
+    return result

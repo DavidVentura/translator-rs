@@ -9,14 +9,38 @@
 #
 # Run inside the marian-bmt image (spm_encode, fast_align, extract_lex, marian-conv).
 #
-# Usage: shortlist.sh SRC_FILE TRG_FILE VOCAB_SPM OUT_DIR [TOOLS=/work]
+# A lexical translation table saturates well before the full KD corpus, and
+# fast_align cost is ~tokens x EM-passes x 2 directions on the SUBWORD stream
+# (subword fragmentation inflates the token count hard for scripts like Uyghur).
+# MAX_LINES caps the corpus to a uniform deterministic sample so the step is
+# ~minutes, not hours; sampling by identical line stride on both files keeps the
+# pairs aligned, and the fixed stride keeps the output reproducible (pipe memoizes).
+#
+# Usage: shortlist.sh SRC_FILE TRG_FILE VOCAB_SPM OUT_DIR [TOOLS=/work] [MAX_LINES=0]
 #   -> OUT_DIR/lex.50.50.s2t.bin   (binarized; goes in the pack next to the model)
 set -euo pipefail
 
-SRC=$1; TRG=$2; VOCAB=$3; OUT=$4; TOOLS=${5:-/work}
+SRC=$1; TRG=$2; VOCAB=$3; OUT=$4; TOOLS=${5:-/work}; MAX_LINES=${6:-0}
 BMT=/opt/marian-dev/build
 FA="$TOOLS/fast_align/build"; XL="$TOOLS/extract-lex/build"
 mkdir -p "$OUT"
+
+# marian-conv detects SentencePiece vocabs by the .spm extension; pipe materializes
+# inputs under bare names, so re-expose the vocab with its extension.
+if [[ "$VOCAB" != *.spm ]]; then
+  ln -sf "$VOCAB" "$OUT/vocab.spm" && VOCAB="$OUT/vocab.spm"
+fi
+
+if [ "$MAX_LINES" -gt 0 ]; then
+  total=$(wc -l < "$SRC")
+  if [ "$total" -gt "$MAX_LINES" ]; then
+    stride=$(( total / MAX_LINES + 1 ))
+    awk -v s="$stride" 'NR % s == 0' "$SRC" > "$OUT/samp.src"
+    awk -v s="$stride" 'NR % s == 0' "$TRG" > "$OUT/samp.trg"
+    SRC="$OUT/samp.src"; TRG="$OUT/samp.trg"
+    echo "shortlist: sampled 1-in-$stride of $total lines -> $(wc -l < "$SRC")"
+  fi
+fi
 
 # 1) SPM-segment both sides
 "$BMT/spm_encode" --model "$VOCAB" < "$SRC" > "$OUT/spm.src"
