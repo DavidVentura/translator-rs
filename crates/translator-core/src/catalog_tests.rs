@@ -211,8 +211,11 @@ fn language_info(
     tts_regions: Vec<(&str, &str, Vec<&str>)>,
     default_region: Option<&str>,
 ) -> LanguageInfo {
+    let script = crate::script::Script::from_iso15924(&language.script)
+        .unwrap_or(crate::script::Script::Other);
     LanguageInfo {
         language,
+        script,
         resources: LanguageResources {
             translation_root_packs: translation_root_packs
                 .into_iter()

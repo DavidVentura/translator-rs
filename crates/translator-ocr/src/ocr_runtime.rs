@@ -717,7 +717,11 @@ fn ocr_source_from_text(
     let available = snapshot
         .availability_by_code
         .keys()
-        .map(|code| LanguageCode::from(code.as_str()))
+        .filter_map(|code| {
+            snapshot
+                .catalog
+                .scripted_language(&LanguageCode::from(code.as_str()))
+        })
         .collect::<Vec<_>>();
     let detected = detect_language_robust_code(text, None, &available)?;
     if let Some(target) = target_code {

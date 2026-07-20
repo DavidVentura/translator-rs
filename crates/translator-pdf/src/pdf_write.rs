@@ -407,12 +407,12 @@ fn build_font_plan(
     // Pass 2: union of texts per (req, handle).
     let mut union_text: HashMap<FontKey, String> = HashMap::new();
     for work in works {
-        let script = translator_core::script::Script::from_bcp47(&work.translation.target_language);
+        let script = work.translation.target_language.script;
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
             for variant in block_variants(block, style) {
                 let req = FontRequest {
                     script,
-                    language: work.translation.target_language.clone(),
+                    language: work.translation.target_language.as_str().to_string(),
                     bold: variant.bold,
                     italic: variant.italic,
                     monospace: style.typography.flags.monospace,
@@ -484,7 +484,7 @@ fn emit_pages(
     for work in works {
         let mut block_resources: Vec<BlockResources> =
             Vec::with_capacity(work.translation.blocks.len());
-        let script = translator_core::script::Script::from_bcp47(&work.translation.target_language);
+        let script = work.translation.target_language.script;
         for (block, style) in work.translation.blocks.iter().zip(work.block_styles.iter()) {
             let mut by_flags: HashMap<
                 BoldItalic,
@@ -496,7 +496,7 @@ fn emit_pages(
             for variant in block_variants(block, style) {
                 let req = FontRequest {
                     script,
-                    language: work.translation.target_language.clone(),
+                    language: work.translation.target_language.as_str().to_string(),
                     bold: variant.bold,
                     italic: variant.italic,
                     monospace: style.typography.flags.monospace,

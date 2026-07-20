@@ -86,10 +86,12 @@ fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
 fn romanizable_source_code(script: Script) -> Option<String> {
     use translator_core::script::Script as S;
     match S::from(script) {
-        S::Latin | S::Common | S::Inherited | S::Other => None,
+        S::Latin => None,
         // Both kana share the Japanese transform (katakana then hiragana).
         S::Hiragana | S::Katakana => Some("Jpan".to_owned()),
-        other => Some(other.iso15924().to_owned()),
+        // Punctuation, marks and unenumerated scripts have no subtag, so they
+        // drop out here rather than needing their own arm.
+        other => other.iso15924().map(str::to_owned),
     }
 }
 

@@ -148,10 +148,10 @@ pub struct PageTranslationResult {
     pub page: PageDims,
     pub blocks: Vec<TranslatedStyledBlock>,
     pub error: Option<String>,
-    /// BCP-47 tag of the language the blocks were translated **into**.
-    /// The PDF writer hands this to its [`FontProvider`] when picking a
-    /// font for the script.
-    pub target_language: String,
+    /// The language the blocks were translated **into**, carrying the script
+    /// the catalog records for it. The PDF writer hands the script straight to
+    /// its [`FontProvider`] instead of inferring one from the tag.
+    pub target_language: translator_core::api::ScriptedLanguage,
 }
 
 #[cfg(test)]

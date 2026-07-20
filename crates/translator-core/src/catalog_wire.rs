@@ -435,6 +435,17 @@ fn compile_language_info(
         .unwrap_or_else(|| entry.meta.code.clone());
     let code = entry.meta.code.clone();
 
+    // An unknown script must not sink the whole catalog: a newer catalog can
+    // name a writing system this build predates, and every other language in it
+    // still works.
+    let script = crate::script::Script::from_iso15924(&entry.meta.script).unwrap_or_else(|| {
+        log::warn!(
+            "language {code} declares unknown script {:?}; treating as Other",
+            entry.meta.script
+        );
+        crate::script::Script::Other
+    });
+
     Some(LanguageInfo {
         language: Language {
             code: code.clone(),
@@ -443,6 +454,7 @@ fn compile_language_info(
             script: entry.meta.script,
             dictionary_code,
         },
+        script,
         resources,
         tts: compile_tts_config(entry.tts),
     })
@@ -579,5 +591,71 @@ pub fn select_best_catalog<'a>(
         (Err(bundled_error), Err(disk_error)) => Err(format!(
             "Bundled catalog invalid: {bundled_error}; disk catalog invalid: {disk_error}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_language_catalog;
+    use crate::api::LanguageCode;
+    use crate::script::Script;
+
+    fn catalog_with_scripts(entries: &[(&str, &str)]) -> String {
+        let languages = entries
+            .iter()
+            .map(|(code, script)| {
+                format!(
+                    r#""{code}":{{"meta":{{"code":"{code}","name":"{code}","shortName":"{code}","script":"{script}"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"formatVersion":5,"generatedAt":0,"dictionaryVersion":1,
+               "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":0,
+                           "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":0}},
+               "languages":{{{languages}}},"packs":{{}}}}"#
+        )
+    }
+
+    /// The catalog is the only source for a language's writing system. Uyghur
+    /// regressed once because a second, hand-maintained table did not list it
+    /// and defaulted to Latin, which romanized Arabic-script text into nothing
+    /// the voice could pronounce.
+    #[test]
+    fn script_comes_from_the_catalog() {
+        let json = catalog_with_scripts(&[("ug", "Arab"), ("en", "Latn"), ("ja", "Jpan")]);
+        let catalog = parse_language_catalog(&json).expect("catalog parses");
+
+        assert_eq!(
+            catalog.script_for(&LanguageCode::from("ug")),
+            Some(Script::Arabic)
+        );
+        assert_eq!(
+            catalog.script_for(&LanguageCode::from("en")),
+            Some(Script::Latin)
+        );
+        assert_eq!(
+            catalog.script_for(&LanguageCode::from("ja")),
+            Some(Script::Hiragana)
+        );
+        assert_eq!(catalog.script_for(&LanguageCode::from("xx")), None);
+    }
+
+    /// A newer catalog may name a writing system this build predates. That
+    /// language degrades to Other; the rest of the catalog still loads.
+    #[test]
+    fn unknown_script_does_not_sink_the_catalog() {
+        let json = catalog_with_scripts(&[("iu", "Cans"), ("en", "Latn")]);
+        let catalog = parse_language_catalog(&json).expect("catalog parses");
+
+        assert_eq!(
+            catalog.script_for(&LanguageCode::from("iu")),
+            Some(Script::Other)
+        );
+        assert_eq!(
+            catalog.script_for(&LanguageCode::from("en")),
+            Some(Script::Latin)
+        );
     }
 }

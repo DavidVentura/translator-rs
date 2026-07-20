@@ -10,7 +10,7 @@ use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::api::{LanguageCode, ScriptedLanguage, TranslatorError};
 use translator_translate::document_translator::DocumentTranslator;
 use translator_translate::language_detect::detect_language_robust_code;
 use translator_translate::translate::TranslationWithAlignment;
@@ -94,7 +94,7 @@ pub struct DocumentOdtTranslator<'a> {
     translator: &'a dyn DocumentTranslator,
     forced_source_code: Option<&'a str>,
     target_code: &'a str,
-    available_language_codes: &'a [LanguageCode],
+    available_languages: &'a [ScriptedLanguage],
 }
 
 impl<'a> DocumentOdtTranslator<'a> {
@@ -102,13 +102,13 @@ impl<'a> DocumentOdtTranslator<'a> {
         translator: &'a dyn DocumentTranslator,
         forced_source_code: Option<&'a str>,
         target_code: &'a str,
-        available_language_codes: &'a [LanguageCode],
+        available_languages: &'a [ScriptedLanguage],
     ) -> Self {
         Self {
             translator,
             forced_source_code,
             target_code,
-            available_language_codes,
+            available_languages,
         }
     }
 }
@@ -135,12 +135,13 @@ impl OdtTextTranslator for DocumentOdtTranslator<'_> {
             Some(code) => LanguageCode::from(code),
             None => {
                 let combined = texts.join(" ");
-                detect_language_robust_code(&combined, None, self.available_language_codes)
-                    .ok_or_else(|| {
+                detect_language_robust_code(&combined, None, self.available_languages).ok_or_else(
+                    || {
                         OdtTranslateError::Translation(
                             "could not detect ODT source language".to_string(),
                         )
-                    })?
+                    },
+                )?
             }
         };
 
@@ -183,14 +184,14 @@ pub fn translate_odt(
     odt_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
-    available_language_codes: &[LanguageCode],
+    available_languages: &[ScriptedLanguage],
 ) -> Result<Vec<u8>, OdtTranslateError> {
     translate_odt_with_progress(
         translator,
         odt_bytes,
         forced_source_code,
         target_code,
-        available_language_codes,
+        available_languages,
         |_| {},
     )
 }
@@ -204,7 +205,7 @@ pub fn translate_odt_with_progress(
     odt_bytes: &[u8],
     forced_source_code: Option<&str>,
     target_code: &str,
-    available_language_codes: &[LanguageCode],
+    available_languages: &[ScriptedLanguage],
     on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<u8>, OdtTranslateError> {
     translator.begin_document_translation();
@@ -212,7 +213,7 @@ pub fn translate_odt_with_progress(
         translator,
         forced_source_code,
         target_code,
-        available_language_codes,
+        available_languages,
     );
     translate_odt_with_translator_and_progress(odt_bytes, &mut adapter, on_progress)
 }

@@ -1,5 +1,20 @@
 use translator::LanguageCode;
+use translator::api::ScriptedLanguage;
 use translator::language_detect::{detect_language, detect_language_robust_code};
+use translator::script::Script;
+
+fn scripted(codes: &[&str]) -> Vec<ScriptedLanguage> {
+    codes
+        .iter()
+        .map(|code| ScriptedLanguage {
+            code: LanguageCode::from(*code),
+            script: match *code {
+                "ja" => Script::Hiragana,
+                _ => Script::Latin,
+            },
+        })
+        .collect()
+}
 
 fn run(text: &str, hint: Option<&str>) {
     let hint_owned = hint.map(LanguageCode::from);
@@ -24,10 +39,7 @@ fn matches_bergamot_shape_no_hint() {
 
 #[test]
 fn robust_code_with_available_list() {
-    let available: Vec<LanguageCode> = ["en", "es", "fr", "de", "ja"]
-        .into_iter()
-        .map(LanguageCode::from)
-        .collect();
+    let available = scripted(&["en", "es", "fr", "de", "ja"]);
     for _ in 0..64 {
         let _ =
             detect_language_robust_code("hello world", Some(&LanguageCode::from("en")), &available);
@@ -39,10 +51,7 @@ fn robust_code_with_available_list() {
 
 #[test]
 fn robust_code_unreliable_falls_through_loop() {
-    let available: Vec<LanguageCode> = ["en", "es", "fr", "de"]
-        .into_iter()
-        .map(LanguageCode::from)
-        .collect();
+    let available = scripted(&["en", "es", "fr", "de"]);
     for _ in 0..64 {
         let _ = detect_language_robust_code("xyz", Some(&LanguageCode::from("en")), &available);
         let _ = detect_language_robust_code("a", Some(&LanguageCode::from("en")), &available);

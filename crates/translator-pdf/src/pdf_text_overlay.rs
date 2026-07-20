@@ -36,7 +36,6 @@ use crate::pdf_resources::{append_content_stream, attach_embedded_fonts_to_page}
 use translator_core::ocr::{
     OverlayLayoutMode, PreparedImageOverlay, PreparedTextBlock, PreparedTextLine,
 };
-use translator_core::script::Script;
 use translator_render::font_metrics::FontMetrics;
 use translator_render::font_provider::{FontHandle, FontProvider, FontRequest};
 
@@ -93,13 +92,13 @@ pub struct OverlayFontPlan {
 pub fn build_overlay_font_plan(
     doc: &mut Document,
     overlays: &[OverlayPage],
-    target_language: &str,
+    target_language: &translator_core::api::ScriptedLanguage,
     fonts: &dyn FontProvider,
 ) -> OverlayFontPlan {
-    let script = Script::from_bcp47(target_language);
+    let script = target_language.script;
     let primary_request = FontRequest {
         script,
-        language: target_language.to_string(),
+        language: target_language.as_str().to_string(),
         bold: false,
         italic: false,
         monospace: false,

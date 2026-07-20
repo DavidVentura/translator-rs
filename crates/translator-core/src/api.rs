@@ -40,6 +40,23 @@ impl fmt::Display for LanguageCode {
     }
 }
 
+/// A language together with the writing system the catalog records for it.
+///
+/// Resolved once where the catalog is in scope, so crates that pick fonts or
+/// decide on romanization receive the script instead of inferring one from the
+/// language tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedLanguage {
+    pub code: LanguageCode,
+    pub script: crate::script::Script,
+}
+
+impl ScriptedLanguage {
+    pub fn as_str(&self) -> &str {
+        self.code.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ScriptCode {

@@ -8,6 +8,7 @@ use piper_rs::{
 };
 use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
 use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
+use translator_core::script::Script;
 use translator_core::tts::{
     PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
 };
@@ -72,6 +73,7 @@ struct ResolvedSpeechAssets {
     model_path: String,
     aux_path: String,
     language_code: String,
+    script: Script,
     speaker_id: Option<i64>,
     support_data_root: Option<String>,
 }
@@ -352,6 +354,7 @@ fn resolve_speech_assets_for_pack(
         model_path,
         aux_path,
         language_code: files.language_code,
+        script: snapshot.catalog.script_for(language_code)?,
         speaker_id: files.speaker_id.map(i64::from),
         support_data_root,
     })
@@ -362,20 +365,20 @@ fn piper_length_scale_for_speed(speech_speed: f32) -> f32 {
 }
 
 /// When the TTS voice writes a Latin script, romanize any foreign-script runs
-/// in the text so eSpeak pronounces them instead of skipping them. Voices that
-/// natively render the source script (Cyrillic, CJK, …) keep the text intact.
+/// in the text so the voice pronounces them instead of skipping them. A voice
+/// renders exactly one script, so anything outside it is dropped at
+/// tokenization; voices that natively write the source script keep the text
+/// intact.
 #[cfg(feature = "transliterate")]
-fn romanize_foreign_runs_for_voice(text: &str, language_code: &str) -> String {
-    if translator_core::script::Script::from_bcp47(language_code)
-        != translator_core::script::Script::Latin
-    {
+fn romanize_foreign_runs_for_voice(text: &str, script: Script) -> String {
+    if script != Script::Latin {
         return text.to_owned();
     }
     translator_transliterate::transliterate::transliterate_mixed_to_latin(text)
 }
 
 #[cfg(not(feature = "transliterate"))]
-fn romanize_foreign_runs_for_voice(text: &str, _language_code: &str) -> String {
+fn romanize_foreign_runs_for_voice(text: &str, _script: Script) -> String {
     text.to_owned()
 }
 
@@ -429,6 +432,7 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
         &assets.aux_path,
         assets.support_data_root.as_deref(),
         &assets.language_code,
+        assets.script,
         text,
         read_urls_and_hashtags,
     )
@@ -454,6 +458,7 @@ pub fn synthesize_pcm_in_snapshot(
         &assets.aux_path,
         assets.support_data_root.as_deref(),
         &assets.language_code,
+        assets.script,
         text,
         speech_speed,
         voice_name.map(VoiceName::as_str),
@@ -798,6 +803,7 @@ fn synthesize_pcm(
     aux_path: &str,
     support_data_root: Option<&str>,
     language_code: &str,
+    script: Script,
     text: &str,
     speech_speed: f32,
     voice_name: Option<&str>,
@@ -812,7 +818,7 @@ fn synthesize_pcm(
     configure_support_data_root(support_data_root);
     let support_data_root = support_data_root.unwrap_or_default();
 
-    let romanized = (!is_phonemes).then(|| romanize_foreign_runs_for_voice(text, language_code));
+    let romanized = (!is_phonemes).then(|| romanize_foreign_runs_for_voice(text, script));
     let text = romanized.as_deref().unwrap_or(text);
 
     log_debug(format!(
@@ -980,6 +986,7 @@ fn plan_speech_chunks_for_text(
     aux_path: &str,
     support_data_root: Option<&str>,
     language_code: &str,
+    script: Script,
     text: &str,
     read_urls_and_hashtags: bool,
 ) -> Result<Vec<SpeechChunk>, String> {
@@ -988,7 +995,7 @@ fn plan_speech_chunks_for_text(
     } else {
         Cow::Owned(strip_urls_and_hashtags(text))
     };
-    let text = romanize_foreign_runs_for_voice(&filtered, language_code);
+    let text = romanize_foreign_runs_for_voice(&filtered, script);
     plan_speech_chunks(&text, |chunk_text| {
         phonemize_chunks(
             cache,

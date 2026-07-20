@@ -203,6 +203,26 @@ impl TranslatorSession {
         build_language_overview(&self.snapshot())
     }
 
+    /// Every available language paired with its catalog script, for callers
+    /// that pick fonts or detect a source language.
+    pub fn available_languages(&self) -> Vec<translator_core::api::ScriptedLanguage> {
+        let snap = self.snapshot();
+        self.language_rows()
+            .into_iter()
+            .filter_map(|row| {
+                snap.catalog
+                    .scripted_language(&LanguageCode::from(row.language.code.as_str()))
+            })
+            .collect()
+    }
+
+    pub fn scripted_language(
+        &self,
+        code: &LanguageCode,
+    ) -> Option<translator_core::api::ScriptedLanguage> {
+        self.snapshot().catalog.scripted_language(code)
+    }
+
     pub fn warm(&self, from_code: &str, to_code: &str) -> Result<(), TranslatorError> {
         let snap = self.snapshot();
         let mut engine = self.engine().lock().expect("engine lock poisoned");

@@ -1540,7 +1540,7 @@ pub fn translate_pdf_pages_as_raster_in_place(
     pdf_bytes: &[u8],
     translator: &dyn ImageTranslator,
     source_code: &str,
-    target_code: &str,
+    target: &translator_core::api::ScriptedLanguage,
     fonts: &(dyn FontProvider + Send + Sync),
     pages_without_text: &HashSet<usize>,
     is_cancelled: &(dyn Fn() -> bool + Send + Sync),
@@ -1609,9 +1609,14 @@ pub fn translate_pdf_pages_as_raster_in_place(
                     if is_cancelled() {
                         break;
                     }
-                    let result =
-                        ocr_page(&mupdf_doc, translator, source_code, target_code, page_index)
-                            .map_err(|reason| (page_index, reason));
+                    let result = ocr_page(
+                        &mupdf_doc,
+                        translator,
+                        source_code,
+                        target.as_str(),
+                        page_index,
+                    )
+                    .map_err(|reason| (page_index, reason));
                     if tx.send(result).is_err() {
                         break;
                     }
@@ -1702,7 +1707,7 @@ pub fn translate_pdf_pages_as_raster_in_place(
         return Ok(pdf_bytes.to_vec());
     }
 
-    let plan = build_overlay_font_plan(&mut doc, &overlay_pages, target_code, fonts);
+    let plan = build_overlay_font_plan(&mut doc, &overlay_pages, target, fonts);
     let used_embeds = collect_used_embed_names(&plan);
 
     let mut any_installed = false;

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use translator_core::api::LanguageCode;
+use translator_core::api::{LanguageCode, ScriptedLanguage};
 use translator_core::ocr::{OverlayColors, Rect, sample_overlay_colors};
 use translator_core::settings::BackgroundMode;
 use translator_translate::document_translator::DocumentTranslator;
@@ -123,19 +123,19 @@ pub fn translate_structured_fragments_batch_ctx(
     pages: &[&[StyledFragment]],
     forced_source_code: Option<&str>,
     target_code: &str,
-    available_language_codes: &[String],
+    available_languages: &[ScriptedLanguage],
     background_mode: BackgroundMode,
     on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Option<Vec<StructuredTranslationResult>>, String> {
-    let available_codes = available_language_codes
-        .iter()
-        .map(|code| LanguageCode::from(code.as_str()))
-        .collect::<Vec<_>>();
-
     let states = pages
         .iter()
         .map(|fragments| {
-            classify_page(fragments, forced_source_code, target_code, &available_codes)
+            classify_page(
+                fragments,
+                forced_source_code,
+                target_code,
+                available_languages,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -294,7 +294,7 @@ fn classify_page(
     fragments: &[StyledFragment],
     forced_source_code: Option<&str>,
     target_code: &str,
-    available_codes: &[LanguageCode],
+    available_languages: &[ScriptedLanguage],
 ) -> PageState {
     let blocks = cluster_fragments_into_blocks(fragments);
     if blocks.is_empty() {
@@ -307,7 +307,7 @@ fn classify_page(
         .join(" ");
     let Some(source_code) = forced_source_code
         .map(LanguageCode::from)
-        .or_else(|| detect_language_robust_code(&combined_text, None, available_codes))
+        .or_else(|| detect_language_robust_code(&combined_text, None, available_languages))
     else {
         return PageState::Empty(NothingReason::CouldNotDetect);
     };

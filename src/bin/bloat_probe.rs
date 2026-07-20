@@ -12,6 +12,14 @@ fn main() {
     if black_box(false) {
         if let Ok(session) = session {
             let languages = vec![LanguageCode::from("en")];
+            let scripted = vec![translator::api::ScriptedLanguage {
+                code: LanguageCode::from("en"),
+                script: translator::script::Script::Latin,
+            }];
+            let target = translator::api::ScriptedLanguage {
+                code: LanguageCode::from("nl"),
+                script: translator::script::Script::Latin,
+            };
             let texts = vec!["hello".to_string()];
             let _ = session.language_rows();
             let _ = session.language_overview();
@@ -55,13 +63,13 @@ fn main() {
                 BackgroundMode::AutoDetect,
                 None,
             );
-            let _ = translator::odt::translate_odt(&session, &[], Some("en"), "nl", &languages);
+            let _ = translator::odt::translate_odt(&session, &[], Some("en"), "nl", &scripted);
             let _ = translator::pdf_translate::translate_pdf(
                 &session,
                 &[],
                 Some("en"),
-                "nl",
-                &languages,
+                &target,
+                &scripted,
             );
             let _ = translator::pdf_write::write_translated_pdf(
                 &[],

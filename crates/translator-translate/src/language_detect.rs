@@ -1,5 +1,5 @@
 use cld2::{Format, Hints, Reliable, detect_language_ext};
-use translator_core::api::LanguageCode;
+use translator_core::api::{LanguageCode, ScriptedLanguage};
 use translator_core::script::Script;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub fn detect_language(text: &str, hint: Option<&LanguageCode>) -> Option<Detect
 pub fn detect_language_robust_code(
     text: &str,
     hint: Option<&LanguageCode>,
-    available_language_codes: &[LanguageCode],
+    available_languages: &[ScriptedLanguage],
 ) -> Option<LanguageCode> {
     if text.trim().is_empty() {
         return None;
@@ -46,11 +46,12 @@ pub fn detect_language_robust_code(
     // narrows the candidates to the supported languages that use it; when exactly
     // one does, that is the answer regardless of what cld2 thinks.
     let candidates: Vec<&LanguageCode> = match Script::dominant(text) {
-        None => available_language_codes.iter().collect(),
+        None => available_languages.iter().map(|lang| &lang.code).collect(),
         Some(script) => {
-            let same_script: Vec<&LanguageCode> = available_language_codes
+            let same_script: Vec<&LanguageCode> = available_languages
                 .iter()
-                .filter(|code| Script::from_bcp47(code.as_str()) == script)
+                .filter(|lang| lang.script == script)
+                .map(|lang| &lang.code)
                 .collect();
             match same_script.len() {
                 0 => return None,
@@ -89,12 +90,33 @@ pub fn detect_language_robust_code(
 mod tests {
     use super::*;
 
-    fn codes(list: &[&str]) -> Vec<LanguageCode> {
-        list.iter().map(|c| LanguageCode::from(*c)).collect()
+    /// Routes through the same ISO 15924 parse production uses, so the
+    /// composite subtags (`Jpan`, `Hans`) resolve here exactly as they do from
+    /// a real catalog.
+    fn languages(list: &[&str]) -> Vec<ScriptedLanguage> {
+        list.iter()
+            .map(|code| ScriptedLanguage {
+                code: LanguageCode::from(*code),
+                script: Script::from_iso15924(match *code {
+                    "hi" => "Deva",
+                    "bn" => "Beng",
+                    "el" => "Grek",
+                    "he" => "Hebr",
+                    "th" => "Thai",
+                    "ko" => "Hang",
+                    "ja" => "Jpan",
+                    "zh" => "Hans",
+                    "ru" | "uk" => "Cyrl",
+                    _ => "Latn",
+                })
+                .expect("catalog script parses"),
+            })
+            .collect()
     }
 
     fn detect(text: &str, available: &[&str]) -> Option<String> {
-        detect_language_robust_code(text, None, &codes(available)).map(|c| c.as_str().to_string())
+        detect_language_robust_code(text, None, &languages(available))
+            .map(|c| c.as_str().to_string())
     }
 
     #[test]

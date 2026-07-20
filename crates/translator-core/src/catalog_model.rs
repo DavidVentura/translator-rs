@@ -35,6 +35,9 @@ pub(crate) struct LanguageResources {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LanguageInfo {
     pub language: Language,
+    /// `language.script` parsed once here rather than re-derived per callsite.
+    /// The string stays on [`Language`] because it crosses the FFI boundary.
+    pub script: crate::script::Script,
     pub resources: LanguageResources,
     pub tts: Option<LanguageTtsV2>,
 }
@@ -480,6 +483,20 @@ impl LanguageCatalog {
         self.languages
             .get(code.as_str())
             .map(|info| info.language.clone())
+    }
+
+    /// The writing system the catalog records for a language. `None` only when
+    /// the language is absent; an unrecognized script parses as
+    /// [`Script::Other`], never as a guess.
+    pub fn script_for(&self, code: &LanguageCode) -> Option<crate::script::Script> {
+        self.languages.get(code.as_str()).map(|info| info.script)
+    }
+
+    pub fn scripted_language(&self, code: &LanguageCode) -> Option<crate::api::ScriptedLanguage> {
+        Some(crate::api::ScriptedLanguage {
+            code: code.clone(),
+            script: self.script_for(code)?,
+        })
     }
 
     pub fn english(&self) -> Option<Language> {

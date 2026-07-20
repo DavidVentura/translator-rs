@@ -9,7 +9,7 @@ use crate::translate::{
     TranslationWithAlignment, execute_translation_plan, execute_translation_plan_with_alignment,
     identity_char_alignments, resolve_translation_plan_in_snapshot,
 };
-use translator_core::api::LanguageCode;
+use translator_core::api::{LanguageCode, ScriptedLanguage};
 use translator_core::catalog::CatalogSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,17 +80,33 @@ fn unique_texts(inputs: &[String]) -> Vec<String> {
     result
 }
 
+/// Pair each available code with the script the catalog records for it. A code
+/// the catalog does not know cannot be a detection candidate, so it is dropped
+/// rather than guessed at.
+fn resolve_available_languages(
+    snapshot: &CatalogSnapshot,
+    available_language_codes: &[String],
+) -> Vec<ScriptedLanguage> {
+    available_language_codes
+        .iter()
+        .filter_map(|code| {
+            let code = LanguageCode::from(code.as_str());
+            let resolved = snapshot.catalog.scripted_language(&code);
+            if resolved.is_none() {
+                log::warn!("available language {code} is not in the catalog; skipping");
+            }
+            resolved
+        })
+        .collect()
+}
+
 pub fn plan_batch_text_translation(
     inputs: &[String],
     forced_source_code: Option<&str>,
     target_code: &str,
-    available_language_codes: &[String],
+    available_languages: &[ScriptedLanguage],
 ) -> BatchTextRoutingPlan {
     let unique_inputs = unique_texts(inputs);
-    let available_language_codes = available_language_codes
-        .iter()
-        .map(|code| LanguageCode::from(code.as_str()))
-        .collect::<Vec<_>>();
     let mut passthrough_texts = Vec::new();
     let mut translatable = Vec::new();
 
@@ -119,7 +135,7 @@ pub fn plan_batch_text_translation(
         }
     } else {
         for text in translatable {
-            let source_code = detect_language_robust_code(&text, None, &available_language_codes);
+            let source_code = detect_language_robust_code(&text, None, available_languages);
             match source_code {
                 None => undetected_texts += 1,
                 Some(source_code) if source_code.as_str() == target_code => {
@@ -166,11 +182,12 @@ pub fn translate_mixed_texts_in_snapshot(
     target_code: &str,
     available_language_codes: &[String],
 ) -> Result<MixedTextTranslationResult, String> {
+    let available_languages = resolve_available_languages(snapshot, available_language_codes);
     let routing_plan = plan_batch_text_translation(
         inputs,
         forced_source_code,
         target_code,
-        available_language_codes,
+        &available_languages,
     );
 
     if routing_plan.batches.is_empty() && routing_plan.passthrough_texts.is_empty() {
@@ -225,11 +242,12 @@ pub fn translate_mixed_texts_with_alignment_in_snapshot(
     target_code: &str,
     available_language_codes: &[String],
 ) -> Result<Vec<TranslationWithAlignment>, String> {
+    let available_languages = resolve_available_languages(snapshot, available_language_codes);
     let routing_plan = plan_batch_text_translation(
         inputs,
         forced_source_code,
         target_code,
-        available_language_codes,
+        &available_languages,
     );
 
     let mut translations = routing_plan
@@ -262,12 +280,21 @@ pub fn translate_mixed_texts_with_alignment_in_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{NothingReason, plan_batch_text_translation};
+    use super::{NothingReason, ScriptedLanguage, plan_batch_text_translation};
+    use translator_core::api::LanguageCode;
+    use translator_core::script::Script;
+
+    fn english() -> Vec<ScriptedLanguage> {
+        vec![ScriptedLanguage {
+            code: LanguageCode::from("en"),
+            script: Script::Latin,
+        }]
+    }
 
     #[test]
     fn keeps_passthrough_inputs() {
         let inputs = vec!["123".to_string(), " -- ".to_string()];
-        let plan = plan_batch_text_translation(&inputs, None, "en", &["en".to_string()]);
+        let plan = plan_batch_text_translation(&inputs, None, "en", &english());
         assert_eq!(plan.passthrough_texts, inputs);
         assert!(plan.batches.is_empty());
         assert!(plan.nothing_reason.is_none());
@@ -276,7 +303,7 @@ mod tests {
     #[test]
     fn reports_no_translatable_text() {
         let inputs = vec!["".to_string()];
-        let plan = plan_batch_text_translation(&inputs, None, "en", &["en".to_string()]);
+        let plan = plan_batch_text_translation(&inputs, None, "en", &english());
         assert!(plan.passthrough_texts.is_empty());
         assert!(plan.batches.is_empty());
         assert_eq!(plan.nothing_reason, Some(NothingReason::NoTranslatableText));

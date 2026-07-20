@@ -3,7 +3,7 @@
 use crate::pdf::PageTranslationResult;
 use crate::pdf::PdfError;
 use crate::pdf_text::extract_text;
-use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::api::{ScriptedLanguage, TranslatorError};
 use translator_core::settings::BackgroundMode;
 use translator_translate::document_translator::DocumentTranslator;
 
@@ -51,15 +51,15 @@ pub fn translate_pdf(
     translator: &dyn DocumentTranslator,
     pdf_bytes: &[u8],
     forced_source_code: Option<&str>,
-    target_code: &str,
-    available_language_codes: &[LanguageCode],
+    target: &translator_core::api::ScriptedLanguage,
+    available_languages: &[ScriptedLanguage],
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
     translate_pdf_with_progress(
         translator,
         pdf_bytes,
         forced_source_code,
-        target_code,
-        available_language_codes,
+        target,
+        available_languages,
         |_| {},
     )
 }
@@ -74,8 +74,8 @@ pub fn translate_pdf_with_progress(
     translator: &dyn DocumentTranslator,
     pdf_bytes: &[u8],
     forced_source_code: Option<&str>,
-    target_code: &str,
-    available_language_codes: &[LanguageCode],
+    target: &translator_core::api::ScriptedLanguage,
+    available_languages: &[ScriptedLanguage],
     on_progress: impl Fn(f32) + Sync,
 ) -> Result<Vec<PageTranslationResult>, PdfTranslateError> {
     translator.begin_document_translation();
@@ -90,10 +90,6 @@ pub fn translate_pdf_with_progress(
         .iter()
         .map(|page| page.fragments.as_slice())
         .collect::<Vec<_>>();
-    let available_codes = available_language_codes
-        .iter()
-        .map(|code| code.as_str().to_string())
-        .collect::<Vec<_>>();
     let report = |done: usize, total: usize| {
         if total > 0 {
             on_progress(done as f32 / total as f32);
@@ -103,8 +99,8 @@ pub fn translate_pdf_with_progress(
         translator,
         &pages_fragments,
         forced_source_code,
-        target_code,
-        &available_codes,
+        target.as_str(),
+        available_languages,
         BackgroundMode::BlackOnWhite,
         &report,
     ) {
@@ -125,7 +121,7 @@ pub fn translate_pdf_with_progress(
             page: page.page,
             blocks: result.blocks,
             error: result.error_message,
-            target_language: target_code.to_string(),
+            target_language: target.clone(),
         })
         .collect();
 

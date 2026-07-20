@@ -164,18 +164,17 @@ fn smoke_translate_and_write_pdf() {
     let session = TranslatorSession::open(&bundled_json, None, bucket.clone(), &checker)
         .expect("open TranslatorSession");
 
-    let available_langs: Vec<LanguageCode> = session
-        .language_overview()
-        .into_iter()
-        .map(|row| LanguageCode::new(row.language.code))
-        .collect();
+    let available_langs = session.available_languages();
+    let target = session
+        .scripted_language(&LanguageCode::new(target_lang.clone()))
+        .expect("target language is in the catalog");
 
     let pdf_bytes = fs::read(&pdf_path).expect("read PDF_TEST_FILE");
     let translations = translate_pdf(
         &session,
         &pdf_bytes,
         forced_source.as_deref(),
-        &target_lang,
+        &target,
         &available_langs,
     )
     .expect("translate_pdf");

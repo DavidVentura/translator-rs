@@ -49,9 +49,11 @@ impl Script {
         matches!(self, Script::Arabic | Script::Hebrew)
     }
 
-    /// ISO 15924 code (matches BCP-47 `Script` subtag).
-    pub fn iso15924(self) -> &'static str {
-        match self {
+    /// ISO 15924 code (matches BCP-47 `Script` subtag), or `None` for the
+    /// itemization categories that name no writing system: punctuation and
+    /// digits, combining marks, and anything unenumerated.
+    pub fn iso15924(self) -> Option<&'static str> {
+        let code = match self {
             Script::Latin => "Latn",
             Script::Cyrillic => "Cyrl",
             Script::Greek => "Grek",
@@ -79,44 +81,54 @@ impl Script {
             Script::Hiragana => "Hira",
             Script::Katakana => "Kana",
             Script::Hangul => "Hang",
-            Script::Common => "Zyyy",
-            Script::Inherited => "Zinh",
-            Script::Other => "Zzzz",
-        }
+            Script::Common | Script::Inherited | Script::Other => return None,
+        };
+        Some(code)
     }
 
-    /// Best-effort mapping from a BCP-47 language tag to its dominant script.
-    /// Used by callers who pass a target language without a script subtag.
-    pub fn from_bcp47(tag: &str) -> Self {
-        let primary = tag.split(['-', '_']).next().unwrap_or(tag);
-        match primary {
-            "ar" | "fa" | "ur" | "ps" | "ku" => Script::Arabic,
-            "he" | "yi" => Script::Hebrew,
-            "ru" | "uk" | "be" | "bg" | "mk" | "sr" | "kk" | "ky" | "tg" | "mn" => Script::Cyrillic,
-            "el" => Script::Greek,
-            "hy" => Script::Armenian,
-            "hi" | "mr" | "ne" | "sa" | "kok" => Script::Devanagari,
-            "bn" | "as" => Script::Bengali,
-            "pa" => Script::Gurmukhi,
-            "gu" => Script::Gujarati,
-            "or" => Script::Oriya,
-            "ta" => Script::Tamil,
-            "te" => Script::Telugu,
-            "kn" => Script::Kannada,
-            "ml" => Script::Malayalam,
-            "si" => Script::Sinhala,
-            "th" => Script::Thai,
-            "lo" => Script::Lao,
-            "bo" | "dz" => Script::Tibetan,
-            "my" => Script::Myanmar,
-            "ka" => Script::Georgian,
-            "am" | "ti" => Script::Ethiopic,
-            "km" => Script::Khmer,
-            "zh" | "yue" | "wuu" => Script::Han,
-            "ja" => Script::Hiragana,
-            "ko" => Script::Hangul,
-            _ => Script::Latin,
-        }
+    /// Inverse of [`Script::iso15924`], plus the composite subtags the catalog
+    /// uses. Returns `None` for anything unrecognized so callers decide what an
+    /// unknown script means; guessing a default here is what made a missing
+    /// language silently render as Latin.
+    pub fn from_iso15924(code: &str) -> Option<Self> {
+        let script = match code {
+            "Latn" => Script::Latin,
+            "Cyrl" => Script::Cyrillic,
+            "Grek" => Script::Greek,
+            "Armn" => Script::Armenian,
+            "Hebr" => Script::Hebrew,
+            "Arab" => Script::Arabic,
+            "Deva" => Script::Devanagari,
+            "Beng" => Script::Bengali,
+            "Guru" => Script::Gurmukhi,
+            "Gujr" => Script::Gujarati,
+            "Orya" => Script::Oriya,
+            "Taml" => Script::Tamil,
+            "Telu" => Script::Telugu,
+            "Knda" => Script::Kannada,
+            "Mlym" => Script::Malayalam,
+            "Sinh" => Script::Sinhala,
+            "Thai" => Script::Thai,
+            "Laoo" => Script::Lao,
+            "Tibt" => Script::Tibetan,
+            "Mymr" => Script::Myanmar,
+            "Geor" => Script::Georgian,
+            "Ethi" => Script::Ethiopic,
+            "Khmr" => Script::Khmer,
+            "Hani" => Script::Han,
+            "Hira" => Script::Hiragana,
+            "Kana" => Script::Katakana,
+            "Hang" => Script::Hangul,
+            // Composite subtags name a writing system rather than one script.
+            // Han is the shared inventory behind both Chinese variants, and kana
+            // is what [`Script::dominant`] keys Japanese on, so Jpan resolves to
+            // Hiragana for consistency with detection.
+            "Hans" | "Hant" => Script::Han,
+            "Jpan" => Script::Hiragana,
+            "Kore" => Script::Hangul,
+            _ => return None,
+        };
+        Some(script)
     }
 }
 
@@ -127,8 +139,9 @@ impl Script {
         Script::from(ch.script())
     }
 
-    /// The script that best identifies the text, aligned with [`Script::from_bcp47`]'s
-    /// buckets so a detected script can be matched against supported languages.
+    /// The script that best identifies the text, aligned with the buckets
+    /// [`Script::from_iso15924`] produces so a detected script can be matched
+    /// against the catalog's supported languages.
     ///
     /// Kana is a definitive Japanese marker, so any Hiragana/Katakana wins outright —
     /// otherwise a kanji-heavy Japanese sentence would count as Han and collide with
@@ -190,5 +203,90 @@ impl From<unicode_script::Script> for Script {
             U::Inherited => Script::Inherited,
             _ => Script::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Script;
+
+    /// Every variant that names a real writing system. The three itemization
+    /// categories are deliberately absent: they have no ISO 15924 subtag.
+    const WRITING_SYSTEMS: &[Script] = &[
+        Script::Latin,
+        Script::Cyrillic,
+        Script::Greek,
+        Script::Armenian,
+        Script::Hebrew,
+        Script::Arabic,
+        Script::Devanagari,
+        Script::Bengali,
+        Script::Gurmukhi,
+        Script::Gujarati,
+        Script::Oriya,
+        Script::Tamil,
+        Script::Telugu,
+        Script::Kannada,
+        Script::Malayalam,
+        Script::Sinhala,
+        Script::Thai,
+        Script::Lao,
+        Script::Tibetan,
+        Script::Myanmar,
+        Script::Georgian,
+        Script::Ethiopic,
+        Script::Khmer,
+        Script::Han,
+        Script::Hiragana,
+        Script::Katakana,
+        Script::Hangul,
+    ];
+
+    #[test]
+    fn iso15924_round_trips() {
+        for &script in WRITING_SYSTEMS {
+            let code = script.iso15924().expect("writing system has a subtag");
+            assert_eq!(Script::from_iso15924(code), Some(script));
+        }
+    }
+
+    #[test]
+    fn itemization_categories_have_no_subtag() {
+        for script in [Script::Common, Script::Inherited, Script::Other] {
+            assert_eq!(script.iso15924(), None);
+        }
+        for code in ["Zyyy", "Zinh", "Zzzz"] {
+            assert_eq!(Script::from_iso15924(code), None);
+        }
+    }
+
+    /// The values the shipped catalog actually carries, so a language whose
+    /// script the catalog knows can never fall back to a guess.
+    #[test]
+    fn parses_every_catalog_script() {
+        let catalog_values = [
+            "Latn", "Cyrl", "Arab", "Deva", "Beng", "Grek", "Gujr", "Hebr", "Jpan", "Knda", "Hang",
+            "Mlym", "Taml", "Telu", "Thai", "Hans", "Hant",
+        ];
+        for value in catalog_values {
+            assert!(
+                Script::from_iso15924(value).is_some(),
+                "catalog script {value} does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_subtags_resolve_to_their_inventory() {
+        assert_eq!(Script::from_iso15924("Hans"), Some(Script::Han));
+        assert_eq!(Script::from_iso15924("Hant"), Some(Script::Han));
+        assert_eq!(Script::from_iso15924("Jpan"), Some(Script::Hiragana));
+        assert_eq!(Script::from_iso15924("Kore"), Some(Script::Hangul));
+    }
+
+    #[test]
+    fn unknown_script_is_none() {
+        assert_eq!(Script::from_iso15924("Cans"), None);
+        assert_eq!(Script::from_iso15924(""), None);
     }
 }
