@@ -13,11 +13,12 @@ FLORES codes are mapped to names here. Greedy by default for a reproducible gate
 """
 
 import argparse
+from pathlib import Path
 
 import sacrebleu
 from vllm import LLM, SamplingParams
 
-from nllb_gate import flores_devtest
+from nllb_gate import flores_devtest, save_pair
 
 # FLORES-200 code -> English language name for the Hy-MT2 prompt (Hy-MT2's 33 langs).
 NAME = {
@@ -50,6 +51,8 @@ def main() -> None:
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--sample", action="store_true",
                     help="use Tencent's recommended sampling (default: greedy, reproducible)")
+    ap.add_argument("--out-dir", type=Path,
+                    help="also write src/hyp/ref per pair, for chrf_score.py (COMET)")
     args = ap.parse_args()
 
     codes = {c for pair in args.pairs.split(",") for c in pair.split("-")}
@@ -78,6 +81,8 @@ def main() -> None:
         ]
         outs = llm.generate(prompts, sp)
         hyps = [o.outputs[0].text.strip() for o in outs]
+        if args.out_dir is not None:
+            save_pair(args.out_dir, src_code, tgt_code, src, hyps, ref)
         chrf = sacrebleu.corpus_chrf(hyps, [ref], word_order=2)
         bleu = sacrebleu.corpus_bleu(hyps, [ref], tokenize="flores200")
         print(f"{src_code}->{tgt_code}: chrF++ {chrf.score:.2f}  spBLEU {bleu.score:.2f}  (n={len(hyps)})")
