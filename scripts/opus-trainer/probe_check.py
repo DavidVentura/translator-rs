@@ -90,25 +90,46 @@ def check_degenerate(src: str, hyp: str, max_ratio: float) -> list[Failure]:
     return out
 
 
+def check(src: str, hyp: str, max_ratio: float = 3.0) -> list[Failure]:
+    """Every reference-free check for one line. The reusable entry point."""
+    return check_numbers(src, hyp) + check_degenerate(src, hyp, max_ratio)
+
+
+def load_sources(path: Path, direction: str) -> list[tuple[str, str, float]]:
+    """(source, category, max_ratio) from either a probes .jsonl or a plain .txt.
+
+    Plain text is what the shared adversarial set is: source lines only, no
+    references and no categories, because it must work for a pair whose target
+    language nobody on the team writes.
+    """
+    if path.suffix != ".jsonl":
+        return [(l, "-", 3.0) for l in
+                path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    src_key = "en" if direction == "en2tl" else "tl"
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        p = json.loads(line)
+        out.append((p[src_key], p["category"], p.get("max_ratio", 3.0)))
+    return out
+
+
 def main() -> None:
-    probes_p, hyp_p, direction = sys.argv[1], sys.argv[2], sys.argv[3]
-    probes = [json.loads(l) for l in
-              Path(probes_p).read_text(encoding="utf-8").splitlines() if l.strip()]
-    hyps = Path(hyp_p).read_text(encoding="utf-8").splitlines()
+    probes_p, hyp_p, direction = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    probes = load_sources(probes_p, direction)
+    hyps = hyp_p.read_text(encoding="utf-8").splitlines()
     if len(probes) != len(hyps):
         sys.exit(f"line-count mismatch: {len(probes)} probes vs {len(hyps)} hyps")
 
-    src_key = "en" if direction == "en2tl" else "tl"
     by_cat: dict[str, list[int]] = {}
     failures: list[tuple[int, str, str, str, list[Failure]]] = []
 
-    for i, (p, hyp) in enumerate(zip(probes, hyps)):
-        src = p[src_key]
-        found = (check_numbers(src, hyp)
-                 + check_degenerate(src, hyp, p.get("max_ratio", 3.0)))
-        by_cat.setdefault(p["category"], []).append(0 if found else 1)
+    for i, ((src, category, max_ratio), hyp) in enumerate(zip(probes, hyps)):
+        found = check(src, hyp, max_ratio)
+        by_cat.setdefault(category, []).append(0 if found else 1)
         if found:
-            failures.append((i, p["category"], src, hyp, found))
+            failures.append((i, category, src, hyp, found))
 
     n = sum(len(v) for v in by_cat.values())
     total = sum(sum(v) for v in by_cat.values())

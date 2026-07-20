@@ -51,29 +51,49 @@ def main() -> None:
     ap.add_argument("--shortlist", default="none")
     ap.add_argument("--bin", default=str(REPO / "target" / "debug" / "slimt_load_test"))
     ap.add_argument("--no-comet", action="store_true", help="skip COMET22 (first run downloads a ~2.3GB model)")
+    ap.add_argument("--probes", required=True, type=Path,
+                    help="adversarial/probe SOURCE lines for this direction "
+                         "(probes/adversarial.en for en->X)")
+    ap.add_argument("--probe-out", required=True, type=Path,
+                    help="where to write probe hypotheses, for probe_review.py")
     args = ap.parse_args()
 
     code = FLORES[args.lang]
     eng, tgt = flores_devtest("eng_Latn"), flores_devtest(code)
     src, ref = (eng, tgt) if args.src == "en" else (tgt, eng)
 
-    proc = subprocess.run(
-        [args.bin, args.model, args.vocab, args.shortlist, "-"],
-        input="\n".join(src), capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        sys.exit(f"slimt_load_test failed: {proc.stderr[-500:]}")
-    hyps = proc.stdout.splitlines()
+    def translate(lines: list[str]) -> list[str]:
+        proc = subprocess.run(
+            [args.bin, args.model, args.vocab, args.shortlist, "-"],
+            input="\n".join(lines), capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            sys.exit(f"slimt_load_test failed: {proc.stderr[-500:]}")
+        return proc.stdout.splitlines()
+
+    # Decoded unconditionally, and its output is never scored here: FLORES cannot
+    # see the failure class that decides shippability, and no metric replaces
+    # reading the pairs. The bench's job is to always produce them.
+    probe_src = [l for l in args.probes.read_text(encoding="utf-8").splitlines() if l.strip()]
+    probe_hyps = translate(probe_src)
+    if len(probe_hyps) != len(probe_src):
+        sys.exit(f"probe decode returned {len(probe_hyps)} lines for {len(probe_src)} inputs")
+    args.probe_out.write_text("\n".join(probe_hyps) + "\n", encoding="utf-8")
+
+    hyps = translate(src)
     n = min(len(hyps), len(ref))
     chrf = sacrebleu.corpus_chrf(hyps[:n], [ref[:n]], word_order=2)
     bleu = sacrebleu.corpus_bleu(hyps[:n], [ref[:n]])
     comet = ""
     if not args.no_comet:
-        from chrf_score import comet22
+        from chrf_score import comet22, load_comet
 
-        comet = f"  COMET22 {comet22(src[:n], hyps[:n], ref[:n]):.2f}"
+        comet = f"  COMET22 {comet22(load_comet(), src[:n], hyps[:n], ref[:n]):.2f}"
     direction = f"{args.src}->{args.lang}" if args.src == "en" else f"{args.lang}->en"
     print(f"{direction}: chrF++ {chrf.score:.2f}  BLEU {bleu.score:.2f}{comet}  (n={n}, shortlist={args.shortlist})")
+    print(f"{direction}: probe hypotheses -> {args.probe_out} ({len(probe_hyps)} lines); "
+          f"render with probe_review.py and READ them -- FLORES does not cover "
+          f"signs, imperatives or short informal input")
 
 
 if __name__ == "__main__":
