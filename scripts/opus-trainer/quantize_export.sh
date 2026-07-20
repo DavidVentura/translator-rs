@@ -15,6 +15,7 @@
 #
 # Usage: quantize_export.sh MODEL_NPZ VOCAB_SPM DEVTEST_SRC OUT_DIR
 set -euo pipefail
+[ -d /work/out ] && echo quantize > /work/out/.phase || true
 
 MODEL=$1; VOCAB=$2; DEVTEST=$3; OUT=$4
 HERE="$(cd "$(dirname "$0")" && pwd)"

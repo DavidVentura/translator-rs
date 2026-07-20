@@ -4,7 +4,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterator, Protocol
 
 
 class Host(Protocol):
@@ -13,11 +13,13 @@ class Host(Protocol):
     def mkdir(self, path: Path) -> None: ...
     def write_file(self, path: Path, text: str, executable: bool = False) -> None: ...
     def read_file(self, path: Path) -> str | None: ...
+    def read_from(self, path: Path, offset: int) -> bytes | None: ...
     def exists(self, path: Path) -> bool: ...
     def remove(self, path: Path) -> None: ...
     def pid_alive(self, pid: int) -> bool: ...
     def capture(self, argv: list[str]) -> str: ...
     def spawn(self, argv: list[str]) -> None: ...
+    def stream(self, argv: list[str]) -> Iterator[bytes]: ...
 
 
 @dataclass
@@ -37,6 +39,13 @@ class LocalHost:
         if not path.is_file():
             return None
         return path.read_text()
+
+    def read_from(self, path: Path, offset: int) -> bytes | None:
+        if not path.is_file():
+            return None
+        with path.open("rb") as f:
+            f.seek(offset)
+            return f.read()
 
     def exists(self, path: Path) -> bool:
         return path.exists()
@@ -68,3 +77,18 @@ class LocalHost:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+
+    def stream(self, argv: list[str]) -> Iterator[bytes]:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        assert proc.stdout is not None
+        try:
+            while chunk := proc.stdout.read1(4096):
+                yield chunk
+        finally:
+            proc.terminate()
+            proc.wait()

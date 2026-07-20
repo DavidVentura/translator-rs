@@ -4,6 +4,7 @@
 #
 # Usage: vllm_decode.sh SRC OUT [LIMIT=0]
 set -euo pipefail
+[ -d /work/out ] && echo decode > /work/out/.phase || true
 
 SRC=$1; OUT=$2; LIMIT=${3:-0}
 

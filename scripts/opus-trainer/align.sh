@@ -13,6 +13,7 @@
 # Usage: align.sh SRC_FILE TRG_FILE OUT_DIR [TOOLS_DIR=/work]
 #   -> OUT_DIR/train.tsv  (src \t trg \t pharaoh-align)  for marian --tsv --tsv-fields 3
 set -euo pipefail
+[ -d /work/out ] && echo align > /work/out/.phase || true
 
 SRC=$1; TRG=$2; OUT=$3; TOOLS=${4:-/work}
 FA="$TOOLS/fast_align/build"

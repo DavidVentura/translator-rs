@@ -10,6 +10,7 @@
 #
 # Usage: backward_step.sh TRAIN_SRC TRAIN_TRG VOCAB VALID_TSV OUT_NPZ [DEVICES=0]
 set -euo pipefail
+[ -d /work/out ] && echo train > /work/out/.phase || true
 
 TSRC=$1; TTRG=$2; VOCAB=$3; VALID=$4; OUT=$5; DEVICES=${6:-0}
 HERE="$(cd "$(dirname "$0")" && pwd)"

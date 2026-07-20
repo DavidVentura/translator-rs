@@ -31,21 +31,31 @@ Deliberate differences from uigen_hy:
   register, not quality. The step stays in the codebase; this flow bypasses it.
 - NO bicleaner / build_human / backward: nothing here needs them. The round-1
   artifacts remain valid for the step-3 arm sweep off this checkpoint.
-- Inputs arrive via `pipe put`, NOT as a flow edge back to `uigen`. Round-1's
-  align@f7c38cfd85e5 stays untouched, so there is no cascade risk on a memoized
-  upstream and no dependency on the round-1 script digests still matching.
+- Inputs arrive via the cross-run store + pins, NOT as a flow edge back to
+  `uigen`. Round-1's align@f7c38cfd85e5 stays untouched, so there is no cascade
+  risk on a memoized upstream and no dependency on the round-1 script digests
+  still matching.
 
 Vocab is the round-1 joint SPM, reused unchanged: a fresh vocab would invalidate
 everything downstream, and the enrichment measured 1.81 pieces/word against it vs
 the existing corpus's 1.78 — same distribution, no re-vocab warranted.
 
-Prerequisites (hub, one time):
-    pipe put r2_existing_src /nvme2/prom/uig/r2/existing.src --kind lines
-    pipe put r2_existing_tgt /nvme2/prom/uig/r2/existing.tgt --kind lines
-    pipe put r2_hplt_src     /nvme2/prom/uig/r2/hplt.src     --kind lines
-    pipe put r2_vocab        /nvme2/prom/uig/r2/vocab.spm    --kind blob
-    pipe put r2_valid        /nvme2/prom/uig/valid.ugen.tsv  --kind blob
-    pipe put r2_devtest /nvme2/prom/flores/flores200_dataset/devtest/uig_Arab.devtest --kind lines
+Prerequisites (hub, one time) — publish into the cross-run store, then pin the
+digests each publish prints for this flow:
+    pipe publish /nvme2/prom/uig/r2/existing.src --type dataset/filtered --label uig-r2-existing-src
+    pipe publish /nvme2/prom/uig/r2/existing.tgt --type dataset/filtered --label uig-r2-existing-tgt
+    pipe publish /nvme2/prom/uig/r2/hplt.src     --type dataset/filtered --label uig-r2-hplt-src
+    pipe publish /nvme2/prom/uig/r2/vocab.spm    --type vocab/spm --label uig-r1-vocab
+    pipe publish /nvme2/prom/uig/valid.ugen.tsv  --type eval/evalset --kind blob --label uig-valid
+    pipe publish /nvme2/prom/flores/flores200_dataset/devtest/uig_Arab.devtest \
+        --type eval/evalset --label flores-devtest-uig
+
+    pipe pin uigen_r2 existing_src <digest>
+    pipe pin uigen_r2 existing_tgt <digest>
+    pipe pin uigen_r2 hplt_src     <digest>
+    pipe pin uigen_r2 vocab        <digest>
+    pipe pin uigen_r2 valid        <digest>
+    pipe pin uigen_r2 devtest      <digest>
 
     pipe --run uigr2 run uigen_r2 decode        # decode only, before committing to train
     pipe --run uigr2 run uigen_r2               # up to the trained student
@@ -58,6 +68,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flows.pack import build_pack
+from pipe.artstore import StoredWrapper
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver, Vast
 from pipe.types import Artifact, Kind
@@ -177,7 +188,9 @@ def train(ctx: Ctx) -> list[str]:
     ]
 
 
-def _decode_source(run: Run, name: str, split_step, gather_step, src: Artifact, k: int) -> Artifact:
+def _decode_source(
+    run: Run, name: str, split_step, gather_step, src: Artifact | StoredWrapper, k: int
+) -> Artifact:
     shards = run.do(split_step, timeout=1800, kd_src=src)
     if sum(s.lines or 0 for s in shards.values()) != src.lines:
         raise RuntimeError(f"split_{name} lost lines across shards")
@@ -208,13 +221,12 @@ def _decode_source(run: Run, name: str, split_step, gather_step, src: Artifact, 
 
 
 def main(run: Run, argv: list[str]) -> dict:
-    a = run.ledger.artifact
     stage = argv[0] if argv else "all"
     if stage not in ("decode", "all", "pack"):
         raise SystemExit(f"unknown stage {stage!r}; want 'decode', 'pack' or nothing")
 
-    existing_src, existing_tgt = a("r2_existing_src"), a("r2_existing_tgt")
-    hplt_src = a("r2_hplt_src")
+    existing_src, existing_tgt = run.pinned("existing_src"), run.pinned("existing_tgt")
+    hplt_src = run.pinned("hplt_src")
     if existing_src.lines != existing_tgt.lines:
         raise RuntimeError(
             f"round-1 carry-over is desynced: {existing_src.lines} src vs {existing_tgt.lines} tgt"
@@ -236,7 +248,7 @@ def main(run: Run, argv: list[str]) -> dict:
     aligned = run.do(align, timeout=2 * 3600, src=pairs["src"], tgt=pairs["tgt"])["train_tsv"]
     model = run.do(
         train, timeout=10 * 3600,
-        train_tsv=aligned, vocab=a("r2_vocab"), valid=a("r2_valid"),
+        train_tsv=aligned, vocab=run.pinned("vocab"), valid=run.pinned("valid"),
     )["model"]
     result = {
         "hplt_tgt": hplt_tgt.to_json(),
@@ -245,8 +257,8 @@ def main(run: Run, argv: list[str]) -> dict:
 
     if stage == "pack":
         packed = build_pack(
-            run, model=model, vocab=a("r2_vocab"),
-            src=pairs["src"], tgt=pairs["tgt"], devtest=a("r2_devtest"), infix="ugen",
+            run, model=model, vocab=run.pinned("vocab"),
+            src=pairs["src"], tgt=pairs["tgt"], devtest=run.pinned("devtest"), infix="ugen",
         )
         result["pack"] = {name: art.to_json() for name, art in packed.items()}
 

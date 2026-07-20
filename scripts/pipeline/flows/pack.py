@@ -9,6 +9,7 @@ the aligned corpus sides, and a FLORES source devtest.
 
 from __future__ import annotations
 
+from pipe.artstore import StoredWrapper
 from pipe.step import Ctx, Output, Run, StepDef, step
 from pipe.target import Bigserver
 from pipe.types import Artifact, Kind
@@ -72,10 +73,10 @@ def build_pack(
     run: Run,
     *,
     model: Artifact,
-    vocab: Artifact,
+    vocab: Artifact | StoredWrapper,
     src: Artifact,
     tgt: Artifact,
-    devtest: Artifact,
+    devtest: Artifact | StoredWrapper,
     infix: str,
 ) -> dict[str, Artifact]:
     model_bin = run.do(quantize, timeout=3600, model=model, vocab=vocab, devtest=devtest)["model_bin"]

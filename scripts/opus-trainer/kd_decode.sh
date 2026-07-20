@@ -12,6 +12,7 @@
 #
 # Usage: kd_decode.sh SRC SRC_LANG TGT_LANG OUT_NBEST_GZ [BEAM=4] [NBEST=4]
 set -euo pipefail
+[ -d /work/out ] && echo decode > /work/out/.phase || true
 
 # The tokenizer is baked into the image (Dockerfile HF-blob trim keeps it and
 # gates it with HF_HUB_OFFLINE=1), so a network fetch is never wanted. Without

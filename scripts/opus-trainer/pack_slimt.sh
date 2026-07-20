@@ -9,6 +9,7 @@
 # Usage: pack_slimt.sh MODEL_BIN LEX_BIN VOCAB_SPM PAIR_INFIX OUT_DIR
 #   PAIR_INFIX is the compact pair tag in the filenames, e.g. ugen / swen / entl.
 set -euo pipefail
+[ -d /work/out ] && echo pack > /work/out/.phase || true
 
 MODEL=$1; LEX=$2; VOCAB=$3; INFIX=$4; OUT=$5
 mkdir -p "$OUT"

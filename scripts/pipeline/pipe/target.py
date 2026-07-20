@@ -130,9 +130,10 @@ class VastSession:
     def collect(self, key: str, local_out: Path) -> None:
         local_out.mkdir(parents=True, exist_ok=True)
         self.host.pull_dir(OUT_DIR, local_out)
-        log = self.host.read_file(self.job_dir(key) / "log")
-        if log is not None:
-            (local_out / "job.log").write_text(log)
+        for remote, local in (("log", "job.log"), ("metrics.jsonl", "metrics.jsonl")):
+            text = self.host.read_file(self.job_dir(key) / remote)
+            if text is not None:
+                (local_out / local).write_text(text)
 
     def close(self, ok: bool) -> None:
         self.host.close()

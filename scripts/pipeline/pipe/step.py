@@ -1,14 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .artstore import ArtStore, StoredWrapper
 from .job import Job, JobState
 from .ledger import JobRef, Ledger
+from .runmodel import PendingDecision, write_runner_result
 from .store import Store
 from .target import IN_DIR, OUT_DIR, SCRIPTS_DIR, Target
 from .types import Artifact, Kind, Name, RunId, Status, digest_file, digest_json
+
+# Written by piped's salvage: the remote job finished but the flow process died
+# before collecting, and the outputs were pulled into local_out on our behalf.
+SALVAGED_MARKER = ".salvaged"
+
+
+class NeedsDecision(Exception):
+    """A flow parked at a human gate; the runner catches this to exit cleanly."""
+
+    def __init__(self, name: str, payload_path: Path | None) -> None:
+        super().__init__(f"decision {name!r} pending")
+        self.name = name
+        self.payload_path = payload_path
 
 
 @dataclass(frozen=True)
@@ -59,23 +74,64 @@ def step(
     return deco
 
 
+def _as_artifact(name: str, value: Artifact | StoredWrapper) -> Artifact:
+    if isinstance(value, Artifact):
+        return value
+    s = value.stored
+    return Artifact(
+        name=Name(name),
+        path=s.path,
+        kind=Kind.LINES if s.lines is not None else Kind.BLOB,
+        digest=s.digest,
+        size=s.size,
+        lines=s.lines,
+    )
+
+
 @dataclass
 class Run:
     id: RunId
     store: Store
     ledger: Ledger
     scripts: Path
+    flow: str | None = None
+    # Snapshotted from run.json at start, so provenance survives repinning.
+    pins: dict[str, str] = field(default_factory=dict)
+    decisions: dict[str, object] = field(default_factory=dict)
+    art: ArtStore | None = None
+
+    def pinned(self, name: str) -> StoredWrapper:
+        flow = self.flow or "<flow>"
+        if self.art is None:
+            raise RuntimeError(f"run {self.id} has no artifact store; pins cannot resolve")
+        if name not in self.pins:
+            raise KeyError(
+                f"no pin {name!r} for flow {flow}; "
+                f"run: pipe pin {flow} {name} <alias|digest>"
+            )
+        return self.art.get(self.pins[name])
+
+    def decide(self, name: str, payload: Path | None = None) -> object:
+        if name in self.decisions:
+            return self.decisions[name]
+        pending = PendingDecision(name=name, payload_path=str(payload) if payload else None)
+        write_runner_result(
+            self.store.run_dir(self.id) / "runner_result.json",
+            {"pending_decision": pending.to_json()},
+        )
+        raise NeedsDecision(name, payload)
 
     def do(
         self,
         defn: StepDef,
         timeout: float,
         args: dict | None = None,
-        **inputs: Artifact,
+        **inputs: Artifact | StoredWrapper,
     ) -> dict[str, Artifact]:
         args = args or {}
+        arts = {name: _as_artifact(name, v) for name, v in inputs.items()}
         # Before open(): a memoized step must not rent a box to find out it has nothing to do.
-        key = self._key(defn, inputs, args)
+        key = self._key(defn, arts, args)
 
         cached = self.ledger.get(key)
         if cached is not None and cached.status is Status.DONE:
@@ -91,7 +147,15 @@ class Run:
             return inherited.outputs
 
         local_out = self.store.run_dir(self.id) / "out" / key
-        in_paths = {name: art.path for name, art in inputs.items()}
+
+        # piped already pulled the finished job's outputs and destroyed the box,
+        # so opening the target would rent a fresh one for nothing.
+        if (local_out / SALVAGED_MARKER).is_file():
+            produced = self._collect(defn, local_out)
+            self.ledger.finish(key, Status.DONE, produced)
+            return produced
+
+        in_paths = {name: art.path for name, art in arts.items()}
 
         session = defn.target.open(
             run=str(self.id), step=defn.name, key=key, image=defn.image, root=self.store.root
@@ -114,7 +178,11 @@ class Run:
                 self.ledger.begin(key, defn.name, local_out / "job.log", job.ref)
                 job.launch(session.exec_sh(defn.image, key), [str(p) for p in payload], args)
 
-            status = job.wait(timeout=timeout)
+            status = job.wait(
+                timeout=timeout,
+                log_dest=local_out / "job.log",
+                metrics_dest=local_out / "metrics.jsonl",
+            )
             session.collect(key, local_out)
             if not status.ok:
                 self.ledger.finish(key, Status.FAILED, {})
@@ -128,6 +196,12 @@ class Run:
 
         self.ledger.finish(key, Status.DONE, produced)
         return produced
+
+    def producing_step(self, art: Artifact) -> str | None:
+        for key, rec in self.ledger.steps.items():
+            if any(o.digest == art.digest for o in rec.outputs.values()):
+                return key
+        return None
 
     def _collect(self, defn: StepDef, out_dir: Path) -> dict[str, Artifact]:
         produced: dict[str, Artifact] = {}

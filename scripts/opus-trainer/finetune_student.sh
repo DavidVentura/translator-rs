@@ -21,6 +21,7 @@
 #
 # Usage: finetune_student.sh CLEAN_TSV VOCAB PRETRAINED_NPZ VALID_2COL_TSV MODEL_OUT [DEVICES=0]
 set -euo pipefail
+[ -d /work/out ] && echo train > /work/out/.phase || true
 
 TSV=$1; VOCAB=$2; PRE=$3; VALID=$4; OUT=$5; DEVICES=${6:-0}
 HERE="$(cd "$(dirname "$0")" && pwd)"

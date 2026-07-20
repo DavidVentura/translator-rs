@@ -19,6 +19,7 @@
 # Usage: shortlist.sh SRC_FILE TRG_FILE VOCAB_SPM OUT_DIR [TOOLS=/work] [MAX_LINES=0]
 #   -> OUT_DIR/lex.50.50.s2t.bin   (binarized; goes in the pack next to the model)
 set -euo pipefail
+[ -d /work/out ] && echo shortlist > /work/out/.phase || true
 
 SRC=$1; TRG=$2; VOCAB=$3; OUT=$4; TOOLS=${5:-/work}; MAX_LINES=${6:-0}
 BMT=/opt/marian-dev/build

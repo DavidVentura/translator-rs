@@ -22,6 +22,7 @@
 #
 # Usage: train_student.sh TRAIN_TSV VOCAB_SPM VALID_2COL_TSV MODEL_OUT_NPZ [DEVICES]
 set -euo pipefail
+[ -d /work/out ] && echo train > /work/out/.phase || true
 
 TSV=$1; VOCAB=$2; VALID=$3; OUT=$4; DEVICES=${5:-}
 HERE="$(cd "$(dirname "$0")" && pwd)"

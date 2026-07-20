@@ -101,6 +101,19 @@ class SshHost:
 
         return self._retry(once)
 
+    def read_from(self, path: Path, offset: int) -> bytes | None:
+        # SFTP files support seek, so a log pump only ever transfers the tail
+        # it has not seen — never the whole file per poll.
+        def once() -> bytes | None:
+            try:
+                with self._sftp().open(str(path), "rb") as f:
+                    f.seek(offset)
+                    return f.read()
+            except FileNotFoundError:
+                return None
+
+        return self._retry(once)
+
     def exists(self, path: Path) -> bool:
         def once() -> bool:
             try:
@@ -141,6 +154,22 @@ class SshHost:
             self._conn().exec_command(f"nohup setsid {cmd} </dev/null >/dev/null 2>&1 &", timeout=30)
 
         self._retry(once)
+
+    def stream(self, argv: list[str]):
+        # A live view is disposable — no retry, no reconnect: the pumped record
+        # is the authoritative copy, this channel only exists while a human watches.
+        transport = self._conn().get_transport()
+        assert transport is not None
+        chan = transport.open_session()
+        chan.exec_command(shlex.join(argv))
+        try:
+            while True:
+                data = chan.recv(4096)
+                if not data:
+                    return
+                yield data
+        finally:
+            chan.close()
 
     def push(self, src: Path, dst: Path) -> None:
         self.mkdir(dst.parent)
