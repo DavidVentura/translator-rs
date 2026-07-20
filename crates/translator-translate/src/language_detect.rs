@@ -71,19 +71,24 @@ pub fn detect_language_robust_code(
         }
     }
 
-    for code in candidates {
-        if hint == Some(code) {
-            continue;
-        }
-        let Some(detected) = detect_language(text, Some(code)) else {
-            continue;
-        };
-        if detected.is_reliable && detected.language == code.as_str() {
-            return Some(code.clone());
-        }
-    }
+    // cld2 gave nothing usable, so all that is left is asking which candidates it
+    // will rubber-stamp when forced. Short input in a language family gets several
+    // (`hej hur mar du` echoes both `da` and `sv`), and taking the first would make
+    // catalog order the tiebreaker. Only a lone echo is evidence of anything.
+    let echoed: Vec<&LanguageCode> = candidates
+        .into_iter()
+        .filter(|code| {
+            matches!(
+                detect_language(text, Some(*code)),
+                Some(detected) if detected.is_reliable && detected.language == code.as_str()
+            )
+        })
+        .collect();
 
-    None
+    match echoed.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +121,12 @@ mod tests {
 
     fn detect(text: &str, available: &[&str]) -> Option<String> {
         detect_language_robust_code(text, None, &languages(available))
+            .map(|c| c.as_str().to_string())
+    }
+
+    fn detect_hinted(text: &str, hint: &str, available: &[&str]) -> Option<String> {
+        let hint = LanguageCode::from(hint);
+        detect_language_robust_code(text, Some(&hint), &languages(available))
             .map(|c| c.as_str().to_string())
     }
 
@@ -168,6 +179,29 @@ mod tests {
         assert_eq!(
             detect("Съешь же ещё этих мягких французских булочек", &available).as_deref(),
             Some("ru")
+        );
+    }
+
+    #[test]
+    fn partial_word_does_not_resolve_to_a_family_member() {
+        // Typing "hello how are you?" passes through "hello ho", which cld2 declines
+        // to classify unhinted but rubber-stamps as both `da` and `no` when forced.
+        let available = ["en", "da", "no", "sv", "de"];
+        assert_eq!(detect("hello ho", &available), None);
+        assert_eq!(detect_hinted("hello ho", "en", &available), None);
+        assert_eq!(
+            detect("hello how are you?", &available).as_deref(),
+            Some("en")
+        );
+    }
+
+    #[test]
+    fn hint_competes_instead_of_being_skipped() {
+        // A lone echo still wins, and the caller's own hint is allowed to be it.
+        let available = ["en", "da", "no", "sv", "de"];
+        assert_eq!(
+            detect_hinted("hei hvordan", "da", &available).as_deref(),
+            Some("da")
         );
     }
 }
