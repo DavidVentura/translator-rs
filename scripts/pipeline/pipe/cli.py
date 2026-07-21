@@ -460,7 +460,9 @@ def cmd_boxes(a: argparse.Namespace) -> int:
                 "status": i.status,
                 "gpu": i.gpu_name,
                 "label": i.label,
-                "ssh": f"{i.ssh_host}:{i.ssh_port}" if i.ssh_host else None,
+                "ssh": (f"{i.endpoint.host}:{i.endpoint.port}"
+                        f"{'' if i.endpoint.direct else ' (proxy)'}")
+                       if i.endpoint else None,
                 "lease": leases[uid].to_json() if uid and uid in leases else None,
             }
         )

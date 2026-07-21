@@ -1,5 +1,11 @@
 """Eval steps shared by every pair flow. Import these; do not hand-roll per pair.
 
+LIVES IN `pipe/`, NOT `flows/`, and that is load-bearing: daemon.load_flow uses
+spec_from_file_location, so a flow is executed as a standalone module with no
+package — `from . import evalsteps` inside flows/ raises ImportError. flows/ is
+entrypoints; shared machinery is library code and belongs beside pipe.gate.
+(Caught by the evalsmoke run, 2026-07-20, before any KD depended on it.)
+
 THE CHECK SET IS A REQUIREMENT, LIKE A TEACHER OR A GPU.
 A pair with no check set does not train. The flow refuses, and that refusal is
 the feature — the en-tl and sw-en rounds were run end to end on OPUS-MT and
@@ -43,7 +49,7 @@ from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver
 from pipe.types import Artifact, Kind
 
-PREP = "prep:next"
+EVAL = "eval:next"
 
 
 def require_check_set(run: Run) -> tuple[Artifact, Artifact]:
@@ -66,7 +72,7 @@ def require_check_set(run: Run) -> tuple[Artifact, Artifact]:
 
 
 @step(
-    image=PREP,
+    image=EVAL,
     target=Bigserver(cpus=16),
     script="eval_score.sh",
     outputs={
@@ -121,7 +127,7 @@ def _student_step(lang: str, src: str):
     """
 
     @step(
-        image=PREP,
+        image=EVAL,
         target=Bigserver(cpus=16),
         script="student_eval.sh",
         outputs={

@@ -78,9 +78,20 @@ def salvage_run(cfg: Config, store: Store, run: RunId) -> list[dict]:
     a resubmit can resume it."""
     ledger = Ledger(store.ledger_path(run))
     vast = VastApi(store.leases_dir())
+    leased = {(l.run, l.step) for l in vast.leases().values()}
     actions: list[dict] = []
     for key, rec in ledger.steps.items():
         if rec.status is not Status.RUNNING or rec.job is None or rec.job.ssh is None:
+            continue
+        # A RUNNING step with no lease is a GHOST: its box was destroyed but an
+        # earlier abort left the ledger entry behind (action "left"). Dialling its
+        # long-dead address is what made every later abort of the run fail before
+        # it reached the live step — the exact moment you most need abort to work,
+        # because a box is burning money. Mark it and move on.
+        if (str(run), key) not in leased:
+            ledger.finish(key, Status.FAILED, {})
+            actions.append({"step": key, "action": "orphaned",
+                            "note": "no lease; box already gone, marked failed"})
             continue
         host = SshHost(
             host=rec.job.ssh.host, port=rec.job.ssh.port, user=rec.job.ssh.user,
@@ -99,7 +110,9 @@ def salvage_run(cfg: Config, store: Store, run: RunId) -> list[dict]:
                 (local_out / "job.log").write_text(log)
             (local_out / SALVAGED_MARKER).touch()
             actions.append({"step": key, "action": "salvaged", "exit_code": status.exit_code})
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
+            # Best-effort by design: a step we cannot reach must not stop the loop,
+            # because the steps AFTER it may still have boxes to destroy.
             actions.append({"step": key, "action": "unreachable", "error": str(e)})
             continue
         finally:

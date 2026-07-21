@@ -1,27 +1,25 @@
 #!/bin/bash
-# pipe step wrapper for prep_data.py: full corpus prep in the prep image,
-# emitting the 2-col pool (src \t tgt) the KD flow consumes. The workdir with
-# raw zips and intermediates is deleted after the paste — the pool is the
-# artifact, everything else is re-derivable.
+# pipe step wrapper for prep_data.py. PURE ARGV ADAPTER — it maps pipe's
+# positional step args onto flags and does NOTHING ELSE.
+#
+# It used to also paste the pool, rename the vocab to .spm and delete
+# intermediates. That made a PARTIAL prep runnable: `prep_data.py` on its own
+# produced two .gz files and a .model, which looks like success and is not — and
+# on 2026-07-20 the tl corpus was built exactly that way, losing the src/tgt
+# pairing (so build_kd_source could not emit kd_ref) and the marian-loadable
+# vocab extension. Those steps now live in prep_data.py's finish(), so the
+# complete step is the only thing that can run.
 #
 # JOBS is explicit because nproc inside a --cpus-limited container reports the
 # host's cores, not the quota (the vast-perf-traps lesson).
 #
-# VOCAB_MODE picks whether this prep trains the pair's joint SPM:
-#   reuse — an existing joint vocab is seeded into the run (a re-prep of a pair
-#           that already shipped). Emits pool.tsv only.
-#   train — a NEW pair has no vocab; train the joint 32k unigram on both sides
-#           and emit it as vocab.spm alongside the pool. A joint SPM is
-#           pair-specific, so it cannot be borrowed from another language.
-# The vocab is emitted as `.spm` because marian detects SentencePiece by
-# extension — a `.model` name fails with "DefaultVocabulary must not contain
-# empty lines" (NOTES pillar 4 gotcha (a)).
+# VOCAB_MODE: reuse (an existing joint vocab is seeded in) | train (a NEW pair
+# has none; a joint SPM is pair-specific and cannot be borrowed).
 #
 # Usage: prep_step.sh TGT_LANG JOBS OUT_DIR [SRC=en] [VOCAB_MODE=reuse] [ONLY=]
 set -euo pipefail
 
 TGT=$1; JOBS=$2; OUT=$3; SRC=${4:-en}; VOCAB_MODE=${5:-reuse}; ONLY=${6:-}
-PAIR="${SRC}${TGT}"
 
 case "$VOCAB_MODE" in
   reuse) SPM_ARGS=(--skip-spm) ;;
@@ -32,15 +30,6 @@ esac
 ONLY_ARGS=()
 [ -n "$ONLY" ] && ONLY_ARGS=(--only "$ONLY")
 
-python3 /scripts/prep_data.py --lang "$TGT" --src "$SRC" --workdir "$OUT/work" \
-  --jobs "$JOBS" "${SPM_ARGS[@]}" "${ONLY_ARGS[@]}" --lid-model /opt/lid.176.ftz
-
-paste <(zcat "$OUT/work/clean/train.${PAIR}.${SRC}.gz") \
-      <(zcat "$OUT/work/clean/train.${PAIR}.${TGT}.gz") > "$OUT/pool.tsv"
-
-if [ "$VOCAB_MODE" = train ]; then
-  cp "$OUT/work/spm/vocab.${PAIR}.model" "$OUT/vocab.spm"
-fi
-
-rm -rf "$OUT/work"
-wc -l "$OUT/pool.tsv"
+python3 /scripts/prep_data.py --lang "$TGT" --src "$SRC" \
+  --workdir "$OUT/work" --out-dir "$OUT" --jobs "$JOBS" \
+  "${SPM_ARGS[@]}" "${ONLY_ARGS[@]}" --lid-model /opt/lid.176.ftz

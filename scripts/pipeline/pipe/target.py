@@ -163,6 +163,10 @@ class Vast:
     tries: int = 3
     geo: tuple[str, ...] = ()
     min_cuda: float = 0.0
+    # Data-parallel on ONE box (marian --devices 0 1 --sync-sgd), never across
+    # machines — that needs MPI and an interconnect. The image is unchanged:
+    # GPU count is a runtime flag, so one marian-cuda serves 1, 2 or CPU.
+    num_gpus: int = 1
 
     def image_id(self, image: str) -> str:
         return ImageRef.parse(image).digest()
@@ -200,9 +204,11 @@ class Vast:
             max_dph=self.max_dph,
             geo_in=self.geo,
             min_cuda=self.min_cuda,
+            num_gpus=self.num_gpus,
         )
         if not offers:
-            raise VastError(f"no {self.gpu} offers matching the filters")
+            raise VastError(
+                f"no {self.gpu} x{self.num_gpus} offers matching the filters")
         # Concurrent renters (shard fan-out) all see the same price-sorted list;
         # sampling the affordable head spreads them across machines instead of
         # racing for the single cheapest offer.
@@ -243,8 +249,12 @@ class Vast:
         return VastSession(host=host, vast=v, lease=lease, instance=inst)
 
     def _ssh(self, inst: Instance) -> SshHost:
-        assert inst.ssh_host and inst.ssh_port
-        return SshHost(host=inst.ssh_host, port=inst.ssh_port, user="root", key=self.key)
+        ep = inst.endpoint
+        assert ep is not None, f"instance {inst.id} has no reachable endpoint"
+        if not ep.direct:
+            print(f"[vast] {inst.id}: no direct port, falling back to the proxy "
+                  f"({ep.host}) — expect ~1 MB/s transfers", flush=True)
+        return SshHost(host=ep.host, port=ep.port, user="root", key=self.key)
 
     def _probe(self, host: SshHost, offer: Offer) -> None:
         """Confirm we got what we paid for before handing the box a 6-hour job."""

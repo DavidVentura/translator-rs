@@ -27,6 +27,7 @@ import sacrebleu
 
 from chrf_score import comet22, load_comet
 from probe_check import check
+from probe_review import render
 
 
 def lines(p: Path) -> list[str]:
@@ -52,6 +53,9 @@ def main() -> None:
                  "check-hyp", "check-src", "check-ref"):
         ap.add_argument(f"--{name}", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--review-out", required=True, type=Path,
+                    help="side-by-side review; REQUIRED so metrics-without-review "
+                         "is not a runnable partial of this step")
     ap.add_argument("--label", default="system")
     args = ap.parse_args()
 
@@ -75,6 +79,7 @@ def main() -> None:
         "mechanical": mechanical,
     }
     args.out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    render(args.check_src, args.review_out, [(args.label, check_hyp)])
     print(json.dumps(result, indent=2))
 
 

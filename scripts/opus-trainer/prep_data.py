@@ -10,9 +10,10 @@ language ID on both sides), deduplicates on disk with `sort -u`, and trains a
 joint unigram SPM. Designed to run on a scratch box: raw shards are deleted
 after cleaning and everything is gzip-streamed, so peak disk stays small.
 
-Outputs under <workdir>:
-    clean/train.<pair>.<src>.gz  clean/train.<pair>.<tgt>.gz
-    spm/vocab.<pair>.spm (+ .vocab)
+Outputs under <out-dir> (the STEP's artifacts, complete — running this script
+is running the whole step, by design; see finish()):
+    pool.tsv    2-col src \t tgt, pairing preserved
+    vocab.spm   joint SPM, named for marian's extension sniffing
 
 Setup (on the box):
     python3 -m venv venv
@@ -26,6 +27,7 @@ import argparse
 import gzip
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -290,6 +292,49 @@ def read_batches(urls, raw: Path, pair: str, src: str, tgt: str, skip_download: 
         zp.unlink()  # reclaim disk immediately
 
 
+def finish(args, pair: str, src_gz: Path, tgt_gz: Path, spm_prefix: Path | None) -> None:
+    """Emit the step's REAL outputs: the 2-col pool, the marian-loadable vocab.
+
+    This used to live in prep_step.sh, which made a partial prep runnable — and
+    on 2026-07-20 it was run that way, losing all three at once: the pool paste
+    (so src/tgt PAIRING was gone and build_kd_source could not emit kd_ref), the
+    `.spm` extension (marian rejects a `.model` name with "DefaultVocabulary must
+    not contain empty lines"), and the intermediate cleanup.
+
+    A step whose script does only part of the step is a step you can do wrong.
+    The wrapper is now a pure argv adapter, so there is no partial form to run.
+    """
+    out = Path(args.out_dir) if args.out_dir else Path(args.workdir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    pool = out / "pool.tsv"
+    with pool.open("w", encoding="utf-8") as w, \
+            gzip.open(src_gz, "rt", encoding="utf-8") as fs, \
+            gzip.open(tgt_gz, "rt", encoding="utf-8") as ft:
+        n = 0
+        for s, t in zip(fs, ft):
+            w.write(f"{s.rstrip(chr(10))}\t{t.rstrip(chr(10))}\n")
+            n += 1
+    print(f"  pool {pool} ({n} pairs)", file=sys.stderr)
+
+    if spm_prefix is not None:
+        vocab = out / "vocab.spm"
+        vocab.write_bytes(Path(f"{spm_prefix}.model").read_bytes())
+        print(f"  vocab {vocab}", file=sys.stderr)
+
+    if args.keep_intermediates:
+        return
+    # The WHOLE workdir, not just clean/ and spm/: raw zips live there too, and
+    # the pool is the artifact — everything else is re-derivable. Removing only
+    # some of it is the same partial-port mistake this function exists to undo.
+    work, dest = Path(args.workdir).resolve(), out.resolve()
+    # Refuse only when the workdir CONTAINS the outputs (deleting it would take
+    # them with it). The normal layout is the opposite — work nested under out —
+    # and an inverted check silently skips every cleanup.
+    if work.is_dir() and work != dest and work not in dest.parents:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lang", default="tl", help="the non-English side (OPUS code)")
@@ -313,6 +358,9 @@ def main() -> None:
     ap.add_argument("--skip-spm", action="store_true", help="skip joint SPM training (reuse an existing vocab)")
     ap.add_argument("--vocab-size", type=int, default=32000)
     ap.add_argument("--sort-mem", default="4G")
+    ap.add_argument("--out-dir", default="", help="where pool.tsv + vocab.spm land (default: workdir)")
+    ap.add_argument("--keep-intermediates", action="store_true",
+                    help="keep clean/ and spm/; they are re-derivable, the pool is the artifact")
     args = ap.parse_args()
 
     src, tgt = args.src, args.lang
@@ -384,8 +432,8 @@ def main() -> None:
     dedup_tsv.unlink()
 
     if args.skip_spm:
+        finish(args, pair, src_gz, tgt_gz, spm_prefix=None)
         print(f"\nDONE {pair}: {n_final} pairs (from {total_seen} raw), SPM skipped", file=sys.stderr)
-        print(f"  {src_gz}\n  {tgt_gz}", file=sys.stderr)
         return
 
     print(f"training joint SPM ({args.vocab_size}) on {n_final} pairs", file=sys.stderr)
@@ -407,8 +455,8 @@ def main() -> None:
     )
     corpus_txt.unlink()
 
+    finish(args, pair, src_gz, tgt_gz, spm_prefix)
     print(f"\nDONE {pair}: {n_final} pairs (from {total_seen} raw)", file=sys.stderr)
-    print(f"  {src_gz}\n  {tgt_gz}\n  {spm_prefix}.model", file=sys.stderr)
 
 
 if __name__ == "__main__":

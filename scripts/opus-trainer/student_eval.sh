@@ -1,15 +1,14 @@
 #!/bin/bash
-# pipe step wrapper: bench the packed student on FLORES AND the check set.
+# pipe step wrapper for benchmark_slimt.py. PURE ARGV ADAPTER — no logic.
+#
 # lang/src arrive as ARGS, not env: the job protocol passes an args file and a
-# script path, never environment.
+# script path, never environment. benchmark_slimt.py emits metrics, probe
+# hypotheses AND the review itself, so no partial of this step is runnable.
 #
 # Usage: student_eval.sh LANG SRC MODEL VOCAB SHORTLIST C_SRC C_REF OUT_HYP OUT_METRICS OUT_REVIEW
 set -euo pipefail
-LANG_=$1; SRC=$2; MODEL=$3; VOCAB=$4; SHORTLIST=$5; C_SRC=$6; C_REF=$7
-OUT_HYP=$8; OUT_M=$9; OUT_R=${10}
 
-python3 /scripts/benchmark_slimt.py --lang "$LANG_" --src "$SRC" \
-    --model "$MODEL" --vocab "$VOCAB" --shortlist "$SHORTLIST" \
-    --probes "$C_SRC" --probe-out "$OUT_HYP" | tee "$OUT_M"
-
-python3 /scripts/probe_review.py "$C_SRC" "$OUT_R" --hyp student "$OUT_HYP"
+python3 /scripts/benchmark_slimt.py --lang "$1" --src "$2" \
+    --bin /usr/local/bin/slimt_load_test \
+    --model "$3" --vocab "$4" --shortlist "$5" \
+    --probes "$6" --probe-out "$8" --review-out "${10}" | tee "$9"

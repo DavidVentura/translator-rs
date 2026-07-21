@@ -23,7 +23,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .artstore import Aligned, ArtifactType, EvalSet, Filtered, Producer, Raw, typed_stage
+from .artstore import (
+    Aligned, ArtifactType, EvalSet, Filtered, Producer, Raw, Vocab, typed_stage,
+)
 from .step import Ctx, Output, Run, StepDef, step
 from .target import Target
 from .types import Artifact, Kind
@@ -122,7 +124,7 @@ def gate(
     run: Run,
     raw: Raw,
     *,
-    vocab: Artifact | Aligned | Raw,
+    vocab: Artifact | Aligned | Raw | Vocab,
     gold: EvalSet,
     known_good: Filtered | Aligned | None,
     budget: float,
@@ -168,7 +170,7 @@ def gate(
         )["kept"]
 
     parents = (raw.digest,)
-    if isinstance(vocab, (Aligned, Raw)):
+    if isinstance(vocab, (Aligned, Raw, Vocab)):
         parents += (vocab.digest,)
     step_key = run.producing_step(kept)
     published = run.art.publish(

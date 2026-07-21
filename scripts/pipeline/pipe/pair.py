@@ -19,7 +19,7 @@ because no signature accepts it:
   requirement that would have stopped both, so it ranks with "needs a teacher"
   and "needs a GPU".
 - `PairResult` is frozen and total: a run that did not evaluate the teacher, the
-  KD checkpoint, the finetuned checkpoint AND the packed student cannot be
+  KD checkpoint AND the packed student cannot be
   constructed, so "we skipped the eval" has no representation.
 
 An implementation could still no-op its own `train()`. That is out of scope —
@@ -72,14 +72,12 @@ class PairResult:
 
     teacher: Evaluated
     kd: Evaluated
-    finetuned: Evaluated
     student: Evaluated
 
     def to_json(self) -> dict:
         return {
             "teacher": self.teacher.to_json(),
             "kd": self.kd.to_json(),
-            "finetuned": self.finetuned.to_json(),
             "student": self.student.to_json(),
         }
 
@@ -112,13 +110,22 @@ class Pair(ABC):
         """
 
     @abstractmethod
-    def train_finetune(self) -> StepDef:
-        """One box: train -> decode(kd) -> finetune -> decode(ft).
+    def train(self) -> StepDef:
+        """One box: train -> decode(FLORES) -> decode(check set).
 
         One step because pipe leases per step key, so splitting it rents a box per
-        phase and ships a checkpoint between them. Must emit kd_model, ft_model,
-        and {kd,ft}_{flores,check}_hyp — the two decodes are what make finetune's
-        effect on deployment-shaped input measurable instead of assumed.
+        phase and ships a checkpoint between them; the decodes are seconds on a
+        GPU already in hand.
+
+        Finetune is deliberately NOT here. It bought +2.87 chrF on tl and +1.3 on
+        sw, always on FLORES, and its effect on deployment-shaped input has never
+        been measured for any pair — so it is an experiment to run against this
+        baseline (train a ft variant, eval it the same way, compare check deltas),
+        not a required stage. Adding it back means a second Evaluated on
+        PairResult, which is the point: a stage that is not measured does not
+        belong in the required shape.
+
+        Must emit: model, flores_hyp, check_hyp.
         """
 
     @abstractmethod
@@ -170,20 +177,18 @@ def run_pair(run: Run, pair: Pair) -> PairResult:
     train_tsv = pair.kd(run, filtered)
 
     trained = run.do(
-        pair.train_finetune(), timeout=12 * 3600,
-        train_tsv=train_tsv, vocab=a("vocab"), valid=a("valid"), ft_tsv=a("ft_tsv"),
+        pair.train(), timeout=12 * 3600,
+        train_tsv=train_tsv, vocab=a("vocab"), valid=a("valid"),
         flores_src=flores_src, check_src=check_src,
     )
-    kd_eval = _score(run, trained["kd_flores_hyp"], trained["kd_check_hyp"],
-                     flores_ref, flores_src, check_src, check_ref)
-    ft_eval = _score(run, trained["ft_flores_hyp"], trained["ft_check_hyp"],
+    kd_eval = _score(run, trained["flores_hyp"], trained["check_hyp"],
                      flores_ref, flores_src, check_src, check_ref)
 
-    packed = pair.pack(run, trained["ft_model"], a("vocab"))
+    packed = pair.pack(run, trained["model"], a("vocab"))
     student_out = evalsteps.student_eval(
         run, pair.lang, pair.src,
         packed["model"], packed["vocab"], packed["shortlist"],
     )
     student = Evaluated(metrics=student_out["metrics"], review=student_out["review"])
 
-    return PairResult(teacher=teacher, kd=kd_eval, finetuned=ft_eval, student=student)
+    return PairResult(teacher=teacher, kd=kd_eval, student=student)

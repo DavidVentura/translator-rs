@@ -5,7 +5,17 @@ clip-norm: 0
 cost-type: ce-mean-words
 disp-first: 10
 disp-freq: 1000
+# Patience is counted in VALIDATIONS, but it is paid in wall time. At the old
+# valid-freq of 5000 a validation was ~25 min of training apart, so 4 of them was
+# ~100 min — about 35% of a 4-5h run spent confirming a plateau (measured
+# 2026-07-21 on the 2-GPU en->tl run).
 early-stopping: 4
+# Anything smaller than this counts as a STALL rather than resetting patience.
+# Without it (default 0) any improvement resets, so a run producing -0.002 per
+# validation never stops on its own — NOTES records tl v2 being "manually stopped
+# at plateau", which is this. Observed deltas were -1.131 then -0.148, so 0.01 is
+# comfortably below real progress and above noise.
+early-stopping-epsilon: 0.01
 exponential-smoothing: True
 learn-rate: 0.0003
 lr-decay-inv-sqrt: 32000
@@ -19,7 +29,13 @@ normalize: 1
 optimizer-delay: 2
 optimizer-params: [0.9, 0.98, 1e-09]
 save-freq: 5000
-valid-freq: 5000
+# 1000, not 5000: a validation costs ~3s (997 lines at valid-mini-batch 64)
+# against ~292s of training per 1000 updates — about 1% overhead — while cutting
+# plateau-detection latency 5x, from ~100 min to ~20 min. The cost of finer
+# spacing is that the 4 patience samples span 4000 updates instead of 20000, so a
+# temporary flat stretch (e.g. an lr schedule transition) is likelier to read as
+# a plateau.
+valid-freq: 1000
 valid-mini-batch: 64
 sentencepiece-alphas: [0.5, 0.5]
 guided-alignment: 2

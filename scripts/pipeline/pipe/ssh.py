@@ -5,6 +5,7 @@ import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
+from typing import ClassVar
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -20,6 +21,7 @@ class SshHost:
     user: str
     key: Path
     name: str = field(default="")
+    TRIES: ClassVar[int] = 6
     _client: paramiko.SSHClient | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -57,15 +59,30 @@ class SshHost:
         # vast's ssh gateways drop sessions mid-poll (paramiko surfaces EOFError);
         # a transient drop must reconnect, not kill a flow with a live 3h job.
         # FileNotFoundError never reaches here: the verbs handle it inside fn.
+        #
+        # 6 not 4: the linear backoff means 4 tries wait only 5+10+15 = 30s, and a
+        # freshly rented box needs longer than that for vast to propagate the
+        # attached key — AuthenticationException (an SSHException subclass, so it
+        # IS retried here) rejected 3 boxes on 2026-07-20, all of them in NL. 6
+        # tries buys 75s, which is the cheap half of the fix; the proper one is a
+        # patient policy for first contact and a fast-failing one for mid-job
+        # drops, since one policy cannot serve both.
         last: Exception | None = None
-        for attempt in range(4):
+        for attempt in range(self.TRIES):
             try:
                 return fn()
-            except (EOFError, paramiko.SSHException, ConnectionError, TimeoutError) as e:
+            # OSError is load-bearing: paramiko's NoValidConnectionsError (a dead
+            # box, a closed port) subclasses socket.error/OSError DIRECTLY, not
+            # SSHException and not ConnectionError, so it escaped this tuple and
+            # propagated raw out of salvage — making a run un-abortable
+            # (2026-07-21).
+            except (EOFError, paramiko.SSHException, OSError, TimeoutError) as e:
                 last = e
                 self.close()
                 time.sleep(5 * (attempt + 1))
-        raise RuntimeError(f"ssh to {self.name} kept failing after 4 tries: {last!r}") from last
+        raise RuntimeError(
+            f"ssh to {self.name} kept failing after {self.TRIES} tries: {last!r}"
+        ) from last
 
     def mkdir(self, path: Path) -> None:
         def once() -> None:
@@ -196,10 +213,19 @@ class SshHost:
         # Flaky vast gateways drop connections mid-transfer; --partial keeps what
         # landed, so each retry resumes rather than restarts. 8 tries rode out a
         # box that dropped every ~15MB of a 125MB model pull (2026-07-16).
+        #
+        # -z is not optional at these speeds: transfers go over vast's US-west ssh
+        # gateway, so an EU hub -> EU box round-trips through California. Measured
+        # 2026-07-21: a 1.96GB train.tsv uploading at ~1.15 MB/s, ~28 min, with the
+        # rented GPU idle at 17W the whole time. train.tsv is 3.0x zstd-compressible
+        # (200MB -> 66.8MB), so this is ~9 min instead. rsync 3.2+ NEGOTIATES the
+        # compressor for plain -z (zstd > lz4 > zlib), so no --compress-choice here:
+        # naming zstd explicitly would fail against an older remote rsync instead of
+        # degrading to zlib.
         last = ""
         for attempt in range(8):
             done = subprocess.run(
-                ["rsync", "-a", "--partial", "--timeout=120", "-e", ssh, src, dst],
+                ["rsync", "-az", "--partial", "--timeout=120", "-e", ssh, src, dst],
                 capture_output=True,
                 text=True,
             )

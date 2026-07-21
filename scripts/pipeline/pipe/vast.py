@@ -6,6 +6,7 @@ import sys
 import time
 import uuid as uuidlib
 from dataclasses import dataclass
+from typing import NamedTuple
 from pathlib import Path
 
 VAST_BIN = Path(sys.executable).parent / "vastai"
@@ -42,12 +43,32 @@ class Offer:
         )
 
 
+class Endpoint(NamedTuple):
+    """Somewhere to ssh to. A type rather than a (host, port) pair so the two
+    routes to a box cannot be mixed up at a call site."""
+
+    host: str
+    port: int
+    direct: bool
+
+
 @dataclass(frozen=True)
 class Instance:
     id: int
     status: str
-    ssh_host: str | None
-    ssh_port: int | None
+    # vast's ssh gateway: always present, and always the slow path. Every byte
+    # is relayed through their US-west proxy, so an EU hub talking to an EU box
+    # crosses the Atlantic twice. Measured 2026-07-21: 1.15 MB/s on a 1.96GB
+    # upload (~28 min) with the rented GPU idle at 17W throughout. It is also
+    # the thing that drops connections mid-transfer — the reason _rsync carries
+    # --partial and 8 retries.
+    proxy_host: str | None
+    proxy_port: int | None
+    # The box's own address, when the offer exposes a mapped port for 22. Absent
+    # on offers with no direct ports, which is why this stays optional rather
+    # than becoming the only field.
+    public_host: str | None
+    public_port: int | None
     label: str | None
     gpu_name: str
 
@@ -56,18 +77,42 @@ class Instance:
         # cur_state is the DESIRED state ("running" from the moment of creation);
         # actual_status is what the box's agent reports. Falling back to cur_state
         # made never-started boxes look running.
+        ports = d.get("ports") or {}
+        mapped = ports.get("22/tcp") or []
+        public_port = None
+        if mapped:
+            try:
+                public_port = int(mapped[0].get("HostPort"))
+            except (TypeError, ValueError, AttributeError):
+                public_port = None
         return Instance(
             id=d["id"],
             status=d.get("actual_status") or "created",
-            ssh_host=d.get("ssh_host"),
-            ssh_port=d.get("ssh_port"),
+            proxy_host=d.get("ssh_host"),
+            proxy_port=d.get("ssh_port"),
+            public_host=d.get("public_ipaddr") or None,
+            public_port=public_port,
             label=d.get("label"),
             gpu_name=d.get("gpu_name") or "?",
         )
 
     @property
+    def endpoint(self) -> Endpoint | None:
+        """Where to reach this box, direct if the offer allows it.
+
+        Direct is preferred ALWAYS, not just for same-continent pairs: the proxy
+        adds an unknown middlebox and its own flakiness on every route. Callers
+        take this and never choose between the two themselves.
+        """
+        if self.public_host and self.public_port:
+            return Endpoint(self.public_host, int(self.public_port), direct=True)
+        if self.proxy_host and self.proxy_port:
+            return Endpoint(self.proxy_host, int(self.proxy_port), direct=False)
+        return None
+
+    @property
     def reachable(self) -> bool:
-        return self.status == "running" and bool(self.ssh_host) and bool(self.ssh_port)
+        return self.status == "running" and self.endpoint is not None
 
 
 @dataclass(frozen=True)
@@ -166,6 +211,15 @@ class VastApi:
                 "--disk", str(disk_gb),
                 "--label", label,
                 "--ssh",
+                # Direct connections instead of vast's ssh proxy. Every offer
+                # already has hundreds of direct ports (52/52 measured
+                # 2026-07-21) — we simply never asked, so all traffic relayed
+                # through their US-west gateway: 1.15 MB/s on a 1.96GB upload,
+                # ~28min, GPU idle at 17W throughout. It is also what drops
+                # connections mid-transfer (see _rsync's --partial + 8 retries).
+                # Instance.endpoint still falls back to the proxy if a box comes
+                # up without a mapped port.
+                "--direct",
                 "--cancel-unavail",
                 # vast's default onstart wraps ssh sessions in tmux, which breaks
                 # non-interactive exec ("open terminal failed: not a terminal").

@@ -55,7 +55,10 @@ def main() -> None:
                     help="adversarial/probe SOURCE lines for this direction "
                          "(probes/adversarial.en for en->X)")
     ap.add_argument("--probe-out", required=True, type=Path,
-                    help="where to write probe hypotheses, for probe_review.py")
+                    help="where to write probe hypotheses")
+    ap.add_argument("--review-out", required=True, type=Path,
+                    help="side-by-side review; REQUIRED so bench-without-review is "
+                         "not a runnable partial of this step")
     args = ap.parse_args()
 
     code = FLORES[args.lang]
@@ -91,9 +94,11 @@ def main() -> None:
         comet = f"  COMET22 {comet22(load_comet(), src[:n], hyps[:n], ref[:n]):.2f}"
     direction = f"{args.src}->{args.lang}" if args.src == "en" else f"{args.lang}->en"
     print(f"{direction}: chrF++ {chrf.score:.2f}  BLEU {bleu.score:.2f}{comet}  (n={n}, shortlist={args.shortlist})")
-    print(f"{direction}: probe hypotheses -> {args.probe_out} ({len(probe_hyps)} lines); "
-          f"render with probe_review.py and READ them -- FLORES does not cover "
-          f"signs, imperatives or short informal input")
+    from probe_review import render
+
+    render(args.probes, args.review_out, [("student", probe_hyps)])
+    print(f"{direction}: READ {args.review_out} -- FLORES does not cover signs, "
+          f"imperatives or short informal input, and no metric substitutes")
 
 
 if __name__ == "__main__":

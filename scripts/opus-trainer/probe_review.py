@@ -24,27 +24,23 @@ from pathlib import Path
 from probe_check import check, load_sources
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("src", type=Path, help="probes .jsonl or plain source .txt")
-    ap.add_argument("out", type=Path)
-    ap.add_argument("--direction", default="en2tl", help="only used for a .jsonl source")
-    ap.add_argument("--hyp", nargs=2, action="append", required=True,
-                    metavar=("LABEL", "FILE"))
-    args = ap.parse_args()
+def render(src_path: Path, out: Path, named: list[tuple[str, list[str]]],
+           direction: str = "en2tl") -> int:
+    """Write the side-by-side review; return how many lines carry a flag.
 
-    probes = load_sources(args.src, args.direction)
-    named = [(label, Path(f).read_text(encoding="utf-8").splitlines())
-             for label, f in args.hyp]
+    A function, not just a CLI, so an eval entry point can produce metrics AND
+    review in ONE invocation. Two separate programs in a step wrapper means
+    "metrics without review" is a runnable partial, and a partial that looks
+    like success is how the tl corpus lost its src/tgt pairing.
+    """
+    probes = load_sources(src_path, direction)
     for label, lines in named:
         if len(lines) != len(probes):
-            raise SystemExit(
-                f"{label}: {len(lines)} hypotheses for {len(probes)} probes")
+            raise SystemExit(f"{label}: {len(lines)} hypotheses for {len(probes)} probes")
 
     width = max(len(label) for label, _ in named)
     flagged = 0
-    with args.out.open("w", encoding="utf-8") as f:
+    with out.open("w", encoding="utf-8") as f:
         for i, (src, category, max_ratio) in enumerate(probes):
             notes = []
             for label, lines in named:
@@ -58,10 +54,24 @@ def main() -> None:
             for n in notes:
                 f.write(f"{'!!'.ljust(width)}  {n}\n")
             f.write("\n")
+    print(f"{out}: {len(probes)} probes x {len(named)} systems, {flagged} with "
+          f"mechanical flags -- READ THIS FILE, the flags are hints not a verdict")
+    return flagged
 
-    print(f"{args.out}: {len(probes)} probes x {len(named)} systems, "
-          f"{flagged} with mechanical flags -- READ THIS FILE, the flags are hints "
-          f"not a verdict")
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("src", type=Path, help="probes .jsonl or plain source .txt")
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--direction", default="en2tl", help="only used for a .jsonl source")
+    ap.add_argument("--hyp", nargs=2, action="append", required=True,
+                    metavar=("LABEL", "FILE"))
+    args = ap.parse_args()
+
+    named = [(label, Path(f).read_text(encoding="utf-8").splitlines())
+             for label, f in args.hyp]
+    render(args.src, args.out, named, args.direction)
 
 
 if __name__ == "__main__":

@@ -20,11 +20,16 @@
 # Gotcha: the trainer target is `marian_train` (underscored); `make marian` builds
 # only the static lib. See docker/Dockerfile.marian-cuda.
 #
-# Usage: train_student.sh TRAIN_TSV VOCAB_SPM VALID_2COL_TSV MODEL_OUT_NPZ [DEVICES]
+# EXTRA passes additional marian flags verbatim (e.g. "--fp16 --mini-batch 4000").
+# Default empty => byte-identical behaviour to before, so an existing run's
+# numbers stay comparable.
+#
+# Usage: train_student.sh TRAIN_TSV VOCAB_SPM VALID_2COL_TSV MODEL_OUT_NPZ [DEVICES] [EXTRA]
 set -euo pipefail
 [ -d /work/out ] && echo train > /work/out/.phase || true
 
-TSV=$1; VOCAB=$2; VALID=$3; OUT=$4; DEVICES=${5:-}
+TSV=$1; VOCAB=$2; VALID=$3; OUT=$4; DEVICES=${5:-}; EXTRA=${6:-}
+read -ra EXTRA_ARGS <<< "$EXTRA"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MARIAN=${MARIAN:-$(command -v marian || echo /root/marian-dev/build/marian)}
 mkdir -p "$(dirname "$OUT")"
@@ -34,15 +39,30 @@ if [[ "$VOCAB" != *.spm ]]; then
   ln -sf "$VOCAB" "$(dirname "$OUT")/vocab.spm" && VOCAB="$(dirname "$OUT")/vocab.spm"
 fi
 
+# The default workspace is omitted when EXTRA sets one: passing --workspace twice
+# is ambiguous (marian may take either), and EXTRA is how a caller tunes it.
 if [ -n "$DEVICES" ]; then
-  DEV=(--devices $DEVICES --workspace 9000)
+  DEV=(--devices $DEVICES)
+  [[ "$EXTRA" == *--workspace* ]] || DEV+=(--workspace 9000)
 else
-  DEV=(--cpu-threads "$(nproc)" --workspace 4000)
+  DEV=(--cpu-threads "$(nproc)")
+  [[ "$EXTRA" == *--workspace* ]] || DEV+=(--workspace 4000)
 fi
 
 OT_CFG="$(dirname "$OUT")/config.opustrainer.yml"
 sed "s|__TSV__|$TSV|g" "$HERE/configs/opustrainer.student.yml" > "$OT_CFG"
 
+# Streaming, deliberately, after weighing materialising the augmented corpus
+# (2026-07-21). `until original inf` re-rolls the modifiers every pass, so a
+# ~28-epoch run sees ~28 DIFFERENT perturbations of each sentence; a fixed
+# N-pass corpus freezes that to N. And the reasons to materialise turned out to
+# be already covered: the augmentation is a pure function of (corpus digest,
+# opustrainer==0.5 pinned in the image, seed: 1111), so determinism does not
+# need the expansion stored — the seed IS the compressed form. The corpus is
+# already shuffled three ways (build_kd_source's seeded shuf, OpusTrainer's
+# per-pass reshuffle, marian's maxi-batch window), and checkpoints already
+# resume weights, so --shuffle data and corpus-position restore bought little
+# for ~23GB of artifact plus ~55GB of shuffle temp on the training box.
 opustrainer-train --config "$OT_CFG" --log-level INFO \
   "$MARIAN" \
   -c "$HERE/configs/student.base-memory.yml" "$HERE/configs/student.train.yml" \
@@ -52,6 +72,6 @@ opustrainer-train --config "$OT_CFG" --log-level INFO \
   --model "$OUT" \
   --valid-sets "$VALID" --valid-metrics ce-mean-words \
   --keep-best --overwrite \
-  "${DEV[@]}"
+  "${DEV[@]}" "${EXTRA_ARGS[@]}"
 
 echo "done: ${OUT%.npz}.best-ce-mean-words.npz"
