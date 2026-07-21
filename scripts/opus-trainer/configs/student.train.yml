@@ -13,9 +13,17 @@ early-stopping: 4
 # Anything smaller than this counts as a STALL rather than resetting patience.
 # Without it (default 0) any improvement resets, so a run producing -0.002 per
 # validation never stops on its own — NOTES records tl v2 being "manually stopped
-# at plateau", which is this. Observed deltas were -1.131 then -0.148, so 0.01 is
-# comfortably below real progress and above noise.
-early-stopping-epsilon: 0.01
+# at plateau", which is this.
+#
+# Scaled to valid-freq: epsilon is judged PER VALIDATION, so cutting valid-freq
+# 5x (5000 -> 1000) makes a fixed epsilon 5x stricter per update. Measured
+# per-1000-update gains on the 2-GPU en->tl run were 0.226 / 0.030 / 0.020 /
+# 0.011 / 0.002 across the 5k-30k band, so 0.01 would start counting stalls
+# around Up.20000 and concede the real best at Up.30000 (ce 1.68246, whose last
+# leg gained only 0.0093 over 5000 updates). 0.005 crosses in the 22k-27k band
+# instead — late enough to keep that best, early enough to avoid the 20000-update
+# patience tail.
+early-stopping-epsilon: 0.005
 exponential-smoothing: True
 learn-rate: 0.0003
 lr-decay-inv-sqrt: 32000
