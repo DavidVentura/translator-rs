@@ -52,7 +52,10 @@ fn asset_file(name: &str, install_path: &str, size_bytes: u64) -> AssetFileV2 {
         delete_after_extract: false,
         install_marker_path: None,
         install_marker_version: None,
-        role: None,
+        // These fixtures exercise install/status/download planning, not runtime
+        // role resolution, so each file just needs a distinct role to stay its
+        // own singleton group (the filename guarantees that).
+        role: FileRole::new(name),
         priority: 0,
         requirement: FileRequirement::Required,
     }
@@ -62,11 +65,11 @@ fn role_file(
     name: &str,
     install_path: &str,
     size_bytes: u64,
-    role: &str,
+    role: FileRole,
     priority: i32,
 ) -> AssetFileV2 {
     AssetFileV2 {
-        role: Some(FileRole::new(role)),
+        role,
         priority,
         ..asset_file(name, install_path, size_bytes)
     }
@@ -76,7 +79,7 @@ fn optional_role_file(
     name: &str,
     install_path: &str,
     size_bytes: u64,
-    role: &str,
+    role: FileRole,
     priority: i32,
 ) -> AssetFileV2 {
     AssetFileV2 {
@@ -189,6 +192,7 @@ fn tts_pack(
         PackKind::Tts(TtsPack {
             language: language.to_string(),
             engine: Some("piper".to_string()),
+            aux_role: FileRole::new("sidecar"),
             locale: None,
             region: Some(region.to_string()),
             voice: None,
@@ -590,21 +594,21 @@ fn catalog_with_detector_alternatives() -> LanguageCatalog {
                     "det_old.mnn",
                     "ppocr/det_old.mnn",
                     100,
-                    FileRole::DETECTOR,
+                    FileRole::Detector,
                     0,
                 ),
                 role_file(
                     "det_new.mnn",
                     "ppocr/det_new.mnn",
                     40,
-                    FileRole::DETECTOR,
+                    FileRole::Detector,
                     1,
                 ),
                 role_file(
                     "pulc.mnn",
                     "ppocr/pulc.mnn",
                     10,
-                    FileRole::SCRIPT_CLASSIFIER,
+                    FileRole::ScriptClassifier,
                     0,
                 ),
             ],
@@ -616,7 +620,7 @@ fn catalog_with_detector_alternatives() -> LanguageCatalog {
         ppocr_recognizer_pack(
             "ocr-ppocr-latin",
             PpocrScript::Latin,
-            role_file("latin.mnn", "ppocr/latin.mnn", 10, FileRole::RECOGNIZER, 0),
+            role_file("latin.mnn", "ppocr/latin.mnn", 10, FileRole::Recognizer, 0),
             vec!["ocr-ppocr-detector"],
         ),
     );
@@ -690,7 +694,7 @@ fn catalog_with_optional_ink() -> LanguageCatalog {
         "ink.mnn",
         "ppocr/ink.mnn",
         50,
-        FileRole::INK,
+        FileRole::Ink,
         0,
     ));
     catalog
@@ -961,23 +965,23 @@ fn parses_bundled_catalog_asset() {
 }
 
 #[test]
-fn parses_v5_migrations_from_asset() {
+fn parses_v6_migrations_from_asset() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let asset_path = manifest_dir
         .parent()
         .and_then(|parent| parent.parent())
         .map(|parent| {
-            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v5.json")
+            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v6.json")
         })
         .expect("repo layout should have a parent");
     let Ok(json) = std::fs::read_to_string(asset_path) else {
         return;
     };
     let catalog =
-        crate::catalog::parse_and_validate_catalog(&json).expect("v5 catalog should parse");
+        crate::catalog::parse_and_validate_catalog(&json).expect("v6 catalog should parse");
     assert!(
         !catalog.migrations.is_empty(),
-        "v5 asset should carry migrations"
+        "v6 asset should carry migrations"
     );
     assert!(
         catalog
@@ -996,8 +1000,8 @@ fn parses_v5_migrations_from_asset() {
 
 #[test]
 fn selects_best_catalog_using_headers_only() {
-    let bundled = r#"{"formatVersion":3,"generatedAt":1}"#;
-    let disk = r#"{"formatVersion":3,"generatedAt":2}"#;
+    let bundled = r#"{"formatVersion":6,"generatedAt":1}"#;
+    let disk = r#"{"formatVersion":6,"generatedAt":2}"#;
 
     let selected = crate::catalog::select_best_catalog(bundled, Some(disk))
         .expect("header-only catalogs should still compare");
@@ -1008,7 +1012,7 @@ fn selects_best_catalog_using_headers_only() {
 fn catalog_json_with_migrations(migrations: &str) -> String {
     format!(
         r#"{{
-          "formatVersion":5,"generatedAt":1,"dictionaryVersion":1,
+          "formatVersion":6,"generatedAt":1,"dictionaryVersion":1,
           "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
                       "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1}},
           "languages":{{}},"packs":{{}},
@@ -1027,7 +1031,7 @@ fn parses_migrations_section() {
            "quantBits":8,"onnxBytes":100,"mnnBytes":40,"feature":"tts"}
         ]"#,
     );
-    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("v5 catalog parses");
+    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("v6 catalog parses");
     assert_eq!(catalog.migrations.len(), 2);
     assert_eq!(catalog.migrations[0].feature, "doc_detect");
     assert_eq!(
@@ -1041,7 +1045,7 @@ fn parses_migrations_section() {
 #[test]
 fn catalog_without_migrations_is_empty() {
     let json = r#"{
-      "formatVersion":4,"generatedAt":1,"dictionaryVersion":1,
+      "formatVersion":6,"generatedAt":1,"dictionaryVersion":1,
       "sources":{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
                  "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1},
       "languages":{},"packs":{}
@@ -1061,7 +1065,7 @@ fn plan_migrations_classifies_by_disk_state() {
           {"onnx":"c.onnx","mnn":"c.mnn","quantBits":8,"onnxBytes":10,"mnnBytes":4,"feature":"tts"}
         ]"#,
     );
-    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("v5 catalog parses");
+    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("v6 catalog parses");
     // a: onnx present, mnn absent -> Convert
     // b: onnx present, mnn already present -> CleanupOnly
     // c: onnx absent -> not in the plan

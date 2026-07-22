@@ -17,7 +17,7 @@ fn unique_dir(tag: &str) -> PathBuf {
 fn catalog_json(migrations: &str) -> String {
     format!(
         r#"{{
-          "formatVersion":5,"generatedAt":1,"dictionaryVersion":1,
+          "formatVersion":6,"generatedAt":1,"dictionaryVersion":1,
           "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
                       "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1}},
           "languages":{{}},"packs":{{}},

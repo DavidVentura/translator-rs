@@ -64,17 +64,17 @@ impl OcrEngine {
         }
 
         let base = std::path::Path::new(&snap.base_dir);
-        let best_present = |pack: &PackRecord, role: &str| {
+        let best_present = |pack: &PackRecord, role: &FileRole| {
             pack.role_alternatives(role)
                 .into_iter()
                 .map(|f| base.join(&f.install_path))
                 .find(|path| path.exists())
         };
-        let det_path = best_present(det_pack, FileRole::DETECTOR).ok_or_else(|| {
+        let det_path = best_present(det_pack, &FileRole::Detector).ok_or_else(|| {
             TranslatorError::missing_asset("ppocr detector pack has no detector model on disk")
         })?;
-        let classifier_path = best_present(det_pack, FileRole::SCRIPT_CLASSIFIER);
-        let textline_orientation_path = best_present(det_pack, FileRole::TEXTLINE_ORIENTATION);
+        let classifier_path = best_present(det_pack, &FileRole::ScriptClassifier);
+        let textline_orientation_path = best_present(det_pack, &FileRole::TextlineOrientation);
 
         let mut specs = Vec::new();
         for (pack_id, pack) in &catalog.packs {
@@ -89,7 +89,7 @@ impl OcrEngine {
             // keys file is also on disk. A half-downloaded upgrade then falls
             // back to the older complete pair instead of mixing generations.
             let pair = pack
-                .role_alternatives(FileRole::RECOGNIZER)
+                .role_alternatives(&FileRole::Recognizer)
                 .into_iter()
                 .find_map(|rec| {
                     let model_path = base.join(&rec.install_path);
@@ -97,7 +97,7 @@ impl OcrEngine {
                         return None;
                     }
                     let keys_path = pack
-                        .role_alternatives(FileRole::KEYS)
+                        .role_alternatives(&FileRole::Keys)
                         .into_iter()
                         .find(|keys| keys.priority == rec.priority)
                         .map(|keys| base.join(&keys.install_path))
@@ -117,7 +117,7 @@ impl OcrEngine {
 
         // Optional ink-matte model. Resolved via the detector pack's declared install
         // path (not det_path.parent() — det may be a different OCR version dir).
-        let ink_path = best_present(det_pack, FileRole::INK);
+        let ink_path = best_present(det_pack, &FileRole::Ink);
 
         let key = PpocrEngineKey {
             detector_path: det_path.to_string_lossy().into_owned(),

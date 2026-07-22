@@ -44,25 +44,61 @@ pub(crate) struct LanguageInfo {
 
 /// Groups interchangeable files within a pack: files sharing a role are
 /// alternatives for the same slot, ranked by `AssetFileV2::priority`.
-/// Opaque to the planner (grouping is by equality), so catalogs can introduce
-/// new roles without breaking older clients' install/upgrade logic.
+///
+/// The named variants are the roles this build dispatches on (OCR sub-models,
+/// translation model/vocab/lex, TTS voice model + engine-specific aux). Any
+/// other role a catalog defines becomes `Other`, kept opaque so grouping still
+/// works by equality — a newer catalog can introduce roles without breaking
+/// install/upgrade logic on older clients.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FileRole(String);
+pub enum FileRole {
+    Detector,
+    ScriptClassifier,
+    TextlineOrientation,
+    Recognizer,
+    Keys,
+    Ink,
+    Model,
+    Lex,
+    SrcVocab,
+    TgtVocab,
+    Vocab,
+    Other(String),
+}
 
 impl FileRole {
-    pub const DETECTOR: &'static str = "detector";
-    pub const SCRIPT_CLASSIFIER: &'static str = "scriptClassifier";
-    pub const TEXTLINE_ORIENTATION: &'static str = "textlineOrientation";
-    pub const RECOGNIZER: &'static str = "recognizer";
-    pub const KEYS: &'static str = "keys";
-    pub const INK: &'static str = "ink";
-
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn new(value: impl AsRef<str>) -> Self {
+        match value.as_ref() {
+            "detector" => Self::Detector,
+            "scriptClassifier" => Self::ScriptClassifier,
+            "textlineOrientation" => Self::TextlineOrientation,
+            "recognizer" => Self::Recognizer,
+            "keys" => Self::Keys,
+            "ink" => Self::Ink,
+            "model" => Self::Model,
+            "lex" => Self::Lex,
+            "srcVocab" => Self::SrcVocab,
+            "tgtVocab" => Self::TgtVocab,
+            "vocab" => Self::Vocab,
+            other => Self::Other(other.to_string()),
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match self {
+            Self::Detector => "detector",
+            Self::ScriptClassifier => "scriptClassifier",
+            Self::TextlineOrientation => "textlineOrientation",
+            Self::Recognizer => "recognizer",
+            Self::Keys => "keys",
+            Self::Ink => "ink",
+            Self::Model => "model",
+            Self::Lex => "lex",
+            Self::SrcVocab => "srcVocab",
+            Self::TgtVocab => "tgtVocab",
+            Self::Vocab => "vocab",
+            Self::Other(value) => value,
+        }
     }
 }
 
@@ -91,7 +127,7 @@ pub struct AssetFileV2 {
     pub delete_after_extract: bool,
     pub install_marker_path: Option<String>,
     pub install_marker_version: Option<i32>,
-    pub role: Option<FileRole>,
+    pub role: FileRole,
     pub priority: i32,
     pub requirement: FileRequirement,
 }
@@ -114,11 +150,11 @@ pub struct PackRecord {
 impl PackRecord {
     /// Files filling the given role, best (highest priority) first.
     /// Ties keep catalog order.
-    pub fn role_alternatives(&self, role: &str) -> Vec<&AssetFileV2> {
+    pub fn role_alternatives(&self, role: &FileRole) -> Vec<&AssetFileV2> {
         let mut files = self
             .files
             .iter()
-            .filter(|file| file.role.as_ref().is_some_and(|r| r.as_str() == role))
+            .filter(|file| &file.role == role)
             .collect::<Vec<_>>();
         files.sort_by_key(|file| std::cmp::Reverse(file.priority));
         files
@@ -252,6 +288,7 @@ impl PpocrScript {
 pub struct TtsPack {
     pub language: String,
     pub engine: Option<String>,
+    pub aux_role: FileRole,
     pub locale: Option<String>,
     pub region: Option<String>,
     pub voice: Option<String>,
@@ -422,30 +459,22 @@ impl LangAvailability {
     }
 }
 
-fn translation_direction_from_pack(pack: &PackRecord) -> Option<LanguageDirection> {
-    let PackKind::Translation(_) = &pack.kind else {
-        return None;
+// A model that shares one vocabulary for both directions publishes it under the
+// `vocab` role; separate source/target vocabularies use `srcVocab`/`tgtVocab`.
+pub fn translation_direction_from_files(files: &[AssetFileV2]) -> Option<LanguageDirection> {
+    let best = |role: &FileRole| -> Option<&AssetFileV2> {
+        files
+            .iter()
+            .filter(|file| &file.role == role)
+            .max_by_key(|file| file.priority)
     };
 
-    let by_name = pack
-        .files
-        .iter()
-        .map(|file| (file.name.clone(), file))
-        .collect::<HashMap<_, _>>();
-    let model = by_name
-        .values()
-        .find(|file| file.name.starts_with("model."))?;
-    let lex = by_name
-        .values()
-        .find(|file| file.name.starts_with("lex."))?;
-    let mut vocab_files = by_name
-        .values()
-        .filter(|file| file.name.contains("vocab"))
-        .copied()
-        .collect::<Vec<_>>();
-    vocab_files.sort_by(|left, right| left.name.cmp(&right.name));
-    let src_vocab = vocab_files.first()?;
-    let tgt_vocab = vocab_files.get(1).copied().unwrap_or(src_vocab);
+    let model = best(&FileRole::Model)?;
+    let lex = best(&FileRole::Lex)?;
+    let src_vocab = best(&FileRole::SrcVocab).or_else(|| best(&FileRole::Vocab))?;
+    let tgt_vocab = best(&FileRole::TgtVocab)
+        .or_else(|| best(&FileRole::Vocab))
+        .unwrap_or(src_vocab);
 
     let to_model_file = |file: &AssetFileV2| ModelFile {
         name: file.name.clone(),
@@ -665,16 +694,6 @@ impl LanguageCatalog {
         let from_can_be_target = from_code.as_str() == "en"
             || self.translation_pack_id("en", from_code.as_str()).is_some();
         to_can_be_source && from_can_be_target
-    }
-
-    pub fn translation_direction(
-        &self,
-        from: &LanguageCode,
-        to: &LanguageCode,
-    ) -> Option<LanguageDirection> {
-        let pack_id = self.translation_pack_id(from.as_str(), to.as_str())?;
-        let pack = self.pack(&pack_id)?;
-        translation_direction_from_pack(pack)
     }
 
     pub(crate) fn root_pack_ids_for_feature(

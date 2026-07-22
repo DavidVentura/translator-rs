@@ -83,9 +83,7 @@ struct AssetFileWire {
     delete_after_extract: bool,
     install_marker_path: Option<String>,
     install_marker_version: Option<i32>,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
+    role: String,
     priority: i32,
     #[serde(default)]
     optional: bool,
@@ -136,6 +134,8 @@ enum AssetPackWire {
     Tts {
         language: String,
         engine: Option<String>,
+        #[serde(rename = "auxRole")]
+        aux_role: String,
         locale: Option<String>,
         region: Option<String>,
         voice: Option<String>,
@@ -242,10 +242,7 @@ impl From<AssetFileWire> for AssetFileV2 {
             delete_after_extract: value.delete_after_extract,
             install_marker_path: value.install_marker_path.filter(|value| !value.is_empty()),
             install_marker_version: value.install_marker_version,
-            role: value
-                .role
-                .filter(|value| !value.is_empty())
-                .map(FileRole::new),
+            role: FileRole::new(value.role),
             priority: value.priority,
             requirement: if value.optional {
                 FileRequirement::Optional
@@ -320,6 +317,7 @@ impl AssetPackWire {
             AssetPackWire::Tts {
                 language,
                 engine,
+                aux_role,
                 locale,
                 region,
                 voice,
@@ -335,6 +333,7 @@ impl AssetPackWire {
                 kind: PackKind::Tts(TtsPack {
                     language,
                     engine: normalized(engine),
+                    aux_role: FileRole::new(aux_role),
                     locale: normalized(locale),
                     region: normalized(region),
                     voice: normalized(voice),
@@ -548,7 +547,7 @@ pub fn parse_language_catalog(json: &str) -> Result<LanguageCatalog, String> {
 
 pub fn parse_and_validate_catalog(json: &str) -> Result<LanguageCatalog, String> {
     let catalog = parse_language_catalog(json)?;
-    if catalog.format_version < 3 {
+    if catalog.format_version < 6 {
         return Err(format!(
             "Unsupported catalog formatVersion={}",
             catalog.format_version
@@ -564,7 +563,7 @@ pub fn select_best_catalog<'a>(
     let parse_header = |json: &str| -> Result<CatalogHeaderWire, String> {
         let header =
             serde_json::from_str::<CatalogHeaderWire>(json).map_err(|error| error.to_string())?;
-        if header.format_version < 3 {
+        if header.format_version < 6 {
             return Err(format!(
                 "Unsupported catalog formatVersion={}",
                 header.format_version
@@ -611,7 +610,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"formatVersion":5,"generatedAt":0,"dictionaryVersion":1,
+            r#"{{"formatVersion":6,"generatedAt":0,"dictionaryVersion":1,
                "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":0,
                            "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":0}},
                "languages":{{{languages}}},"packs":{{}}}}"#

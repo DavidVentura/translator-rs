@@ -10,7 +10,7 @@ pub use model::{
     DownloadTask, FileRequirement, FileRole, InstalledTtsPack, LangAvailability, LanguageCatalog,
     LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2, MigrationAction, MigrationEntry,
     MigrationJob, OcrEngine, OcrPack, PackKind, PackRecord, PpocrScript, ResolvedTtsVoiceFiles,
-    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
+    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion, translation_direction_from_files,
 };
 pub use planner::{
     CatalogSnapshot, FsPackInstallChecker, LanguageAvailabilityRow, LanguageOverview,

@@ -12,7 +12,7 @@ use piper_rs::{
 use serde::Deserialize;
 use translator::tts::{PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks};
 
-const DEFAULT_INDEX_PATH: &str = "~/AndroidStudioProjects/bucket/index_v5.json";
+const DEFAULT_INDEX_PATH: &str = "~/AndroidStudioProjects/bucket/index_v6.json";
 const DEFAULT_OUTPUT_DIR: &str = "samples";
 const SAMPLE_TEXTS_JSON: &str = include_str!("../../data/sample_texts.json");
 

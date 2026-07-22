@@ -28,6 +28,11 @@ pub struct PackInstallStatus {
     /// Role alternatives on disk that are outranked by a better file also on
     /// disk, safe to delete.
     pub superseded_files: Vec<AssetFileV2>,
+    /// The highest-priority present file of each role — the pack's resolved
+    /// on-disk configuration. Runtime resolution (translation model/vocab, TTS
+    /// voice model/aux) reads these so it never picks a catalog alternative that
+    /// is not actually installed.
+    pub active_files: Vec<AssetFileV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,17 +198,11 @@ where
         let mut missing_files = Vec::new();
         let mut upgrade_files = Vec::new();
         let mut superseded_files = Vec::new();
+        let mut active_files = Vec::new();
         let mut any_file_present = false;
         let mut role_groups: Vec<(&FileRole, Vec<&AssetFileV2>)> = Vec::new();
         for file in &pack.files {
-            let Some(role) = &file.role else {
-                if file_present(file) {
-                    any_file_present = true;
-                } else {
-                    missing_files.push(file.clone());
-                }
-                continue;
-            };
+            let role = &file.role;
             match role_groups.iter_mut().find(|(r, _)| *r == role) {
                 Some((_, group)) => group.push(file),
                 None => role_groups.push((role, vec![file])),
@@ -227,6 +226,10 @@ where
                 }
                 continue;
             };
+            // The disk-resolved file for this role: what runtime resolution
+            // (translation/TTS) must load, so an install still on an older
+            // alternative uses the file it actually has.
+            active_files.push((*best_present).clone());
             if group[0].install_path != best_present.install_path {
                 upgrade_files.push(group[0].clone());
             }
@@ -248,6 +251,7 @@ where
             missing_dependency_ids,
             upgrade_files,
             superseded_files,
+            active_files,
         };
         self.status_cache
             .insert(pack_id.to_string(), status.clone());
@@ -716,28 +720,28 @@ pub fn resolve_tts_voice_files_for_pack(
     let PackKind::Tts(tts) = &voice_pack.kind else {
         return None;
     };
-    let pack_files = snapshot
-        .catalog
-        .pack_files_with_dependencies(&voice_pack_id);
     let engine = tts.engine.clone().unwrap_or_else(|| "piper".to_string());
-    // The runtime is MNN-only: every engine's model blob is a `.mnn` (piper-family
-    // voices were migrated from `.onnx`; their `.onnx.json` sidecar is the aux file
-    // resolved below). Earlier this looked for `.onnx` for non-kokoro engines,
-    // which no longer matches the catalog and resolved no voice.
-    let model_asset = pack_files.iter().find(|file| file.name.ends_with(".mnn"))?;
-    let aux_asset = match engine.as_str() {
-        "kokoro" | "kokoro_mnn" => pack_files.iter().find(|file| file.name.ends_with(".bin")),
-        "mms" => pack_files
+
+    // The model and its aux file may live in the voice pack or in a shared
+    // dependency (kokoro core/voices, cotovia lexicon), so resolve across the
+    // closure's on-disk files.
+    let active_files = snapshot
+        .catalog
+        .dependency_closure([voice_pack_id.as_str()])
+        .into_iter()
+        .filter_map(|pack_id| snapshot.pack_statuses.get(&pack_id))
+        .flat_map(|status| status.active_files.iter())
+        .collect::<Vec<_>>();
+    let by_role = |role: &FileRole| {
+        active_files
             .iter()
-            .find(|file| file.name.ends_with("tokens.txt")),
-        "coqui_vits" | "sherpa_vits" => pack_files.iter().find(|file| file.name == "config.json"),
-        "cotovia_vits" => pack_files
-            .iter()
-            .find(|file| file.name.ends_with("lexicon.txt.zst")),
-        _ => pack_files
-            .iter()
-            .find(|file| file.name.ends_with(".onnx.json")),
-    }?;
+            .copied()
+            .filter(|file| &file.role == role)
+            .max_by_key(|file| file.priority)
+    };
+
+    let model_asset = by_role(&FileRole::Model)?;
+    let aux_asset = by_role(&tts.aux_role)?;
     Some(ResolvedTtsVoiceFiles {
         engine,
         model_install_path: model_asset.install_path.clone(),

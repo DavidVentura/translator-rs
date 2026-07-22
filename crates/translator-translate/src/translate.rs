@@ -5,7 +5,7 @@ use crate::bergamot::{BergamotEngine, ModelPaths, TranslateCtx};
 use crate::html_translate;
 use crate::routing::{MixedTextTranslationResult, translate_mixed_texts_in_snapshot};
 use translator_core::api::{LanguageCode, TranslatorError};
-use translator_core::catalog::CatalogSnapshot;
+use translator_core::catalog::{CatalogSnapshot, translation_direction_from_files};
 
 pub struct Translator<'a> {
     engine: &'a mut BergamotEngine,
@@ -539,9 +539,7 @@ pub fn resolve_translation_plan_in_snapshot(
         if !status.installed {
             return None;
         }
-        let direction = snapshot
-            .catalog
-            .translation_direction(&LanguageCode::from(from), &LanguageCode::from(to))?;
+        let direction = translation_direction_from_files(&status.active_files)?;
         Some(TranslationStep {
             from_code: from.to_string(),
             to_code: to.to_string(),
