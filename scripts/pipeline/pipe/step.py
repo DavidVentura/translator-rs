@@ -52,6 +52,7 @@ class StepDef:
     script: str
     outputs: dict[str, Output]
     fn: Callable[[Ctx], list[str]]
+    deps: tuple[str, ...] = ()
 
 
 def step(
@@ -60,7 +61,19 @@ def step(
     target: Target,
     script: str,
     outputs: dict[str, Output],
+    deps: tuple[str, ...] = (),
 ) -> Callable[[Callable[[Ctx], list[str]]], StepDef]:
+    """Declare a step.
+
+    `deps` names the OTHER files in the scripts dir this step's behaviour depends
+    on — the libraries its wrapper invokes. Only the wrapper is digested into the
+    key otherwise, so `prep_step.sh` calling `prep_data.py` hashes the six-line
+    adapter and not the thousand lines that decide what the corpus contains. On
+    2026-07-21 a placeholder-regex bug corrupted the UI register; the fix changed
+    no `.sh`, so the step would have been served from the memo with the corrupt
+    pool still in it.
+    """
+
     def deco(fn: Callable[[Ctx], list[str]]) -> StepDef:
         return StepDef(
             name=fn.__name__,
@@ -69,6 +82,7 @@ def step(
             script=script,
             outputs=outputs,
             fn=fn,
+            deps=tuple(deps),
         )
 
     return deco
@@ -218,10 +232,19 @@ class Run:
         script_path = self.scripts / defn.script
         if not script_path.is_file():
             raise FileNotFoundError(f"step {defn.name} names a missing script: {script_path}")
+        deps = {}
+        for rel in sorted(defn.deps):
+            dep_path = self.scripts / rel
+            if not dep_path.is_file():
+                raise FileNotFoundError(
+                    f"step {defn.name} declares a missing dep: {dep_path}"
+                )
+            deps[rel] = str(digest_file(dep_path))
         payload = {
             "step": defn.name,
             "image": defn.target.image_id(defn.image),
             "script": str(digest_file(script_path)),
+            "deps": deps,
             "inputs": {k: str(v.digest) for k, v in sorted(inputs.items())},
             "args": args,
         }

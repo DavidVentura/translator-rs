@@ -21,6 +21,7 @@ It is an experiment to run against this baseline and compare check deltas.
 from __future__ import annotations
 
 from pipe import evalsteps
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -55,6 +56,7 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
     image=CUDA,
     target=Vast(gpu="RTX_4090", max_hours=12, disk_gb=80, tries=8, geo=EU, min_cuda=11.8),
     script="train_eval.sh",
+    deps=deps.TRAIN_EVAL,
     outputs={
         "model": Output(rel="model.npz.best-ce-mean-words.npz", kind=Kind.BLOB),
         "flores_hyp": Output(rel="flores.hyp", kind=Kind.LINES),

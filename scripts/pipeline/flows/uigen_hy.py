@@ -39,6 +39,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver, Vast
 from pipe.types import Artifact, Kind
@@ -62,6 +63,7 @@ SALVAGE_MIN = "0.8"
     image=PREP,
     target=Bigserver(cpus=16),
     script="prep_step.sh",
+    deps=deps.PREP,
     outputs={
         "pool_tsv": Output(rel="pool.tsv", kind=Kind.LINES),
         "vocab": Output(rel="vocab.spm", kind=Kind.BLOB),
@@ -75,6 +77,7 @@ def prep(ctx: Ctx) -> list[str]:
     image=PREP,
     target=Bigserver(cpus=16),
     script="prep_step.sh",
+    deps=deps.PREP,
     outputs={"pool_tsv": Output(rel="pool.tsv", kind=Kind.LINES)},
 )
 def prep_ft(ctx: Ctx) -> list[str]:
@@ -135,6 +138,7 @@ def align_ft(ctx: Ctx) -> list[str]:
     image=CUDA,
     target=Vast(gpu="RTX_4090", max_hours=3, disk_gb=40, tries=8, geo=EU, min_cuda=11.8),
     script="backward_step.sh",
+    deps=deps.BACKWARD,
     outputs={"model": Output(rel="backward/model.npz.best-ce-mean-words.npz", kind=Kind.BLOB)},
 )
 def backward(ctx: Ctx) -> list[str]:
@@ -233,6 +237,7 @@ def cefilter_cut(ctx: Ctx) -> list[str]:
     image=CUDA,
     target=Vast(gpu="RTX_4090", max_hours=8, disk_gb=60, tries=8, geo=EU, min_cuda=11.8),
     script="train_student.sh",
+    deps=deps.TRAIN_STUDENT,
     outputs={"model": Output(rel="model/model.npz.best-ce-mean-words.npz", kind=Kind.BLOB)},
 )
 def train(ctx: Ctx) -> list[str]:
@@ -247,6 +252,7 @@ def train(ctx: Ctx) -> list[str]:
     image=CUDA,
     target=Vast(gpu="RTX_4090", max_hours=3, disk_gb=60, tries=8, geo=EU, min_cuda=11.8),
     script="finetune_student.sh",
+    deps=deps.FINETUNE,
     outputs={"model": Output(rel="model_ft/model.npz.best-ce-mean-words.npz", kind=Kind.BLOB)},
 )
 def finetune(ctx: Ctx) -> list[str]:

@@ -18,6 +18,7 @@ those mistakes reachable no longer exist.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver
 from pipe.types import Kind
@@ -31,6 +32,7 @@ KD_LINES = "10000000"
     image=PREP,
     target=Bigserver(cpus=16),
     script="prep_step.sh",
+    deps=deps.PREP,
     outputs={
         "pool_tsv": Output(rel="pool.tsv", kind=Kind.LINES),
         "vocab": Output(rel="vocab.spm", kind=Kind.BLOB),

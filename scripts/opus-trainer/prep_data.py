@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """Phase 1: build cleaned en<->X parallel bitext + joint SentencePiece vocab.
 
-Resolves OPUS moses resources for the pair (via `opus_get -l`), downloads an
-allowlist of corpora (localization junk and entity-only sets are skipped),
-streams each zip through cleaning (Moses de-escape, subtitle/markup artifact
-strip, wiki-boilerplate fix, alpha/word-ratio + num/url mismatch filters ported
-from mozilla/translations' OpusCleaner, length/ratio filters, and fastText
-language ID on both sides), deduplicates on disk with `sort -u`, and trains a
-joint unigram SPM. Designed to run on a scratch box: raw shards are deleted
-after cleaning and everything is gzip-streamed, so peak disk stays small.
+Resolves OPUS moses resources for the pair (via `opus_get -l`), downloads every
+corpus carrying a REGISTER (registers.py — that table is the allowlist), streams
+each zip through cleaning (Moses de-escape, subtitle/markup artifact strip,
+wiki-boilerplate fix, alpha/word-ratio + num/url mismatch filters ported from
+mozilla/translations' OpusCleaner, length/ratio filters, fastText language ID on
+both sides, then the register's own extra filters), deduplicates ACROSS
+registers by precedence, and trains a joint unigram SPM. Designed to run on a
+scratch box: raw shards are deleted after cleaning and everything is
+gzip-streamed, so peak disk stays small.
 
 Outputs under <out-dir> (the STEP's artifacts, complete — running this script
 is running the whole step, by design; see finish()):
-    pool.tsv    2-col src \t tgt, pairing preserved
-    vocab.spm   joint SPM, named for marian's extension sniffing
+    pool.tsv            2-col src \t tgt, every register, pairing preserved
+    pool.<register>.tsv  the same split by register, always all five
+    vocab.spm           joint SPM, named for marian's extension sniffing
+
+The per-register split is what lets the KD sampler hit absolute targets instead
+of drawing proportionally, which is how UI text disappeared from the en->tl
+corpus entirely (~4k lines of 10M against 63.5M lines of NLLB).
 
 Setup (on the box):
     python3 -m venv venv
@@ -39,16 +45,7 @@ from pathlib import Path
 
 import fasttext
 
-# corpora worth keeping for MT (skip Ubuntu/GNOME/translatewiki/ELRC*: localization
-# junk; ParaCrawl-Bonus: dup of ParaCrawl). XLEnt/WikiTitles are entity/title
-# pairs — useless as sentences, but without them the model has almost no 1-2
-# word training pairs and free-runs on short inputs ("hallo" -> "Hello in the
-# hello"); mozilla's short-sentences fix is exactly these datasets.
-ALLOWLIST = {
-    "NLLB", "CCAligned", "CCMatrix", "OpenSubtitles", "ParaCrawl", "WikiMatrix",
-    "wikimedia", "bible-uedin", "TED2020", "tico-19", "Tatoeba", "QED",
-    "XLEnt", "WikiTitles", "LinguaTools-WikiTitles",
-}
+from registers import PRECEDENCE, REGISTER, Register, apply_extra
 URL_RE = re.compile(r"(https://\S+/OPUS-([^/]+)/\S+/moses/\S+\.txt\.zip)")
 # opus_get prints this to stdout and exits 0 when the API call fails.
 API_FAIL = "Unable to retrieve the data from"
@@ -65,7 +62,7 @@ def _opus_list(venv_bin: Path, src: str, tgt: str) -> tuple[dict[str, str], bool
         if not m:
             continue
         url, name = m.group(1), m.group(2)
-        if name in ALLOWLIST and name not in seen:
+        if name in REGISTER and name not in seen:
             seen[name] = url
     return seen, API_FAIL in out.stdout
 
@@ -138,6 +135,7 @@ DEESCAPE = [
 FOOTNOTE = re.compile(r"\[[0-9]+\]")
 WIKILINK = re.compile(r"\[\[(?:.+?\|)?(.+?)\]\]")
 HEADING = re.compile(r"(==+)(.+?)\1")
+WIKI_EMPHASIS = re.compile(r"'{2,5}")
 WIKI_CODE = re.compile(r"\.mw-parser-output")
 URL = re.compile(
     r"https?://(?:www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b"
@@ -163,7 +161,11 @@ def deescape(s: str) -> str:
 def fix_wiki(s: str) -> str:
     s = FOOTNOTE.sub("", s)
     s = WIKILINK.sub(r"\1", s)
-    return HEADING.sub("", s)
+    s = HEADING.sub("", s)
+    # ''italic'' / '''bold''' emphasis. Here rather than in the UI filter because
+    # it is wiki markup, and wikimedia/WikiMatrix carry it too — 159 lines reached
+    # pool.ui as "'''Error:''' no page title was specified."
+    return WIKI_EMPHASIS.sub("", s)
 
 
 def alpha_ratio_ok(s: str, word_ratio: float, alpha_ratio: float) -> bool:
@@ -246,10 +248,13 @@ def _init_worker(lid_model: str, args) -> None:
 def _clean_batch(task: tuple[str, list]) -> tuple[str, int, list[str]]:
     name, rows = task
     args = _WORKER_ARGS
+    register = REGISTER[name]
     src_buf: list[str] = []
     tgt_buf: list[str] = []
     for bs, bt in rows:
         pair = clean_pair(bs.decode("utf-8", "replace"), bt.decode("utf-8", "replace"), args)
+        if pair:
+            pair = apply_extra(register, *pair)
         if pair:
             src_buf.append(pair[0])
             tgt_buf.append(pair[1])
@@ -292,7 +297,65 @@ def read_batches(urls, raw: Path, pair: str, src: str, tgt: str, skip_download: 
         zp.unlink()  # reclaim disk immediately
 
 
-def finish(args, pair: str, src_gz: Path, tgt_gz: Path, spm_prefix: Path | None) -> None:
+def dedup_by_precedence(clean: Path, tmp: Path, sort_mem: str, jobs: int) -> dict[Register, Path]:
+    """Deduplicate ACROSS registers, keeping the highest-precedence copy.
+
+    Per-register `sort -u` would leave a pair present in both HUMAN and CRAWL to
+    be drawn twice by the sampler, once from each. Which copy survives is not
+    arbitrary: a human-checked line beats a mined copy of the same text, and a UI
+    string beats the same string scraped into a crawl, so the rank rides along
+    and the first row per (src, tgt) wins.
+    """
+    tagged = clean / "tagged.tsv"
+    with open(tagged, "w", encoding="utf-8") as w:
+        for rank, register in enumerate(PRECEDENCE):
+            part = clean / f"all.{register.value}.tsv"
+            if not part.exists():
+                continue
+            with open(part, encoding="utf-8") as f:
+                for line in f:
+                    w.write(f"{rank}\t{register.value}\t{line}")
+            part.unlink()
+
+    ranked = clean / "ranked.tsv"
+    env = {**os.environ, "LC_ALL": "C"}
+    with open(ranked, "w") as out:
+        subprocess.run(
+            ["sort", "-t", "\t", "-k3,3", "-k4,4", "-k1,1n", "-S", sort_mem,
+             "--parallel", str(jobs), "-T", str(tmp), str(tagged)],
+            check=True, stdout=out, env=env,
+        )
+    tagged.unlink()
+
+    paths = {r: clean / f"dedup.{r.value}.tsv" for r in Register}
+    handles = {r: open(p, "w", encoding="utf-8") for r, p in paths.items()}
+    kept = {r: 0 for r in Register}
+    try:
+        previous = None
+        with open(ranked, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 4:
+                    continue
+                _, register, s, t = parts
+                if (s, t) == previous:
+                    continue
+                previous = (s, t)
+                r = Register(register)
+                handles[r].write(f"{s}\t{t}\n")
+                kept[r] += 1
+    finally:
+        for h in handles.values():
+            h.close()
+    ranked.unlink()
+
+    for r in PRECEDENCE:
+        print(f"[{r.value}] {kept[r]} pairs after cross-register dedup", file=sys.stderr)
+    return paths
+
+
+def finish(args, pair: str, src_gz: Path, tgt_gz: Path, spm_prefix: Path | None,
+           register_files: dict[Register, Path] | None = None) -> None:
     """Emit the step's REAL outputs: the 2-col pool, the marian-loadable vocab.
 
     This used to live in prep_step.sh, which made a partial prep runnable — and
@@ -316,6 +379,22 @@ def finish(args, pair: str, src_gz: Path, tgt_gz: Path, spm_prefix: Path | None)
             w.write(f"{s.rstrip(chr(10))}\t{t.rstrip(chr(10))}\n")
             n += 1
     print(f"  pool {pool} ({n} pairs)", file=sys.stderr)
+
+    # Per-register pools alongside the combined one. A tag COLUMN on pool.tsv
+    # would have been the other option, but every existing consumer reads it as
+    # 2-col (build_kd_source.sh asserts NF == 2), and separate files make the
+    # sampler a per-file draw instead of a filtered scan of 47M lines.
+    # Always all five, empty ones included: a pair with no UI corpus must still
+    # produce the file, or the step output is missing and the run fails on
+    # something that is a legitimate (and recorded) outcome.
+    for register in Register:
+        dest = out / f"pool.{register.value}.tsv"
+        source = (register_files or {}).get(register)
+        if source is not None and source.exists():
+            shutil.copyfile(source, dest)
+        else:
+            dest.write_text("", encoding="utf-8")
+        print(f"  pool.{register.value} {sum(1 for _ in dest.open())} pairs", file=sys.stderr)
 
     if spm_prefix is not None:
         vocab = out / "vocab.spm"
@@ -379,60 +458,56 @@ def main() -> None:
         sys.exit(f"no OPUS moses corpora resolved for {src}-{tgt}")
     print(f"corpora for {src}-{tgt}: {', '.join(n for n, _ in urls)}", file=sys.stderr)
 
-    all_tsv = clean / f"all.{pair}.tsv"
     kept_by: dict[str, int] = {n: 0 for n, _ in urls}
     seen_by: dict[str, int] = {n: 0 for n, _ in urls}
     batches = read_batches(urls, raw, pair, src, tgt, args.skip_download)
     max_inflight = args.jobs * 4  # bound queued batches so a huge corpus can't blow up RAM
 
-    def collect(sink, inflight, drain_all: bool) -> None:
+    def collect(sinks, inflight, drain_all: bool) -> None:
         while inflight and (drain_all or len(inflight) >= max_inflight):
             name, seen, kept = inflight.popleft().get()
             seen_by[name] += seen
             kept_by[name] += len(kept)
+            sink = sinks[REGISTER[name]]
             for line in kept:
                 sink.write(line + "\n")
             print(f"  cleaned {sum(seen_by.values())}", end="\r", file=sys.stderr)
 
-    with open(all_tsv, "w", encoding="utf-8") as sink, \
-            Pool(args.jobs, initializer=_init_worker, initargs=(args.lid_model, args)) as pool:
-        inflight: deque = deque()
-        for task in batches:
-            inflight.append(pool.apply_async(_clean_batch, (task,)))
-            collect(sink, inflight, drain_all=False)
-        collect(sink, inflight, drain_all=True)
+    sinks = {r: open(clean / f"all.{r.value}.tsv", "w", encoding="utf-8") for r in Register}
+    try:
+        with Pool(args.jobs, initializer=_init_worker, initargs=(args.lid_model, args)) as pool:
+            inflight: deque = deque()
+            for task in batches:
+                inflight.append(pool.apply_async(_clean_batch, (task,)))
+                collect(sinks, inflight, drain_all=False)
+            collect(sinks, inflight, drain_all=True)
+    finally:
+        for h in sinks.values():
+            h.close()
     for name in kept_by:
-        print(f"[{name}] kept {kept_by[name]}/{seen_by[name]}", file=sys.stderr)
+        print(f"[{name}] ({REGISTER[name].value}) kept {kept_by[name]}/{seen_by[name]}", file=sys.stderr)
     total_kept, total_seen = sum(kept_by.values()), sum(seen_by.values())
 
-    dedup_tsv = clean / f"dedup.{pair}.tsv"
-    print(f"dedup {total_kept} pairs -> sort -u", file=sys.stderr)
-    env = {**os.environ, "LC_ALL": "C"}
-    with open(dedup_tsv, "w") as out:
-        subprocess.run(
-            ["sort", "-u", "-S", args.sort_mem, "--parallel", str(os.cpu_count() or 4),
-             "-T", str(tmp), str(all_tsv)],
-            check=True, stdout=out, env=env,
-        )
-    all_tsv.unlink()
+    print(f"dedup {total_kept} pairs across registers", file=sys.stderr)
+    register_files = dedup_by_precedence(clean, tmp, args.sort_mem, os.cpu_count() or 4)
 
     src_gz = clean / f"train.{pair}.{src}.gz"
     tgt_gz = clean / f"train.{pair}.{tgt}.gz"
     n_final = 0
-    with open(dedup_tsv, encoding="utf-8") as f, \
-            gzip.open(src_gz, "wt", encoding="utf-8") as fs, \
+    with gzip.open(src_gz, "wt", encoding="utf-8") as fs, \
             gzip.open(tgt_gz, "wt", encoding="utf-8") as ft:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 2:
-                continue
-            fs.write(parts[0] + "\n")
-            ft.write(parts[1] + "\n")
-            n_final += 1
-    dedup_tsv.unlink()
+        for register in PRECEDENCE:
+            with open(register_files[register], encoding="utf-8") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) != 2:
+                        continue
+                    fs.write(parts[0] + "\n")
+                    ft.write(parts[1] + "\n")
+                    n_final += 1
 
     if args.skip_spm:
-        finish(args, pair, src_gz, tgt_gz, spm_prefix=None)
+        finish(args, pair, src_gz, tgt_gz, spm_prefix=None, register_files=register_files)
         print(f"\nDONE {pair}: {n_final} pairs (from {total_seen} raw), SPM skipped", file=sys.stderr)
         return
 
@@ -455,7 +530,7 @@ def main() -> None:
     )
     corpus_txt.unlink()
 
-    finish(args, pair, src_gz, tgt_gz, spm_prefix)
+    finish(args, pair, src_gz, tgt_gz, spm_prefix, register_files)
     print(f"\nDONE {pair}: {n_final} pairs (from {total_seen} raw)", file=sys.stderr)
 
 

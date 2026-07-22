@@ -11,6 +11,7 @@ teacher was eyeballed on, saving outputs for a head-to-head.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -23,6 +24,7 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
     image=NLLB,
     target=Vast(gpu="RTX_4090", max_hours=2, disk_gb=80, tries=8, geo=EU, min_cuda=12.1),
     script="hy_mt2.sh",
+    deps=deps.HY_MT2,
     outputs={"hyp": Output(rel="hymt2_out.en", kind=Kind.LINES)},
 )
 def hymt2(ctx: Ctx) -> list[str]:

@@ -14,6 +14,7 @@ on, so the comparison is head-to-head. No SFT — just the CPT base, few-shot.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -26,6 +27,7 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
     image=NLLB,
     target=Vast(gpu="RTX_4090", max_hours=2, disk_gb=60, tries=8, geo=EU, min_cuda=12.1),
     script="gemma_fewshot.sh",
+    deps=deps.GEMMA,
     outputs={"hyp": Output(rel="gemma_out.en", kind=Kind.LINES)},
 )
 def gemma(ctx: Ctx) -> list[str]:

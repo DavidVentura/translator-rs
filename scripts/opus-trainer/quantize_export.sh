@@ -28,6 +28,12 @@ if [[ "$VOCAB" != *.spm ]]; then
   ln -sf "$VOCAB" "$OUT/vocab.spm" && VOCAB="$OUT/vocab.spm"
 fi
 
+# Same for the model: marian sniffs .npz/.bin by extension and aborts on a bare
+# name ("Unknown model format for file"), which is how the entl v4 pack failed.
+if [[ "$MODEL" != *.npz && "$MODEL" != *.bin ]]; then
+  ln -sf "$MODEL" "$OUT/model.npz" && MODEL="$OUT/model.npz"
+fi
+
 # 1) collect typical quantization multipliers by decoding a sample (beam 1)
 "$BMT/marian-decoder" --models "$MODEL" --vocabs "$VOCAB" "$VOCAB" \
   --config "$HERE/configs/quantize.decoder.yml" \

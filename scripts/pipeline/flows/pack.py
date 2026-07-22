@@ -9,6 +9,7 @@ the aligned corpus sides, and a FLORES source devtest.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.artstore import StoredWrapper
 from pipe.step import Ctx, Output, Run, StepDef, step
 from pipe.target import Bigserver
@@ -29,6 +30,7 @@ SHORTLIST_MAX_LINES = 2_000_000
     image=BMT,
     target=Bigserver(cpus=2),
     script="quantize_export.sh",
+    deps=deps.QUANTIZE,
     outputs={"model_bin": Output(rel="model.intgemm.alphas.bin", kind=Kind.BLOB)},
 )
 def quantize(ctx: Ctx) -> list[str]:

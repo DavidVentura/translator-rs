@@ -45,6 +45,7 @@ GPU-hour after that point is spent distilling a known-bad model.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver
 from pipe.types import Artifact, Kind
@@ -75,6 +76,7 @@ def require_check_set(run: Run) -> tuple[Artifact, Artifact]:
     image=EVAL,
     target=Bigserver(cpus=16),
     script="eval_score.sh",
+    deps=deps.EVAL_SCORE,
     outputs={
         "metrics": Output(rel="metrics.json", kind=Kind.BLOB),
         "review": Output(rel="review.txt", kind=Kind.BLOB),
@@ -130,6 +132,7 @@ def _student_step(lang: str, src: str):
         image=EVAL,
         target=Bigserver(cpus=16),
         script="student_eval.sh",
+        deps=deps.STUDENT_EVAL,
         outputs={
             "metrics": Output(rel="metrics.json", kind=Kind.BLOB),
             "check_hyp": Output(rel="check.hyp", kind=Kind.LINES),

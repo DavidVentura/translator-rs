@@ -11,6 +11,7 @@ CPU (int8 NLLB-1.3B on CPU is too slow to be worth it).
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -23,6 +24,7 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
     image=NLLB,
     target=Vast(gpu="RTX_4090", max_hours=1, disk_gb=60, tries=8, geo=EU, min_cuda=12.1),
     script="nllb_flores.sh",
+    deps=deps.KD_DECODE,
     outputs={"hyp": Output(rel="nllb_teacher.en", kind=Kind.LINES)},
 )
 def teacher(ctx: Ctx) -> list[str]:

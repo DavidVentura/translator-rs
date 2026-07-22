@@ -25,7 +25,7 @@ ledger would re-run the lost-update race it fixes.
 
 from __future__ import annotations
 
-from pipe import evalsteps
+from pipe import deps, evalsteps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -49,9 +49,15 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
 # (212,157 w/s x 253.36s / 1000 updates), so the 2-GPU batch scores a ratio of 2
 # and gets 2x lr, including during warmup since the ramp targets the scaled rate.
 #
-# VERIFY EARLY: the 1-GPU run logged L.r. 1.8750e-05 at Up.1000. This run must
-# show ~3.75e-05 there. If it does not, the reference units are wrong and the
-# correction is off by a factor of two — do not wait for the CE to tell you.
+# DO NOT verify the correction by the logged L.r. — it does NOT show the scaling.
+# marian logs the SCHEDULED rate (warmup x decay x base = 0.0003 x 1000/16000 =
+# 1.875e-05 at Up.1000) and applies mbSize/refMBWords INSIDE the optimizer,
+# invisible to the log. The successful tl2gpu run and the 1-GPU control both
+# logged 1.8750e-05 at Up.1000; an earlier comment here claimed this run "must
+# show 3.75e-05", which is FALSE and cost a false alarm on the v4 launch.
+# The correction shows up in the CE trajectory, not the lr: uncorrected 2-GPU hit
+# ce 4.095 at Up.5000, corrected hit 3.126. Verify there, or just confirm the
+# marian command carries `--mini-batch-words-ref 53752 --sync-sgd`.
 MARIAN_EXTRA = ("--fp16 --workspace 12000 --mini-batch 4000 --sync-sgd "
                 "--mini-batch-words-ref 53752")
 DEVICES = "0 1"
@@ -62,6 +68,12 @@ DEVICES = "0 1"
     target=Vast(gpu="RTX_4090", num_gpus=2, max_hours=12, disk_gb=80,
                 tries=8, geo=EU, min_cuda=11.8),
     script="train_eval.sh",
+    # The training behaviour lives in train_student.sh and the three configs, not
+    # in the six-line train_eval.sh wrapper. Without them in the key, the
+    # early-stopping-epsilon fix (which aborted the v4 launch) would re-run from
+    # the memo with the broken config; and any future config edit would be
+    # invisible. This is the config-not-in-key gap, closed for this step.
+    deps=deps.TRAIN_EVAL,
     outputs={
         "model": Output(rel="model.npz.best-ce-mean-words.npz", kind=Kind.BLOB),
         "flores_hyp": Output(rel="flores.hyp", kind=Kind.LINES),

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver, Vast
 from pipe.types import Kind
@@ -45,6 +46,10 @@ def split_kd(ctx: Ctx) -> list[str]:
     image=HYKD,
     target=Vast(gpu="RTX_4090", max_hours=6, disk_gb=60, tries=8, geo=EU, min_cuda=12.1),
     script="vllm_kd.sh",
+    # vllm_kd.sh is an argv adapter; vllm_kd.py is what decides how the teacher is
+    # prompted and batched. Without it in the key, a change to the decode would be
+    # served from the memo (see pipe.step.step docstring).
+    deps=deps.VLLM_KD,
     outputs={"targets": Output(rel="targets", kind=Kind.LINES)},
 )
 def kd_decode(ctx: Ctx) -> list[str]:

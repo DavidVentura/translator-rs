@@ -13,6 +13,7 @@ real decode commits it into the shard step keys.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -25,6 +26,7 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
     image=NLLB,
     target=Vast(gpu="RTX_4090", max_hours=1, disk_gb=40, tries=8, geo=EU, min_cuda=12.1),
     script="bench_batch.sh",
+    deps=deps.BENCH_BATCH,
     outputs={"table": Output(rel="table.txt", kind=Kind.LINES)},
 )
 def bench(ctx: Ctx) -> list[str]:

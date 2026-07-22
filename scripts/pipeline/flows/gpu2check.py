@@ -23,6 +23,7 @@ should carry probe-sized inputs.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -38,6 +39,7 @@ EU = ("FR", "HU", "PL", "UA", "DE", "NL", "CZ", "AT", "RO", "BG", "IT", "ES", "P
     target=Vast(gpu="RTX_4090", num_gpus=2, max_hours=2, disk_gb=60,
                 tries=8, geo=EU, min_cuda=11.8),
     script="gpu2_validate.sh",
+    deps=deps.VALIDATE,
     outputs={"report": Output(rel="report.txt", kind=Kind.BLOB)},
 )
 def gpu2(ctx: Ctx) -> list[str]:

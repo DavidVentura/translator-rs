@@ -18,6 +18,7 @@ output is READ, not scored.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -31,6 +32,7 @@ MODEL = "tencent/Hy-MT2-7B-FP8"
     image=HYKD,
     target=Vast(gpu="RTX_4090", max_hours=2, disk_gb=60, tries=8, geo=EU, min_cuda=12.1),
     script="probe_gate.sh",
+    deps=deps.PROBE_GATE,
     outputs={
         "en2tl": Output(rel="probe/en2tl.hyp", kind=Kind.LINES),
         "tl2en": Output(rel="probe/tl2en.hyp", kind=Kind.LINES),

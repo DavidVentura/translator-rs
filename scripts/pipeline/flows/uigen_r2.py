@@ -68,6 +68,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flows.pack import build_pack
+from pipe import deps
 from pipe.artstore import StoredWrapper
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Bigserver, Vast
@@ -175,6 +176,7 @@ def align(ctx: Ctx) -> list[str]:
     image=CUDA,
     target=Vast(gpu="RTX_4090", max_hours=10, disk_gb=60, tries=8, geo=EU, min_cuda=11.8),
     script="train_student.sh",
+    deps=deps.TRAIN_STUDENT,
     outputs={"model": Output(rel="model/model.npz.best-ce-mean-words.npz", kind=Kind.BLOB)},
 )
 def train(ctx: Ctx) -> list[str]:

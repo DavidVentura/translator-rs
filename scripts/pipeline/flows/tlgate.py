@@ -24,6 +24,7 @@ measured by one scorer and unbabel-comet never enters the vLLM image.
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -39,6 +40,7 @@ LIMIT = "300"
     image=HYKD,
     target=Vast(gpu="RTX_4090", max_hours=2, disk_gb=60, tries=8, geo=EU, min_cuda=12.1),
     script="hy_gate.sh",
+    deps=deps.HY_GATE,
     outputs={
         "scores": Output(rel="hy_tl_gate.txt", kind=Kind.LINES),
         "en_tl_hyp": Output(rel="hyp/eng_Latn-tgl_Latn.hyp", kind=Kind.LINES),

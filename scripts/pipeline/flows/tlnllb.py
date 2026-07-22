@@ -19,6 +19,7 @@ probe lines is minutes).
 
 from __future__ import annotations
 
+from pipe import deps
 from pipe.step import Ctx, Output, Run, step
 from pipe.target import Vast
 from pipe.types import Kind
@@ -42,6 +43,7 @@ def _outputs() -> dict[str, Output]:
     image=NLLB,
     target=Vast(gpu="RTX_4090", max_hours=3, disk_gb=80, tries=8, geo=EU, min_cuda=12.1),
     script="nllb_all.sh",
+    deps=deps.NLLB_ALL,
     outputs=_outputs(),
 )
 def nllb(ctx: Ctx) -> list[str]:
