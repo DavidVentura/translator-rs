@@ -6,6 +6,7 @@
 //! feature provides the conversion to/from `unicode_script::Script`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Script {
     Latin,
     Cyrillic,

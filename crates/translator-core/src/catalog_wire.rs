@@ -450,10 +450,9 @@ fn compile_language_info(
             code: code.clone(),
             display_name: entry.meta.name,
             short_display_name: entry.meta.short_name,
-            script: entry.meta.script,
+            script,
             dictionary_code,
         },
-        script,
         resources,
         tts: compile_tts_config(entry.tts),
     })

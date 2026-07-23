@@ -41,7 +41,7 @@ use crate::api::VoiceName;
 #[cfg(feature = "tts")]
 use crate::catalog::{InstalledTtsPack, installed_tts_voices_for_language};
 #[cfg(feature = "tts")]
-use crate::tts::{PcmAudio, SpeechChunk, TtsVoiceOption};
+use crate::tts::{PcmAudio, SpeechChunk, TtsVoiceOption, UrlsAndHashtags};
 #[cfg(feature = "tts")]
 use translator_tts::engine::TtsEngine;
 
@@ -206,13 +206,9 @@ impl TranslatorSession {
     /// Every available language paired with its catalog script, for callers
     /// that pick fonts or detect a source language.
     pub fn available_languages(&self) -> Vec<translator_core::api::ScriptedLanguage> {
-        let snap = self.snapshot();
         self.language_rows()
             .into_iter()
-            .filter_map(|row| {
-                snap.catalog
-                    .scripted_language(&LanguageCode::from(row.language.code.as_str()))
-            })
+            .map(|row| row.language.scripted())
             .collect()
     }
 
@@ -685,14 +681,14 @@ impl TranslatorSession {
         language_code: &str,
         text: &str,
         pack_id: Option<&str>,
-        read_urls_and_hashtags: bool,
+        urls_and_hashtags: UrlsAndHashtags,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
         self.tts.plan_speech_chunks(
             &self.snapshot(),
             &LanguageCode::from(language_code),
             text,
             pack_id,
-            read_urls_and_hashtags,
+            urls_and_hashtags,
         )
     }
 
@@ -730,7 +726,8 @@ impl TranslatorSession {
             let mucab_path_str = mucab_path
                 .exists()
                 .then(|| mucab_path.to_string_lossy().into_owned());
-            let source_script = crate::api::ScriptCode::from(language.script.clone());
+            // A script this build cannot name is one it cannot romanize either.
+            let source_script = crate::api::ScriptCode::from(language.script.iso15924()?);
             let target_script = crate::api::ScriptCode::from("Latn");
             crate::transliterate::transliterate_with_policy_for_language(
                 text,

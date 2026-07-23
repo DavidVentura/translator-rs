@@ -133,4 +133,4 @@ pub use translate::{
     TokenAlignment, TranslationWithAlignment, TranslationWithAlternatives, WordAlternative,
     WordAlternatives,
 };
-pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption};
+pub use tts::{PcmAudio, SpeechChunk, TtsVoiceOption, UrlsAndHashtags};

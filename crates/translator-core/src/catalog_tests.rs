@@ -216,11 +216,8 @@ fn language_info(
     tts_regions: Vec<(&str, &str, Vec<&str>)>,
     default_region: Option<&str>,
 ) -> LanguageInfo {
-    let script = crate::script::Script::from_iso15924(&language.script)
-        .unwrap_or(crate::script::Script::Other);
     LanguageInfo {
         language,
-        script,
         resources: LanguageResources {
             translation_root_packs: translation_root_packs
                 .into_iter()
@@ -257,14 +254,14 @@ fn base_catalog() -> LanguageCatalog {
         code: "en".to_string(),
         display_name: "English".to_string(),
         short_display_name: "English".to_string(),
-        script: "Latn".to_string(),
+        script: crate::script::Script::Latin,
         dictionary_code: "en".to_string(),
     };
     let spanish = Language {
         code: "es".to_string(),
         display_name: "Spanish".to_string(),
         short_display_name: "Spanish".to_string(),
-        script: "Latn".to_string(),
+        script: crate::script::Script::Latin,
         dictionary_code: "es".to_string(),
     };
 

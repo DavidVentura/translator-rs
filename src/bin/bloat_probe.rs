@@ -51,7 +51,8 @@ fn main() {
             let _ = session.lookup_dictionary("en", "hello");
             let _ = session.available_tts_voices("en");
             let _ = session.warm_tts_model("en");
-            let _ = session.plan_speech_chunks("en", "hello", None, false);
+            let _ =
+                session.plan_speech_chunks("en", "hello", None, translator::UrlsAndHashtags::Skip);
             let _ = session.synthesize_pcm("en", "hello", 1.0, None, false, None);
             let _ = session.transliterate("hello", "ja");
 

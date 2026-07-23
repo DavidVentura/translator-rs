@@ -48,6 +48,14 @@ pub struct SpeechChunk {
     pub pause_after_ms: Option<i32>,
 }
 
+/// Whether a voice speaks URLs and hashtags or passes over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum UrlsAndHashtags {
+    Read,
+    Skip,
+}
+
 const CLAUSE_PAUSE_MS: i32 = 0;
 const SENTENCE_PAUSE_MS: i32 = 0;
 const PARAGRAPH_PAUSE_MS: i32 = 0;

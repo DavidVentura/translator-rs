@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
 use translator_core::catalog::CatalogSnapshot;
-use translator_core::tts::{PcmAudio, SpeechChunk, TtsVoiceOption};
+use translator_core::tts::{PcmAudio, SpeechChunk, TtsVoiceOption, UrlsAndHashtags};
 
 use crate::speech::{
     SpeechCache, available_tts_voices_in_snapshot, plan_speech_chunks_for_text_in_snapshot,
@@ -50,7 +50,7 @@ impl TtsEngine {
         language: &LanguageCode,
         text: &str,
         pack_id: Option<&str>,
-        read_urls_and_hashtags: bool,
+        urls_and_hashtags: UrlsAndHashtags,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
         let mut cache = self.cache.lock().expect("speech cache poisoned");
         plan_speech_chunks_for_text_in_snapshot(
@@ -59,7 +59,7 @@ impl TtsEngine {
             language,
             text,
             pack_id,
-            read_urls_and_hashtags,
+            urls_and_hashtags,
         )
     }
 

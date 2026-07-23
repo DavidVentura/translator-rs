@@ -40,7 +40,7 @@ pub struct Language {
     pub code: String,
     pub display_name: String,
     pub short_display_name: String,
-    pub script: String,
+    pub script: crate::script::Script,
     pub dictionary_code: String,
 }
 
@@ -61,6 +61,13 @@ impl Hash for Language {
 impl Language {
     pub fn is_english(&self) -> bool {
         self.code == "en"
+    }
+
+    pub fn scripted(&self) -> crate::api::ScriptedLanguage {
+        crate::api::ScriptedLanguage {
+            code: crate::api::LanguageCode::from(self.code.as_str()),
+            script: self.script,
+        }
     }
 }
 
@@ -95,10 +102,11 @@ mod tests {
             code: "en".to_string(),
             display_name: "English".to_string(),
             short_display_name: "English".to_string(),
-            script: "Latn".to_string(),
+            script: crate::script::Script::Latin,
             dictionary_code: "en".to_string(),
         };
 
         assert!(language.is_english());
+        assert_eq!(language.scripted().script, crate::script::Script::Latin);
     }
 }

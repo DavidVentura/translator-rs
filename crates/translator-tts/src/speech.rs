@@ -10,7 +10,8 @@ use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
 use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
 use translator_core::script::Script;
 use translator_core::tts::{
-    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, plan_speech_chunks,
+    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, UrlsAndHashtags,
+    plan_speech_chunks,
 };
 
 fn log_debug(message: impl AsRef<str>) {
@@ -421,7 +422,7 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
     language_code: &LanguageCode,
     text: &str,
     pack_id: Option<&str>,
-    read_urls_and_hashtags: bool,
+    urls_and_hashtags: UrlsAndHashtags,
 ) -> Result<Vec<SpeechChunk>, TranslatorError> {
     let assets = resolve_speech_assets_for_pack(snapshot, language_code, pack_id)
         .ok_or_else(|| missing_tts_asset(language_code))?;
@@ -434,7 +435,7 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
         &assets.language_code,
         assets.script,
         text,
-        read_urls_and_hashtags,
+        urls_and_hashtags,
     )
     .map_err(TranslatorError::tts)
 }
@@ -988,12 +989,11 @@ fn plan_speech_chunks_for_text(
     language_code: &str,
     script: Script,
     text: &str,
-    read_urls_and_hashtags: bool,
+    urls_and_hashtags: UrlsAndHashtags,
 ) -> Result<Vec<SpeechChunk>, String> {
-    let filtered = if read_urls_and_hashtags {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(strip_urls_and_hashtags(text))
+    let filtered = match urls_and_hashtags {
+        UrlsAndHashtags::Read => Cow::Borrowed(text),
+        UrlsAndHashtags::Skip => Cow::Owned(strip_urls_and_hashtags(text)),
     };
     let text = romanize_foreign_runs_for_voice(&filtered, script);
     plan_speech_chunks(&text, |chunk_text| {
