@@ -1362,12 +1362,19 @@ impl PpocrEngine {
             // for a single contributing chunk (multi-chunk fractions are chunk-local) on a
             // non-RTL line (RTL reverses visual→logical, breaking the firing order). Edge
             // whitespace trimmed from `text` is fine: it never forms a word unit.
-            let firings: Vec<translator_core::ocr::CharFiring> =
-                if text.is_empty() || scripts[idx].is_rtl() {
-                    Vec::new()
-                } else {
-                    stitch_chunk_firings(&contrib_chunks, &rec_chunks, &results)
-                };
+            // Visual-order firings (1:1 with the visually-ordered glyphs) drive the selectable
+            // source-word geometry and stay populated for RTL. `firings` (logical order, for style
+            // pooling) drops RTL, where the visual→logical reversal breaks the 1:1 alignment.
+            let visual_firings: Vec<translator_core::ocr::CharFiring> = if text.is_empty() {
+                Vec::new()
+            } else {
+                stitch_chunk_firings(&contrib_chunks, &rec_chunks, &results)
+            };
+            let firings: Vec<translator_core::ocr::CharFiring> = if scripts[idx].is_rtl() {
+                Vec::new()
+            } else {
+                visual_firings.clone()
+            };
             lines.push(translator_core::ocr::RecognizedTextLine {
                 rect: boxes[idx].rect,
                 oriented_box: boxes[idx].oriented_box,
@@ -1375,6 +1382,7 @@ impl PpocrEngine {
                 confidence,
                 source_code: None,
                 firings,
+                visual_firings,
             });
         }
         log::info!(
@@ -1432,7 +1440,7 @@ fn normalize_rec_text_for_script(script: PpocrScript, text: String) -> String {
 /// common shared punctuation — stay forward; every other character is its own unit.
 /// Reversing the sequence of units flips the RTL script (and overall word order) while
 /// keeping embedded Latin words and numbers readable.
-fn reverse_visual_to_logical(text: &str) -> String {
+pub(crate) fn reverse_visual_to_logical(text: &str) -> String {
     fn is_ltr_run_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, ' ' | ':' | '*' | '.' | '/' | '%' | '+' | '-')
     }

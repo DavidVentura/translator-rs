@@ -334,7 +334,13 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         reading_order,
         ink_union.as_deref(),
     )?;
-    overlay.source_words = translator_core::ocr::order_words_visually(source_words);
+    let rtl_lines: std::collections::HashSet<u32> = scripts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_rtl())
+        .map(|(i, _)| i as u32)
+        .collect();
+    overlay.source_words = translator_core::ocr::order_words_visually(source_words, &rtl_lines);
     Ok(overlay)
 }
 
@@ -350,11 +356,30 @@ fn still_source_words(
         .enumerate()
         .flat_map(|(i, line)| {
             let firings: Vec<(char, f32)> = line
-                .firings
+                .visual_firings
                 .iter()
                 .map(|f| (char::from_u32(f.ch).unwrap_or('\u{fffd}'), f.at))
                 .collect();
-            let is_cjk = scripts.get(i).copied() == Some(PpocrScript::Cj);
+            let script = scripts.get(i).copied();
+            if script.is_some_and(|s| s.is_rtl()) {
+                // The firings are in visual (left-to-right) order, so carve the boxes against the
+                // visual text (`reverse_visual_to_logical` is its own inverse), then flip each
+                // word's glyphs back to logical for the copied text. Word order is handled later
+                // by `order_words_visually` reversing the RTL line.
+                let visual_text = crate::ppocr::reverse_visual_to_logical(&line.text);
+                let mut words = translator_raster::text_metrics::firing_word_boxes(
+                    &visual_text,
+                    &firings,
+                    false,
+                    &line.oriented_box,
+                    i as u32,
+                );
+                for w in &mut words {
+                    w.text = crate::ppocr::reverse_visual_to_logical(&w.text);
+                }
+                return words;
+            }
+            let is_cjk = script == Some(PpocrScript::Cj);
             translator_raster::text_metrics::firing_word_boxes(
                 &line.text,
                 &firings,

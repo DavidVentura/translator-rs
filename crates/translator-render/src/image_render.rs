@@ -119,7 +119,8 @@ pub fn render_overlay(
         }
     }
 
-    let translated_words = translator_core::ocr::order_words_visually(carver.words);
+    let translated_words =
+        translator_core::ocr::order_words_visually(carver.words, &std::collections::HashSet::new());
     Ok(RenderedOverlay {
         rgba_bytes: canvas,
         translated_words,

@@ -557,7 +557,16 @@ pub struct PositionedWord {
 /// by their cross-reading position, words within a line by reading position. The detection/block
 /// grouping order isn't visually monotonic, so callers (drag-to-select) get this so a contiguous
 /// range is contiguous on screen — keeping the ordering in the crate, not each consumer.
-pub fn order_words_visually(words: Vec<PositionedWord>) -> Vec<PositionedWord> {
+///
+/// Lines whose `line_index` is in `rtl_lines` read right-to-left, so their words are put into
+/// logical order by [`bidi_reorder_rtl_line`]: the line is reversed, but each embedded run of
+/// left-to-right words (Latin, digits) keeps its internal order. A contiguous index range still
+/// maps to a visually-contiguous run, so drag-select stays intuitive while list order joins to
+/// logical (not screen-left-to-right) text.
+pub fn order_words_visually(
+    words: Vec<PositionedWord>,
+    rtl_lines: &std::collections::HashSet<u32>,
+) -> Vec<PositionedWord> {
     fn cross(b: &OrientedRect) -> f32 {
         -b.cx * b.angle_radians.sin() + b.cy * b.angle_radians.cos()
     }
@@ -576,6 +585,12 @@ pub fn order_words_visually(words: Vec<PositionedWord>) -> Vec<PositionedWord> {
                 .partial_cmp(&read(&b.bounds))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        if line
+            .first()
+            .is_some_and(|w| rtl_lines.contains(&w.line_index))
+        {
+            bidi_reorder_rtl_line(line);
+        }
     }
     lines.sort_by(|a, b| {
         let ca = a.iter().map(|w| cross(&w.bounds)).fold(f32::MAX, f32::min);
@@ -583,6 +598,44 @@ pub fn order_words_visually(words: Vec<PositionedWord>) -> Vec<PositionedWord> {
         ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
     });
     lines.into_iter().flatten().collect()
+}
+
+fn is_rtl_char(c: char) -> bool {
+    matches!(c as u32,
+        0x0590..=0x05FF   // Hebrew
+        | 0x0600..=0x06FF // Arabic
+        | 0x0750..=0x077F // Arabic Supplement
+        | 0x08A0..=0x08FF // Arabic Extended-A
+        | 0xFB1D..=0xFB4F // Hebrew presentation forms
+        | 0xFB50..=0xFDFF // Arabic presentation forms-A
+        | 0xFE70..=0xFEFF // Arabic presentation forms-B
+    )
+}
+
+/// A word carries the right-to-left base direction only if it contains a strong RTL character;
+/// Latin/digit/punctuation-only words are left-to-right and keep their order inside an RTL line.
+fn word_is_ltr(text: &str) -> bool {
+    !text.chars().any(is_rtl_char)
+}
+
+/// Put a right-to-left line's words (given in visual left-to-right order) into logical order:
+/// reverse the whole line, then restore the internal order of each maximal run of LTR words. This
+/// is the word-level analogue of the character-level `reverse_visual_to_logical` in the recognizer,
+/// so an embedded `Play Services` reads forward while the surrounding RTL words read right-to-left.
+fn bidi_reorder_rtl_line(line: &mut [PositionedWord]) {
+    line.reverse();
+    let mut i = 0;
+    while i < line.len() {
+        if !word_is_ltr(&line[i].text) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < line.len() && word_is_ltr(&line[i].text) {
+            i += 1;
+        }
+        line[start..i].reverse();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -678,6 +731,12 @@ pub struct RecognizedTextLine {
     /// where the firings line up 1:1 with `text`; empty otherwise (the caller then falls back
     /// to a per-line bold estimate).
     pub firings: Vec<CharFiring>,
+    /// Per-character CTC firings in visual (left-to-right along the strip) order, 1:1 with the
+    /// visually-ordered glyphs. Unlike `firings` (logical order, gated out for RTL so the style
+    /// pooling stays aligned) this stays populated for RTL lines, and drives the selectable
+    /// source-word geometry — which is inherently a visual-space quantity. Empty on dropped
+    /// (empty/low-score) lines.
+    pub visual_firings: Vec<CharFiring>,
 }
 
 /// One CTC firing: a recognised character (as a Unicode scalar) and where its run fired
@@ -2623,9 +2682,61 @@ mod tests {
             mk("top", 10.0, 10.0, 0),
             mk("a", 10.0, 100.0, 1),
         ];
-        let out = order_words_visually(input);
+        let out = order_words_visually(input, &std::collections::HashSet::new());
         let texts: Vec<&str> = out.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(texts, vec!["top", "a", "b"]);
+    }
+
+    #[test]
+    fn order_words_visually_reverses_rtl_lines() {
+        use super::{OrientedRect, PositionedWord, order_words_visually};
+        let mk = |text: &str, cx: f32, line: u32| PositionedWord {
+            text: text.to_string(),
+            bounds: OrientedRect {
+                cx,
+                cy: 10.0,
+                width: 10.0,
+                height: 10.0,
+                angle_radians: 0.0,
+            },
+            line_index: line,
+        };
+        // Line 0 is RTL: logical-first word sits rightmost on screen. Screen order (l→r) is
+        // "من نظام هل"; logical order (the join order we want) is "هل نظام من".
+        let input = vec![mk("من", 10.0, 0), mk("نظام", 30.0, 0), mk("هل", 50.0, 0)];
+        let rtl: std::collections::HashSet<u32> = [0u32].into_iter().collect();
+        let out = order_words_visually(input, &rtl);
+        let texts: Vec<&str> = out.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["هل", "نظام", "من"]);
+    }
+
+    #[test]
+    fn order_words_visually_keeps_embedded_ltr_run_forward() {
+        use super::{OrientedRect, PositionedWord, order_words_visually};
+        let mk = |text: &str, cx: f32, line: u32| PositionedWord {
+            text: text.to_string(),
+            bounds: OrientedRect {
+                cx,
+                cy: 10.0,
+                width: 10.0,
+                height: 10.0,
+                angle_radians: 0.0,
+            },
+            line_index: line,
+        };
+        // RTL line "متجر أو Play Services دون" — on screen (l→r): متجر أو Play Services دون.
+        // Logical order reverses the RTL words but keeps "Play Services" forward.
+        let input = vec![
+            mk("متجر", 10.0, 0),
+            mk("أو", 30.0, 0),
+            mk("Play", 50.0, 0),
+            mk("Services", 70.0, 0),
+            mk("دون", 90.0, 0),
+        ];
+        let rtl: std::collections::HashSet<u32> = [0u32].into_iter().collect();
+        let out = order_words_visually(input, &rtl);
+        let texts: Vec<&str> = out.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["دون", "Play", "Services", "أو", "متجر"]);
     }
 
     #[test]
