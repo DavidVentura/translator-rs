@@ -14,6 +14,7 @@ pub use translator_core::language;
 pub use translator_core::ocr;
 pub use translator_core::script;
 pub use translator_core::script_normalize;
+pub use translator_core::selection;
 #[cfg(feature = "epub")]
 pub use translator_doc::epub;
 #[cfg(feature = "odt")]
