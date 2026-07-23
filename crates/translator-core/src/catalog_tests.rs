@@ -8,6 +8,7 @@ use crate::catalog::{
     plan_language_download,
 };
 use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair};
+use crate::catalog::{plan_translation_upgrades, translation_upgrade_language_codes};
 use crate::language::Language;
 
 use super::model::{
@@ -651,6 +652,118 @@ fn lower_priority_alternative_keeps_pack_installed_and_offers_upgrade() {
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["ppocr/det_new.mnn"]);
     assert_eq!(upgrades.total_size, 40);
+}
+
+fn catalog_with_translation_priority() -> LanguageCatalog {
+    // A translation pack with a legacy p1 model at the flat path (what an old
+    // install has on disk) and a p2 model namespaced under bin/en-tl/v2 (the new
+    // upgrade). Mirrors the en->tl opusmt(p1) / hymt2(p2) shape.
+    let mut catalog = base_catalog();
+    catalog.packs.insert(
+        "translate-en-tl".to_string(),
+        translation_pack(
+            "translate-en-tl",
+            "en",
+            "tl",
+            vec![
+                role_file(
+                    "model.entl.bin",
+                    "bin/model.entl.bin",
+                    100,
+                    FileRole::Model,
+                    1,
+                ),
+                role_file(
+                    "model.entl.bin",
+                    "bin/en-tl/v2/model.entl.bin",
+                    40,
+                    FileRole::Model,
+                    2,
+                ),
+                role_file("lex.entl.bin", "bin/lex.entl.bin", 10, FileRole::Lex, 1),
+                role_file(
+                    "lex.entl.bin",
+                    "bin/en-tl/v2/lex.entl.bin",
+                    8,
+                    FileRole::Lex,
+                    2,
+                ),
+                role_file(
+                    "vocab.entl.spm",
+                    "bin/vocab.entl.spm",
+                    5,
+                    FileRole::Vocab,
+                    1,
+                ),
+                role_file(
+                    "vocab.entl.spm",
+                    "bin/en-tl/v2/vocab.entl.spm",
+                    4,
+                    FileRole::Vocab,
+                    2,
+                ),
+            ],
+            vec![],
+        ),
+    );
+    catalog.translation_pack_ids.insert(
+        ("en".to_string(), "tl".to_string()),
+        "translate-en-tl".to_string(),
+    );
+    catalog
+}
+
+#[test]
+fn translation_upgrade_offered_when_lower_priority_variant_installed() {
+    let catalog = catalog_with_translation_priority();
+    // Only the p1 (flat) files on disk — the shipped older model.
+    let checker = FakeInstallChecker::with_files(&[
+        "bin/model.entl.bin",
+        "bin/lex.entl.bin",
+        "bin/vocab.entl.spm",
+    ]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    assert!(snapshot.pack_statuses["translate-en-tl"].installed);
+    assert_eq!(
+        translation_upgrade_language_codes(&snapshot),
+        vec![LanguageCode::from("tl")]
+    );
+
+    let plan = plan_translation_upgrades(&snapshot, &[LanguageCode::from("tl")]);
+    let mut paths = plan
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "bin/en-tl/v2/lex.entl.bin",
+            "bin/en-tl/v2/model.entl.bin",
+            "bin/en-tl/v2/vocab.entl.spm",
+        ]
+    );
+    assert_eq!(plan.total_size, 40 + 8 + 4);
+}
+
+#[test]
+fn no_translation_upgrade_when_best_variant_already_installed() {
+    let catalog = catalog_with_translation_priority();
+    let checker = FakeInstallChecker::with_files(&[
+        "bin/en-tl/v2/model.entl.bin",
+        "bin/en-tl/v2/lex.entl.bin",
+        "bin/en-tl/v2/vocab.entl.spm",
+    ]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    assert!(translation_upgrade_language_codes(&snapshot).is_empty());
+    assert!(
+        plan_translation_upgrades(&snapshot, &[LanguageCode::from("tl")])
+            .tasks
+            .is_empty()
+    );
 }
 
 #[test]

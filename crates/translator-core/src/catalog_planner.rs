@@ -552,6 +552,79 @@ pub fn plan_ocr_engine_upgrades(
     }
 }
 
+fn translation_pack_ids_for_languages(
+    catalog: &LanguageCatalog,
+    language_codes: &[LanguageCode],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for code in language_codes {
+        for id in [
+            catalog.translation_pack_id("en", code.as_str()),
+            catalog.translation_pack_id(code.as_str(), "en"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Non-English language codes whose installed translation pack has a
+/// higher-priority variant available on top of what is on disk — i.e. a newer
+/// model. Drives the "Upgrades for: ..." card. A pair still on its old model
+/// keeps working; this only lists the ones where an upgrade exists.
+pub fn translation_upgrade_language_codes(snapshot: &CatalogSnapshot) -> Vec<LanguageCode> {
+    let mut codes: Vec<LanguageCode> = Vec::new();
+    for (pack_id, status) in &snapshot.pack_statuses {
+        if status.upgrade_files.is_empty() {
+            continue;
+        }
+        let Some(pack) = snapshot.catalog.pack(pack_id) else {
+            continue;
+        };
+        let PackKind::Translation(translation) = &pack.kind else {
+            continue;
+        };
+        let code = if translation.from == "en" {
+            &translation.to
+        } else {
+            &translation.from
+        };
+        let code = LanguageCode::new(code.clone());
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    codes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    codes
+}
+
+/// The download that upgrades the given languages' translation packs to their
+/// highest-priority variant. Mirrors plan_ocr_engine_upgrades for translation.
+pub fn plan_translation_upgrades(
+    snapshot: &CatalogSnapshot,
+    language_codes: &[LanguageCode],
+) -> DownloadPlan {
+    let pack_ids = translation_pack_ids_for_languages(&snapshot.catalog, language_codes);
+    let tasks = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
+        status.upgrade_files.iter().collect()
+    })
+    .into_iter()
+    .filter_map(|item| {
+        let pack = snapshot.catalog.pack(&item.pack_id)?;
+        Some(download_task_for(pack, &item.file))
+    })
+    .collect::<Vec<_>>();
+    DownloadPlan {
+        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
+        tasks,
+    }
+}
+
 /// Downloads that restore packs the user already has to a working state: packs
 /// with some files on disk but missing required ones (a partial download, or a
 /// catalog change that orphaned the on-disk variant), plus whatever their

@@ -657,4 +657,25 @@ mod tests {
             Some(Script::Latin)
         );
     }
+
+    /// The camelCase field names the generator writes must match what the wire
+    /// deserializes. `rename_all` does not reach struct-variant fields, so each
+    /// multi-word field needs its own rename; a mismatch fails the whole catalog.
+    #[test]
+    fn tts_pack_reads_camelcase_aux_role() {
+        use crate::catalog::{FileRole, PackKind};
+        let json = r#"{"formatVersion":6,"generatedAt":0,"dictionaryVersion":1,
+            "sources":{"languageIndexVersion":1,"languageIndexUpdatedAt":0,
+                       "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":0},
+            "languages":{},
+            "packs":{"tts-x":{"feature":"tts","language":"en","engine":"piper","auxRole":"sidecar",
+              "files":[{"name":"v.mnn","sizeBytes":1,"installPath":"p","url":"u","role":"model","priority":0},
+                       {"name":"v.onnx.json","sizeBytes":1,"installPath":"q","url":"u","role":"sidecar","priority":0}],
+              "dependsOn":[]}}}"#;
+        let catalog = parse_language_catalog(json).expect("tts pack with auxRole parses");
+        let PackKind::Tts(tts) = &catalog.pack("tts-x").expect("pack present").kind else {
+            panic!("expected a tts pack");
+        };
+        assert_eq!(tts.aux_role, FileRole::new("sidecar"));
+    }
 }
