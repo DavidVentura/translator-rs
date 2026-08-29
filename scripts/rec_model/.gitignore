@@ -13,3 +13,6 @@ fonts/*
 out/*
 data/indic_eval/*
 data/indic_corpus.txt
+data/georgian_corpus.txt
+data/georgian_corpus.bal.txt
+data/indic_corpus.bal.txt

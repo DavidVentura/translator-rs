@@ -27,14 +27,14 @@ import random
 import subprocess
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable
 
 import freetype
 import numpy as np
 import uharfbuzz as hb
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -55,6 +55,14 @@ class Spec:
     # fallbacks so a synthesized label can never contain an out-of-dict glyph. Filled
     # from --dict by run_cli; the corpus path is already kept-only (build_corpus).
     vocab: frozenset = frozenset()
+    # Per-font overrides of how this charset is drawn, as {font_path: ((char, drawn_as), ...)}.
+    # `drawn_as = None` bars the face from that character. Needed where a face draws a
+    # character at a codepoint other than the label's: BPG's pre-Unicode-11 Georgian Caps
+    # fonts carry caps-shaped glyphs at the *Mkhedruli* codepoints, so they render Mtavruli
+    # only after mapping down, and must be barred from Mkhedruli or they would teach
+    # caps shapes under lowercase labels. Applied to coverage and to the shaped text
+    # together, so font choice and rasterization cannot disagree.
+    font_remap: dict[str, tuple[tuple[str, str | None], ...]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------- fonts / shaping
@@ -85,58 +93,124 @@ def _covered(path: str, charset: str) -> frozenset:
     return frozenset(cp for cp in map(ord, charset) if face.get_char_index(cp) != 0)
 
 
-def fonts_for(text: str, fonts: tuple[str, ...], charset: str) -> list[str]:
+@lru_cache(maxsize=None)
+def _covered_as(path: str, charset: str, remap: tuple[tuple[str, str | None], ...]) -> frozenset:
+    face = _ft_face(path)
+    sub = dict(remap)
+    return frozenset(ord(ch) for ch in charset
+                     if sub.get(ch, ch) is not None and face.get_char_index(ord(sub.get(ch, ch))) != 0)
+
+
+def _draws(spec: "Spec", path: str) -> frozenset:
+    return _covered_as(path, spec.charset, spec.font_remap.get(path, ()))
+
+
+def _as_drawn(spec: "Spec", path: str, text: str) -> str:
+    remap = spec.font_remap.get(path)
+    return text.translate({ord(a): b for a, b in remap}) if remap else text
+
+
+def fonts_for(text: str, spec: "Spec") -> list[str]:
     need = set(map(ord, text)) - {0x20}
-    return [p for p in fonts if need <= _covered(p, charset)]
+    return [p for p in spec.fonts if need <= _draws(spec, p)]
 
 
-def shape_render(text: str, font_path: str, px: int, rng: random.Random | None, reorder: bool) -> np.ndarray | None:
-    """Coverage (H x W float 0..1) for `text`, or None on a .notdef glyph.
+MAX_FALLBACK_FONTS = 3
 
-    Shapes with HarfBuzz and rasterizes each glyph at the shaped pen positions.
-    `reorder=False` forces LTR with no bidi/reordering (caller pre-ordered the
-    string); `reorder=True` uses HB's natural per-script shaping. When `rng` is
-    given, inter-word gaps are jittered while the label keeps single spaces.
+
+def plan_runs(text: str, spec: "Spec", rng: random.Random) -> list[tuple[str, str]] | None:
+    """Split `text` into (run_text, font_path) runs, or None if no font set covers it.
+
+    A single covering face stays a single run, so lines that render today are unaffected.
+    When no one face covers the line, the text is split across up to MAX_FALLBACK_FONTS
+    by greedy set cover, which is what a real renderer does: distribution builds of
+    script fonts routinely carry no Latin or digits (Debian's Noto Sans Georgian has
+    neither), so <script> <email> <script> and all-caps-plus-price lines exist on real
+    pages only as multi-font renders. Refusing to synthesize them teaches the model that
+    the script never co-occurs with Latin, and the NRTR head then suppresses those decodes.
     """
-    hbfont = _hb_font(font_path)
-    hbfont.scale = (px * 64, px * 64)
-    buf = hb.Buffer()
-    buf.add_str(text)
-    buf.guess_segment_properties()
-    if not reorder:
-        buf.direction = "ltr"
-    hb.shape(hbfont, buf)
-    infos, poss = buf.glyph_infos, buf.glyph_positions
-    if any(i.codepoint == 0 for i in infos):
-        return None
-    advances = []
-    for info, pos in zip(infos, poss):
-        adv = pos.x_advance
-        if rng is not None and text[info.cluster] == " ":
-            adv = int(adv * rng.uniform(0.7, 2.4))
-        advances.append(adv)
+    single = fonts_for(text, spec)
+    if single:
+        font = rng.choice(single)
+        return [(_as_drawn(spec, font, text), font)]
 
-    ft = _ft_face(font_path)
-    ft.set_pixel_sizes(0, px)
+    remaining = set(map(ord, text)) - {0x20}
+    chosen: list[str] = []
+    while remaining and len(chosen) < MAX_FALLBACK_FONTS:
+        gains = [(len(_draws(spec, p) & remaining), p) for p in spec.fonts if p not in chosen]
+        best = max(g for g, _ in gains)
+        if best == 0:
+            return None
+        chosen.append(rng.choice([p for g, p in gains if g == best]))
+        remaining -= _draws(spec, chosen[-1])
+    if remaining:
+        return None
+
+    runs: list[tuple[str, str]] = []
+    for ch in text:
+        # A space carries no glyph worth switching fonts for, so it extends the current run
+        # (and only opens a new one when it leads the line).
+        font = runs[-1][1] if ch == " " and runs else next(p for p in chosen if ord(ch) in _draws(spec, p))
+        if runs and runs[-1][1] == font:
+            runs[-1] = (runs[-1][0] + ch, font)
+        else:
+            runs.append((ch, font))
+    return [(_as_drawn(spec, f, t), f) for t, f in runs]
+
+
+def shape_render(runs: list[tuple[str, str]], px: int, rng: random.Random | None, reorder: bool) -> np.ndarray | None:
+    """Coverage (H x W float 0..1) for the text in `runs`, or None on a .notdef glyph.
+
+    Shapes with HarfBuzz and rasterizes each glyph at the shaped pen positions. `runs` is
+    the (text, font) segmentation from plan_runs, laid out left to right on one baseline at
+    one em size — the metric mismatch between a script face and its Latin fallback is what
+    a real renderer produces too. `reorder=False` forces LTR with no bidi/reordering (caller
+    pre-ordered the string); `reorder=True` uses HB's natural per-script shaping. When `rng`
+    is given, inter-word gaps are jittered while the label keeps single spaces.
+    """
+    shaped = []
+    for run_text, font_path in runs:
+        hbfont = _hb_font(font_path)
+        hbfont.scale = (px * 64, px * 64)
+        buf = hb.Buffer()
+        buf.add_str(run_text)
+        buf.guess_segment_properties()
+        if not reorder:
+            buf.direction = "ltr"
+        hb.shape(hbfont, buf)
+        infos, poss = buf.glyph_infos, buf.glyph_positions
+        if any(i.codepoint == 0 for i in infos):
+            return None
+        advances = []
+        for info, pos in zip(infos, poss):
+            adv = pos.x_advance
+            if rng is not None and run_text[info.cluster] == " ":
+                adv = int(adv * rng.uniform(0.7, 2.4))
+            advances.append(adv)
+        shaped.append((font_path, infos, poss, advances))
+
     pad = max(4, px // 6)
-    width = sum(advances) // 64 + 2 * pad
+    width = sum(a for _, _, _, advs in shaped for a in advs) // 64 + 2 * pad
     height = int(px * 1.7)
     baseline = int(px * 1.3)
     canvas = np.zeros((height, width), np.float32)
     x = pad * 64
-    for info, pos, adv in zip(infos, poss, advances):
-        ft.load_glyph(info.codepoint, freetype.FT_LOAD_RENDER)
-        bm = ft.glyph.bitmap
-        gw, gh = bm.width, bm.rows
-        if gw and gh:
-            glyph = np.asarray(bm.buffer, np.uint8).reshape(gh, gw).astype(np.float32) / 255.0
-            gx = (x + pos.x_offset) // 64 + ft.glyph.bitmap_left
-            gy = baseline - ft.glyph.bitmap_top - pos.y_offset // 64
-            y0, x0 = max(0, gy), max(0, gx)
-            y1, x1 = min(height, gy + gh), min(width, gx + gw)
-            if y1 > y0 and x1 > x0:
-                canvas[y0:y1, x0:x1] = np.maximum(canvas[y0:y1, x0:x1], glyph[y0 - gy:y1 - gy, x0 - gx:x1 - gx])
-        x += adv
+    for font_path, infos, poss, advances in shaped:
+        ft = _ft_face(font_path)
+        ft.set_pixel_sizes(0, px)
+        for info, pos, adv in zip(infos, poss, advances):
+            ft.load_glyph(info.codepoint, freetype.FT_LOAD_RENDER)
+            bm = ft.glyph.bitmap
+            gw, gh = bm.width, bm.rows
+            if gw and gh:
+                glyph = np.asarray(bm.buffer, np.uint8).reshape(gh, gw).astype(np.float32) / 255.0
+                gx = (x + pos.x_offset) // 64 + ft.glyph.bitmap_left
+                gy = baseline - ft.glyph.bitmap_top - pos.y_offset // 64
+                y0, x0 = max(0, gy), max(0, gx)
+                y1, x1 = min(height, gy + gh), min(width, gx + gw)
+                if y1 > y0 and x1 > x0:
+                    canvas[y0:y1, x0:x1] = np.maximum(canvas[y0:y1, x0:x1], glyph[y0 - gy:y1 - gy, x0 - gx:x1 - gx])
+            x += adv
     rows = np.where(canvas.max(axis=1) > 0.05)[0]
     cols = np.where(canvas.max(axis=0) > 0.05)[0]
     if rows.size < 4 or cols.size < 4:
@@ -253,9 +327,9 @@ def make_negative(rng: random.Random, spec: Spec, corpus: list[str]) -> np.ndarr
         cov = None
         for _ in range(4):
             render_text, _ = spec.gen_pair(rng, corpus, spec.vocab)
-            fonts = fonts_for(render_text, spec.fonts, spec.charset)
-            if render_text.strip() and fonts:
-                cov = shape_render(render_text, rng.choice(fonts), rng.randint(16, 40), rng, spec.reorder)
+            runs = plan_runs(render_text, spec, rng) if render_text.strip() else None
+            if runs:
+                cov = shape_render(runs, rng.randint(16, 40), rng, spec.reorder)
                 if cov is not None and cov.shape[1] >= 8:
                     break
                 cov = None
@@ -289,8 +363,8 @@ def sample(rng: random.Random, spec: Spec, corpus: list[str], neg_frac: float = 
         render_text, label = spec.gen_pair(rng, corpus, spec.vocab)
         if not render_text.strip():
             continue
-        fonts = fonts_for(render_text, spec.fonts, spec.charset)
-        if not fonts:
+        runs = plan_runs(render_text, spec, rng)
+        if runs is None:
             continue
         # native_h is the detector's oriented-box height; real source text sits ~30-48 px
         # tall, so floor at 30 — below it the strip is a 2x+ upsample of text the detector
@@ -299,7 +373,7 @@ def sample(rng: random.Random, spec: Spec, corpus: list[str], neg_frac: float = 
         # confusable letters. Mirrors the ink generator's render floor.
         native_h = rng.randint(30, 60)
         px = max(20, int(native_h * rng.uniform(0.62, 0.9)))
-        cov = shape_render(render_text, rng.choice(fonts), px, rng, spec.reorder)
+        cov = shape_render(runs, px, rng, spec.reorder)
         if cov is None or cov.shape[1] < 8:
             continue
         strip_h = max(native_h, cov.shape[0])
@@ -340,16 +414,29 @@ def join_to_budget(rng: random.Random, words: list[str], budget: int) -> str:
 # ---------------------------------------------------------------- CLI
 
 
-def write_inspect_sheet(samples, path, annotate):
-    band, width = 18, max(im.shape[1] for im, _ in samples)
-    font = ImageFont.load_default(size=22)
+def write_inspect_sheet(samples, path, annotate, spec: Spec):
+    """QA sheet: each strip with its label above it, for eyeballing before a training run.
+
+    The label is drawn through the same shaping and font-fallback path as the sample, since
+    PIL's default bitmap font covers only Latin and drew every other script as tofu boxes —
+    which defeats the one thing the sheet is for. Annotation shapes with reorder=True so an
+    RTL label reads in logical order, whatever the sample itself was rendered from.
+    """
+    band, width = 30, max(im.shape[1] for im, _ in samples)
+    rng = random.Random(0)
     cells = []
     for im, label in samples:
         cell = np.full((STRIP_HEIGHT + band, width, 3), 255, np.uint8)
         cell[band:, :im.shape[1]] = im
-        pim = Image.fromarray(cell)
-        ImageDraw.Draw(pim).text((2, 2), annotate(label) or "(empty)", fill=(200, 0, 0), font=font)
-        cells.append(np.asarray(pim.resize((720, int(pim.height * 720 / pim.width)))))
+        text = annotate(label) or "(empty)"
+        runs = plan_runs(text, spec, rng)
+        cov = shape_render(runs, 18, None, True) if runs else None
+        if cov is None:
+            raise RuntimeError(f"inspect: no font renders label {text!r}")
+        h, w = min(cov.shape[0], band), min(cov.shape[1], width)
+        ink = cov[:h, :w, None]
+        cell[:h, :w] = (ink * np.array([200, 0, 0], np.float32) + (1 - ink) * 255).astype(np.uint8)
+        cells.append(np.asarray(Image.fromarray(cell).resize((720, int(cell.shape[0] * 720 / width)))))
     Image.fromarray(np.concatenate(cells, axis=0)).save(path)
 
 
@@ -381,7 +468,7 @@ def run_cli(spec: Spec, *, annotate=lambda s: s, extra_args=lambda ap: None):
             s = sample_safe(rng, spec, corpus, args.neg_frac, errs)
             if s:
                 got.append(s)
-        write_inspect_sheet(got, os.path.join(args.out, "inspect.png"), annotate)
+        write_inspect_sheet(got, os.path.join(args.out, "inspect.png"), annotate, spec)
         print(f"wrote {args.out}/inspect.png ({len(got)} samples)")
         return
 
