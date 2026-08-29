@@ -520,6 +520,15 @@ impl LanguageCatalog {
             .map(|info| info.language.script)
     }
 
+    /// The writing system the catalog declares for a language, composite
+    /// subtags intact. [`LanguageCatalog::script_for`] answers which glyphs to
+    /// draw it with; this answers which writing system it is.
+    pub fn writing_system_for(&self, code: &LanguageCode) -> Option<crate::script::WritingSystem> {
+        self.languages
+            .get(code.as_str())
+            .map(|info| info.language.writing_system)
+    }
+
     pub fn scripted_language(&self, code: &LanguageCode) -> Option<crate::api::ScriptedLanguage> {
         Some(crate::api::ScriptedLanguage {
             code: code.clone(),

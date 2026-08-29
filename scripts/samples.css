@@ -22,6 +22,7 @@ main {
 }
 h1 { margin: 0 0 8px; font-size: 32px; }
 h2 { margin: 0 0 12px; font-size: 22px; }
+h2 a { color: inherit; }
 h3 {
   margin: 16px 0 8px;
   font-size: 16px;

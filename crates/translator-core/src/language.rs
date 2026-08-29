@@ -41,6 +41,10 @@ pub struct Language {
     pub display_name: String,
     pub short_display_name: String,
     pub script: crate::script::Script,
+    /// The subtag the catalog declared, kept alongside the inventory `script`
+    /// collapses it to: romanization is keyed on the writing system, not on the
+    /// glyphs it is drawn with.
+    pub writing_system: crate::script::WritingSystem,
     pub dictionary_code: String,
 }
 
@@ -103,6 +107,7 @@ mod tests {
             display_name: "English".to_string(),
             short_display_name: "English".to_string(),
             script: crate::script::Script::Latin,
+            writing_system: crate::script::WritingSystem::Single(crate::script::Script::Latin),
             dictionary_code: "en".to_string(),
         };
 

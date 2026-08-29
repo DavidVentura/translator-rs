@@ -128,30 +128,34 @@ pub fn selection_indices(words: &[PositionedWord], start: u32, end: u32) -> Vec<
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
         0x4E00..=0x9FFF   // CJK unified ideographs
+        | 0x3000..=0x303F // CJK symbols and punctuation
         | 0x3400..=0x4DBF // extension A
         | 0x3040..=0x30FF // hiragana + katakana
         | 0xAC00..=0xD7AF // hangul syllables
         | 0xF900..=0xFAFF // compatibility ideographs
+        | 0xFF00..=0xFFEF // halfwidth and fullwidth forms
     )
 }
 
-/// Join one block's words. Scripts that don't space their words get none; a block counts as such
-/// when at least half its non-whitespace characters are CJK.
+/// Join one block's words. A gap closes up only when the characters on both sides of it are CJK;
+/// every other gap takes a space, so an embedded Latin run keeps the spacing it was rendered with.
+///
+/// The decision is per gap rather than per block because a block-wide ratio miscounts: a Latin word
+/// contributes one character per letter while a CJK word contributes one per word, so a single
+/// "Microsoft" outvotes ten ideographs and every ideograph then gets spaced.
 fn join_block(texts: &[&str]) -> String {
-    let non_ws: usize = texts
-        .iter()
-        .map(|t| t.chars().filter(|c| !c.is_whitespace()).count())
-        .sum();
-    let cjk: usize = texts
-        .iter()
-        .map(|t| t.chars().filter(|c| is_cjk(*c)).count())
-        .sum();
-    let separator = if non_ws > 0 && cjk * 2 >= non_ws {
-        ""
-    } else {
-        " "
-    };
-    texts.join(separator).trim().to_string()
+    let mut joined = String::new();
+    for text in texts {
+        let tight = match (joined.chars().last(), text.chars().next()) {
+            (Some(previous), Some(next)) => is_cjk(previous) && is_cjk(next),
+            _ => true,
+        };
+        if !joined.is_empty() && !tight {
+            joined.push(' ');
+        }
+        joined.push_str(text);
+    }
+    joined.trim().to_string()
 }
 
 /// Split words into runs sharing a `line_index`. Words arrive in reading order, so a line's words
@@ -377,6 +381,48 @@ mod tests {
         spread[3].bounds.cy = 60.0;
         let split = resolve_selection(&spread, 0, 3).expect("selection");
         assert_eq!(split.text, "hello world\nsecond line");
+    }
+
+    #[test]
+    fn latin_inside_cjk_does_not_space_the_ideographs() {
+        // One unit per selection unit, as WordCarver carves them: ideographs individually, Latin
+        // words whole. A block-wide CJK ratio scores "Microsoft" as nine characters against ten
+        // ideographs and spaces the lot.
+        let units = [
+            "\u{81ea}",
+            "\u{5b9a}",
+            "\u{4e49}",
+            "Microsoft",
+            "Edge",
+            "\u{4ee5}",
+            "\u{5339}",
+            "\u{914d}",
+            "\u{60a8}",
+            "\u{7684}",
+            "\u{98ce}",
+            "\u{683c}",
+        ];
+        let words: Vec<PositionedWord> = units
+            .iter()
+            .enumerate()
+            .map(|(i, t)| word(t, 20.0 + (i as f32) * 30.0, 10.0, 28.0, 0))
+            .collect();
+        let view = resolve_selection(&words, 0, units.len() as u32 - 1).expect("selection");
+        assert_eq!(
+            view.text,
+            "\u{81ea}\u{5b9a}\u{4e49} Microsoft Edge \u{4ee5}\u{5339}\u{914d}\u{60a8}\u{7684}\u{98ce}\u{683c}"
+        );
+    }
+
+    #[test]
+    fn cjk_punctuation_stays_tight() {
+        let words = vec![
+            word("\u{4f60}", 20.0, 10.0, 20.0, 0),
+            word("\u{597d}", 45.0, 10.0, 20.0, 0),
+            word("\u{3002}", 70.0, 10.0, 20.0, 0),
+        ];
+        let view = resolve_selection(&words, 0, 2).expect("selection");
+        assert_eq!(view.text, "\u{4f60}\u{597d}\u{3002}");
     }
 
     #[test]

@@ -717,23 +717,21 @@ impl TranslatorSession {
         #[cfg(feature = "transliterate")]
         {
             let snap = self.snapshot();
-            let language = snap
-                .catalog
-                .language_by_code(&LanguageCode::from(language_code))?;
+            let code = LanguageCode::from(language_code);
+            // The declared writing system, not the inventory `script_for`
+            // collapses it to: CLDR keys its romanizations on `Hans`/`Jpan`,
+            // and there is no transform under the collapsed `Hani`/`Hira`.
+            let source = snap.catalog.writing_system_for(&code)?;
             let mucab_path = std::path::Path::new(&snap.base_dir)
                 .join("bin")
                 .join("mucab.bin");
             let mucab_path_str = mucab_path
                 .exists()
                 .then(|| mucab_path.to_string_lossy().into_owned());
-            // A script this build cannot name is one it cannot romanize either.
-            let source_script = crate::api::ScriptCode::from(language.script.iso15924()?);
-            let target_script = crate::api::ScriptCode::from("Latn");
             crate::transliterate::transliterate_with_policy_for_language(
                 text,
-                &LanguageCode::from(language_code),
-                &source_script,
-                &target_script,
+                &code,
+                source,
                 mucab_path_str.as_deref(),
                 true,
             )

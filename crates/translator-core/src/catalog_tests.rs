@@ -255,6 +255,7 @@ fn base_catalog() -> LanguageCatalog {
         display_name: "English".to_string(),
         short_display_name: "English".to_string(),
         script: crate::script::Script::Latin,
+        writing_system: crate::script::WritingSystem::Single(crate::script::Script::Latin),
         dictionary_code: "en".to_string(),
     };
     let spanish = Language {
@@ -262,6 +263,7 @@ fn base_catalog() -> LanguageCatalog {
         display_name: "Spanish".to_string(),
         short_display_name: "Spanish".to_string(),
         script: crate::script::Script::Latin,
+        writing_system: crate::script::WritingSystem::Single(crate::script::Script::Latin),
         dictionary_code: "es".to_string(),
     };
 

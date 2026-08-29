@@ -2,7 +2,8 @@ use icu_experimental::transliterate::Transliterator;
 use icu_locale_core::Locale;
 use unicode_script::{Script, UnicodeScript};
 
-use translator_core::api::{LanguageCode, ScriptCode};
+use translator_core::api::LanguageCode;
+use translator_core::script::{Script as CatalogScript, WritingSystem};
 
 fn make_transliterator(source_script: &str) -> Option<Transliterator> {
     let locale_str = format!("und-Latn-t-und-{}", source_script.to_lowercase());
@@ -60,38 +61,43 @@ fn restore_malayalam_vowel_signs(romanized: String) -> String {
         })
 }
 
-fn transliterate(text: &str, source_script: &ScriptCode) -> Option<String> {
-    match source_script.as_str() {
-        "Jpan" => {
+fn transliterate(text: &str, source: WritingSystem) -> Option<String> {
+    match source {
+        // CLDR publishes no `Jpan` transform: katakana and hiragana each have
+        // their own, and mucab hands us readings in katakana.
+        WritingSystem::Japanese => {
             let kana = make_transliterator("Kana")?;
             let hira = make_transliterator("Hira")?;
             let result = kana.transliterate(text.to_string());
             Some(hira.transliterate(result))
         }
-        "Mlym" => {
+        WritingSystem::Single(CatalogScript::Malayalam) => {
             let t = make_transliterator("Mlym")?;
             let masked = mask_malayalam_vowel_signs(text);
             Some(restore_malayalam_vowel_signs(t.transliterate(masked)))
         }
-        _ => {
-            let t = make_transliterator(source_script.as_str())?;
+        other => {
+            let t = make_transliterator(other.iso15924()?)?;
             Some(t.transliterate(text.to_string()))
         }
     }
 }
 
-/// ICU source script subtag that romanizes a given run, or `None` for runs we
-/// leave untouched (Latin, punctuation, marks). Scripts ICU has no transform
-/// for still fall back to pass-through via `transliterate` returning `None`.
-fn romanizable_source_code(script: Script) -> Option<String> {
-    use translator_core::script::Script as S;
-    match S::from(script) {
-        S::Latin => None,
+/// Writing system that romanizes a given run, or `None` for runs we leave
+/// untouched (Latin, punctuation, marks). Scripts ICU has no transform for
+/// still fall back to pass-through via `transliterate` returning `None`.
+fn romanizable_source(script: Script) -> Option<WritingSystem> {
+    match CatalogScript::from(script) {
+        CatalogScript::Latin => None,
         // Both kana share the Japanese transform (katakana then hiragana).
-        S::Hiragana | S::Katakana => Some("Jpan".to_owned()),
+        CatalogScript::Hiragana | CatalogScript::Katakana => Some(WritingSystem::Japanese),
+        // A Han run carries no simplified/traditional marker of its own, and
+        // CLDR romanizes both with the same pinyin rules, so either subtag
+        // reaches them.
+        CatalogScript::Han => Some(WritingSystem::HanSimplified),
         // Punctuation, marks and unenumerated scripts have no subtag, so they
-        // drop out here rather than needing their own arm.
-        other => other.iso15924().map(str::to_owned),
+        // drop out of `transliterate` rather than needing their own arm.
+        other => Some(WritingSystem::Single(other)),
     }
 }
 
@@ -160,8 +166,8 @@ fn flush_run(out: &mut String, run: &str, run_script: Option<Script>) {
         return;
     }
     let romanized = run_script
-        .and_then(romanizable_source_code)
-        .and_then(|source| transliterate(run, &ScriptCode::from(source)));
+        .and_then(romanizable_source)
+        .and_then(|source| transliterate(run, source));
     match romanized {
         Some(romanized) => out.push_str(&romanized),
         None => out.push_str(run),
@@ -171,11 +177,10 @@ fn flush_run(out: &mut String, run: &str, run_script: Option<Script>) {
 fn transliterate_with_policy(
     text: &str,
     language_code: &LanguageCode,
-    source_script: &ScriptCode,
-    target_script: &ScriptCode,
+    source: WritingSystem,
     japanese_preprocessed: Option<&str>,
 ) -> Option<String> {
-    if source_script == target_script {
+    if source.script() == CatalogScript::Latin {
         return None;
     }
 
@@ -184,14 +189,15 @@ fn transliterate_with_policy(
         _ => text,
     };
 
-    transliterate(input, source_script)
+    transliterate(input, source)
 }
 
+/// Romanize `text`, written in `source`. `None` when the text is already Latin
+/// or when CLDR has no transform for the writing system.
 pub fn transliterate_with_policy_for_language(
     text: &str,
     language_code: &LanguageCode,
-    source_script: &ScriptCode,
-    target_script: &ScriptCode,
+    source: WritingSystem,
     japanese_dict_path: Option<&str>,
     japanese_spaced: bool,
 ) -> Option<String> {
@@ -209,8 +215,7 @@ pub fn transliterate_with_policy_for_language(
     transliterate_with_policy(
         normalized,
         language_code,
-        source_script,
-        target_script,
+        source,
         japanese_preprocessed.as_deref(),
     )
 }
@@ -241,8 +246,12 @@ fn preprocess_japanese(
 mod tests {
     use super::*;
 
-    fn translit(script: &str, text: &str) -> String {
-        transliterate(text, &ScriptCode::from(script)).unwrap()
+    fn writing_system(subtag: &str) -> WritingSystem {
+        WritingSystem::from_iso15924(subtag).expect("test subtag parses")
+    }
+
+    fn translit(subtag: &str, text: &str) -> String {
+        transliterate(text, writing_system(subtag)).unwrap()
     }
 
     #[test]
@@ -421,17 +430,16 @@ mod tests {
 
     #[test]
     fn test_latin_is_none() {
-        assert!(transliterate("Hello", &ScriptCode::from("Latn")).is_none());
+        assert!(transliterate("Hello", writing_system("Latn")).is_none());
     }
 
     #[test]
-    fn test_policy_skips_same_script() {
+    fn test_policy_skips_latin_source() {
         assert!(
             transliterate_with_policy(
                 "Hello",
                 &LanguageCode::from("en"),
-                &ScriptCode::from("Latn"),
-                &ScriptCode::from("Latn"),
+                writing_system("Latn"),
                 None
             )
             .is_none()
@@ -444,12 +452,63 @@ mod tests {
             transliterate_with_policy(
                 "東京タワー",
                 &LanguageCode::from("ja"),
-                &ScriptCode::from("Jpan"),
-                &ScriptCode::from("Latn"),
+                writing_system("Jpan"),
                 Some("とうきょう タワー")
             )
             .unwrap(),
             "toukyou tawā"
+        );
+    }
+
+    /// mucab reports readings in katakana, so the Japanese arm has to romanize
+    /// katakana before hiragana. Keying on the `Hira` inventory instead left
+    /// the reading in katakana.
+    #[test]
+    fn test_policy_romanizes_katakana_reading_from_mucab() {
+        assert_eq!(
+            transliterate_with_policy(
+                "こんにちは",
+                &LanguageCode::from("ja"),
+                writing_system("Jpan"),
+                Some("コンニチワ")
+            )
+            .unwrap(),
+            "kon'nichiwa"
+        );
+    }
+
+    /// CLDR has no `Hani` transform: pinyin is published under the
+    /// simplified/traditional subtags, which is why the catalog's own subtag
+    /// has to survive to here.
+    #[test]
+    fn test_chinese_subtags_romanize_to_pinyin() {
+        assert_eq!(
+            transliterate_with_policy(
+                "你好世界",
+                &LanguageCode::from("zh"),
+                writing_system("Hans"),
+                None
+            )
+            .unwrap(),
+            "nǐ hǎo shì jiè"
+        );
+        assert_eq!(
+            transliterate_with_policy(
+                "你好世界",
+                &LanguageCode::from("zh-Hant"),
+                writing_system("Hant"),
+                None
+            )
+            .unwrap(),
+            "nǐ hǎo shì jiè"
+        );
+    }
+
+    #[test]
+    fn test_mixed_han_in_latin_sentence() {
+        assert_eq!(
+            transliterate_mixed_to_latin("the city 北京 is large"),
+            "the city běi jīng is large"
         );
     }
 }

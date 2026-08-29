@@ -175,8 +175,9 @@ def render_region(r: RegionGroup) -> str:
 def render_language(lang: LanguageSection) -> str:
     sample = f'<p class="sample-text">{escape(lang.sample_text)}</p>\n' if lang.sample_text else ""
     regions = "\n".join(render_region(r) for r in lang.regions)
+    anchor = escape(lang.name.replace(" ", "-"), quote=True)
     return f"""<section>
-<h2>{escape(lang.name)}</h2>
+<h2 id="{anchor}"><a href="#{anchor}">{escape(lang.name)}</a></h2>
 {sample}{regions}
 </section>"""
 

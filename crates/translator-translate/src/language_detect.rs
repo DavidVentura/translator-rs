@@ -102,7 +102,7 @@ mod tests {
         list.iter()
             .map(|code| ScriptedLanguage {
                 code: LanguageCode::from(*code),
-                script: Script::from_iso15924(match *code {
+                script: translator_core::script::WritingSystem::from_iso15924(match *code {
                     "hi" => "Deva",
                     "bn" => "Beng",
                     "el" => "Grek",
@@ -114,7 +114,8 @@ mod tests {
                     "ru" | "uk" => "Cyrl",
                     _ => "Latn",
                 })
-                .expect("catalog script parses"),
+                .expect("catalog script parses")
+                .script(),
             })
             .collect()
     }

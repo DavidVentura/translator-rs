@@ -437,20 +437,22 @@ fn compile_language_info(
     // An unknown script must not sink the whole catalog: a newer catalog can
     // name a writing system this build predates, and every other language in it
     // still works.
-    let script = crate::script::Script::from_iso15924(&entry.meta.script).unwrap_or_else(|| {
-        log::warn!(
-            "language {code} declares unknown script {:?}; treating as Other",
-            entry.meta.script
-        );
-        crate::script::Script::Other
-    });
+    let writing_system = crate::script::WritingSystem::from_iso15924(&entry.meta.script)
+        .unwrap_or_else(|| {
+            log::warn!(
+                "language {code} declares unknown script {:?}; treating as Other",
+                entry.meta.script
+            );
+            crate::script::WritingSystem::Single(crate::script::Script::Other)
+        });
 
     Some(LanguageInfo {
         language: Language {
             code: code.clone(),
             display_name: entry.meta.name,
             short_display_name: entry.meta.short_name,
-            script,
+            script: writing_system.script(),
+            writing_system,
             dictionary_code,
         },
         resources,

@@ -87,10 +87,12 @@ impl Script {
         Some(code)
     }
 
-    /// Inverse of [`Script::iso15924`], plus the composite subtags the catalog
-    /// uses. Returns `None` for anything unrecognized so callers decide what an
-    /// unknown script means; guessing a default here is what made a missing
-    /// language silently render as Latin.
+    /// Inverse of [`Script::iso15924`]. Returns `None` for anything
+    /// unrecognized so callers decide what an unknown script means; guessing a
+    /// default here is what made a missing language silently render as Latin.
+    /// The composite subtags a catalog declares (`Hans`, `Jpan`, ...) name a
+    /// writing system rather than one inventory and parse as
+    /// [`WritingSystem`].
     pub fn from_iso15924(code: &str) -> Option<Self> {
         let script = match code {
             "Latn" => Script::Latin,
@@ -120,16 +122,67 @@ impl Script {
             "Hira" => Script::Hiragana,
             "Kana" => Script::Katakana,
             "Hang" => Script::Hangul,
-            // Composite subtags name a writing system rather than one script.
-            // Han is the shared inventory behind both Chinese variants, and kana
-            // is what [`Script::dominant`] keys Japanese on, so Jpan resolves to
-            // Hiragana for consistency with detection.
-            "Hans" | "Hant" => Script::Han,
-            "Jpan" => Script::Hiragana,
-            "Kore" => Script::Hangul,
             _ => return None,
         };
         Some(script)
+    }
+}
+
+/// The writing system a catalog language is written in, as ISO 15924 names it.
+///
+/// Separate from [`Script`] because the two answer different questions. A
+/// [`Script`] is the character inventory to itemize and pick a font by, so the
+/// composite subtags collapse into it: `Hans` and `Hant` are both drawn with
+/// Han glyphs. A writing system is what CLDR publishes its romanization
+/// transforms under, and there is no `Hani` transform — pinyin lives under
+/// `Hans`/`Hant`, and `Jpan` needs kana romanized before hiragana. Collapsing
+/// first and romanizing after therefore silently produces no transliteration
+/// for Chinese and leaves katakana untouched for Japanese.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum WritingSystem {
+    /// Written in one script, which is also its inventory.
+    Single(Script),
+    HanSimplified,
+    HanTraditional,
+    Japanese,
+    Korean,
+}
+
+impl WritingSystem {
+    pub fn from_iso15924(code: &str) -> Option<Self> {
+        let composite = match code {
+            "Hans" => WritingSystem::HanSimplified,
+            "Hant" => WritingSystem::HanTraditional,
+            "Jpan" => WritingSystem::Japanese,
+            "Kore" => WritingSystem::Korean,
+            _ => return Script::from_iso15924(code).map(WritingSystem::Single),
+        };
+        Some(composite)
+    }
+
+    /// ISO 15924 subtag, or `None` for the itemization categories that name no
+    /// writing system.
+    pub fn iso15924(self) -> Option<&'static str> {
+        match self {
+            WritingSystem::HanSimplified => Some("Hans"),
+            WritingSystem::HanTraditional => Some("Hant"),
+            WritingSystem::Japanese => Some("Jpan"),
+            WritingSystem::Korean => Some("Kore"),
+            WritingSystem::Single(script) => script.iso15924(),
+        }
+    }
+
+    /// The character inventory this writing system is drawn with. Kana is what
+    /// [`Script::dominant`] keys Japanese on, so `Jpan` resolves to Hiragana
+    /// for consistency with detection.
+    pub fn script(self) -> Script {
+        match self {
+            WritingSystem::HanSimplified | WritingSystem::HanTraditional => Script::Han,
+            WritingSystem::Japanese => Script::Hiragana,
+            WritingSystem::Korean => Script::Hangul,
+            WritingSystem::Single(script) => script,
+        }
     }
 }
 
@@ -209,7 +262,7 @@ impl From<unicode_script::Script> for Script {
 
 #[cfg(test)]
 mod tests {
-    use super::Script;
+    use super::{Script, WritingSystem};
 
     /// Every variant that names a real writing system. The three itemization
     /// categories are deliberately absent: they have no ISO 15924 subtag.
@@ -271,23 +324,52 @@ mod tests {
         ];
         for value in catalog_values {
             assert!(
-                Script::from_iso15924(value).is_some(),
+                WritingSystem::from_iso15924(value).is_some(),
                 "catalog script {value} does not parse"
             );
         }
     }
 
     #[test]
+    fn composite_subtags_keep_their_own_subtag() {
+        for (code, expected) in [
+            ("Hans", WritingSystem::HanSimplified),
+            ("Hant", WritingSystem::HanTraditional),
+            ("Jpan", WritingSystem::Japanese),
+            ("Kore", WritingSystem::Korean),
+        ] {
+            let parsed = WritingSystem::from_iso15924(code).expect("composite subtag parses");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.iso15924(), Some(code));
+        }
+        assert_eq!(Script::from_iso15924("Hans"), None);
+        assert_eq!(Script::from_iso15924("Jpan"), None);
+    }
+
+    #[test]
     fn composite_subtags_resolve_to_their_inventory() {
-        assert_eq!(Script::from_iso15924("Hans"), Some(Script::Han));
-        assert_eq!(Script::from_iso15924("Hant"), Some(Script::Han));
-        assert_eq!(Script::from_iso15924("Jpan"), Some(Script::Hiragana));
-        assert_eq!(Script::from_iso15924("Kore"), Some(Script::Hangul));
+        assert_eq!(WritingSystem::HanSimplified.script(), Script::Han);
+        assert_eq!(WritingSystem::HanTraditional.script(), Script::Han);
+        assert_eq!(WritingSystem::Japanese.script(), Script::Hiragana);
+        assert_eq!(WritingSystem::Korean.script(), Script::Hangul);
+    }
+
+    #[test]
+    fn writing_system_round_trips_single_scripts() {
+        for &script in WRITING_SYSTEMS {
+            let code = script.iso15924().expect("writing system has a subtag");
+            assert_eq!(
+                WritingSystem::from_iso15924(code),
+                Some(WritingSystem::Single(script))
+            );
+        }
     }
 
     #[test]
     fn unknown_script_is_none() {
         assert_eq!(Script::from_iso15924("Cans"), None);
         assert_eq!(Script::from_iso15924(""), None);
+        assert_eq!(WritingSystem::from_iso15924("Cans"), None);
+        assert_eq!(WritingSystem::from_iso15924(""), None);
     }
 }
