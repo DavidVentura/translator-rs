@@ -637,6 +637,38 @@ Generate into `/dev/shm` and parallelize by `--seed`. Reclaim leaked
 
 ## H. Evaluate
 
+### Do not diagnose data from an unconverged checkpoint
+
+Tempting, because a checkpoint exists at epoch 3 and the box is busy anyway. It
+cost most of an evening on the Georgian round.
+
+The epoch-3 model read `Ზ` as `%` on two signs and `Ბ` as `Გ` on a third. That
+produced two full causal investigations — a Mtavruli exposure deficit, then a
+display-typeface gap — with glyph-similarity measurements, corpus context counts,
+per-letter exposure pulled off the training box, and a re-measure of the font
+pool. A round-2 training run was designed around the conclusion.
+
+Every one of those errors was gone at epoch 20, with no change to data, fonts or
+config. It was optimization error (§ the three-way split at the top of
+`IMPROVEMENTS.md`) misfiled as data error.
+
+**An under-trained model and a badly-taught model look identical from outside:**
+both emit confident wrong characters on real photos, and both do it on the hard
+surfaces first. Nothing in the output distinguishes them. Only convergence does.
+
+So a mid-run probe is worth running for exactly two things — confirming the
+export→convert→infer path works end to end, and confirming the model is reading
+the target script at all. Any error it shows is provisional. Do not measure
+against it, do not build a hypothesis on it, and do not design the next round
+around it. Wait for the final checkpoint, which on this recipe is 20 epochs and
+about an hour.
+
+A corollary worth internalising: the cosine tail is where styled and low-quality
+text gets learned (the Hebrew round-3 note says the same). Display faces, banners
+and unusual signage are exactly the cases that look broken at epoch 3 and are
+fixed by epoch 20, which is precisely the material a real-photo golden set is
+made of.
+
 ### Synthetic val is blind to the failure that matters
 
 Model error splits into optimization error, approximation error, and irreducible

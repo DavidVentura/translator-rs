@@ -373,66 +373,127 @@ waits on the translation pair.
 
 ## Rounds
 
-### Round 1 — not yet run
+### Round 1 — trained, and what the mid-run probe got wrong
 
-To be filled in after the first training run. Record, following the Hebrew and
-Indic precedent:
+300K synthetic lines, 20 epochs, ~70 min on a rented RTX 4080 Super. Synthetic val
+0.99287. Real-photo results on the 8-image golden set below.
 
-- Dataset size, epochs, wall-clock, hardware
-- Synthetic val accuracy (sanity check only)
-- Per-surface real-photo results: book pages, street signs, shop fronts,
-  screenshots, price lists
-- Mkhedruli vs Mtavruli CER broken out separately — the round-1 question is
-  whether the uppercase transform gave Mtavruli enough coverage
-- Confusable pairs seen in the errors, with the font-pool hypothesis tested
-  against them the way Hebrew round 2 did
-- Whether the lari sign and other `KEEP_SET` glyphs actually read
+**Read this section for the methodological lesson before the results.** An
+epoch-3 checkpoint was probed against real photos while training continued, and
+its errors were diagnosed at length: `Ზ` decoded as `%` on two signs, `Ბ` as `Გ`
+on a third. Two causal accounts were built on that — first a Mtavruli exposure
+deficit (`Ზ` at 4752 instances against `%` at 5213), then, when `Ბ` turned out to
+have failed at 15805, a display-typeface gap (Mtavruli has 5 font designs to
+Mkhedruli's 26). Glyph similarity was measured, corpus contexts were counted,
+per-letter exposure was pulled off the box, the font pool was re-measured.
 
-### Mid-run probe at epoch 3 (real photos)
+Every one of those errors disappeared by epoch 20, with no change to data, fonts
+or config:
 
-The epoch-3 `best_accuracy` checkpoint was exported and run over three real
-photos through the production det + dewarp path. Reading real Georgian already:
+| epoch 3 | epoch 20 | |
+|---|---|---|
+| `Გ%Ა ᲛᲨᲕᲘᲓᲝᲑᲘᲡᲐ` | `ᲒᲖᲐ ᲛᲨᲕᲘᲓᲝᲑᲘᲡᲐ` | `Ზ` |
+| `ᲐᲑᲐᲜᲝᲡ ᲡᲐᲮᲣᲠᲐᲕ%Ე ᲐᲡᲕᲚᲐ` | `…ᲡᲐᲮᲣᲠᲐᲕᲖᲔ…` | `Ზ` |
+| `ᲛᲣ%ᲔᲣᲛᲘ` | `ᲛᲣᲖᲔᲣᲛᲘ` | `Ზ` |
+| `ᲡᲐᲒᲭᲝᲗᲐ` | `ᲡᲐᲑᲭᲝᲗᲐ` | `Ბ` |
+| `აზი% სლოევები` | `აზიზ სლოევები` | Mkhedruli `ზ` |
+| `TSCHUNVALI` | `TSCHINVALI` | Latin |
+| `აკადემაური` | `აკადემიური` | Mkhedruli |
 
-| image | result |
-|---|---|
-| motorway sign (ს-1 / Tbilisi / Tskhinvali / Gori) | 7/8 strips exact; the one error is Latin (`TSCHUNVALI` for `TSCHINVALI`) |
-| `ᲒᲖᲐ ᲛᲨᲕᲘᲓᲝᲑᲘᲡᲐ` / HAPPY JOURNEY | 1 char wrong, English exact |
-| trilingual bathhouse sign | Georgian 1 char wrong, English exact, Cyrillic correctly unreadable (no Cyrillic classes) |
+The errors were **optimization error, not data error** — `IMPROVEMENTS.md`
+category 1 misfiled as category 3. The model had not converged. Nothing about
+exposure or fonts was involved, and the two hypotheses were elaborate
+explanations for a checkpoint that was simply 13 epochs early.
 
-Two things this settled early:
+**The rule this earns: do not diagnose data from an unconverged checkpoint.** A
+mid-run probe is useful for confirming the pipeline runs end to end and that the
+script is being read at all. It cannot distinguish "the data taught this wrong"
+from "training has not finished", because both present identically as confident
+wrong characters on real photos. Wait for the final model, or state explicitly
+that any finding is provisional and do not build on it.
 
-- **Mtavruli was the right call and the signs confirm it.** All three signs are
-  set in caps-style Georgian, verified by glyph extent rather than by eye: the
-  photo's letters share one band (top spread 0.02, bottom spread 0.03) matching
-  Mtavruli (0.00/0.00), not Mkhedruli (0.20/0.25). The model also emitted
-  *Mkhedruli* `ს` for the route badge on the same image, so it is resolving case
-  rather than defaulting to one.
-- **`800Მ` reads**, so the Mtavruli-plus-digit co-occurrence works — the
-  combination that was absent from the data entirely before the mixed-font and
-  caps-routing work.
+This also reverses the round-2 plan that the probe motivated. The Mtavruli
+coverage stream was justified entirely by the `Ზ` error; with that error gone
+there is nothing for it to fix, and the exposure change costs ~13% of Mkhedruli
+labels while pushing the caps share of labels from 19.2% to 28.9%. The machinery
+built for it is still correct on its own merits — preferring real corpus text
+over `synth_tail`, and a group-relative floor instead of an absolute 300 — and it
+is worth keeping for a script whose corpus genuinely starves a class. It is not
+worth spending on this one.
 
-**The one systematic error: `Ზ` decoded as `%`, in both Georgian signs.** Two
-hypotheses tested and rejected — it is not visual (`Ზ`/`%` scores 0.193 mean,
-0.329 max, against 0.69–0.78 for the real confusables), and it is not a bad
-synthetic context (`%` never hit the floor-fill path; 2932 of 3364 corpus
-occurrences follow a digit, none are Georgian-flanked). The cause is exposure:
+### Round 1 residuals (final model)
+
+Real regressions against epoch 3, all minor: `ს-1` → `Ს-1` (case flip on a route
+badge that epoch 3 read correctly), `OCCUPATION` → `OCCUPATIOx`, a spurious space
+before a full stop, a duplicated `-`.
+
+The one worth tracking: strips that returned **empty** at epoch 3 now emit short
+garbage (`@/`, `U`, `T-`, `V`) on detector false positives — ornament and
+non-text boxes. This is the hallucination-on-false-positives behaviour Hebrew
+round 1 showed. The runtime score gate is documented as separating garbage
+(≤0.6) from text (≥0.93), so it likely never surfaces in production, but
+`golden_eval` does not apply that gate and so cannot confirm it. Check box scores
+on those strips before assuming it is harmless.
+
+### Round 1 golden-set score
+
+Nine real photographs, 98 scorable strips, 3620 characters. Ground truth written
+per-strip against the images; ornament, pictogram and Russian strips excluded
+(the dict has no Cyrillic classes, so ignoring them is the designed behaviour).
 
 ```
-Mtavruli mean/letter  15170     Mkhedruli mean/letter  71758
-Ზ  4752  (rank 22/33)           ზ  22699
-%  5213  → a punctuation mark outnumbers the letter it displaces
+TOTAL                     98 strips   CER 0.72%   folded 0.30%   exact 90/98
+  georgian only (folded)  64 strips   CER 0.34%                  exact 60/64
+  latin only (folded)     34 strips   CER 0.24%                  exact 31/34
 ```
 
-Mtavruli reaches the set only through the uppercase pass, so its letters get
-~21% of their Mkhedruli counterparts' exposure, and the lower half of that
-budget falls under the `%` count. This is the Zipfian mechanism from
-`IMPROVEMENTS.md`: the boundary is set by the more frequent member. Next
-casualties by the same measure: `Ჟ` 677, `Ჰ` 984, `Ჭ` 1250, `Ჯ` 1302.
+"folded" maps Mtavruli onto Mkhedruli, isolating letter identity from case. The
+gap between 0.72% and 0.30% is entirely two case decisions, so case is worth
+tracking as its own metric:
 
-Round-2 fix: raise `MTAVRULI_LINE_FRAC`/`MTAVRULI_WORD_FRAC` (0.12/0.08), or add
-a coverage stream that floors Mtavruli letters directly instead of letting
-natural frequency set them. Prefer the coverage stream — raising the line
-fraction alone shifts the whole distribution rather than lifting the tail.
+```
+Georgian-bearing strips   66     (11 Mtavruli-dominant, 55 Mkhedruli)
+Pure case-error strips     1     1.5%
+Georgian characters     2007
+Wrong on case alone       15     0.75%    always over-predicting Mtavruli
+```
+
+Case errors are **whole-line, not per-character** — the model committed an entire
+running head to caps rather than mixing within the line. That is the right shape
+of behaviour, since a printed line is typographically uniform, but it means each
+case error costs a full line of characters rather than one.
+
+Per image, worst to best:
+
+| image | strips | CER (folded) | exact |
+|---|---|---|---|
+| bathhouse sign (trilingual) | 4 | 1.27% | 3/4 |
+| Maro Tarkhnishvili plaque | 14 | 1.08% | 11/14 |
+| Bakhcho & Aziz Sloevs plaque | 8 | 1.01% | 7/8 |
+| museum banner | 5 | 0.93% | 4/5 |
+| book page (Lay of Leithian) | 35 | 0.09% | 33/35 |
+| Erkomaishvili plaque | 17 | 0.00% | 17/17 |
+| motorway sign, Olympic plaque, HAPPY JOURNEY | 15 | 0.00% | 15/15 |
+
+The book page is the useful result: bendy paper, an italic serif, dense verse,
+and it produced the best per-character score in the set. Dense Mkhedruli body
+text is both the dominant real-world case and the model's strongest surface.
+
+Remaining errors across the whole set, in full: one running-head case flip, one
+em dash rendered `--`, one duplicated dash, one spurious `.` (a bolt head on a
+plaque — arguably the ground truth is wrong), one `N` clipped by a sticker
+overlapping the sign, one `s` lost to glare, one `on`/`On`, and one genuinely
+hard low-contrast strip. No systematic failure mode is visible.
+
+**Read the score with its bias in mind.** The ground truth was written by the
+same model that is being scored, so a systematic misreading would be invisible
+and the absolute figure is optimistic. It is sound for tracking movement between
+rounds, which is what it was built for. A native reader spot-checking a sample
+would be needed to anchor it as an absolute number.
+
+Sample skew worth noting: only 11 of 66 Georgian strips are Mtavruli-dominant,
+so the case decision — the design question this script exists to test — is mostly
+being exercised on Mkhedruli. More Mtavruli signage would strengthen the set.
 
 ### Confusables: measured candidates, deliberately not acted on yet
 
