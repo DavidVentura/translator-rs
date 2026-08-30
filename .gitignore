@@ -14,3 +14,4 @@ viz-out/
 *.bin
 *.map
 *.jsonl
+*.mnn
