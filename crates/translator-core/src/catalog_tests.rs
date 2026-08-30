@@ -1200,3 +1200,29 @@ fn plan_migrations_classifies_by_disk_state() {
 
     assert!(jobs.iter().all(|job| job.entry.onnx != "c.onnx"));
 }
+
+/// The `georgian` recognizer must resolve from the shipping index: `ka` maps to the pack,
+/// the pack parses as a PPOCR recognizer, and the script comes back LTR. Catches a slug
+/// typo or a missing `from_slug` arm, which otherwise surface only as a silent
+/// "no ppocr pack for language ka" at runtime.
+#[test]
+fn georgian_recognizer_resolves_for_ka() {
+    let index = std::path::Path::new("/home/david/AndroidStudioProjects/bucket/index_v6.json");
+    if !index.exists() {
+        return; // the bucket checkout is not present in every environment
+    }
+    let raw = std::fs::read_to_string(index).expect("read index");
+    let catalog = crate::catalog::parse_and_validate_catalog(&raw).expect("parse index");
+    let code = crate::api::LanguageCode::new("ka".to_string());
+    let pack_id = catalog
+        .ocr_pack_id_for_engine(&code, "ppocr")
+        .expect("ka should have a ppocr pack");
+    let pack = catalog.pack(&pack_id).expect("pack present");
+    match &pack.kind {
+        crate::catalog::PackKind::Ocr(crate::catalog::OcrPack::PpocrRecognizer { script }) => {
+            assert_eq!(script.as_slug(), "georgian");
+            assert!(!script.is_rtl(), "Georgian is left-to-right");
+        }
+        other => panic!("ka resolved to the wrong pack kind: {other:?}"),
+    }
+}

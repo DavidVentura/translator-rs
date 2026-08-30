@@ -317,27 +317,50 @@ Code touchpoints for the harness:
 - `src/bin/golden_eval.rs:23` — add `"georgian" => PpocrScript::Georgian` to `script_from_slug`
 - `src/bin/viz_pipeline.rs` — add the same arm to its slug match
 
-## Ship-side wiring
+## Ship-side wiring — done
 
-Rust, `crates/translator-core/src/catalog_model.rs:218`:
+All of the below is landed and verified; kept as the record of what a script's
+ship step touches.
 
-- Add `PpocrScript::Georgian` to the enum
-- Add `PpocrScript::Georgian => "georgian"` to `as_slug`
-- Add `"georgian" => Some(PpocrScript::Georgian)` to `from_slug`
-- Leave it out of `is_rtl()`
+Rust:
+
+- `crates/translator-core/src/catalog_model.rs` — `PpocrScript::Georgian`, plus
+  `as_slug` / `from_slug` arms. Deliberately absent from `is_rtl()`.
+- `src/bin/golden_eval.rs` and `src/bin/viz_pipeline.rs` — `"georgian"` arms in
+  their slug matches.
+- `scripts/rec_model/run_golden.py` — `"georgian": ["georgian"]` in `FAMILIES`.
 
 Catalog, `~/AndroidStudioProjects/Translator/catalog_ppocr.py`:
 
-- `PPOCR_V6_FILENAMES` — add `georgian_rec_int8.mnn` and `georgian_keys.txt`
-- `PPOCR_V6_NATIVE_RECOGNIZER_FILENAMES` — add
-  `"georgian": ("georgian_rec_int8.mnn", "georgian_keys.txt")`
-- `PPOCR_RECOGNIZER_SLUGS` — add `"georgian"`
-- `ISO_SCRIPT_TO_PPOCR` — add `"Geor": "georgian"`
+- `PPOCR_V6_FILENAMES` — `georgian_rec_int8.mnn`, `georgian_keys.txt`
+- `PPOCR_V6_NATIVE_RECOGNIZER_FILENAMES` — the `(model, keys)` pair
+- `PPOCR_RECOGNIZER_SLUGS` — `"georgian"`
+- `ISO_SCRIPT_TO_PPOCR` — `"Geor": "georgian"`
 
 The `assert set(ISO_SCRIPT_TO_PPOCR.values()) | {"eslav"} == set(PPOCR_RECOGNIZER_SLUGS)`
 at the bottom of that file catches a half-done edit.
 
-Then upload the files to the bucket and regenerate the index.
+Bucket and index: the two files were copied to `bucket/ocr/1/PP-OCRv6/`, then
+`generate_index.py` was run in `internal` mode and again in `public` mode, and
+the result copied to `bucket/index_v6.json` so the served index and the app's
+bundled asset stay identical. Regenerating to a scratch path and diffing against
+the live index first is worth the extra step — it confirmed the only change was
+one added pack, `ka` gaining its `ocr` asset, and correct `sizeBytes`, with no
+existing pack touched.
+
+### Verifying the wiring rather than assuming it
+
+Two checks, both cheap, both catching failures that are otherwise silent:
+
+- `catalog_tests.rs::georgian_recognizer_resolves_for_ka` parses the real
+  shipping index and asserts `ka` resolves to a PPOCR recognizer whose slug is
+  `georgian` and which reports LTR. A slug typo or a missing `from_slug` arm
+  otherwise surfaces only at runtime as "no ppocr pack for language ka". The
+  test skips when the bucket checkout is absent.
+- Re-run the golden set with the real slug and diff against the run made with
+  the `latin` stand-in. For an LTR script the outputs must be byte-identical,
+  since the slug only gates the bidi pass; all nine images matched. For an RTL
+  script this diff is the check that the bidi pass actually engaged.
 
 ## Open items
 

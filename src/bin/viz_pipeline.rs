@@ -222,6 +222,7 @@ fn script_from_slug(slug: &str) -> Option<PpocrScript> {
         "devanagari" => PpocrScript::Devanagari,
         "el" => PpocrScript::El,
         "eslav" => PpocrScript::Eslav,
+        "georgian" => PpocrScript::Georgian,
         "hebrew" => PpocrScript::Hebrew,
         "indic" => PpocrScript::Indic,
         "korean" => PpocrScript::Korean,

@@ -22,6 +22,7 @@ fn contour_points(c: &[f32]) -> Vec<(f32, f32)> {
 
 fn script_from_slug(s: &str) -> Option<PpocrScript> {
     Some(match s {
+        "georgian" => PpocrScript::Georgian,
         "hebrew" => PpocrScript::Hebrew,
         "indic" => PpocrScript::Indic,
         "latin" => PpocrScript::Latin,

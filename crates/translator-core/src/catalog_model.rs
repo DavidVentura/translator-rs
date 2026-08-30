@@ -222,6 +222,10 @@ pub enum PpocrScript {
     Devanagari,
     El,
     Eslav,
+    /// Georgian. Mkhedruli plus Mtavruli, which is a separate codepoint block rather
+    /// than a case styling, so the recognizer emits whichever the page carries. The
+    /// script is unicameral — case applies to a whole run, never to a leading letter.
+    Georgian,
     /// Hebrew. The fine-tuned rec model emits glyphs in visual (RTL) order; logical
     /// order is recovered downstream by the bidi pass, same as Arabic.
     Hebrew,
@@ -244,6 +248,7 @@ impl PpocrScript {
             PpocrScript::Devanagari => "devanagari",
             PpocrScript::El => "el",
             PpocrScript::Eslav => "eslav",
+            PpocrScript::Georgian => "georgian",
             PpocrScript::Hebrew => "hebrew",
             PpocrScript::Indic => "indic",
             PpocrScript::Korean => "korean",
@@ -262,6 +267,7 @@ impl PpocrScript {
             "devanagari" => Some(PpocrScript::Devanagari),
             "el" => Some(PpocrScript::El),
             "eslav" => Some(PpocrScript::Eslav),
+            "georgian" => Some(PpocrScript::Georgian),
             "hebrew" => Some(PpocrScript::Hebrew),
             "indic" => Some(PpocrScript::Indic),
             "korean" => Some(PpocrScript::Korean),

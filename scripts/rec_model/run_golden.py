@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-FAMILIES = {"indic": ["bengali", "gujarati", "kannada", "malayalam"], "hebrew": ["hebrew"]}
+FAMILIES = {"indic": ["bengali", "gujarati", "kannada", "malayalam"], "hebrew": ["hebrew"], "georgian": ["georgian"]}
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN_EVAL = os.path.normpath(os.path.join(HERE, "../../target/debug/golden_eval"))
 
