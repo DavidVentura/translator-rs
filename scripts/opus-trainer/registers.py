@@ -43,8 +43,13 @@ class Register(StrEnum):
 # there is one table to edit rather than a set and a mapping that can disagree.
 # Excluded on purpose: ParaCrawl-Bonus (duplicate of ParaCrawl), ELRC-* (tiny
 # health leaflets, mostly boilerplate).
+# MultiHPLT is NOT a duplicate of HPLT despite the name: measured on en-ka they
+# share 82.4% of pairs and each holds 264k the other lacks. Both are listed, and
+# the cross-register dedup collapses the overlap.
 REGISTER: Mapping[str, Register] = {
     "NLLB": Register.CRAWL,
+    "HPLT": Register.CRAWL,
+    "MultiHPLT": Register.CRAWL,
     "CCAligned": Register.CRAWL,
     "CCMatrix": Register.CRAWL,
     "ParaCrawl": Register.CRAWL,

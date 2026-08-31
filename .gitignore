@@ -15,3 +15,6 @@ viz-out/
 *.map
 *.jsonl
 *.mnn
+
+# MT training corpora — kept out of git, destined for HF datasets
+scripts/opus-trainer/data/

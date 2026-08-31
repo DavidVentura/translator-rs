@@ -20,6 +20,9 @@
 # Gotcha: the trainer target is `marian_train` (underscored); `make marian` builds
 # only the static lib. See docker/Dockerfile.marian-cuda.
 #
+# OPUSTRAINER_CFG overrides the augmentation config (default
+# configs/opustrainer.student.yml). A pair whose target script has no case
+# needs its own, or UpperCase byte-falls-back every perturbed line.
 # EXTRA passes additional marian flags verbatim (e.g. "--fp16 --mini-batch 4000").
 # Default empty => byte-identical behaviour to before, so an existing run's
 # numbers stay comparable.
@@ -50,7 +53,7 @@ else
 fi
 
 OT_CFG="$(dirname "$OUT")/config.opustrainer.yml"
-sed "s|__TSV__|$TSV|g" "$HERE/configs/opustrainer.student.yml" > "$OT_CFG"
+sed "s|__TSV__|$TSV|g" "${OPUSTRAINER_CFG:-$HERE/configs/opustrainer.student.yml}" > "$OT_CFG"
 
 # Streaming, deliberately, after weighing materialising the augmented corpus
 # (2026-07-21). `until original inf` re-rolls the modifiers every pass, so a

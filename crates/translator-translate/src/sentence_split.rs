@@ -41,7 +41,7 @@ fn boundary_regex() -> &'static Regex {
         // Group 1 ends after the closing delimiters (they stay with the current
         // sentence); group 2 is the opening-delimiter run and group 3 the first
         // real character — the next sentence begins at group 2's start.
-        Regex::new(r#"([.!?]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*)(\S)"#)
+        Regex::new(r#"([.!?।॥։۔؟።፧]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*)(\S)"#)
             .expect("valid sentence-boundary regex")
     })
 }
@@ -61,7 +61,7 @@ static NONBREAKING_PREFIXES: &[&str] = &[
     "Sgt", "Cpl", "Pvt", "Adm", "Messrs", "Jr", "Sr", "Bros",
     // en misc
     "vs", "v", "Mt", "Ft", "Ave", "Blvd", "Rd", "Dept", "Univ", "Inc", "Ltd",
-    "Corp", "Co", "Est", "Ph.D", "M.D", "B.A", "M.A", "D.C",
+    "Corp", "Co", "Est", "Ph.D", "M.D", "B.A", "M.A", "D.C", "e.g", "i.e",
     // es
     "Sra", "Srta", "Ud", "Uds", "Vd", "Vds", "Dña", "Excmo", "Ilmo", "Avda",
     // fr
@@ -70,7 +70,39 @@ static NONBREAKING_PREFIXES: &[&str] = &[
     "Hr", "Frau", "Nr", "Str", "z.B", "bzw", "usw", "ca",
     // pl (lowercase forms commonly precede capitalized names: "ul. Krakowska")
     "ul", "al", "prof", "dr", "mgr", "inż", "hab", "im", "św", "ks", "płk",
+    // ka — needed now that Georgian splits at `.` at all; without these,
+    // "ელ. ფოსტა" (email) is cut in half.
+    "ე.წ", "ელ", "მაგ", "იხ", "წმ", "დაახლ", "თ.წ", "ე.ი",
 ];
+
+// Scripts that do not mark sentence starts with a capital. The `.` boundary
+// guard below requires an uppercase opener, which is a Latin/Cyrillic/Greek
+// assumption: applied to these scripts it silently disables period-splitting
+// altogether, so a whole paragraph reaches a sentence-trained model as one
+// unit. Georgian is listed even though Unicode gives Mkhedruli lowercase
+// status with an uppercase mapping into Mtavruli (U+1C90..U+1CBF) -- that
+// mapping is for all-caps display only and never appears sentence-initially,
+// so `char::is_uppercase` is false for every letter of ordinary Georgian prose.
+#[rustfmt::skip]
+static UNICAMERAL_RANGES: &[(char, char)] = &[
+    ('\u{10A0}', '\u{10FF}'), ('\u{1C90}', '\u{1CBF}'), ('\u{2D00}', '\u{2D2F}'),
+    ('\u{0590}', '\u{05FF}'), ('\u{FB1D}', '\u{FB4F}'),
+    ('\u{0600}', '\u{06FF}'), ('\u{0750}', '\u{077F}'), ('\u{08A0}', '\u{08FF}'),
+    ('\u{FB50}', '\u{FDFF}'), ('\u{FE70}', '\u{FEFF}'),
+    ('\u{0700}', '\u{074F}'), ('\u{0780}', '\u{07BF}'),
+    ('\u{0900}', '\u{097F}'), ('\u{0980}', '\u{09FF}'), ('\u{0A00}', '\u{0A7F}'),
+    ('\u{0A80}', '\u{0AFF}'), ('\u{0B00}', '\u{0B7F}'), ('\u{0B80}', '\u{0BFF}'),
+    ('\u{0C00}', '\u{0C7F}'), ('\u{0C80}', '\u{0CFF}'), ('\u{0D00}', '\u{0D7F}'),
+    ('\u{0D80}', '\u{0DFF}'),
+    ('\u{0E00}', '\u{0E7F}'), ('\u{0E80}', '\u{0EFF}'), ('\u{0F00}', '\u{0FFF}'),
+    ('\u{1000}', '\u{109F}'), ('\u{1200}', '\u{137F}'), ('\u{1780}', '\u{17FF}'),
+    ('\u{1100}', '\u{11FF}'), ('\u{3040}', '\u{30FF}'), ('\u{3400}', '\u{4DBF}'),
+    ('\u{4E00}', '\u{9FFF}'), ('\u{AC00}', '\u{D7AF}'), ('\u{F900}', '\u{FAFF}'),
+];
+
+fn is_unicameral(c: char) -> bool {
+    UNICAMERAL_RANGES.iter().any(|&(lo, hi)| c >= lo && c <= hi)
+}
 
 fn is_nonbreaking_prefix(before_period: &str) -> bool {
     let word = before_period
@@ -111,18 +143,20 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
         // split before an uppercase letter (guards decimals `3.14`, `e.g.`,
         // lowercase parentheticals `(or so I thought)`) and never after a
         // title/initial abbreviation.
-        let strong = punct.as_str().contains('!') || punct.as_str().contains('?');
+        let strong = punct
+            .as_str()
+            .chars()
+            .any(|c| matches!(c, '!' | '?' | '\u{061F}'));
         if !strong {
             if punct.as_str() == "." && is_nonbreaking_prefix(&text[..punct.start()]) {
                 continue;
             }
-            if !first
+            let first = first
                 .as_str()
                 .chars()
                 .next()
-                .expect("group 3 is one character")
-                .is_uppercase()
-            {
+                .expect("group 3 is one character");
+            if !is_unicameral(first) && !first.is_uppercase() {
                 continue;
             }
         }
@@ -376,6 +410,80 @@ mod tests {
         assert_eq!(
             split_sentences("She paused. \"and then nothing\""),
             vec!["She paused. \"and then nothing\""]
+        );
+    }
+
+    #[test]
+    fn caseless_scripts_split_on_period() {
+        // These have no uppercase, so an is_uppercase() opener check silently
+        // disables period-splitting and hands the model a whole paragraph.
+        for (script, text) in [
+            (
+                "ka",
+                "კარი დაკეტილია. გთხოვთ გამოიყენოთ გვერდითი შესასვლელი.",
+            ),
+            ("he", "הדלת סגורה. אנא השתמש בכניסה הצדדית."),
+            ("ar", "الباب مغلق. الرجاء استخدام المدخل الجانبي."),
+            ("bn", "দরজা বন্ধ. পাশের প্রবেশপথ ব্যবহার করুন."),
+            ("th", "ประตูปิดอยู่. กรุณาใช้ทางเข้าด้านข้าง."),
+        ] {
+            assert_eq!(split_sentences(text).len(), 2, "{script} must split");
+        }
+    }
+
+    #[test]
+    fn non_latin_terminators_split() {
+        assert_eq!(split_sentences("दरवाज़ा बंद है। कृपया आएं।").len(), 2);
+        assert_eq!(split_sentences("أين هو؟ إنه هنا.").len(), 2);
+    }
+
+    #[test]
+    fn georgian_abbreviations_do_not_split() {
+        assert_eq!(
+            split_sentences("ეს არის ელ. ფოსტა."),
+            vec!["ეს არის ელ. ფოსტა."]
+        );
+        assert_eq!(
+            split_sentences("მაგ. წყალი და პური."),
+            vec!["მაგ. წყალი და პური."]
+        );
+        assert_eq!(
+            split_sentences("ეს არის ე.წ. პრობლემა. მეორე წინადადება.").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cased_scripts_keep_the_uppercase_guard() {
+        // The guard must still suppress the Latin false positives it was
+        // written for; unicameral handling is additive, not a relaxation.
+        assert_eq!(split_sentences("The value is 3.14 and no more.").len(), 1);
+        assert_eq!(split_sentences("Bring gear, e.g. rope and boots.").len(), 1);
+        assert_eq!(split_sentences("He left. (or so I thought)").len(), 1);
+        assert_eq!(split_sentences("It was J. K. Rowling.").len(), 1);
+    }
+
+    #[test]
+    fn latin_eg_ie_do_not_split_before_a_capital() {
+        // The uppercase guard hides this only while the next word is lowercase;
+        // "e.g. Paris" broke mid-sentence for every language pair.
+        assert_eq!(
+            split_sentences("Visit a city, e.g. Paris in spring.").len(),
+            1
+        );
+        assert_eq!(
+            split_sentences("The result, i.e. Total revenue, fell.").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn georgian_etc_terminates_a_sentence() {
+        // `ა.შ.` is "and so on"; like the deliberately-absent Latin `etc`, it ends
+        // a sentence, and suppressing the break desynchronises it from English.
+        assert_eq!(
+            split_sentences("წიგნები, ჟურნალები და ა.შ. შემდეგი წინადადება.").len(),
+            2
         );
     }
 }

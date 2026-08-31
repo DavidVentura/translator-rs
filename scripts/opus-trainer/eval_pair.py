@@ -57,6 +57,9 @@ def main() -> None:
                     help="side-by-side review; REQUIRED so metrics-without-review "
                          "is not a runnable partial of this step")
     ap.add_argument("--label", default="system")
+    ap.add_argument("--tgt-lang", default="en",
+                    help="language the hypotheses are IN; selects probe_check's "
+                         "spelled-out numerals, which are per-language")
     args = ap.parse_args()
 
     model = load_comet()
@@ -67,7 +70,7 @@ def main() -> None:
 
     mechanical: dict[str, int] = {}
     for src, hyp in zip(check_src, check_hyp):
-        for failure in check(src, hyp):
+        for failure in check(src, hyp, tgt_lang=args.tgt_lang):
             mechanical[failure.kind] = mechanical.get(failure.kind, 0) + 1
 
     result = {

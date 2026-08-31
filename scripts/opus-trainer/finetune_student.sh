@@ -16,6 +16,9 @@
 # VALID_TSV must be a 2-COLUMN tsv (src\ttrg) -- marian validation wants 2 fields,
 # a 3-col valid (with alignment) aborts with "Excessive field(s)".
 #
+# OPUSTRAINER_CFG overrides the augmentation config (default
+# configs/opustrainer.student.yml). A pair whose target script has no case
+# needs its own, or UpperCase byte-falls-back every perturbed line.
 # Needs `pip install opustrainer` (console script opustrainer-train) in the env.
 # MARIAN env var = path to the marian trainer binary (default /root/marian-dev/build/marian).
 #
@@ -35,7 +38,7 @@ if [[ "$PRE" != *.npz && "$PRE" != *.bin ]]; then
 fi
 
 OT_CFG="$(dirname "$OUT")/config.opustrainer.finetune.yml"
-sed "s|__TSV__|$TSV|g" "$HERE/configs/opustrainer.student.yml" > "$OT_CFG"
+sed "s|__TSV__|$TSV|g" "${OPUSTRAINER_CFG:-$HERE/configs/opustrainer.student.yml}" > "$OT_CFG"
 
 opustrainer-train --config "$OT_CFG" --log-level INFO \
   "$MARIAN" \

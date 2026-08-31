@@ -1,0 +1,911 @@
+# en↔ka (Georgian) — teacher gate findings
+
+Measured 2026-08-30 across four rented 4090s, $1.64 of GPU total. Scripts added
+for this: `madlad_decode.py`, `lmt_decode.py`, `eval_slices.py`, `mojibake.py`,
+`mojibake_filter.py`, `gen_short_en.py`. Data produced:
+`data/short.en-ka.gen.jsonl` (10,863 short pairs) and `probes/check.ka.gen.jsonl`
+(67 camera-path lines), both model-generated and awaiting native review.
+
+Verdict: teacher is **NiuTrans LMT-60**, both directions. MADLAD-400 is
+unusable for Georgian and the reason is section 2.
+
+## 1. South-Slavic mojibake contaminates the Georgian side of mined corpora
+
+**~80% of the Georgian side of OPUS OpenSubtitles en-ka is South-Slavic
+subtitles**, not Georgian. CP1251 Cyrillic bytes were painted with the glyphs of
+an 8-bit Georgian font and then stored as the Georgian codepoints, so every
+character lands inside the Mkhedruli block. It survives codepoint-range checks,
+"does this contain Georgian script" checks, and fastText `lid.176`, all of which
+see a well-formed Georgian string.
+
+The content is mostly Bulgarian but includes Macedonian, Serbian and Russian, so
+treat it as Slavic rather than one language.
+
+The substitution is the 32 CP1251 lowercase Cyrillic letters laid position by
+position onto the first 32 letters of the TRADITIONAL 38-letter Georgian
+alphabet. The archaic letters ჱ ჲ ჳ carry з и х because they sit at traditional
+positions 7, 14 and 21, which modern Georgian skips. Aligning onto the 30-letter
+Bulgarian alphabet instead is wrong past щ: it mis-maps ჩ ც ძ წ, and წ=я is among
+the most frequent letters in the corrupt text.
+
+    გთზ რჲგა.      ->  виж това.      (Look at that.)
+    ვი, მამჲ.      ->  ей, мамо.      (Hey, Mama.)
+
+Detection ladder, drop-only and never keep-only, following the uig/kk precedent
+in `script_lid.py`:
+
+1. **Archaic Mkhedruli letters `U+10F1-10FA`.** ჱ ჲ ჳ are the images of Cyrillic
+   з и х, which are common in Slavic and effectively absent from modern
+   Georgian, so the false-positive risk is near zero. This also drops genuine
+   Mingrelian and Svan, which use ჷ and ჸ.
+2. **Invert the map, then run LID.** A demapped mojibake line is fluent
+   Bulgarian and LID says so; a demapped genuine Georgian line is Cyrillic noise
+   that LID will not confidently label. This needs no mined marker list.
+3. **A character-trigram likelihood ratio** for the residue: score each line
+   under a Georgian model and its demapped form under a Slavic model trained on
+   the corpus's own tier-1 hits, and drop when Slavic wins by a margin. Training
+   the Slavic side on the corpus itself costs nothing and needs no extra data.
+
+Tier 1 alone is not enough. A third of the archaic-free OpenSubtitles lines are
+also corrupt, so a codepoint rule by itself leaves tens of thousands of Slavic
+pairs in the pool.
+
+Shipped as `mojibake_filter.py` at `--margin 0.5`: 98.5% catch on a hand-labelled
+residue, and 23 false positives across 91,700 known-clean lines (0.025%), which
+are `.kgm` place names and printf format strings. Measured drops: OpenSubtitles
+76.67%, KDE4 0.09%, translatewiki 0.02%, TED2020 0.004%, GNOME/ELRC/QED and the
+generated short set 0.00%.
+
+Demap-then-LID was tried and rejected: `lid.176` labels 104 of 134 genuine
+Georgian lines as `ru`, because demapped Georgian is still Cyrillic and `ru` is
+the block's default answer.
+
+Known residue: roughly 7-8% of the kept OpenSubtitles lines are still Slavic.
+All are 1-3 words ("ეა."=да, "ნვ."=не), too short for trigram context. A minimum
+length filter on the pool is the cheaper fix than lowering the threshold.
+
+Scale, measured on the full prepared pool rather than on OpenSubtitles alone.
+An early reading had this confined to OpenSubtitles because the corpus sample it
+used excluded NLLB, which is 76% of the bitext. It is not confined:
+
+| corpus | archaic-bearing ka lines | share |
+|---|---|---|
+| OpenSubtitles | 163,112 | 66.80% |
+| NLLB | 110,847 | 1.00% |
+| WikiMatrix / wikimedia / CCAligned / XLEnt | 117 total | ~0.01% |
+| HPLT, MultiHPLT, and every clean corpus | 0-48 | 0.00% |
+
+NLLB's raw rate looked alarming at 110,847 lines, but almost none of it is
+Slavic. Demapping the 80,902 lines the filter dropped from the crawl register
+finds **195 Slavic and 80,707 not** (0.2% / 99.8%). The rest is **Old Georgian**,
+where ჲ ჳ ჵ are doing their real historical job:
+
+    EN  29 As they were going out of Jericho, a great crowd followed him.
+    KA  29. და ვითარ გამოვიდოდეს იგინი იერიქოჲთ, შეუდგა მას ერი მრავალი.
+
+That is a correct translation in archaic orthography, mixed with misaligned
+liturgical text and junk. Dropping it is still defensible, because archaic forms
+would teach the student ჰრქუა where modern Georgian wants უთხრა, but that is a
+REGISTER decision and not a contamination one, and tier 1's calibration never
+covered this population: the clean references it was tuned against contain no
+biblical text.
+
+So the Slavic contamination really is confined to OpenSubtitles: 122,781
+dialogue lines against 195 in crawl.
+
+The vocab shows the cost directly. A joint 32k SPM trained on the unfiltered
+pool put **133 of its 32,000 pieces** on subwords containing archaic Mkhedruli:
+they are learned units from Slavic-in-Georgian-letters, not byte fallback, and
+`გთზ რჲგა.` tokenizes as `['▁გთ', 'ზ', '▁რჲგა', '.']`. Filter before training the
+vocab.
+
+## 2. MADLAD-400's Georgian is the same mojibake
+
+MADLAD-400 scores ~15-17 chrF on en→ka in its own paper across FLORES and NTREX,
+against ~47 for NLLB, and the paper offers no explanation. The mechanism is that
+it emits Bulgarian in Georgian letters:
+
+    <2ka> I love pizza!   ->  ჲბთფამ ოთუა!   =  обичам пица!
+    <2ka> No Smoking      ->  ნვ ოსქთ.        =  не пуши.
+
+Measured over 300 FLORES lines, the fraction of each model's own Georgian output
+that carries the mojibake signature:
+
+| model | mojibake |
+|---|---|
+| madlad400-3b-mt | 59.0% |
+| nllb-200-distilled-1.3B | 5.7% |
+| nllb-200-distilled-600M | 0.7% |
+| LMT-60-8B | 0.0% |
+| opus-mt-synthetic-en-ka | 0.0% |
+
+Our own en→ka FLORES chrF++ for madlad-3b is 16.12, reproducing the published
+number. So the anomaly replicates and now has a cause: the corrupted Georgian
+web text reached the model's training data. NLLB carries a trace of the same
+contamination, and the 1.3B carries eight times more of it than the 600M.
+
+**MADLAD is unusable as an en→ka teacher**, and filtering the mojibake does not
+rescue it. Restricting the comparison to the lines where madlad emitted real
+Georgian, so it is scored only where it did not fail this way (chrF++ / spBLEU):
+
+| slice | n | madlad-3b | LMT-60-8B |
+|---|---|---|---|
+| flores | 123 | 24.64 / 11.23 | **49.29 / 35.77** |
+| signs | 29 | 40.42 / 28.19 | **59.17 / 50.12** |
+| ui | 142 | **51.82 / 35.90** | 45.02 / 27.13 |
+
+The clean rate is itself register-dependent, and it collapses on exactly the
+register the app cares about: FLORES 41% clean, signs 43%, ui 95%, ted 3%,
+subtitles 1.3%.
+
+Reading the clean lines shows a second failure mode underneath the first. Where
+madlad emits real Georgian it frequently ignores the source and generates
+fluent unrelated prose, recycling one template across different inputs: three
+separate FLORES sources about Shark Tank, a shopping channel and an antibody
+trial all came back as a Georgian sentence about a band releasing an album. A
+third mode leaves English proper nouns untransliterated and breaks word order.
+The same hallucination appears in ka→en, which is why madlad carries the highest
+repetition defect count of any model there. So the 48.20 ka→en FLORES score is
+an average over correct lines and invented ones.
+
+The `ui` win is training-set overlap rather than capability. Those references
+come from KDE4, GNOME and translatewiki, which MADLAD-400 trained on, and madlad
+reproduces several of them verbatim. LMT loses that slice partly because it
+reads the accelerator `&` as the word "and".
+
+A teacher whose failure mode is fluent invention cannot be repaired downstream.
+Mojibake is detectable and could be filtered; hallucination that is grammatical,
+plausible and off-topic is the hard case, so there is no filter that makes this
+model safe to distil from in either direction.
+
+## 3. When a model emits garbage, check that library defaults still match the spec
+
+The first madlad run produced Chinese, Thai and timestamps for every input. That
+looked like confirmation of the model's known weakness and it was a loading bug:
+a config flag that the repo sets one way was being defaulted the other way by a
+newer version of the library, and nothing errored.
+
+The lesson is procedural. Before believing a bad result about a model, decode
+the model card's own documented example and check you reproduce its documented
+output. Here `<2pt> I love pizza!` should return `Eu adoro pizza!`; when it did
+not, the fault was ours and not the model's. A control that costs one line
+separates "this model is bad at our language" from "we loaded it wrong", and
+those two conclusions lead to opposite decisions.
+
+Pin the library version across every model in one comparison. Different versions
+in the same table is a confound, not a detail.
+
+## 4. Mtavruli belongs at the MT boundary, not in the trainer
+
+FLORES `kat_Geor` is 122,570 Mkhedruli characters and zero Mtavruli, and the six
+clean en-ka corpora are the same. Web text is Mkhedruli, so no teacher has been
+gated on the all-caps form. The recognizer deliberately emits Mtavruli
+codepoints, because `rec_model/GEORGIAN.md` keeps the label faithful to the page.
+
+Decision: normalize Mtavruli to Mkhedruli at the MT input call site, not in
+`ppocr.rs`, because OCR output also feeds the per-word box and copy paths, which
+want what was actually on the sign. `str.lower()` performs the map, verified to
+land every character back in `U+10D0-10FF`.
+
+**Shipped as `configs/opustrainer.student.ka.yml`** with `UpperCase: 0.0`,
+selected through the new `OPUSTRAINER_CFG` override on `train_student.sh` and
+`finetune_student.sh` so the shared config keeps working for the Latin-script
+pairs. `TitleCase` stays at 0.05: `.title()` is a no-op on Mkhedruli, so it only
+ever title-cases the English side.
+
+The cost is real and needs paying back elsewhere. Turning `UpperCase` off also
+removes the ALL-CAPS ENGLISH perturbation, and English signage is exactly what
+an en→ka camera path photographs. The fix belongs in the finetune set rather
+than the trainer: uppercase a fraction of the ENGLISH side of the 10,863 short
+pairs while leaving the Georgian in Mkhedruli, which teaches caps-in to
+Mkhedruli-out directly instead of coupling the two sides the way the modifier
+does.
+
+Do not reach for OpusTrainer's `UpperCase` to teach the student Mtavruli. It
+uppercases both sides of the pair, so it couples source casing to target
+casing, and the SPM vocab is trained before the modifier runs. The vocab would
+carry no Mtavruli pieces, byte-fallback would fire at roughly three pieces per
+character, and `check_vocab.py` cannot see it because it inspects the pool
+rather than the augmented stream. `TitleCase` is a no-op on Georgian, which has
+no titlecase mapping.
+
+## 5. Teacher gate, both directions
+
+chrF++ / COMET22. `signs` is 67 hand-built camera-path lines; `subtitles`,
+`ted` and `ui` are held-out human OPUS slices; `adversarial` is reference-free.
+
+en→ka:
+
+| slice | nllb-600M | nllb-1.3B | madlad-3b | opus-synth | LMT-60-8B |
+|---|---|---|---|---|---|
+| flores | 46.60 / 85.18 | 46.27 / 83.36 | 16.12 / 41.98 | 44.01 / 80.11 | **49.10 / 88.29** |
+| signs | 46.40 / 83.62 | 49.54 / 81.14 | 21.05 / 55.10 | 39.69 / 75.06 | **58.43 / 88.00** |
+| subtitles | 23.36 / 56.10 | 16.94 / 46.70 | 8.72 / 35.74 | 37.94 / 77.29 | **40.21 / 81.97** |
+| ted | 43.53 / 77.62 | 43.10 / 75.03 | 10.53 / 32.38 | — | **45.28 / 84.32** |
+| ui | 38.07 / 76.48 | 40.61 / 77.48 | 49.33 / 80.52 | — | **44.31 / 81.25** |
+
+ka→en:
+
+| slice | nllb-600M | nllb-1.3B | madlad-3b | LMT-60-8B |
+|---|---|---|---|---|
+| flores | 52.50 / 85.20 | 55.38 / 86.69 | 48.20 / 80.08 | **56.09 / 87.84** |
+| subtitles | 44.71 / 78.63 | 46.26 / 79.73 | **46.93 / 81.71** | 44.77 / 80.69 |
+| ted | 49.53 / 82.57 | 51.75 / 83.35 | 50.90 / 83.77 | **52.27 / 84.82** |
+| ui | 32.34 / 64.91 | 38.47 / 72.05 | **51.33 / 84.19** | 47.39 / 81.53 |
+
+Harness validation: our NLLB-600M FLORES numbers are 46.60 en→ka and 52.50
+ka→en against Meta's published 46.6 and 52.6.
+
+Readings:
+
+- **LMT-60-8B wins both directions** and takes COMET on every en→ka slice. It is
+  Apache-2.0 and Qwen3-shaped, so it serves through the existing vLLM KD path.
+- **FLORES hides the register cliff.** NLLB-600M drops 46.60 to 23.36 from FLORES
+  to subtitles; LMT drops 49.10 to 40.21. On FLORES alone the two look three
+  points apart, and on conversational text they are seventeen apart.
+- **Scaling NLLB does not help en→ka and hurts conversation.** The 1.3B loses to
+  the 600M on subtitles by 6.4 chrF, consistent with its eight-times-higher
+  mojibake rate.
+- **The 60M synthetic model beats both NLLBs on conversation** (37.94 against
+  23.36 and 16.94) while losing on FLORES. It was trained only on GPT-4o
+  forward-translated Europarl, so it is clean by construction. This is evidence
+  for the synthetic route on en→ka rather than for that particular checkpoint.
+- **madlad's ka→en `ui` and `subtitles` wins are partly copy-through**, so read
+  them next to the defect counts rather than alone.
+
+## 6. Size and decoding
+
+Size and decoding were measured together because they trade against each other.
+chrF++ / COMET22, en→ka:
+
+| config | flores | signs | subtitles |
+|---|---|---|---|
+| LMT-4B greedy | 47.51 / 88.13 | 56.77 / 86.01 | 40.70 / 82.12 |
+| **LMT-4B beam 5** | **49.10 / 89.00** | **58.54 / 88.39** | **40.81 / 82.58** |
+| LMT-8B greedy | 49.10 / 88.29 | 58.43 / 88.00 | 40.21 / 81.97 |
+| LMT-8B beam 5 | 49.87 / 88.91 | 60.08 / 88.50 | — |
+
+ka→en FLORES: 4B greedy 55.22 / 87.34, 4B beam 5 55.68 / 87.66, 8B greedy
+56.09 / 87.84.
+
+**4B with beam 5 matches 8B greedy on chrF and beats it on COMET**, at half the
+weights. On quality alone that is the configuration to run, and it recovers what
+was lost by LMT having no FP8 checkpoint: 4B in bf16 is ~8GB, the footprint an
+8B FP8 build would have had, so a 24GB card keeps ~16GB for KV cache instead of
+~8GB.
+
+**Throughput kills it.** Measured on a 4090 under vLLM 0.28.0, bf16, eager,
+decoding FLORES-length lines:
+
+| config | lines/s | 8M lines on 6 boxes | cost |
+|---|---|---|---|
+| 4B greedy | 44.9 | 8.3 h | $17 |
+| 8B greedy | 29.2 | 12.7 h | $26 |
+| 4B beam 5 | 1.04 | 356 h | $727 |
+| 8B beam 5 | 0.54 | 682 h | $1,391 |
+
+Beam is 43x (4B) to 54x (8B) slower than greedy, and it is not a mis-call or a
+CPU fallback: the GPU sits at 100% and 380-420W throughout. vLLM 0.28 removed
+`SamplingParams(use_beam_search=...)` and the only remaining path,
+`llm.beam_search()`, is a Python per-token loop that rebuilds each beam's full
+prefix and resubmits it as a fresh single-token request, so beam-5 over 200
+prompts is 256 synchronous engine round-trips of 1,000 requests. Wall time is
+therefore set by `max_tokens` rather than by the actual output length: the same
+batch took 191.9s at 30 output tokens and 194.3s at 144.
+
+So beam is out, and the remaining choice is size and sampling. On quality per
+line the 8B leads the 4B by +1.66 chrF and +1.99 COMET on `signs`; on speed the
+4B leads by 1.82x once cudagraphs are on (53.1 vs 29.2 lines/s).
+
+**The replacement for beam is `SamplingParams(n=5)` plus a rerank.** In vLLM V1
+that is native parallel sampling: `ParentRequest` expands one n>1 request into n
+children submitted together with prefill shared through prefix caching, inside
+the engine. It costs 3.3x (short lines) to 4.0x (long) greedy, and output
+tok/s goes UP under it because the engine has more parallel work in flight,
+which is the structural opposite of beam.
+
+Quality, 8B en→ka, chrF++ gain over the same harness's own greedy baseline:
+
+| slice | beam 5 | n=5 t=0.3 | n=5 t=0.7 |
+|---|---|---|---|
+| flores | +0.77 | +0.55 | +0.42 |
+| signs | +1.65 | +1.72 | +2.21 |
+
+It recovers ~71% of beam's FLORES gain and beats beam outright on `signs`, for
+12x less than beam. Rerank on MEAN logprob, not cumulative, or the shortest
+candidate always wins. Sampling has a runaway tail greedy does not: at t=0.7,
+183 of 4000 long candidates hit the length cap, so a length guard is needed.
+Set a seed or the draw is not reproducible.
+
+Tuning notes, measured with a control run rather than assumed:
+
+- **Cudagraphs help the 4B and HURT the 8B.** On the 4B, `enforce_eager=False`
+  gives 44.9 -> 53.1 lines/s (+18%). On the 8B they consume 34% of the KV cache
+  (35,008 -> 22,160 tokens) to buy kernel-launch savings it does not need, for a
+  net -12%. Keep `enforce_eager=True` on the 8B.
+- **Lowering `max_model_len` does nothing for the 8B.** Concurrency rose 34x to
+  106x and throughput moved -3%: at 16GB of weights on a 24GB card the 8B is
+  bandwidth-bound, not concurrency-starved. An early guess that these numbers
+  were a 1.3-1.8x floor was wrong and is withdrawn; only the 4B moves.
+
+That KV pressure is also the argument for FP8 on the 8B specifically. At 8GB of
+weights it would have room for both cudagraphs and a deep KV cache, turning the
+current -12% into a gain. `llm-compressor` with `FP8_DYNAMIC` needs no
+calibration data.
+
+Beam matters more than expected, and most on the shortest inputs: +1.65 chrF on
+`signs` for the 8B against +0.77 on `flores`. A short output has a small search
+space, so greedy's first-token commitment costs more there. Greedy costs about
+0.9 COMET.
+
+That also explains the published numbers. The paper reports 89.02 COMET for 4B
+en→ka; we measure 89.00 with beam 5 and 88.13 greedy. So NiuTrans's figures are
+beam-search figures, and the 4B→8B gap of +0.15 they report is real and tiny.
+
+Open question before the KD run: vLLM's beam search support is weak, and the
+throughput figures we plan against (~126 l/s for a 7B class model) are greedy
+figures. Measure 4B beam 5 throughput under the serving stack on one box before
+renting a fleet, and if beam is unavailable there, the choice becomes 4B greedy
+against 8B greedy rather than the table above.
+
+## 7. LMT-60-8B spot-check: wins the gate, still not clean
+
+Read by hand over the 30 safety-critical `signs` lines, a sample of the 179
+reference-free adversarial lines, and ka→en subtitles. The reviewer reads
+Georgian well enough to judge meaning, numbers, entities and register, and not
+well enough to certify idiomatic naturalness, so the native pass still stands.
+
+The error profile is consistent and it matters for this app: **LMT handles full
+sentences well and degrades on short context-free strings**, which is what a
+camera sees. FLORES, subtitles, TED and postal addresses come back accurate and
+fluent, with entities properly transliterated. Signage and labels are where it
+slips, because a two-word string carries no context to disambiguate a word sense.
+
+Real semantic errors found on the safety lines, roughly seven in thirty:
+
+- *power button* → "ძალაუფლების ღილაკს", the button of political power
+- *Do not immerse in water* → "არ გაახვიოთ", do not **wrap**
+- *tire pressure* → "საჭის წნევა", **steering wheel** pressure, and *psi* → "ფუნტი/სმ2",
+  pounds per square **centimetre**. The digit 32 survives, so the numeric check
+  passes while the unit is wrong.
+- *Allow the engine to cool* → "დაალაგეთ ძრავა", **tidy up** the engine; and
+  *radiator cap* → "ქუდი", a hat
+- *before disconnecting the hose* → "არ დაკავშირებამდე", inserting a **spurious
+  negation**, before **not** connecting
+- *Rinse thoroughly* → "საკმარისია…", turning an emergency imperative into an
+  assertion that rinsing **is sufficient**
+- *Contains nuts* → "შეიცავს თხილს", contains **hazelnut** specifically, losing
+  the allergen's generality
+
+From the adversarial list: *Right* → "მართალია" (correct/true, not the
+direction), *Check please* → "გთხოვთ, შეამოწმეთ" (please verify, not the bill),
+*Construction ahead* → "მშენებლობა წინ მიდის" (construction is progressing).
+Several English terms come back as transliterations that are not Georgian words,
+including "სეალი" for seal and "ფირმვერსია" for firmware.
+
+ka→en is solid and sometimes more complete than the loose subtitle references.
+One systematic limit is worth planning around rather than fixing: Georgian `ის`
+is gender-neutral, so any ka→en system guesses English pronoun gender and will
+be wrong about half the time.
+
+Bearing on the decision: LMT still wins clearly, since NLLB-600M dropped a
+negation outright, inverted *Sign out*, and degenerated into character loops,
+none of which LMT did anywhere. But a student distilled from LMT inherits this
+short-string weakness, and that is the app's dominant input. Teacher choice does
+not solve it. The lever is a curated sign, menu and label set used as finetune
+data, which is what the check set should grow into.
+
+## 8. Why LMT fails the way it does, and what that means for tuning it
+
+`NiuTrans/LMT-60-sft-data` is public, so the teacher's Georgian supervision can
+be inspected directly. `en-ka.jsonl` is 1.65 MB, about 2,960 pairs. Of 716
+sampled, 716 are FLORES **dev** sentences and none appear in devtest. Median
+length is 20 English words and no sampled line is 4 words or shorter.
+
+For scale, `en-de` is 10.2 MB, and Georgian costs ~3 bytes per character in
+UTF-8 against German's ~1.1, so German carries roughly ten times the pairs.
+Georgian sits with `en-ug` (1.4 MB) and `en-tl` (1.0 MB) in the low-resource
+tier.
+
+This matches the measured error profile exactly. The model is strong on news
+because news is what it was tuned on, loses register on dialogue, and fails on
+signage because it has never been supervised on a short Georgian string.
+
+It also means our FLORES devtest number for LMT should be read as slightly
+optimistic, since devtest is the sibling split of its own SFT data. The slices
+that decided the gate, `signs` and `subtitles`, are unaffected.
+
+On fine-tuning the teacher: data volume is not the constraint. Our ~100k clean
+human prose pairs and ~44k UI strings already exceed what NiuTrans used by a
+large factor. The constraint is that this data is abundant in the register the
+model already handles and scarce in the register where it fails, so tuning on it
+would mostly reinforce an existing strength. The only data that moves the
+failure class is a curated short-string set, which is also what a student
+finetune would want, so the decision is where to spend one scarce dataset rather
+than whether it exists.
+
+The asymmetry that settles the sequencing is that any change to the teacher
+invalidates the whole KD decode, costing a re-decode and a full re-gate per
+iteration, while a student finetune is a few GPU-hours and reversible. The
+uig escalation to CPT→SFT was triggered by a teacher that was blocked; this
+teacher clears in both directions, so that trigger is not met. Run KD with LMT
+as-is, measure the student, then decide.
+
+## 9. Metrics stay blind to the failure that decides shippability
+
+NLLB-600M scores 46.40 chrF++ and 83.62 COMET on `signs` while rendering
+*No Smoking* as "სიგარეტის მოწევა", which reads as *Smoking cigarettes*. The
+negation is gone and both metrics are comfortable. Other cases from the same
+decode: *Sign out* becomes *register*, *Out of Order* becomes *incorrect
+sequence*, and *Spicy or non-spicy?* degenerates into a repeated-character loop.
+
+The mechanical checks in `probe_check.py` caught the loop and the length blowup.
+They cannot catch the dropped negation, and no reference-based metric ranked it
+low. Read the pairs.
+
+## 10. Corpus gotchas for en-ka
+
+- **ELRC-5218-Georgian_Legal_MT contains no legal text.** 16 of its 1,001 English
+  lines carry any legal keyword; the content is encyclopedic prose. There is no
+  legal or government eval slice available from OPUS for this pair.
+- **KDE4 leaks `msgctxt` into the Georgian side** on 42.6% of otherwise-clean
+  pairs, for example *Toronto* becoming "ტორონტოcanada. kgm". Training on KDE4
+  en-ka without stripping these teaches the student to emit trailing English.
+- **GNOME en-ka is 89% duplicates**, 4,601 raw pairs collapsing to 386 unique.
+- **QED alignment is poor**, with 47.8% of pairs outside a 0.4-2.5 length ratio
+  against 0.75% for TED2020.
+- No CCMatrix and no ParaCrawl exist for en-ka. NLLB alone is 76% of the
+  available mined bitext.
+
+## 11. The KD plan
+
+Decided after the gate, and deliberately staged so the expensive question is
+answered by measurement rather than on spec.
+
+**Iteration 1: LMT-60-4B, greedy, cudagraphs on, en→ka only, 4M lines.**
+DONE 2026-08-30: 4.9h wall on 4 boxes, **$6.1**, 67-76 lines/s per box against the
+45-55 projected. Every chunk exactly 1,000,000 lines with zero empty outputs, and
+the concatenated source re-hashes to the pinned artifact's first 4M
+(`726b70ee...`), so the corpus is provably its prefix rather than merely the same
+size.
+
+Defect rates over the 4M: empty 0.000%, control_chars 0.000%, copy_through
+0.097%, wrong_script 0.103%, too_long 0.127%, length ratio median 1.09. Read per
+register they are not defects at all -- entity sits at 2.28% wrong_script against
+crawl's 0.05%, which is XLEnt passing brand names and acronyms through as it
+should. `verify_kd.py --registers` exists so that distinction is visible rather
+than averaged away.
+
+Why the 4B and not the 8B, given the 8B is better per line: the student is
+expected to land 5-6 chrF below its teacher, which is larger than the entire
+4B-to-8B teacher gap. So that gap may not survive distillation at all, and one
+cheap iteration says whether teacher quality is worth paying for here. Running
+the 8B first would answer a question we do not have yet.
+
+Why greedy and not `n=5`, given `n=5` is measured and affordable: the first
+iteration exists to isolate one variable. With both size and sampling changed at
+once, a student that handles signs well would not tell us which choice did it.
+`n=5` is now a measured upgrade with known cost, available when the student's
+numbers justify it.
+
+Why en→ka and not the cheaper ka→en: every piece of curated data we have is
+English-source — the 67-line `signs` set and the 10,863 short pairs — so the
+finetune experiment can only run in this direction. It is also the harder
+generation problem and the more expensive to decode, because Georgian runs at
+roughly one token per character in the Qwen3 vocabulary against 2.6 characters
+per token for English.
+
+**Pinned.** `PIPE_ROOT=/nvme2/prom/pipe` on bigserver, run `kakd`, beside
+`tlkd`, `swenv3` and `uigr2`: `kd_src` and `kd_ref` at 10,000,000 lines
+(`921e9b48...`, `2854315c...`), plus `vocab` and `mix` blobs. The digests match
+the sha256 taken before transfer, so bigserver to store is byte-verified. The
+durable working copy with `MANIFEST.md` is `/nvme2/prom/enka2/kd.en2ka/`.
+
+Realized mix: human 30,357 / ui 21,049 / dialogue 37,500 / entity 98,381 /
+crawl 9,812,713. Deduplicating on the English column costs less than it might:
+crawl 11,255,501 unique pairs becomes 10,713,303 unique English sides.
+
+**Draw 10M, pin it, decode 4M.** The artifact is the full 10M draw from
+`sample_mix.py`, not the slice being decoded. Drawing 4M now and 10M later would
+only be additive while the pool stays byte-identical, because
+`shuf --random-source` re-permutes everything when a single line changes.
+Pinning the whole draw removes that dependency: the line list is fixed, the pool
+may then change, and extending to the next chunk is a split of a fixed file
+rather than a re-draw that has to be proven equivalent.
+
+Split the pinned draw into 1M chunks and decode the first four. Chunks 5-10 are
+additive later at no re-cost, and the same pinned source makes an 8B re-decode a
+controlled comparison rather than a different experiment.
+
+**What iteration 1 answers.** Score the student on the same slices as the
+teachers and read the per-slice teacher-to-student delta:
+
+- tracks the teacher within 1-2 across the board: the pipeline is healthy and
+  the 8B's +1.66 is worth buying.
+- drops 5-6 uniformly: KD compression dominates, teacher choice is close to
+  irrelevant, and the 8B re-decode is wasted money.
+- drops uniformly except `signs`, which falls further: the short-string
+  hypothesis is confirmed, and the fix is the curated finetune set rather than a
+  bigger teacher. Test it in the same iteration by finetuning the KD checkpoint
+  on the 10,863 short pairs and scoring again.
+
+**Recovering the dialogue register for en→ka.** The mojibake filter drops
+122,781 dialogue pairs, which is most of the conversational data, and there is
+no other Georgian dialogue corpus on OPUS. For en→ka that loss is recoverable:
+the KD source is the ENGLISH side and the teacher regenerates the Georgian, so a
+pair whose only defect is a corrupt ka side is still a usable source line. Its
+English is ordinary subtitle text. That takes en→ka dialogue from 40,087 to
+162,962. Those lines have no valid `kd_ref`, so they cannot feed extract-best or
+ce-filter, which costs nothing for a greedy 1-best run.
+
+The ceiling this cannot lift is teacher style. LMT loses the T-V distinction on
+dialogue and literalizes idioms, and the tl experiment already showed that more
+teacher-labeled data reinforces teacher style rather than closing the
+human-reference gap. More dialogue KD makes the student a better imitator of a
+mediocre dialogue teacher, which still beats the near-zero exposure that made
+`Right` and `Pull` vanish from the tl student, but it is not a fix.
+
+ka→en has no such recovery, since its source must be Georgian. The 40,087 clean
+lines are what exists; HPLT monolingual Georgian would add volume through
+`segment_mono.py` but it is web prose, not conversation.
+
+**A launch trap from the pipe notes.** The step key covers the script digest and
+inputs but neither argv nor `configs/*.yml`, so swapping the teacher from 4B to
+8B without changing an input hashes identically and can be memoised away. Pass
+the teacher through `args={...}`.
+
+**Settings.** 4B: `enforce_eager=False` (+18%). 8B: `enforce_eager=True`, and do
+not lower `max_model_len` — both cost throughput on that model. If the 8B is
+ever run, FP8-quantise it first: at 8GB of weights it has room for cudagraphs
+and a deep KV cache together, which is what the bf16 build cannot afford.
+
+## 12. Operational notes for the next run
+
+- **`PIPE_ROOT=/nvme2/prom/pipe`, on bigserver.** It holds all 31 prior
+  campaigns. `piped` had been running since a network outage on 3 August with
+  400 `NameResolutionError`s against `console.vast.ai` and no log line since;
+  DNS resolves fine now, so restart it before trusting it to orchestrate.
+- **Kill `piped` by explicit PID.** `pgrep -f "pipe.cli piped"` matches the
+  `bash -c` line carrying it over ssh and kills the session (exit 255). The
+  bracket trick is not enough when the same command also launches the process.
+- **Filter vast offers on `cuda_vers>=12.8`.** Three boxes failed at start
+  across two runs, from three different causes: `unresolvable CDI devices`,
+  `failed to create task for container`, and CUDA driver error 803 on a host
+  advertising `cuda_max_good` 12.5. Only the last is predictable from the offer
+  listing, and filtering on it is free. Two of the three were Romanian hosts.
+  Budget one re-roll regardless.
+- **Rented price drifts above the cheapest listed offer.** A 4-box fleet came in
+  at $0.333-0.392/h against a $0.282 headline, because the cheapest offers go
+  first. Size the budget on the blended rate.
+- **bigserver can push to a rented box DIRECTLY, at ~96 Mbit/s.** The standing
+  note says to relay bigserver→laptop→vast because bigserver "can't scp to vast".
+  That conflates inbound with outbound: bigserver is not publicly reachable, so
+  vast cannot pull FROM it, but bigserver's own outbound works fine and it
+  initiates the connection happily. The laptop uplink is ~1.5 Mbit/s, so
+  relaying a 378MB training corpus through it takes ~26 HOURS against ~30
+  SECONDS direct. Push from bigserver; only the return leg needs thought.
+- **Pull decode images from Docker Hub, not ghcr.io.** A decode box died on
+  `TOOMANYREQUESTS` pulling our own `ghcr.io/.../hy-kd:cu129p` and never finished
+  the pull. `vastai/vllm:v<version>-cuda-12.9` off Docker Hub avoids the rate
+  limit entirely, is faster to obtain, needs no custom image, and pins the exact
+  vLLM the teacher gate ran on.
+- **Train on a 4090 or Ampere, never a 5090.** That is where the CUDA
+  11.8 / sm_89 constraint on `marian.cuda` actually binds. It does NOT bind on
+  the decode boxes, which run vLLM, so a Blackwell card is legitimate there and
+  is the better value per unit of decode throughput.
+
+## 13. The short-text corpus — harvest what exists, generate only what does not
+
+Cross-language asset, not a Georgian one. The English side is frozen once at
+`data/short.en.v1.en` (100,000 lines) and reused for every pair, so adding a
+language is a translation job rather than a curation job, and every pair ends up
+scored on translations of the same source.
+
+**The instinct to generate short text is mostly wrong, and one measurement
+settles it.** Unique English lines by length in OpenSubtitles en-ka alone:
+
+| band | available |
+|---|---|
+| 1 word | 5,584 |
+| 2-4 words | 62,458 |
+| 5-8 words | 83,400 |
+| 9-15 words | 45,519 |
+| 16-25 words | 9,022 |
+
+The short bands are the LARGEST, not the smallest. An earlier plan to generate
+the 2-8 word bands would have paid to invent 57k lines that one subtitle corpus
+supplies 145,858 of, already real rather than a model's idea of how people talk.
+
+The distinction that matters is that **short is not the same as signage**:
+
+- short CONVERSATIONAL ("Yes.", "What?", "Come on.") is abundant and harvestable
+- short SIGNAGE ("Emergency Exit", "Wet Floor") appears in no corpus, because no
+  film says it, and that is the only part worth generating
+
+Generation is also bounded by how much genuinely exists. Asking for 2,800
+single-word signs returned 1,784 unique, a 36% duplicate rate: real one-word
+signage is a small closed set that runs out in the low thousands. Budgeting 8k
+there, as an early draft did, would have bought padding and near-duplicates.
+
+Frozen composition, 12,641 generated against 87,359 harvested:
+
+| band | total | generated | harvested |
+|---|---|---|---|
+| w01 | 7,500 | 1,784 | 5,716 |
+| w02_04 | 30,000 | 6,819 | 23,181 |
+| w05_08 | 34,000 | 4,038 | 29,962 |
+| w09_15 | 21,000 | 0 | 21,000 |
+| w16_25 | 7,500 | 0 | 7,500 |
+
+Weighted toward what the KD pool lacks: an en-ka draw is 96% crawl, so long
+prose needs nothing and short text needs everything.
+
+**Order is a seeded shuffle across bands, so any prefix is a stratified sample.**
+Translation is bought in 20k slices as quota allows, and stopping after two
+leaves a balanced corpus rather than nothing but signs.
+
+**Harvest must apply the eval exclusion list.** `subtitles.300` came from
+OpenSubtitles, so harvesting it unfiltered would put eval lines into a finetune
+set. `data/eval_exclude.sha256` holds the 1,000 digests; the run that built v1
+caught 635 of them.
+
+The two halves buy different things, which matters when reading results. Signage
+is NEW COVERAGE, absent from everything the student sees. Dialogue is a
+TARGET-QUALITY UPGRADE on lines the student already meets in KD with LMT targets
+that lose the T-V distinction and flatten idioms, so a frontier target on the
+same source corrects a specific measured error. That argues against engineering
+the overlap away.
+
+Scripts: `harvest_short_en.py`, `gen_short_en.py` (`--words 1-1` for the
+single-word band), `build_short_corpus.py`. Measured cost to translate is about
+$0.0013-0.0017 per line, so roughly $30 per 20k slice and $150 per language.
+
+This serves en→X only. ka→en needs Georgian source text and has no equivalent.
+
+## 14. Split sentences BEFORE the KD decode, not after
+
+The app sentence-splits at inference: slimt feeds the model exactly one sentence
+per call. The training corpora do not match that. Measured, with an
+abbreviation-aware splitter:
+
+| corpus | single-sentence | multi, counts agree | ka fewer | ka more |
+|---|---|---|---|---|
+| short.en-ka.v1 | 89.6% | 7.9% | 0.4% | 2.1% |
+| long.en-ka.v1 | 87.4% | 8.4% | 0.8% | 3.4% |
+| KD 4M | 90.2% | 4.5% | 0.5% | 4.7% |
+
+Two separate readings, and only the second is a problem.
+
+**Translation fidelity is fine.** It is N sentences in, N sentences out: ~97% of
+pairs either are single sentences or preserve the count, and the residual splits
+about evenly in both directions. A first measurement suggested 56% of
+multi-sentence KD pairs disagreed; that was an artifact of a naive splitter
+breaking English on `Mr.` and `Ms.` and then blaming the Georgian side. Any
+sentence-count check on this data MUST carry a non-breaking-prefix list or it
+will manufacture a defect that is not there.
+
+**The distribution mismatch is real.** Roughly 10% of training pairs are
+multi-sentence while 100% of inference input is single-sentence, so that capacity
+is spent on a case that never occurs, and it plausibly skews the model's length
+prior — the finetuned student dropped "Dalhousie University" from a long FLORES
+sentence the KD student rendered completely.
+
+**For en→ka this was found after the KD decode**, when re-splitting would
+invalidate the pinned artifact, its alignment and its digests. It was left alone
+there.
+
+**For ka→en, split before the decode.** The order that costs nothing is: build
+the pool, split sentences, THEN draw the KD source, decode, align. Splitting
+after alignment means redoing the alignment; splitting after the draw breaks the
+pinned artifact's prefix property.
+
+Split with the SAME rule the runtime uses, not an approximation of it. The Rust
+side's `NONBREAKING_PREFIXES` is the authority; a Python splitter for corpus prep
+should consume that same list so that a sentence boundary in training is a
+sentence boundary in production. Where the two sides' counts agree, a
+multi-sentence pair splits 1:1 and yields MORE training pairs than it consumed;
+where they disagree, drop the pair rather than guessing an alignment.
+
+## 15. Results, and what the finetune actually buys
+
+chrF++ / COMET22 on the six slices. `v1` is the first KD student, trained with a
+config that perturbed 5% of lines into Mtavruli; `v2 KD` is the retrain after
+that was fixed; `FT v1` finetunes v2 on 99k short-only pairs; `FT v2` on 123k
+after adding long-form and sentence-splitting; `int8` is `FT v2` quantized,
+which is what actually ships.
+
+| slice | teacher | v2 KD | FT v1 | FT v2 | **int8 SHIPPED** |
+|---|---|---|---|---|---|
+| flores | 47.51 / 88.13 | 47.36 / 85.04 | 45.89 / 83.06 | 46.60 / 83.26 | **46.86 / 83.21** |
+| signs | 56.77 / 86.01 | 52.97 / 84.47 | 65.44 / 90.51 | 64.53 / 89.13 | **63.50 / 89.30** |
+| subtitles | 40.70 / 82.12 | 40.97 / 81.55 | 41.98 / 81.10 | 41.62 / 80.96 | **41.87 / 80.87** |
+| ted | 44.89 / 84.23 | 44.18 / 82.54 | 42.67 / 81.44 | 42.30 / 82.32 | **42.25 / 82.45** |
+| ui | 43.73 / 81.11 | 44.38 / 81.35 | 41.19 / 79.12 | 41.76 / 79.87 | **41.72 / 79.77** |
+
+**The KD student reaches teacher parity, which the tl history did not predict.**
+v2 KD is within 0.15 chrF of its teacher on flores and ahead on subtitles and
+ui. The documented expectation was 5-6 chrF below (tl was -5.7). The likely
+difference is `sample_mix.py`'s absolute per-register targets, which exist
+because tl's short registers were diluted to nothing by a proportional draw.
+
+**Removing the Mtavruli perturbation improved training, not just output.** v2
+beat v1 on 4 of 5 slices, reached a better validation floor (1.017 vs 1.051) and
+trained 26k updates longer before stalling. 5% of lines byte-falling-back at ~3
+pieces per character was real noise, not a cosmetic defect.
+
+**The finetune is a fixed trade, and composition is not the lever.** FT v1 bought
++12.47 chrF on `signs` for -1.47 flores, -1.51 ted, -3.19 ui. The obvious
+diagnosis was a length-distribution mismatch, so FT v2 added 29% long-form and
+made the corpus single-sentence. Everything moved under a point, in both
+directions. Finetuning on ~120k pairs after 4M shifts the model toward those
+120k more or less regardless of what is in them. Budget the trade rather than
+trying to engineer it away.
+
+**Frontier references buy what human references were supposed to.** The tl
+doctrine is that a student only exceeds its teacher on human references, and
+that more teacher-generated data merely reinforces teacher style. The finetuned
+student beats its teacher by 8.67 chrF on `signs` using luna/sonnet-generated
+Georgian. Reading all 67 lines confirms these are real corrections -- *wet
+storey* to *wet floor*, *payment reduced* to *payment declined*, an untranslated
+"Fire Extinguisher" -- not agreement with the reference's style.
+
+**Quantization is free here.** int8 costs -1.03 chrF on `signs` and moves three
+slices slightly UP. The quantization-aware finetune (`quantize-bits: 8`) is why.
+Score the int8 artifact, not the fp32 checkpoint: slimt loads the former.
+
+Shipped pack: `model.enka.intgemm.alphas.bin` 31,561,697 bytes, sha256
+`41f5bffa...`, with a subword shortlist and the joint vocab. Total GPU cost for
+the whole pair, gate through pack: **about $12**.
+
+## 16. The TitleCase trap
+
+`UpperCase: 0` is not sufficient for a caseless script. OpusTrainer's
+`TitleCaseModifier` does `word[0].upper() + word[1:]`, NOT Python's `.title()`.
+On Mkhedruli `.title()` is genuinely a no-op -- Unicode gives Georgian no
+titlecase mapping -- so testing the stdlib function says the modifier is safe,
+and it is not: `.upper()` maps Mkhedruli into Mtavruli.
+
+Left at 0.05 it put Mtavruli initials on 5% of training lines and the student
+emitted "Არ Არის Პარკინგი" on 6% of signs and 7.3% of UI strings. Georgian has
+no Title Case at all, so that output is simply wrong, and chrF barely notices
+(+0.15 when normalized) because the metric sees near-identical characters.
+
+Verify the MODIFIER's source, not the stdlib function that shares its name. Both
+are 0.0 in `configs/opustrainer.student.ka.yml`.
+
+## 17. The runtime splitter never split any caseless script
+
+Splitting the pool for ka→en (§14) turned up the reason the corpus and the
+runtime could not have agreed anyway: `split_sentences` in
+`crates/translator-translate/src/sentence_split.rs` guarded a lone `.` with
+`first.is_uppercase()`, and no caseless script has an uppercase. Measured on the
+shipped code with one sentence per script:
+
+| script | "The door is closed. Please use the side entrance." |
+|---|---|
+| Latin, Cyrillic, Greek | 2 pieces |
+| Georgian, Hebrew, Arabic, Devanagari, Bengali, Thai, Japanese | 1 piece |
+
+Georgian is the subtle case. Unicode gives Mkhedruli lowercase status with an
+uppercase mapping into Mtavruli, so `is_uppercase()` is false for every letter of
+ordinary prose and the guard never passed. `!` and `?` still split, because they
+bypass the guard, which is why the failure was invisible: dialogue split, prose
+did not.
+
+The consequence for ka→en is that it inverts §14's rationale. The pool was split
+so that training would match one-sentence-per-call inference, while the runtime
+would have handed the model whole Georgian paragraphs. The same applies to every
+shipped X→en pair with a caseless source, where it degrades quality without ever
+producing a visible failure.
+
+The fix is a unicameral-script table consulted before the uppercase guard, the
+non-Latin terminators `।॥։۔؟።፧` added to the boundary regex, and Georgian
+non-breaking prefixes. Georgian needed those prefixes only because it now splits
+at `.` at all — before the fix, `ელ. ფოსტა` was safe by accident.
+
+**A non-breaking entry has to be symmetric with the other side's list.** The
+first version of the Georgian prefixes included `ა.შ` ("and so on"). That is the
+Georgian `etc.`, and `etc` is deliberately absent from the Latin list because it
+ends a sentence. Listing one and not the other breaks the two sides at different
+places. On the 1,788 pool pairs where both languages use the construction,
+dropping `ა.შ` kept 68.6% against 17.7% for keeping it. Check a candidate prefix
+against what the OTHER language does with its translation, not only against
+whether it looks like an abbreviation.
+
+**Count agreement is a biased metric for split quality.** Keeping `ა.შ` won on
+raw mismatch (31.91% against 35.54%) and was still wrong, because a
+count-agreement metric scores a coincidental match as a win. The pairs it
+uniquely kept were 57% alignment-consistent by character ratio against 85% for
+dropping it, so keeping bought ~245 extra good pairs at the cost of ~560
+misaligned ones — and its failure mode is silent, where the alternative loudly
+drops the pair. When a split heuristic is judged by count agreement, audit the
+kept pairs for alignment before believing the number.
+
+**`e.g` and `i.e` were missing from the Latin list**, which cost English-side
+splits on every pair the app ships. The uppercase guard masked it whenever the
+next word was lowercase, so only `e.g. Paris` broke. Adding them was the larger
+half of the final re-split: +998 lines and −1,033 mismatches, against +551 and
++807 for the `ა.შ` removal.
+
+### Split results, en-ka pool
+
+Applied to the 11,459,301-pair filtered pool, giving 10,604,811 pairs:
+
+| register | in | out | mismatch |
+|---|---|---|---|
+| human | 30,651 | 26,684 | 17.64% |
+| ui | 22,540 | 23,382 | 0.89% |
+| dialogue | 40,087 | 34,930 | 13.04% |
+| entity | 110,522 | 110,522 | 0.00% |
+| crawl | 11,255,501 | 10,409,293 | 11.85% |
+| TOTAL | 11,459,301 | 10,604,811 | 11.73% |
+
+The 11.7% mismatch is a corpus property, not a splitter artifact: the prefix
+fixes moved it by 0.1pp. 92.8% of crawl mismatches have more sentences on the
+Georgian side and 70% are exactly one-into-two, which is web and subtitle
+translators rendering one long English sentence as two Georgian ones. That
+restructuring stays invisible while the pair is whole and becomes a hard drop
+once split. Entity is 0% because titles have nothing to split; the higher
+human/dialogue rates track TED and OpenSubtitles alignment drifting across
+segment boundaries.
+
+Two defects the split exposed rather than caused, both still open: 1,697 dialogue
+pairs whose Georgian side begins with the untranslated English source (`Once.` →
+`Once. ერთხელ.`), which `nearid.py` misses because the pair is only ~50%
+identical, and 1,175 similar in entity. Count matching also does not guarantee
+boundary matching — one of ten hand-checked 2-into-2 splits put a clause on the
+wrong side of the break while still matching on count.
+
+### Measured ka→en decode, 2026-08-31
+
+LMT-60-8B greedy on a 4090, vLLM 0.28.0, `enforce_eager=True`,
+`gpu_memory_utilization=0.92`, KV cache 38,432 tokens: **92.8 lines/s on crawl**,
+against 29.2 for en→ka on the same teacher. The 3.18x is the token-efficiency
+argument of §6 paying out — English output runs ~2.6 characters per token where
+Georgian runs ~1 token per character, and greedy decode is dominated by output
+tokens.
+
+Price the campaign on the CRAWL rate, not the aggregate. The short registers
+decode far faster because their lines are short — entity ran 303 lines/s — and
+they are 17.7% of chunk 00 and absent from every later chunk. A rate averaged
+over chunk 00 would underestimate the cost of chunks 01-03 by roughly half.
+
+4M lines came to ~13 GPU-hours and ~$4.20 at $0.3211/h actual against a $0.2952
+headline. Budget on the blended rate; the cheapest offers go first.
+
+Source-length figures from `wc -c` are BYTES, and Mkhedruli is 3 bytes per
+character in UTF-8. The 169-byte mean line is ~56 Georgian characters, so a
+4096-token `max_model_len` is generous headroom rather than a constraint.
+
+## 18. The two directions of a pair do not hold the same amount of data
+
+The ka→en draw asked for 10M and realized 6,308,923. Nothing failed: the fill
+register ran out. `sample_mix.py --kd-col` deduplicates on the SOURCE column, and
+the two directions therefore dedup on different columns of the same corpus.
+
+| crawl pool | lines | unique en | unique ka |
+|---|---|---|---|
+| after split | 10,409,293 | 9,875,791 | 6,132,386 |
+| before split | 11,255,501 | 10,713,303 | 6,689,244 |
+
+Mined en-ka crawl is many-to-one on the Georgian side, so the same corpus yields
+10M usable en→ka sources and 6.31M usable ka→en ones. The repetition is
+structural rather than random: the most frequent Georgian strings are list
+enumerators and site furniture — `1.` occurs 2,135 times, then `კონტაქტი`,
+`ძიება`, `გალერეა`, `კონფიდენციალურობის პოლიტიკა`.
+
+Measure unique counts per COLUMN before budgeting a direction. A pair's headline
+size is the bitext line count, which is an upper bound that only the
+better-supplied direction gets to use, and the shortfall appears at draw time
+after the pool is already built.
+
+Sentence-splitting costs a further 556,858 unique Georgian sources, 8.3%,
+because splitting a long unique line yields short fragments that collide with
+fragments from elsewhere. That cost is worth paying only because the runtime
+splitter was fixed (§17) so inference actually splits Georgian. Splitting the
+corpus for a language the runtime cannot split is a pure loss that also widens
+the train/inference gap it was meant to close.
+
+Extending past 6.31M needs Georgian monolingual through `segment_mono.py`. The
+iteration-1 plan is unaffected, since chunks 00-03 are still a full 4M, and the
+remaining 2.31M stay available as chunks 04-06 of the same pinned draw.

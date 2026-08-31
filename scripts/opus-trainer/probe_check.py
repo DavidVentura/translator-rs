@@ -20,7 +20,7 @@ What this deliberately does NOT catch: meaning inversions (discontinue ->
 continue) and wrong word choice, both of which are fluent and short. Those stay a
 reading job.
 
-    probe_check.py probes.jsonl HYP_FILE <en2tl|tl2en>
+    probe_check.py probes.jsonl HYP_FILE <SRC2TGT, e.g. en2ka|ka2en>
 """
 
 import json
@@ -31,16 +31,38 @@ from pathlib import Path
 
 NUM = re.compile(r"\d+(?:[.,]\d+)?")
 
-# Spelled-out forms, so a digit rendered as a word is not reported as dropped.
-WORD_NUM = {
-    "0": ("zero", "sero"), "1": ("one", "isa", "isang"), "2": ("two", "dalawa", "dalawang"),
-    "3": ("three", "tatlo", "tatlong"), "4": ("four", "apat"),
-    "5": ("five", "lima", "limang"), "6": ("six", "anim"),
-    "7": ("seven", "pito", "pitong"), "8": ("eight", "walo", "walong"),
-    "9": ("nine", "siyam"), "10": ("ten", "sampu", "sampung"),
-    "15": ("fifteen", "labinlima"), "24": ("twenty-four", "dalawampu't apat"),
-    "45": ("forty-five", "apatnapu't lima"),
-    "302": ("three hundred two",), "350": ("three hundred and fifty",),
+# Spelled-out numerals, keyed by the language the HYPOTHESIS is in, so a digit
+# rendered as a word is not reported as dropped. A missing entry costs a false
+# positive on one line, never a missed defect, so a pair may start with the
+# numbers its own check set actually contains.
+SPELLED = {
+    "en": {
+        "0": ("zero",), "1": ("one",), "2": ("two",), "3": ("three",), "4": ("four",),
+        "5": ("five",), "6": ("six",), "7": ("seven",), "8": ("eight",), "9": ("nine",),
+        "10": ("ten",), "15": ("fifteen",), "24": ("twenty-four",),
+        "45": ("forty-five",), "302": ("three hundred two",),
+        "350": ("three hundred and fifty",),
+    },
+    "tl": {
+        "0": ("sero",), "1": ("isa", "isang"), "2": ("dalawa", "dalawang"),
+        "3": ("tatlo", "tatlong"), "4": ("apat",), "5": ("lima", "limang"),
+        "6": ("anim",), "7": ("pito", "pitong"), "8": ("walo", "walong"),
+        "9": ("siyam",), "10": ("sampu", "sampung"), "15": ("labinlima",),
+        "24": ("dalawampu\'t apat",), "45": ("apatnapu\'t lima",),
+    },
+    # Georgian numerals inflect (ori -> orjer "twice"), so the listed forms are
+    # the citation forms plus the multiplicative, not a stem: a two-letter stem
+    # like "or" matches unrelated words (organizacia) and would hide real drops.
+    "ka": {
+        "0": ("\u10dc\u10e3\u10da",), "1": ("\u10d4\u10e0\u10d7", "\u10d4\u10e0\u10d7\u10ee\u10d4\u10da"),
+        "2": ("\u10dd\u10e0\u10d8", "\u10dd\u10e0\u10ef\u10d4\u10e0"),
+        "3": ("\u10e1\u10d0\u10db\u10d8", "\u10e1\u10d0\u10db\u10ef\u10d4\u10e0"),
+        "4": ("\u10dd\u10d7\u10ee\u10d8",), "5": ("\u10ee\u10e3\u10d7\u10d8",),
+        "6": ("\u10d4\u10e5\u10d5\u10e1\u10d8",), "7": ("\u10e8\u10d5\u10d8\u10d3\u10d8",),
+        "8": ("\u10e0\u10d5\u10d0",), "9": ("\u10ea\u10ee\u10e0\u10d0",),
+        "10": ("\u10d0\u10d7\u10d8",), "15": ("\u10d7\u10ee\u10e3\u10d7\u10db\u10d4\u10e2\u10d8",),
+        "24": ("\u10dd\u10ea\u10d3\u10d0\u10dd\u10d7\u10ee\u10d8",),
+    },
 }
 
 
@@ -50,10 +72,10 @@ class Failure:
     detail: str
 
 
-def check_numbers(src: str, hyp: str) -> list[Failure]:
+def check_numbers(src: str, hyp: str, spelled: dict[str, tuple[str, ...]]) -> list[Failure]:
     low = hyp.lower()
     lost = [n for n in NUM.findall(src)
-            if n not in hyp and not any(w in low for w in WORD_NUM.get(n, ()))]
+            if n not in hyp and not any(w in low for w in spelled.get(n, ()))]
     if not lost:
         return []
     return [Failure("number_dropped", f"{lost} absent from output")]
@@ -90,9 +112,10 @@ def check_degenerate(src: str, hyp: str, max_ratio: float) -> list[Failure]:
     return out
 
 
-def check(src: str, hyp: str, max_ratio: float = 3.0) -> list[Failure]:
+def check(src: str, hyp: str, max_ratio: float = 3.0, tgt_lang: str = "en") -> list[Failure]:
     """Every reference-free check for one line. The reusable entry point."""
-    return check_numbers(src, hyp) + check_degenerate(src, hyp, max_ratio)
+    return (check_numbers(src, hyp, SPELLED.get(tgt_lang, {}))
+            + check_degenerate(src, hyp, max_ratio))
 
 
 def load_sources(path: Path, direction: str) -> list[tuple[str, str, float]]:
@@ -105,7 +128,7 @@ def load_sources(path: Path, direction: str) -> list[tuple[str, str, float]]:
     if path.suffix != ".jsonl":
         return [(l, "-", 3.0) for l in
                 path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    src_key = "en" if direction == "en2tl" else "tl"
+    src_key = direction.split("2")[0]
     out = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -117,6 +140,7 @@ def load_sources(path: Path, direction: str) -> list[tuple[str, str, float]]:
 
 def main() -> None:
     probes_p, hyp_p, direction = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    tgt_lang = direction.split("2")[1]
     probes = load_sources(probes_p, direction)
     hyps = hyp_p.read_text(encoding="utf-8").splitlines()
     if len(probes) != len(hyps):
@@ -126,7 +150,7 @@ def main() -> None:
     failures: list[tuple[int, str, str, str, list[Failure]]] = []
 
     for i, ((src, category, max_ratio), hyp) in enumerate(zip(probes, hyps)):
-        found = check(src, hyp, max_ratio)
+        found = check(src, hyp, max_ratio, tgt_lang)
         by_cat.setdefault(category, []).append(0 if found else 1)
         if found:
             failures.append((i, category, src, hyp, found))
