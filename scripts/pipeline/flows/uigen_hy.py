@@ -3,8 +3,7 @@
 Same graph as uigen_v3, one teacher swap. Hy-MT2-7B-FP8 beat NLLB on the uig→en
 gate (chrF++ 51.6 / COMET 87.7 vs 49 / 85.9) AND fixed the entity errors that made
 NLLB gist-usable-but-not-trustworthy, while staying faithful/literal enough to
-distill into a 40M student (validated 2026-07-16; see NOTES.md "Hy-MT2-7B
-REVISITED" + "vLLM VALIDATED", and hy_kd_plan.md).
+distill into a 40M student (validated 2026-07-16; see hy_kd_plan.md).
 
     prep ─┬─ kd_source ─┬─ split_kd ─ kd_decode ×K ─ gather ─┐
           │             │                                     │
