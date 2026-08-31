@@ -122,6 +122,46 @@ markup, invalid character or word ratios, number and URL mismatches, excessive
 word lengths, and wrong-language rows. Inspect the filter implementation before
 changing a default, and report what each filter removes by corpus and register.
 
+Qualify the non-English source independently of pair alignment. A mined pair can
+be well aligned while its non-English side is itself an upstream machine
+translation: correctly encoded and spaced, yet calqued, ungrammatical, or
+semantically unreliable. Mechanical rules can remove invalid encoding, broken
+script mixtures, and other surface damage, but cannot establish that apparently
+fluent text was written naturally in the language.
+
+Draw a uniform sample from each important corpus and register before committing
+to KD. Have a native reviewer, or a capable model with native review of its
+calibration set, classify the source side for native quality and translationese.
+Use that sample to estimate the dirty rate and decide whether the corpus remains
+worth keeping; do not infer the rate from rows selected by a proposed filter. If
+trusted native monolingual data is available, prefer decoding it with the teacher
+to trying to repair a corpus whose source was machine-generated upstream.
+
+When no replacement corpus is available, train an acceptability/translationese
+classifier to rank the existing source. It needs reviewed clean and degraded
+examples: a clean-only language model may help mine suspicious candidates, but
+will also rank names, rare terminology, and legitimate register differences as
+unusual. Calibrate the classifier's cutoff on a separate representative reviewed
+sample, then retain only the confidence range whose false-positive cost is
+acceptable.
+
+Measure a defect rate before building a filter for it. Estimate it from a
+uniform random sample judged directly. A rate read off the filter's own output
+measures the filter. Keep any deliberately skewed sample separate and use it only
+to evaluate a proposed cut.
+
+Character and token models detect orthographic damage. They do not detect a
+source that is fluent but wrong, which is correctly spelled and scores near the
+median of its length. Detecting that requires the reference side of the pair.
+State which of the two an instrument detects, and do not let it be cited as the
+other.
+
+Where a defect has no negative class to train against, emit a score and calibrate
+it against labelled lines rather than thresholding it directly. An absolute
+perplexity cut rejects proper nouns, loanwords and short lines, and a
+length-normalised score ranked globally is a short-line filter. Rank within
+length buckets and stratify any labelling set by length.
+
 Classify corpora by role and register. Keep sentence-level prose, UI strings,
 named-entity data, subtitles, spoken text, and religious or historical text
 separate when deciding what to train on.

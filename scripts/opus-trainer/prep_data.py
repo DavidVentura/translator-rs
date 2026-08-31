@@ -199,6 +199,61 @@ def max_word_ok(s: str, t: str, limit: int) -> bool:
     return not any(len(tok) > limit for field in (s, t) for tok in field.split(" "))
 
 
+# A DECODE-HANG GUARD, not a quality rule, and the threshold is set accordingly.
+# One 146-character run of a single letter made a vLLM decode batch loop until its
+# 1800s timeout, taking 100 lines of KD with it. At a 9-character threshold the
+# rule was only 22% precise against labelled data -- 32 of 41 hits were ordinary
+# expressive text -- so it is set well above the length any emphasis reaches and
+# only catches the pathological case it exists for.
+DEGENERATE_RUN = re.compile(r"(\w)\1{15,}")
+PUNCT = " \t.,;:!?\"'()[]{}<>«»„“”‘’-–—…"
+
+
+# A Latin letter touching a non-Latin letter with nothing between them. Measured
+# against 2,000 judged lines this fired on 0 of 1,373 clean ones while catching
+# character-corrupted and script-mixed rows ("სანახავდName"). A case suffix
+# attached to a Latin brand is normal and keeps its hyphen ("iPhone-ის"), which
+# is why the rule requires DIRECT adjacency. On a Latin-script corpus it is inert.
+SCRIPT_CLASH = re.compile(r"[A-Za-z][^\W\dA-Za-z_]|[^\W\dA-Za-z_][A-Za-z]")
+
+
+def mixed_script(text: str) -> bool:
+    return SCRIPT_CLASH.search(text) is not None
+
+
+def corrupt_encoding(text: str) -> bool:
+    """Decode damage: replacement characters, or C0/C1 controls in running text.
+
+    The single highest-precision quality rule we have measured: 0 false positives
+    on 1,373 judged-clean lines while catching 37% of the character-corrupted
+    ones. Language-independent, because a replacement character is evidence of a
+    decode that already failed.
+    """
+    return "\ufffd" in text or any(unicodedata.category(c) == "Cc" for c in text)
+
+
+def degenerate(text: str) -> bool:
+    if DEGENERATE_RUN.search(text):
+        return True
+    # A short PHRASE repeating back to back. Decoders fall into this loop
+    # ("the All-compassionate, the All-compassionate, the All-compassionate")
+    # and mined corpora carry it from the same failure upstream. Matching on
+    # adjacent identical WORDS misses it, because the repeating unit there is a
+    # bigram. A single word needs a longer run to qualify: subtitle dialogue
+    # legitimately says "No, no, no!", and three is well inside normal speech.
+    # Compared with surrounding punctuation stripped: the repeating unit is
+    # usually punctuated on every copy but the last, so "A, A, A" is three
+    # repeats of one word and not two of a bigram.
+    words = [w.strip(PUNCT).lower() for w in text.split()]
+    words = [w for w in words if w]
+    for size, need in ((1, 5), (2, 3), (3, 3), (4, 3)):
+        for i in range(len(words) - size * need + 1):
+            unit = words[i:i + size]
+            if all(words[i + k * size:i + (k + 1) * size] == unit for k in range(1, need)):
+                return True
+    return False
+
+
 def clean_pair(s_raw: str, t_raw: str, args) -> tuple[str, str] | None:
     """All non-langid filtering + transforms. Returns the cleaned pair, or None
     to drop it. Pure and picklable-input, so it runs in worker processes."""
@@ -209,6 +264,12 @@ def clean_pair(s_raw: str, t_raw: str, args) -> tuple[str, str] | None:
     s = strip_artifacts(fix_wiki(s))
     t = strip_artifacts(fix_wiki(t))
     if not s or not t or s == t:
+        return None
+    if degenerate(s) or degenerate(t):
+        return None
+    if corrupt_encoding(s) or corrupt_encoding(t):
+        return None
+    if mixed_script(s) or mixed_script(t):
         return None
     if not max_word_ok(s, t, args.max_word_len):
         return None

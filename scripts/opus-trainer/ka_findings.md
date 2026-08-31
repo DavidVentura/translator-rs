@@ -589,6 +589,26 @@ and a deep KV cache together, which is what the bf16 build cannot afford.
   the pull. `vastai/vllm:v<version>-cuda-12.9` off Docker Hub avoids the rate
   limit entirely, is faster to obtain, needs no custom image, and pins the exact
   vLLM the teacher gate ran on.
+- **`Permission denied (publickey)` is not always key propagation.** A host can
+  provision `/root/.ssh/authorized_keys` with wrong ownership or modes, and sshd
+  then rejects a correctly-installed key. From the client the two are
+  indistinguishable and waiting never fixes the second. Read `vastai logs <id>`:
+  the real cause appears there as `bad ownership or modes`. `vastai execute` only
+  works on stopped instances, and a reboot re-runs the same provisioning.
+  Destroy and re-roll.
+- **A stalled image pull is diagnosable in ~90 seconds.** Sample `status_msg`
+  twice and compare the layer digest: an unchanged digest is a stall, a changing
+  one is a slow host. Elapsed time alone is the wrong signal — `pipe`'s 600 s
+  `loading` budget would have killed a box that took 22 minutes to pull and then
+  decoded fine. Give a box that just finished a layer a few minutes' grace, then
+  destroy.
+- **A watchdog needs a claim file, not a cleverer pgrep.** Three separate
+  watchdog collisions happened in one campaign, including two sessions putting
+  three watchdogs on one box. `pgrep -f '[c]ollect.sh <id>'` does not protect
+  you: the `bash -c` wrapper carrying the command contains the unbracketed
+  pattern, so the guard matches itself and reports a watchdog that does not
+  exist. Write a claim file holding the instance id next to the log, so a
+  watchdog can tell it is pointed at a box someone else already collected.
 - **Train on a 4090 or Ampere, never a 5090.** That is where the CUDA
   11.8 / sm_89 constraint on `marian.cuda` actually binds. It does NOT bind on
   the decode boxes, which run vLLM, so a Blackwell card is legitimate there and
@@ -775,137 +795,73 @@ are 0.0 in `configs/opustrainer.student.ka.yml`.
 
 ## 17. The runtime splitter never split any caseless script
 
-Splitting the pool for ka→en (§14) turned up the reason the corpus and the
-runtime could not have agreed anyway: `split_sentences` in
-`crates/translator-translate/src/sentence_split.rs` guarded a lone `.` with
-`first.is_uppercase()`, and no caseless script has an uppercase. Measured on the
-shipped code with one sentence per script:
+`split_sentences` guarded a lone `.` with `first.is_uppercase()`. No caseless
+script has an uppercase, so Georgian, Hebrew, Arabic, Devanagari, Bengali, Thai
+and Japanese never split at a period; only `!` and `?` did, which hid it in
+dialogue while prose stayed unsplit. Georgian is the subtle case: Unicode gives
+Mkhedruli lowercase status with an uppercase mapping into Mtavruli, so
+`is_uppercase()` is false for ordinary prose.
 
-| script | "The door is closed. Please use the side entrance." |
-|---|---|
-| Latin, Cyrillic, Greek | 2 pieces |
-| Georgian, Hebrew, Arabic, Devanagari, Bengali, Thai, Japanese | 1 piece |
+Fixed with a unicameral-script table, the terminators `।॥։۔؟።፧`, and Georgian
+non-breaking prefixes. Affects every shipped X→en pair with a caseless source.
 
-Georgian is the subtle case. Unicode gives Mkhedruli lowercase status with an
-uppercase mapping into Mtavruli, so `is_uppercase()` is false for every letter of
-ordinary prose and the guard never passed. `!` and `?` still split, because they
-bypass the guard, which is why the failure was invisible: dialogue split, prose
-did not.
+Two traps in the prefix list:
 
-The consequence for ka→en is that it inverts §14's rationale. The pool was split
-so that training would match one-sentence-per-call inference, while the runtime
-would have handed the model whole Georgian paragraphs. The same applies to every
-shipped X→en pair with a caseless source, where it degrades quality without ever
-producing a visible failure.
+- An entry must be symmetric with the other language's list. `ა.შ` ("and so on")
+  is the Georgian `etc.`, which is deliberately absent from the Latin list
+  because it ends a sentence. On the 1,788 pool pairs where both sides use the
+  construction, dropping `ა.შ` kept 68.6% against 17.7% for keeping it.
+- `e.g` and `i.e` were missing from the Latin list, costing English-side splits
+  on every pair the app ships. Masked whenever the next word was lowercase.
 
-The fix is a unicameral-script table consulted before the uppercase guard, the
-non-Latin terminators `।॥։۔؟።፧` added to the boundary regex, and Georgian
-non-breaking prefixes. Georgian needed those prefixes only because it now splits
-at `.` at all — before the fix, `ელ. ფოსტა` was safe by accident.
+Split results: 11,459,301 → 10,604,811 pairs, 11.73% mismatch. That rate is a
+corpus property, not a splitter artifact — the prefix fixes moved it 0.1pp. 92.8%
+of crawl mismatches have more sentences on the Georgian side and 70% are exactly
+one-into-two: web translators rendering one English sentence as two Georgian ones.
 
-**A non-breaking entry has to be symmetric with the other side's list.** The
-first version of the Georgian prefixes included `ა.შ` ("and so on"). That is the
-Georgian `etc.`, and `etc` is deliberately absent from the Latin list because it
-ends a sentence. Listing one and not the other breaks the two sides at different
-places. On the 1,788 pool pairs where both languages use the construction,
-dropping `ა.შ` kept 68.6% against 17.7% for keeping it. Check a candidate prefix
-against what the OTHER language does with its translation, not only against
-whether it looks like an abbreviation.
-
-**Count agreement is a biased metric for split quality.** Keeping `ა.შ` won on
-raw mismatch (31.91% against 35.54%) and was still wrong, because a
-count-agreement metric scores a coincidental match as a win. The pairs it
-uniquely kept were 57% alignment-consistent by character ratio against 85% for
-dropping it, so keeping bought ~245 extra good pairs at the cost of ~560
-misaligned ones — and its failure mode is silent, where the alternative loudly
-drops the pair. When a split heuristic is judged by count agreement, audit the
-kept pairs for alignment before believing the number.
-
-**`e.g` and `i.e` were missing from the Latin list**, which cost English-side
-splits on every pair the app ships. The uppercase guard masked it whenever the
-next word was lowercase, so only `e.g. Paris` broke. Adding them was the larger
-half of the final re-split: +998 lines and −1,033 mismatches, against +551 and
-+807 for the `ა.შ` removal.
-
-### Split results, en-ka pool
-
-Applied to the 11,459,301-pair filtered pool, giving 10,604,811 pairs:
-
-| register | in | out | mismatch |
-|---|---|---|---|
-| human | 30,651 | 26,684 | 17.64% |
-| ui | 22,540 | 23,382 | 0.89% |
-| dialogue | 40,087 | 34,930 | 13.04% |
-| entity | 110,522 | 110,522 | 0.00% |
-| crawl | 11,255,501 | 10,409,293 | 11.85% |
-| TOTAL | 11,459,301 | 10,604,811 | 11.73% |
-
-The 11.7% mismatch is a corpus property, not a splitter artifact: the prefix
-fixes moved it by 0.1pp. 92.8% of crawl mismatches have more sentences on the
-Georgian side and 70% are exactly one-into-two, which is web and subtitle
-translators rendering one long English sentence as two Georgian ones. That
-restructuring stays invisible while the pair is whole and becomes a hard drop
-once split. Entity is 0% because titles have nothing to split; the higher
-human/dialogue rates track TED and OpenSubtitles alignment drifting across
-segment boundaries.
-
-Two defects the split exposed rather than caused, both still open: 1,697 dialogue
-pairs whose Georgian side begins with the untranslated English source (`Once.` →
-`Once. ერთხელ.`), which `nearid.py` misses because the pair is only ~50%
-identical, and 1,175 similar in entity. Count matching also does not guarantee
-boundary matching — one of ten hand-checked 2-into-2 splits put a clause on the
-wrong side of the break while still matching on count.
-
-### Measured ka→en decode, 2026-08-31
-
-LMT-60-8B greedy on a 4090, vLLM 0.28.0, `enforce_eager=True`,
-`gpu_memory_utilization=0.92`, KV cache 38,432 tokens: **92.8 lines/s on crawl**,
-against 29.2 for en→ka on the same teacher. The 3.18x is the token-efficiency
-argument of §6 paying out — English output runs ~2.6 characters per token where
-Georgian runs ~1 token per character, and greedy decode is dominated by output
-tokens.
-
-Price the campaign on the CRAWL rate, not the aggregate. The short registers
-decode far faster because their lines are short — entity ran 303 lines/s — and
-they are 17.7% of chunk 00 and absent from every later chunk. A rate averaged
-over chunk 00 would underestimate the cost of chunks 01-03 by roughly half.
-
-4M lines came to ~13 GPU-hours and ~$4.20 at $0.3211/h actual against a $0.2952
-headline. Budget on the blended rate; the cheapest offers go first.
-
-Source-length figures from `wc -c` are BYTES, and Mkhedruli is 3 bytes per
-character in UTF-8. The 169-byte mean line is ~56 Georgian characters, so a
-4096-token `max_model_len` is generous headroom rather than a constraint.
+Still open: 1,697 dialogue pairs whose Georgian side begins with the untranslated
+English source, which `nearid.py` misses at ~50% identity, and 1,175 in entity.
 
 ## 18. The two directions of a pair do not hold the same amount of data
 
-The ka→en draw asked for 10M and realized 6,308,923. Nothing failed: the fill
-register ran out. `sample_mix.py --kd-col` deduplicates on the SOURCE column, and
-the two directions therefore dedup on different columns of the same corpus.
+The ka→en draw asked for 10M and realized 6,308,923. `--kd-col` dedups on the
+source column, so the two directions dedup different columns of the same corpus.
 
 | crawl pool | lines | unique en | unique ka |
 |---|---|---|---|
 | after split | 10,409,293 | 9,875,791 | 6,132,386 |
 | before split | 11,255,501 | 10,713,303 | 6,689,244 |
 
-Mined en-ka crawl is many-to-one on the Georgian side, so the same corpus yields
-10M usable en→ka sources and 6.31M usable ka→en ones. The repetition is
-structural rather than random: the most frequent Georgian strings are list
-enumerators and site furniture — `1.` occurs 2,135 times, then `კონტაქტი`,
-`ძიება`, `გალერეა`, `კონფიდენციალურობის პოლიტიკა`.
+Mined en-ka crawl is many-to-one on the Georgian side; the repetition is list
+enumerators and site furniture (`1.` occurs 2,135 times). Splitting costs a
+further 8.3% of unique sources, because fragments collide — worth paying only
+because §17 made the runtime actually split Georgian.
 
-Measure unique counts per COLUMN before budgeting a direction. A pair's headline
-size is the bitext line count, which is an upper bound that only the
-better-supplied direction gets to use, and the shortfall appears at draw time
-after the pool is already built.
+Measure unique counts per COLUMN before budgeting a direction. Extending past
+6.31M needs monolingual through `segment_mono.py`.
 
-Sentence-splitting costs a further 556,858 unique Georgian sources, 8.3%,
-because splitting a long unique line yields short fragments that collide with
-fragments from elsewhere. That cost is worth paying only because the runtime
-splitter was fixed (§17) so inference actually splits Georgian. Splitting the
-corpus for a language the runtime cannot split is a pure loss that also widens
-the train/inference gap it was meant to close.
+## 19. What the ka→en teacher actually does wrong
 
-Extending past 6.31M needs Georgian monolingual through `segment_mono.py`. The
-iteration-1 plan is unaffected, since chunks 00-03 are still a full 4M, and the
-remaining 2.31M stay available as chunks 04-06 of the same pinned draw.
+Chunk 00 passed every automated gate: no defect class above 0.16%, zero empties,
+length ratio median 0.99. Reading it found two failures the gate cannot see.
+
+**Obscure entities are invented.** `მიხელ სააკაშვილმა` → "Mikheil Saakashvili" is
+correct, but `ანდრე კოლინგბა` → "Andre Collinba" when the man is André Kolingba.
+Same gist-faithful, entity-weak shape the uig KD run recorded.
+
+**On degraded input the teacher does not degrade with it.** Where the source is
+garbled machine translation, the output is fluent, confident English carrying
+substituted facts — one medical line acquired "commonly known as Femoral Head and
+Neck Ostectomy", naming a surgery absent from the source. A student learns to
+sound authoritative exactly where it should be uncertain, and every
+fluency-shaped metric moves the wrong way on these pairs.
+
+This is why `kd_ref` is pinned alongside `kd_src`: extract-best is the only lever
+that sees it. Orthographic filters cannot — an §19 line is well spaced, correctly
+punctuated, real words, and scores at the median of its length bucket. Verified
+by reading 60+ lines across every band of `source_quality.py`'s distribution
+without surfacing one.
+
+Judge these from the FULL line. The `verify_kd.py` sample cuts at 110 characters,
+and one suspected fabrication turned out to be present in the source once read
+whole.
