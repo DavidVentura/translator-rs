@@ -1,0 +1,255 @@
+{
+  "language": "Georgian",
+  "code": "ka",
+  "country": "Georgia",
+  "prompt_version": "ka-pairs-v4",
+  "system": "You are a native Georgian speaker who documents Georgian text exactly as it is printed and written in Georgia, and gives the English that the same text carries in an English-speaking country. You output JSON arrays and nothing else.",
+  "have_cap_category": 60,
+  "have_cap_global": 40,
+
+  "target_notes": [
+    "Mkhedruli only. Georgian has no capital letters: never Mtavruli, never Asomtavruli, and no all-caps Georgian even where an English sign would be set in capitals.",
+    "Vary the imperative, but match it to the setting. Manuals, packaging instructions, device screens and official notices use the polite plural in -თ (დახურეთ, გთხოვთ დაელოდოთ, შეინახეთ, ნუ შეხვალთ); the plain form (დახურე, ნუ შეეხები) belongs on blunt machinery warnings and text addressed to one person. A manual or a UI line written in the plain form is wrong.",
+    "Units inside Georgian text are written in Georgian: კგ, გრ, მლ, ლ, სმ, მ, კმ, კმ/სთ, ვტ, ვ, °C. A Latin unit abbreviation belongs only where the pack or the rating plate itself prints it.",
+    "Prohibitions are written several ways: აკრძალულია, არ + verb, ნუ + verb, verbal noun + აკრძალულია, and impersonal არ შეიძლება. Vary them across the list instead of rendering every English 'No X' the same way.",
+    "Prices are in ლარი and თეთრი, written as a Georgian price tag prints them (₾ or ლარი, and თეთრი or the decimal part).",
+    "Do not start a first-person sentence with an explicit მე unless it is emphatic. The verb already carries the person, and a მე on every line is the translationese this set exists to displace.",
+    "Do not calque an English sign into Georgian. Where a Georgian sign says something different for the same situation (a different verb, a masdar, a genitive attributive standing alone), print what Georgia prints.",
+    "Write loanwords in Mkhedruli as Georgian shops and screens write them. Latin letters belong only in brand names, model codes and the units Georgian itself prints in Latin.",
+    "Prices are written in Georgian on the Georgian side (ლარი, თეთრი, ₾) and in Latin on the English side (GEL, or lari): a Georgian currency word must never appear in the English row.",
+    "Emergency, hotline and service numbers must be the ones really used in Georgia -- 112 for emergency, the operator and agency short numbers Georgia actually prints -- not another country's.",
+    "Punctuate as printed: a one-line label carries no full stop, a sentence notice does. Use Georgian quotation marks where a printed notice uses them."
+  ],
+
+  "gates": {
+    "script_ranges": [["10D0", "10FF"]],
+    "script_min_share": 0.55,
+    "folds": [
+      {"name": "Mtavruli", "lo": "1C90", "hi": "1CBA", "delta": -3008},
+      {"name": "Asomtavruli", "lo": "10A0", "hi": "10C5", "delta": 48}
+    ],
+    "latin_allow": [
+      "wi", "fi", "wifi", "usb", "pin", "sim", "gps", "led", "lcd", "oled", "hdmi",
+      "qr", "id", "vip", "wc", "sos", "atm", "pos", "gsm", "lte", "nfc", "rfid",
+      "kg", "mg", "ml", "cl", "dl", "cm", "mm", "km", "gb", "mb", "kb", "tb",
+      "hz", "khz", "mhz", "ghz", "mah", "kwh", "psi", "rpm", "spf", "uv", "ip",
+      "abs", "esp", "adblue", "diesel", "premium", "regular", "cd", "dvd",
+      "sms", "mms", "pdf", "jpg", "png", "email", "app", "ios", "android",
+      "bluetooth", "windows", "linux", "google", "apple", "samsung", "visa",
+      "mastercard", "amex", "paypal", "gel", "usd", "eur", "eco", "bio",
+      "halal", "kosher", "vegan", "free", "max", "min", "xl", "xxl", "xs",
+      "iso", "gost", "din", "en", "ce", "ean", "sku", "vin", "co", "ph"
+    ],
+    "max_latin_run": 4,
+    "word_ratio": [0.35, 2.5],
+    "word_ratio_slack": [1, 2],
+    "band_slack": 3
+  },
+
+  "bands": {
+    "w01_03": {
+      "lo": 1, "hi": 3,
+      "text": "A bare label, plate or button: one to three words as printed, with nothing added to make it a sentence."
+    },
+    "w04_08": {
+      "lo": 4, "hi": 8,
+      "text": "A short printed line: the usual wording of a sign, shelf label, menu item, packaging line or on-screen message."
+    },
+    "w09_18": {
+      "lo": 9, "hi": 18,
+      "text": "A full printed line or two: a complete sentence that a reader stops and reads."
+    }
+  },
+
+  "forms": {
+    "label": {
+      "rows": 45,
+      "numbers": "free",
+      "bands": ["w01_03", "w04_08"],
+      "text": "Bare printed labels, headings and names: the phrase as it stands alone on the plate, shelf edge, menu heading, packaging panel or screen. No invented verb, no article a sign would not print, no explanation of what the sign means."
+    },
+    "instruction": {
+      "rows": 45,
+      "numbers": "free",
+      "bands": ["w01_03", "w04_08", "w09_18"],
+      "text": "Instructions addressed to the reader: what to do, in what order, how to use or handle the thing, what is required before proceeding. Vary the politeness and the construction across the list."
+    },
+    "prohibition": {
+      "rows": 45,
+      "numbers": "free",
+      "bands": ["w01_03", "w04_08", "w09_18"],
+      "text": "Prohibitions, refusals and restrictions: what is forbidden, not allowed, out of order, closed, unavailable, reserved for somebody else, or permitted only under a condition. Vary how absolute the ban is and vary the construction."
+    },
+    "statement": {
+      "rows": 45,
+      "numbers": "free",
+      "bands": ["w04_08", "w09_18"],
+      "text": "Notices and messages written as complete statements: an announcement, a warning that gives its reason, a status or result message, a condition and its consequence, an apology for a disruption."
+    },
+    "numeric": {
+      "rows": 45,
+      "numbers": "required",
+      "bands": ["w01_03", "w04_08", "w09_18"],
+      "text": "Text that carries figures: quantities and units, doses and frequencies, prices, dates, times and opening hours, capacities, temperatures, speeds and distances, percentages, codes, batch, model and reference numbers. Any shape -- label, instruction or notice -- as long as the figure is in it."
+    }
+  },
+
+  "registers": [
+    {
+      "name": "signage",
+      "blurb": "signs, plates and notices fixed in public places, shops and buildings",
+      "forms": ["label", "instruction", "prohibition", "statement", "numeric"],
+      "categories": [
+        "road and traffic signs",
+        "parking and vehicle notices",
+        "pedestrian crossing and street signs",
+        "building entrance, exit and door signs",
+        "restroom and washroom signs",
+        "fire safety and firefighting equipment signs",
+        "evacuation routes, assembly points and emergency exits",
+        "electrical, voltage and machinery hazard warnings",
+        "construction site and roadworks notices",
+        "floor, step, wet surface and falling hazard notices",
+        "lift, escalator and stairwell signs",
+        "opening hours, closure and holiday notices",
+        "shop front, department and aisle signs",
+        "queue, counter and service window signs",
+        "railway and metro station signs",
+        "bus stop, minibus and marshrutka signs",
+        "airport terminal, gate and baggage signs",
+        "border, customs and passport control signs",
+        "hotel, guesthouse and reception signs",
+        "hospital ward and clinic department signs",
+        "pharmacy counter and medicine shelf signs",
+        "school, kindergarten and university signs",
+        "office, workplace and factory floor signs",
+        "park, forest and nature reserve signs",
+        "beach, pool and swimming notices",
+        "ski resort, cable car and mountain signs",
+        "church, monastery and heritage site notices",
+        "museum, gallery and exhibit labels",
+        "petrol station, pump and car wash signs",
+        "waste, recycling and bin labels",
+        "taxi rank, ride-hailing and pickup point notices",
+        "EV charging, car park barrier and toll signs"
+      ]
+    },
+    {
+      "name": "labels",
+      "blurb": "product labels, packaging text and printed instructions on goods",
+      "forms": ["label", "instruction", "prohibition", "statement", "numeric"],
+      "categories": [
+        "ingredient lists on food packaging",
+        "allergen declarations on food packaging",
+        "nutrition, additive and E-number labels",
+        "food storage, refrigeration and freezing instructions",
+        "expiry, best-before and production date markings",
+        "net weight, volume and pack size markings",
+        "price tags, per-kilo prices and discount labels",
+        "medicine dosage, strength and frequency instructions",
+        "medicine route, administration and storage instructions",
+        "medicine warnings, contraindications and side effects",
+        "prescription, pharmacy and pack count labels",
+        "cleaning product hazard, first-aid and disposal statements",
+        "cosmetics, toiletry and skincare labels",
+        "clothing care, size and fabric labels",
+        "appliance rating plates: voltage, wattage and current",
+        "battery, charger and power adapter labels",
+        "hand tool, power tool and hardware packaging labels",
+        "paint, adhesive and sealant labels",
+        "automotive fluid, oil, coolant and tyre labels",
+        "batch, lot, serial and traceability markings",
+        "barcode, article, catalogue and model number labels",
+        "warranty, guarantee and return period notices",
+        "tamper seal and packaging integrity notices",
+        "baby food, toy and child safety labels",
+        "pet food and veterinary product labels",
+        "garden, seed, plant and fertiliser labels"
+      ]
+    },
+    {
+      "name": "menus",
+      "blurb": "menus, food counters, bakeries and food shop labels",
+      "forms": ["label", "statement", "numeric"],
+      "categories": [
+        "menu section headings",
+        "menu breakfast dishes",
+        "menu starters, salads and cold dishes",
+        "menu soups and hot appetisers",
+        "menu main courses and grilled dishes",
+        "menu Georgian national dishes",
+        "menu khachapuri, bread and bakery items",
+        "menu side dishes and garnishes",
+        "menu desserts and pastries",
+        "menu hot drinks",
+        "menu cold drinks and juices",
+        "menu wine, beer and spirits",
+        "menu portion sizes, weights and prices",
+        "menu allergen, spicy and vegetarian markers",
+        "cafe and takeaway counter signs",
+        "restaurant service, table and reservation signs",
+        "bakery and pastry shelf labels",
+        "market stall, greengrocer and produce signs",
+        "butcher, fishmonger and deli counter labels",
+        "dairy, cheese and egg counter labels"
+      ]
+    },
+    {
+      "name": "ui",
+      "blurb": "device screens, app interfaces, error messages and machine prompts",
+      "forms": ["label", "instruction", "prohibition", "statement", "numeric"],
+      "categories": [
+        "phone and computer interface labels",
+        "app menu, settings and preference items",
+        "buttons, confirmation dialogs and choices",
+        "login, password and account screens",
+        "error and failure messages",
+        "network, Wi-Fi and connectivity messages",
+        "battery, charging and power messages",
+        "storage, memory and software update messages",
+        "permission, privacy and consent prompts",
+        "card terminal and payment prompts",
+        "ATM and banking machine prompts",
+        "ticket machine and fare prompts",
+        "vending machine and self-service kiosk prompts",
+        "parking meter and toll terminal prompts",
+        "washing machine, oven and fridge control panels",
+        "TV, remote control and media player menus",
+        "car dashboard, infotainment and warning light messages",
+        "printer, scanner and copier messages",
+        "delivery, courier and taxi app notifications",
+        "SMS, bank and operator notification messages"
+      ]
+    },
+    {
+      "name": "notices",
+      "blurb": "public and institutional notices, announcements and posted rules",
+      "forms": ["label", "instruction", "prohibition", "statement", "numeric"],
+      "categories": [
+        "public transport service and delay announcements",
+        "building management, entrance and tenant notices",
+        "utility outage, water and maintenance notices",
+        "municipality, street works and traffic diversion notices",
+        "police, security and CCTV notices",
+        "government office and service window notices",
+        "tax, revenue and receipt notices",
+        "post office, courier and parcel locker notices",
+        "bank, insurance and notary office notices",
+        "hospital visiting rules and patient notices",
+        "vaccination, screening and blood donation notices",
+        "sanitary, hygiene and food safety notices",
+        "school and university announcements",
+        "election and polling station notices",
+        "library, archive and reading room notices",
+        "event, concert and ticketing notices",
+        "sports facility, gym and pool rules",
+        "weather, ice and road condition warnings",
+        "flood, landslide and earthquake warnings",
+        "lost property and found item notices",
+        "job vacancy, hiring and staff notices",
+        "rental, sale and property notices",
+        "rules about pets and animals in public places"
+      ]
+    }
+  ]
+}

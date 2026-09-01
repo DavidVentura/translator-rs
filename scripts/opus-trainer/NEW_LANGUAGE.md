@@ -183,6 +183,99 @@ teachers are strongest on news and web prose, so a large crawl pool can still
 leave the student weak on short and conversational inputs. The composition of the
 pool is part of the training design, not a property to inspect only after a run.
 
+Measure the short band by REGISTER, not by count. A length histogram says whether
+short text is present, not what it teaches, and the two can point opposite ways.
+A pool that is 30% short can still contain almost no common nouns as labels: most
+of its short lines may be named entities, which teach the student to romanize
+whatever it does not recognise, or mixed-script fragments, which teach it to pass
+foreign tokens through. Both are short text that installs the wrong behaviour for
+a camera pair, and a student can then fail on isolated words while the histogram
+says it saw millions of them. Count the short band with foreign-script tokens and
+digits excluded, then break it down by source register, and check what the
+examples actually are before concluding anything about coverage.
+
+Verify an eval slice measures what its name says. A slice commissioned as
+"isolated words" turned out to have multi-word references on 22% of its rows, and
+because corpus chrF is character-weighted those rows carried 30% of the weight and
+reversed the verdict — the candidate won the genuine one-word rows and lost the
+pooled score. Check the reference side's shape, not just the source side's, and
+report subsets separately when a slice mixes them.
+
+Decompose a metric gap before trusting it. Split the rows into both-right,
+both-wrong-identical, both-wrong-differing, and the exact-answer swaps. If most of
+the gap comes from rows where NEITHER system is right, the metric is scoring how
+wrong the wrong answers are, which may not be what you care about. One comparison
+had 144% of its net gap in that class while a hand-read of usability came out
+level.
+
+Separate beam sensitivity from quantization sensitivity. Decode fp32 at the
+training beam, fp32 at the deployed beam, then the packed artifact. A checkpoint
+can be unusually fragile to ANY narrowing of the decoder rather than to the
+quantizer specifically — one candidate lost twice as much to beam-1 as its rival
+before quantization ever ran, which no amount of re-quantizing could fix.
+
+Compare the artifact you ship, not the checkpoint you trained. Quantization loss
+is not uniform across checkpoints: two finetunes of the same base lost 3.7 and 7.0
+chrF++ respectively on the same band, so a fp32 ranking reversed once both were
+packed. The more specialised checkpoint lost more, which is worth suspecting
+whenever a candidate has been pushed hard toward a narrow register. Score the
+packed int8 artifact before choosing between checkpoints, and note that the
+calibration set given to the quantizer is part of that result — a set drawn from
+a different distribution than deployment is a plausible cause rather than a
+detail.
+
+A chrF gain with no exact-match gain means the output looks more like the target
+register without being right more often. Track both: on isolated words or labels,
+a checkpoint can learn the shape of a label — casing, length, article-free
+phrasing — while its accuracy is unchanged. Two separate runs showed that
+signature, one from training longer and one from adding more generated data of a
+kind already saturated.
+
+Generated short-text data saturates; attested morphology does not. Once a
+language's headword vocabulary is covered, adding more model-generated one-word
+pairs stops paying: an increment of ~22k moved exact match by zero and made
+transliteration slightly worse. An increment of the same size drawn from a
+lexicon's DECLENSION TABLES moved exact match +2.4 and cut transliteration. The
+mechanism is that an isolated inflected form segments into subwords the decoder
+has only seen mid-word, and a paradigm supplies those forms as ground truth
+rather than as a model's guess at them. Deduplicate an increment against the
+OTHER component too, not only its own prior round — the two overlapped by 17%
+here.
+
+Case-fold before believing a gain on short or label-like text, and keep at least
+one metric casing cannot reach. Sign and UI references are conventionally Title
+Case while a model may emit lowercase, so a checkpoint that learned only
+capitalisation can post a large chrF++ gain on exactly the slice you are trying to
+fix. One run showed +10.26 on isolated words that became +2.11 case-folded, while
+two casing-immune measures — the share of outputs closer to a transliteration of
+the source than to the reference, and the share dropping or corrupting a number —
+showed no improvement and one regression. Decide which of those you are measuring
+before reading the table.
+
+A filter that avoids ambiguity selects for sparse data, not for unambiguous data.
+Keeping only dictionary entries with a single sense sounds like skipping the
+disambiguation you cannot do; what it actually keeps is the thinly-documented
+entries, because a well-covered common word carries many senses and gets dropped.
+The survivors are rare words with one under-described gloss, and those glosses are
+often wrong. The same shape appears whenever a quality filter keys on an
+attribute that correlates with coverage. Check what a filter's survivors have in
+common before trusting them, especially for isolated-word training data, where
+the model has no context to override a wrong sense.
+
+Where a lexicon does pay for a morphologically rich language is its INFLECTION
+tables rather than its glosses. Headword vocabulary saturates quickly against a
+mined pool; attested surface forms do not, and an isolated inflected form is
+exactly what a decoder mis-segments into pieces it has only seen mid-word. Expand
+a gloss you trust from elsewhere across an attested paradigm rather than
+importing the lexicon's own translations. Two constraints: multiplying a gloss
+across N forms multiplies any error in it by N, and case or postpositional forms
+that carry meaning the target language must express need templating, not copying.
+
+That also makes a named-entity corpus a judgement call rather than a default.
+It is the standard supply of short pairs and it is the right fix for short-input
+degeneracy in general, but for a camera pair it installs a romanize-on-sight
+prior on exactly the inputs the app photographs most.
+
 If OpenSubtitles is available, use a cleaned portion to add conversational and
 short inputs. Subtitle data often combines several sentences and contains
 formatting artifacts. Run `split_sentences.py` before sampling, alignment, or KD
@@ -197,6 +290,16 @@ review the outputs, and record the model and prompt version. Keep this set
 separate from human bitext and use it to address the short-input gap. It does not
 replace the KD corpus scale requirement.
 
+`gen_pairs.py` is the generator for sign, label, menu, UI and notice registers.
+It is language-parametric: the grid, target-language notes and gates live in a
+per-language spec under `configs/gen_pairs.<lang>.json`, and both sides of each
+pair come out of one call so the register that disambiguates a short label stays
+attached to it. It hash-excludes every eval file passed with `--exclude`,
+deduplicates against existing sets passed with `--known`, gates script, digits
+and length, and `--judge-sample` sends a fraction of the kept rows back to the
+model as a faithfulness judge. Run it in rounds; each round reads what earlier
+rounds wrote so duplicates fall rather than rise.
+
 Use these corpus roles:
 
 - **KD source:** the source column used for teacher translation. The teacher
@@ -206,7 +309,12 @@ Use these corpus roles:
   unavailable. Semantic misalignment directly teaches incorrect mappings.
 - **Validation data:** held-out two-column pairs in the direction being trained.
 - **Evaluation data:** held-out references and production-input probes that are
-  excluded from training by content hash.
+  excluded from training by content hash. Apply the exclusion to every finetune
+  source, generated sets included, since a generated set is usually built from
+  the same prompts that produced the check set. Before scoring any finetuned
+  checkpoint, count exact overlaps between each eval slice and the actual
+  training TSV; a gain on an overlapping slice is memorisation until proven
+  otherwise.
 
 Prepare the KD source and its original reference column together. Use
 `build_kd_source.sh` rather than independently sorting and sampling the two
@@ -239,6 +347,21 @@ training.
 
 Keep a corrupt target row as a KD source when the source is usable and the teacher
 will regenerate the target. Do not use that row as human finetune data.
+
+Measure corpus quality by usability, and read before trusting a rate. A judge
+that counts any detectable imperfection reports several times the damage of one
+that asks whether a translator could render the line, so decide `keep`
+separately from the defect type. Protocol: `judge_mono.py` over uniform samples
+of a few hundred lines per source, the source field only; a hand read of a few
+dozen source, teacher-output and reference triples per direction; and a
+per-register breakdown, since entity and UI rows behave differently from crawl.
+Judge the reference column as well: mined bitext can carry a large share of
+unrelated references, which disqualifies reference-based selection even where
+the source is fine. Orthographic features find spam and shattered text and are
+blind to fluent machine-translated source, which is the class that makes a
+teacher fabricate; reference-free quality estimation over the decoded pairs is
+the instrument for that class. Keep the judged samples, they are the validation
+set for every cheap filter built afterwards.
 
 ## 5. Gate the teacher
 
@@ -370,9 +493,36 @@ Build the shortlist from SentencePiece subwords with:
 shortlist.sh <source> <target> <vocab.spm> <out_dir> <tools_dir>
 ```
 
+The shortlist restricts the output projection to the pieces fast_align saw
+aligned in the corpus it was built from, plus a fixed number of frequent pieces.
+Build it over every corpus the student trained on, not the KD corpus alone. A
+table built from a KD sample cannot emit vocabulary that only the finetune stage
+taught, and the loss lands on the short registers as non-words, misspellings and
+dropped digits. Concatenate the KD sample with the finetune corpus repeated
+enough times to be a large share of the alignment input, and segment the target
+side the way the model was trained: a student trained under SentencePiece
+sampling emits alternative segmentations of the same word, and a table built
+from one deterministic segmentation cannot reach them. Encode the target side
+once deterministically and once with `--output_format sample_piece` at the
+training alpha, aligned to the same deterministic source. The runtime admits
+every digit piece whenever the source carries one, so numbers do not depend on
+the table; other pieces do.
+
 Benchmark the quantized model without a shortlist first. Then benchmark the
-shortlisted package. Compare the model and package against the teacher, the
-previous package, held-out slices, and probes.
+shortlisted package on the same slices and read the short-input outputs side by
+side. A shortlist loss looks like a quantization loss until the pack is decoded
+with `none`, so measure both before attributing a gap to the quantizer. Judge the
+table on the rows where the two decodes differ: count exact hits each side wins
+and read them. A table whose exclusive losses are pieces missing from words the
+model knows is still starving the decoder; rebuild it. A residue of rare
+vocabulary both decodes miss is a model problem the table cannot fix. A package
+that still loses to `none` on the short slices after a correct rebuild is a
+speed-for-quality call to make explicitly, not a default. Do not expect the
+low-confidence re-decode to rescue a starved shortlist: a decoder missing the
+piece it wants usually picks a wrong piece confidently, so the deficit router
+does not fire on most of those rows. Compare
+the model and package against the teacher, the previous package, held-out
+slices, and probes.
 
 Package only after the artifact passes the release checks. Use a new package
 directory for each model update and verify hashes, sizes, vocabulary, shortlist,
@@ -389,6 +539,8 @@ A language pair is ready for release when:
 - the vocabulary passes script, round-trip, unknown-token, and fertility checks
 - each teacher passes the load, reference, production-input, and probe checks
 - KD, alignment, filtering, and training artifacts are reproducible and verified
-- the quantized model and shortlist pass independent package tests
+- the quantized model and shortlist pass independent package tests, and the
+  shortlisted pack matches the no-shortlist decode on the short slices
+- every eval slice has zero exact overlap with the training TSVs
 - all evaluation slices and probes have been reviewed
 - the release decision and remaining limitations are recorded
