@@ -15,11 +15,11 @@ use translator_core::tts::{
 };
 
 fn log_debug(message: impl AsRef<str>) {
-    let _ = message.as_ref();
+    log::debug!("{}", message.as_ref());
 }
 
 fn log_error(message: impl AsRef<str>) {
-    eprintln!("{}", message.as_ref());
+    log::error!("{}", message.as_ref());
 }
 
 pub struct SpeechCache {
@@ -469,13 +469,22 @@ pub fn synthesize_pcm_in_snapshot(
     .map_err(TranslatorError::tts)
 }
 
-fn derive_japanese_dict_path(support_data_root: &str, language_code: &str) -> Option<PathBuf> {
-    if language_code != "ja" || support_data_root.is_empty() {
-        return None;
+fn japanese_dict_path(support_data_root: &str) -> Result<PathBuf, String> {
+    if support_data_root.is_empty() {
+        return Err(
+            "Japanese speech needs the mucab dictionary, but no support data is installed"
+                .to_owned(),
+        );
     }
 
     let candidate = Path::new(support_data_root).join("mucab.bin");
-    candidate.exists().then_some(candidate)
+    if !candidate.exists() {
+        return Err(format!(
+            "Japanese speech needs the mucab dictionary at {}, which is not installed",
+            candidate.display()
+        ));
+    }
+    Ok(candidate)
 }
 
 fn load_speech_model(
@@ -494,7 +503,8 @@ fn load_speech_model(
             let mut model =
                 KokoroMnnModel::new(Path::new(model_path), Path::new(aux_path), language_code)
                     .map_err(|err| format!("Failed to load Kokoro MNN voice: {err}"))?;
-            if let Some(dict_path) = derive_japanese_dict_path(support_data_root, language_code) {
+            if language_code == "ja" {
+                let dict_path = japanese_dict_path(support_data_root)?;
                 model
                     .load_japanese_dict(dict_path.to_string_lossy().as_ref())
                     .map_err(|err| format!("Failed to load Japanese dictionary: {err}"))?;
