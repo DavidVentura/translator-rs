@@ -73,6 +73,7 @@ static NONBREAKING_PREFIXES: &[&str] = &[
     // ka — needed now that Georgian splits at `.` at all; without these,
     // "ელ. ფოსტა" (email) is cut in half.
     "ე.წ", "ელ", "მაგ", "იხ", "წმ", "დაახლ", "თ.წ", "ე.ი",
+    "ძვ", "მდ", "გვ", "სთ",
 ];
 
 // Scripts that do not mark sentence starts with a capital. The `.` boundary
@@ -115,7 +116,10 @@ fn is_nonbreaking_prefix(before_period: &str) -> bool {
     }
     let mut chars = word.chars();
     if let (Some(first), None) = (chars.next(), chars.next()) {
-        if first.is_uppercase() {
+        // A lone letter before a period is an initial. `is_uppercase` alone misses
+        // this for every caseless script, splitting a Georgian name mid-way at its
+        // initial -- the same assumption the boundary guard above had to drop.
+        if first.is_uppercase() || is_unicameral(first) {
             return true;
         }
     }
@@ -483,6 +487,25 @@ mod tests {
         // a sentence, and suppressing the break desynchronises it from English.
         assert_eq!(
             split_sentences("წიგნები, ჟურნალები და ა.შ. შემდეგი წინადადება.").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn caseless_initials_and_abbreviations_do_not_split() {
+        // `is_uppercase` is false for every letter of a caseless script, so the
+        // lone-initial rule never fired and Georgian names split mid-way.
+        for text in [
+            "სტენლი ვ. კუბრიკი იყო რეჟისორი.",
+            "ძვ. წ. 500 წელს დაარსდა ქალაქი.",
+            "ქ. თბილისი დედაქალაქია.",
+            "მდ. მტკვარი კვეთს ქალაქს.",
+            "იხ. გვ. 42 დამატებითი ინფორმაციისთვის.",
+        ] {
+            assert_eq!(split_sentences(text).len(), 1, "must not split: {text}");
+        }
+        assert_eq!(
+            split_sentences("წიგნი დაიწერა 1990 წელს. ავტორი გარდაიცვალა.").len(),
             2
         );
     }

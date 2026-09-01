@@ -35,6 +35,7 @@ NONBREAKING = [
     "Hr", "Frau", "Nr", "Str", "z.B", "bzw", "usw", "ca",
     "ul", "al", "prof", "dr", "mgr", "inż", "hab", "im", "św", "ks", "płk",
     "ე.წ", "ელ", "მაგ", "იხ", "წმ", "დაახლ", "თ.წ", "ე.ი",
+    "ძვ", "მდ", "გვ", "სთ",
 ]
 NONBREAKING_SET = {p.rstrip(".").lower() for p in NONBREAKING}
 
@@ -66,7 +67,9 @@ def _is_boundary(text: str, dot: int) -> bool:
     if m is None:
         return True
     word = m.group(1).lstrip("(\"'“„")
-    return word.lower() not in NONBREAKING_SET and not re.fullmatch(r"[A-Z]", word)
+    # A lone letter before a period is an initial. Matching only [A-Z] misses it
+    # for every caseless script, splitting a Georgian name at its initial.
+    return word.lower() not in NONBREAKING_SET and not re.fullmatch(r"[A-Zა-ჿᲐ-Ჿ]", word)
 
 
 def split(text: str) -> list[str]:

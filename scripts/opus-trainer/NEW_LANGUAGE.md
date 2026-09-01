@@ -162,6 +162,10 @@ perplexity cut rejects proper nouns, loanwords and short lines, and a
 length-normalised score ranked globally is a short-line filter. Rank within
 length buckets and stratify any labelling set by length.
 
+Record the licence of every source alongside its size, and decide eligibility
+before measuring quality. The app is non-commercial, so CC BY-NC sources are
+usable.
+
 Classify corpora by role and register. Keep sentence-level prose, UI strings,
 named-entity data, subtitles, spoken text, and religious or historical text
 separate when deciding what to train on.

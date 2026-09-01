@@ -602,6 +602,23 @@ and a deep KV cache together, which is what the bf16 build cannot afford.
   `loading` budget would have killed a box that took 22 minutes to pull and then
   decoded fine. Give a box that just finished a layer a few minutes' grace, then
   destroy.
+- **Do not stop on a stall. The en→ka shipped checkpoint came after two.** That
+  run stalled at Up.40000 and again at Up.42000, then Up.44000 delivered
+  1.09659 → 1.05091, a 4.2% gain that became its final best and the model that
+  shipped. Marian's `early-stopping` counts only CONSECUTIVE non-improvements, so
+  the standing advice to stop manually at a plateau is right about the epsilon
+  grind and wrong if applied to a couple of stalls. Any automatic stopper belongs
+  at the pathological zero-gain case, not near convergence: replayed over that
+  history, a rule of "ten consecutive new bests gaining under 0.5% together" saw
+  a 15.7% gain and correctly declined to fire.
+- **To test whether a process is alive, match argv[0], not the command line.**
+  `pgrep -f`, and equally a grep over whole `/proc/*/cmdline`, match ANY process
+  whose arguments contain the pattern -- including the checking pipeline itself
+  and the ssh `bash -c` wrapper carrying it. This produced a false "the trainer
+  restarted under a new PID" alarm, and separately a guard that reported a
+  watchdog which did not exist. Bracketing the first character does not help when
+  the wrapper also holds the unbracketed string. Match the executable instead
+  (`argv[0].endswith("/marian.cuda")`), or write a PID file.
 - **A watchdog needs a claim file, not a cleverer pgrep.** Three separate
   watchdog collisions happened in one campaign, including two sessions putting
   three watchdogs on one box. `pgrep -f '[c]ollect.sh <id>'` does not protect
@@ -865,3 +882,124 @@ without surfacing one.
 Judge these from the FULL line. The `verify_kd.py` sample cuts at 110 characters,
 and one suspected fabrication turned out to be present in the source once read
 whole.
+
+## 20. ka→en results
+
+4M KD pairs from LMT-60-8B, one RTX 4090, 2h42m, **$0.97**. KD best valid ce
+1.75998 at Up.48000, stopped Up.60000 on six stalls; finetune on 113,217 aligned
+pairs.
+
+int8 pack, the artifact that ships:
+
+| slice | chrF++ | COMET22 | int8 vs fp32 |
+|---|---|---|---|
+| flores | 48.89 | 82.28 | −0.71 |
+| signs | 59.03 | 85.79 | −0.32 |
+| subtitles | 65.88 | 86.72 | −1.26 |
+| ted | 54.94 | 84.71 | −0.75 |
+| ui | 64.34 | 88.52 | −1.09 |
+| crawl | 39.41 | 68.22 | −0.24 |
+
+7.2 below the teacher's 56.09 on FLORES, inside the documented KD-compression
+band, and 6.5 in fp32.
+
+**The finetune had no trade here.** fp32 fp deltas: signs +3.94, ui +2.66,
+subtitles +2.57, ted +0.31, flores +0.10, crawl +0.03 — every slice up. §15's
+en→ka finetune bought +11.56 on signs and paid −0.76 flores, −1.51 ted, −3.19 ui,
+and concluded the trade was fixed. It is not fixed; see below for why this one
+was luckier rather than better.
+
+**The finetune stage needs its own valid set, drawn from the finetune
+distribution.** This run validated stage 2 against the same held-out TED/human
+prose as stage 1. Adapting toward short text makes that metric worse BY
+CONSTRUCTION, and it did, monotonically — 1.75739, 1.80160, 1.86362, 1.94520 —
+while training cost fell to 0.25. Early stopping therefore selected Up.500, about
+12 epochs against en→ka's ~47.
+
+That accident produced the better result: stopping early captured the short-text
+gain before the general-quality cost arrived, so the mismatched yardstick acted
+as a regulariser. Do not read that as vindication. The curve was uninformative by
+construction, so nothing in the setup could have indicated the stopping point was
+a good one. **`ce` measured against a mismatched valid set can neither condemn
+nor bless a checkpoint.** Both points are generic pipeline lessons, not Georgian
+ones.
+
+**The one-word band is the weak spot, and no metric sees it.** Bare single-word
+signs come back malformed: `მოქაჩეთ` (Pull) → "Stret", `ცეცხლმაქრი` (Fire
+Extinguisher) → "fire extinger". `შეცდომა 404` → "Error 44" silently dropped a
+digit, which is worse than a garbled word because it stays plausible and the
+number IS the meaning in error codes, prices and dosages. chrF is blind to all of
+it — "extinger" scores well against "Extinguisher" on character n-grams. Judge
+one-word output against the SOURCE, not the reference, which separates model
+errors from inherited ones: "Emergency Exit" → "Common exit" traces to a
+generated Georgian source that said "spare exit".
+
+## 21. Why isolated words fail, and why more short data is not the fix
+
+The §20 one-word failure looked like mozilla's short-input degeneracy (#210/#215),
+whose root cause is that cleaners strip short pairs until 1-word input is
+out-of-distribution. It is not that. The KD draw is not short-starved: 29.89% of
+the 4M is 1-4 Georgian words.
+
+The problem is what the short examples TEACH. Composition of the 106,432 lines
+holding exactly one Georgian word:
+
+| register | share | what it teaches |
+|---|---|---|
+| crawl | 57.6% | `Maps სტატისტიკა` → "Maps Statistics", `5000kg ჰორიზონტალური turntable` — mixed-script, Latin passed through |
+| entity | 34.1% | `ფინეთი` → Finland, `დუფალაკი` → Duphalac — proper nouns, i.e. ROMANIZE |
+| ui | 5.4% | `ლიბერიაukraine. kgm` → "Liberiaukraine. kgm" — KDE geo-file artifacts |
+| dialogue | 2.6% | |
+| human | 0.2% | |
+
+Counting Georgian words alone overstates it. Requiring no Latin and no digits
+leaves **36,803 lines, 0.92% of the draw, 29,942 unique forms** — and a large
+share of those are the entity block's proper nouns.
+
+So the student's prior for an isolated Georgian word is "this is probably a name,
+romanize it", which is what `ქანჩი` → "kanchi" is, and "Drine" / "cluff" /
+"doughnt" are that prior failing on words it does not know. Common nouns as
+labels — the register a camera photographs — are close to absent.
+
+**Measure the short band by REGISTER, not by count.** A pool can be 30% short and
+still teach nothing about labels. Before concluding a model is short-starved,
+check what its short examples are: proper nouns and mixed-script fragments are
+short text that teaches the wrong behaviour for this app.
+
+**The entity register is actively harmful at w01 for a camera pair.** It is
+included as short-pair supply (mozilla's fix for short-input degeneracy) and for
+this direction it installs a romanize-on-sight prior. Consider reducing its share
+in a future draw rather than raising it.
+
+### Numbers are copied unreliably at BOTH lengths
+
+Not a short-text problem, and worse on prose:
+
+| slice | number-bearing lines | wrong | rate |
+|---|---|---|---|
+| probes | 14 | 2 | 14.3% |
+| flores | 84 | 9 | 10.7% |
+| crawl | 138 | 6 | 4.3% |
+| ted | 133 | 1 | 0.8% |
+| signs / subtitles / ui | 4 / 5 / 3 | 0 | 0% |
+
+Two mechanisms. **Omission**, where a clause is dropped and takes its number with
+it (`Water is spilling over the levee in a section 100 feet wide` → "Water flows
+around the germ"). **Corruption**, where the number survives but is wrong:
+`2039` → `2019` turning a pension forecast into history, `7004` → `7074` on a
+legal citation, `404` → `44`. Corruption is the dangerous class because the
+output stays fluent and plausible.
+
+Score number preservation as a set comparison, and allow correct word forms —
+`2-ჯერ` → "twice" is right, and a naive digit match counts it as an error. Note
+also that signs/ui/subtitles carry almost no numbers in these eval slices, so the
+registers where numbers matter most to the app are the ones the eval barely tests.
+
+### Order of attack
+
+The finetune's w01 band is the right register (29% ui, 28% dialogue, 26% crawl,
+14% signage; entity excluded) but it trained for only ~12 epochs because of the
+valid-set mismatch above. Overturning a prior installed by 4M pairs needs more
+than that. So: redo the finetune against a finetune-distribution valid set first,
+~$0.15, and only re-draw KD with a label-register short block if that is not
+enough. More short data of the same kind is not the fix.

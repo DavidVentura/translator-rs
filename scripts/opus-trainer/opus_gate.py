@@ -21,6 +21,7 @@ from nllb_gate import flores_devtest, save_pair
 # FLORES-200 code -> the OPUS-MT lang token used in the model name.
 OPUS = {
     "eng_Latn": "en", "tgl_Latn": "tl", "swh_Latn": "sw", "urd_Arab": "ur",
+    "gle_Latn": "ga", "cym_Latn": "cy",
 }
 
 # Pairs with no dedicated model; only the multilingual one covers them.
