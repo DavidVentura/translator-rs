@@ -1437,6 +1437,14 @@ router does catch the starvation cases that do collapse, and beam on the
 shortlist still helps the confident-early-token-then-collapse case, so the
 existing behaviour stays.
 
+Arm D re-scored with its own rebuild-3 table (KD 1-in-4 + armD.train.tsv ×10,
+sampled target). On the 538 isolated-word rows arm D beats arm C 52.2% vs 49.1%
+exact match, 5.9% vs 7.6% romanize, 64.71 vs 62.47 case-folded chrF++; on the
+150 multi-word rows D still trails (24.7% vs 26.7%); off-band slices are within
+noise (signs and ui favour C by ~1.5 and 0.5, probes favours D by 1.9). The
+§25/§26 conclusion that arm D lost as a pack was the table, not the checkpoint.
+Arm D is the base for the next ka→en finetune.
+
 Decoding without any shortlist costs 1.7-2.3× wall time on CPU. The remaining
 choice for this pair is the rebuild-3 table with the runtime digit rule against
 `none`, and the difference is the one-word residue above.
@@ -1459,3 +1467,301 @@ How the packs were assessed, so it can be repeated: decode every eval slice with
 `SRC / REF / SL / NONE`, read the short slices whole (probes 67, signs sample 60,
 one-word 80, en→ka signs 175) and treat chrF++ only as direction. Every finding
 above came from a pair that scored fine.
+
+## 29. Finetune v3: luna signage tranche, KD rehearsal, and an enforced eval gate
+
+2026-09-02, one RTX 3090, 89 min, $0.31. Corpora on bigserver at `ft4.enka/` and
+`ft4.kaen/`: shipped finetune set (ft2 for en→ka, arm D for ka→en) + 46,448 luna
+round-1 rows from `gen_pairs.py` (65,278 raw, 71.2% kept, judge 93.9% ok) + a
+1:1 KD rehearsal sample, everything passed through `exclude_eval.py`, which
+`finetune_student.sh` now requires. Shortlists rebuilt with the §28 recipe over
+the new finetune corpora (`sl5.*`), packs at `pack.enka.ft4` and `pack.kaen.ft4`.
+Nothing published.
+
+What the gate found. 1,759 rows of the shipped en→ka training corpus matched
+`ft2/valid.ft2.tsv`, so the previous en→ka early stopping was partly measured on
+memorised rows; 528 matched the one-word adversarial list ("No", "Yes",
+"Right"). On ka→en, arm D scored 56-64% exact match on one-word rows whose
+answer was in its training data against 38% on rows whose answer was not, a
+twenty-point memorisation gap. The one-word gains credited in §23 and §24 were
+substantially measured on contaminated rows and should be read down accordingly.
+
+en→ka, int8: flores 46.62 → 46.93, the 67 referenced signs 64.02 → 65.58, and the
+table now costs 0.13 against `none` where the old one cost 0.69. Read pairs: "Keep
+out of reach of children" is now the reference exactly (was "do not approach
+children"), "Connect to network" moved to the imperative, "Iced coffee" to ცივი
+ყავა, "Firmware" dropped the ფირმულური calque. New losses: "Allow the engine to
+cool" came back as ჩართეთ ძრავა ("turn on the engine"), a sense inversion, and
+"Tighten the bolts" is still wrong in a new way. Net better; ship candidate.
+
+ka→en, int8, against arm D with its corrected table: flores 48.27 → 49.35, ted
+54.18 → 55.27, crawl 38.40 → 39.58, probes 63.73 → 64.87; signs 68.27 → 67.21,
+ui 69.38 → 67.80, subtitles 68.04 → 67.43, numbers_ho 76.30 → 74.02, one-word
+exact 46.2% → 43.0%, romanize 7.7% → 7.4%. Splitting the short slices by whether
+the gate removed that row's answer from training: on rows whose answer was in
+arm D's data the new model is 5-8 chrF lower (memorisation gone); on clean rows
+signs −0.5, ui −1.3, numbers_ho −2.1, oneword +1.5. Read pairs: მოქაჩეთ → "Pull"
+(was "Mottor"), "Payment declined", "Do not touch", "before disconnecting the
+hose" all fixed; losses are "Expiry date" → "Shelf life" and rare one-word items.
+The rehearsal bought the prose gain without the previous trade.
+
+One defect in the gate as run: the either-column rule dropped 435 arm D rows
+whose English target ("Ironing", "Boil") is also the reference of a different
+Georgian word in `oneword_ho`. Pair-level leakage on that slice is zero, so those
+were legitimate training rows, and the ka→en one-word and numbers slices paid for
+their absence. For X→en holdouts the rule should be source-side or pair match,
+not either column. Rebuilding the ka→en corpus with that rule and retraining
+costs about $0.15 and no re-decode; do that before deciding on the ka→en pack.
+
+Rounds 2 and 3 of the tranche (~60k more rows) were still generating when this
+ran and are the input to the next iteration.
+
+## 30. Finetune v4 (ft5): full tranche, pair-aware gate; en→ka published, ka→en held
+
+2026-09-02, two RTX 3090s in parallel, $0.28. Same recipe as §29 with the full
+132,969-row luna tranche (three rounds, judge 92.8% ok) and `exclude_eval.py
+--eval-pair`, which matches a held-out reference only together with its source.
+On ka→en the pair rule dropped 262 rows against 1,204 under either-column and
+found zero pair-level leaks, so the 435 arm D one-word rows §29 flagged were
+legitimate and are back in. Corpora 506,848 (en→ka) and 598,434 (ka→en) rows.
+
+en→ka, int8 with its table: FLORES 46.36 shipped → 46.93 ft4 → 47.36 ft5,
+COMET22 82.93 → 83.89, the 67 referenced signs 60.86 → 68.55. Read: "Sign out" →
+გამოდით (shipped and ft4 both said "sign in"), "On" → ჩართულია (shipped said off),
+"Keep out of reach of children", "Fire Extinguisher", "Beware of dog", "Detour",
+"Pull", "Iced coffee", "Expiry date" all fixed; "Push" → დააჩქარეთ ("hurry") is a
+new loss and some UI labels drift to imperatives. No prose slice regressed.
+Published as `en-ka/lmt60_distill_20260902` via the new `publish_pack.sh`;
+the 20260831 pack stays addressable.
+
+ka→en, ft5 against the arm C pack WITH THE OLD TABLE (the comparison the run
+used; §31 corrects it against live): flores +1.56, ted +1.05, crawl +0.78,
+probes +8.63, one-word exact 39.4% → 44.8%, but subtitles −1.10, ui −1.15,
+numbers_ho −3.30 and COMET22 82.60 → 82.45, the lowest of the four candidates.
+Fails the selection rule (no prose slice may lose more than ~0.3, no safety
+regression). Not published. Against live (arm C + rebuild-3 table) the picture
+is worse: signs −1.60, ui −2.60, numbers_ho −3.94, and the one-word gain
+disappears, because that gain was the table.
+
+The cheapest ka→en win is not a checkpoint: arm C read through its rebuild-3
+table beats the shipped pack on every slice (signs 67.97 → 69.91, ui 68.47 →
+69.91, oneword_ho 48.05 → 51.67, flores 47.92 → 48.61) and arm D with its own
+rebuild-3 table does the same with a larger one-word lead, part of which is the
+§29 memorisation. Neither is packed. That decision is open.
+
+Why ft5 loses ka→en subtitles and numbers while gaining prose and probes is
+not yet read; the candidates are the 1:1 rehearsal shifting the length prior
+and the tranche's ₾/decimal conventions. Read before the next iteration.
+
+## 31. Why ft5 lost ka→en short slices, and what the eval was really measuring
+
+Read 2026-09-02 from the differing rows, a blind source-only luna A/B over every
+differing row, and corpus statistics on bigserver. Notes in the session
+scratchpad `kaen_ft5_investigation.md`.
+
+The ui and subtitles slices are not held out. Normalised match against the 4M
+KD training corpus (`train.ka2en/aligned/train.tsv`): ui 293 of 300 sources
+and 166 of 300 full pairs are in it, subtitles 416 of 500 and 157 of 500;
+numbers, numbers_ho and flores 0. Arm D's finetune corpus also held 16 ui and
+15 subtitles eval pairs verbatim, which ft5's pair-aware gate removed. On the 40
+worst-regressing rows the live pack equals the reference exactly on 23 (ui), 21
+(subtitles) and 22 (numbers_ho). Those slices measure KD reproduction, and a
+1-1.5 chrF move there should not veto a pack. Rebuild them from text outside
+the pool, or report only the clean stratum (ui n=7, subtitles n=84).
+
+Blind A/B, luna judging source against the two hypotheses with no reference,
+order randomised: subtitles live 77 / ft5 69 / tie 99 of 245 differing rows
+(net −8 of 500); ui 46 / 32 / 67 of 145 (net −14 of 300, real but a third of
+the chrF gap); numbers 42 / 46 / 101; numbers_ho 64 / 46 / 125; probes 1 / 11 /
+24. Register drift is measurable on ui: mid-sentence capitals 10 in the
+references, 13 live, 30 ft5 ("Color Palette", "Read Directory A"); lower-casing
+recovers 0.53 of ui's 2.60. Length ratios move by at most 0.012 on any slice.
+
+Numbers, split: currency written GEL where live wrote ₾ or lari (16 / 22 rows),
+decimal comma → point (7 / 7), thousands separators added (8 / 6), digit set
+changed (11 / 12), other wording (153 / 194). Digit fidelity against the SOURCE
+on numbers_ho: live 384 ok / 5 omitted / 1 corrupted, ft5 379 / 10 / 3, with
+the real cases "198 volts" → "18 volts", train 832 dropped, 1201000 →
+"120,1000", 2387 → "237", "250 °C" dropped. On prose ft5 is better (flores 78 →
+82 ok). The conventions come from the tranche: its English side writes GEL
+4,421 times against lari 207 and ₾ 53, point decimals 3,824 against comma 3,
+while the references mirror the Georgian ("8,75 ₾" stays "8,75 ₾"). The app
+overlays onto a photographed price tag, so the source's own symbol and
+separator are what belongs in the target; the tranche should change, not the
+references. Normalising both sides recovers only ~0.5 chrF; the rest of the
+numbers_ho gap is on long rows (>5 words −4.13, ≤5 words −2.47; numbers ≤5
+words +1.42).
+
+Hypotheses. Rehearsal ratio, falsified: English-token share of rehearsal is
+64.3% in ft4 and 64.1% in ft5; what changed is luna 7.8% → 16.2%. The tranche is
+29.7% digit-bearing but only 1.5% digit-and-long, so the finetune's
+short-numeric to long-numeric ratio went 3.0:1 → 5.7:1, which is the mechanism
+for the long-row omissions. The swapped tranche matches the short slices in
+length (5.46 words mean vs ui 4.02, subtitles 4.61) and mismatches them in
+target style: a bigram-LM probe puts the probe and signs references on the
+luna side and subtitles on the OPUS side, and ft5 moved toward luna on every
+short slice, so probes rewards what ui and subtitles punish. The valid set
+(`ft2/valid.ft.ka2en.tsv`, OpenSubtitles/TED/KDE, 6.4 words mean) is biased
+toward the incumbent style and still picked this checkpoint; it holds no long
+number-dense rows and cannot see the numbers regression.
+
+Probes +7 against live: of 36 changed rows read against the source, 11-13 are
+substance ("before disconnecting the hose", "500 working hours", "Untreated
+water, do not drink", "Payment declined"), 9 are luna-style agreement ("Do not
+touch" vs "Don't touch it"), the rest ties. Direction real, magnitude inflated.
+
+Next iteration for ka→en, corpus only plus one ~$0.15 finetune: rewrite the
+tranche's English number conventions at build time to mirror the Georgian row
+(currency symbol and separators copied, ~4,400 rows); add a long-numeric band
+(over-sample the rehearsal's 20,724 digit-and-long rows ~3× or generate a
+10-20k band); sentence-case UI labels in the prompt; leave the rehearsal ratio
+alone. Expected against ft5: numbers +1.2 to +1.7, numbers_ho +2.5 to +3.5, ui
++0.5, subtitles unchanged, probes and prose held. Eval: score digits as a
+multiset after stripping separators, accept ₾/lari/GEL and comma/point as
+equivalent, and gate on source-vs-hypothesis digit fidelity directly, which is
+what caught the one real ft5 defect chrF buried.
+
+## 32. ft6: the number conventions were never the cause; the gate refused it
+
+2026-09-02, one RTX 3090, 43 min, $0.11. The §31 recipe applied as reusable
+build steps: `build_tranche.py` rewrote 4,328 tranche rows so the English
+figure, separator and currency mirror the Georgian row (71 rows dropped where
+the two sides already disagreed on digits, 36 UI labels sentence-cased);
+`sample_rehearsal.py` tripled the rehearsal's digit-and-long rows (26,331 →
+78,993) inside an unchanged 1:1 budget; 598,341 rows. Same valid set as ft5.
+Pack `pack.kaen.ft6` with the `sl7.kaen` rebuild-3 table. Not published.
+
+Against live (arm C + rebuild-3 table), int8 with own table: flores +0.36, ted
++0.74, crawl +0.86, COMET22 82.73 vs 82.60 (best of the finetunes), probes
++6.05, one-word exact 44.3% vs 44.2%; subtitles −1.83, signs −1.65, ui −1.38,
+numbers −2.39, numbers_ho −3.90. Blind source-only A/B: ui net −3 of 300 (ft5
+was −14, so the casing fix worked), subtitles −18 of 500, numbers_ho −23 of 400,
+probes +8 of 67.
+
+The conventions moved: on numbers_ho ft6 writes ₾ 3× and lari 25× where the
+references write 3 and 25 (ft5: 0 and 6), decimal commas 7 (reference 7), GEL
+22 → 8. The figure loss did not move with them: source-vs-hypothesis digit
+fidelity on numbers_ho is live 3 bad lines, ft5 9, ft6 11, with 2387 → 237,
+1201000 → 120,000, 7002 → 702, ISO 10012:2003 → 101012:2003, 13 საათზე → "1
+a.m."; identical with shortlist=none, so it is the checkpoint. The long-numeric
+band recovered a few omissions ("every 24 months") and cost more than it bought.
+
+The new `gate_pack.sh` requires a `number_fidelity.py` report for the candidate
+and for live on the same slices and refuses when the candidate omits or corrupts
+more figures on any slice; it refused ft5 and ft6. `score_strata.py` reports
+each slice split into pair-leaked / source-only / clean against the KD corpus.
+
+Reading: every finetune that contains the luna tranche re-segments digit runs,
+in proportion to tranche size (ft4 → ft5 → ft6), while arm C never saw that data
+and keeps 4-7 digit strings intact. The tranche's numeric form is 36k rows of
+one-to-three-digit figures, so the decoder learned a short-digit-run prior and
+emits too few pieces on longer runs; "2387" is not long, it is longer than the
+prior. Adding a band of long figures would move the prior rather than remove it.
+The fix under test in ft7 is an offline augmentation (`perturb_numbers.py`)
+that rewrites every figure identically on both sides of numeric pairs, K
+variants per row with long-tailed lengths, so the digits can only be copied
+from the source; measured by the same fidelity gate.
+
+## 33. ft7: number perturbation fixes the digits and the way it was applied diluted the labels
+
+2026-09-02, one RTX 3090 Ti, 47 min, $0.15. `perturb_numbers.py` rewrites every
+figure in a numeric pair identically on both sides, keyed on the canonical
+value so "8,75 ₾" and "8.75 GEL" agree, re-printed in each occurrence's own
+shape, with hour/day/month/year roles respected and whitespace token counts
+held so the alignment column stays valid; lengths long-tailed toward 4-7
+digits. Applied at K=3 to the ft6 finetune rows: 48,343 eligible → 143,928
+variants, every one verified to carry identical digit multisets on both sides;
+4-8 digit runs went from 9.3% to 30.6% of the finetune band. Fresh 1:1
+rehearsal, same valid set. Pack `pack.kaen.ft7`, table `sl8.kaen`. Not published.
+
+Digits: source-vs-hypothesis bad lines on numbers live 5 / ft6 7 / ft7 5, on
+numbers_ho 3 / 11 / 6 (one of the six a scoring artefact on "2754 03:25"); six
+of the eight §32 lines repaired (2387, 7002, ISO 10012:2003, "13 o'clock", the
+eleven-digit id, 198 volts), 1201000 still wrong, train 832 kept but attached to
+the wrong noun. Blind A/B on numbers_ho went from −23 (ft6) to +4. Prose and
+probes gained again: flores +0.90, ted +1.25, crawl +1.01, probes +6.55 over
+live, COMET22 82.88.
+
+Cost: signs −3.27, ui −3.54, subtitles −2.13, one-word holdout −3.3 against
+live, and the A/B attributes ui (−16) and subtitles (−12) to lexical and meaning
+changes, not style. Mechanism measured rather than guessed: the variants add no
+new content, so the non-numeric share of the finetune half fell from 83% to
+56%, and every short-label register was diluted. The gate refused the pack on
+numbers_ho (6 vs 3) and the A/B clause.
+
+So the hypothesis holds and the dose was wrong. Next: the same perturbation
+without expansion (K=1 in place, or perturb only the long-numeric band, or
+repeat the non-numeric rows to hold the share at 83%), about $0.15. If that
+keeps the digit gain with labels flat, it is the ka→en pack to ship. The result
+also argues for a streaming OpusTrainer Numbers modifier, which perturbs a
+probability of batches at read time and leaves the corpus mix untouched, the
+variable that broke this run; open that upstream only with a shipped result
+behind it.
+
+Disk: the shortlist intermediates of passes 1-3 and the ft4 artefacts were
+deleted on 2026-09-02 (46 GB); the tables in `sl*/out/*.bin`, build logs and
+scripts were kept.
+
+## 34. ft8: the perturbation in place holds the labels and does not buy the pack
+
+2026-09-02, one RTX 3090, 46 min, $0.13. `perturb_numbers.py` gained a second
+dose. `Emit.APPEND` is what ft7 ran, the row plus K perturbed copies;
+`Emit.REPLACE` emits ONE perturbed row in place of the original for a `--share`
+of the eligible rows and leaves the rest as written. At `--share 0.7` over the
+same ft6 aligned finetune material, 48,343 eligible rows produced 33,541
+replacements (258 dropped because they would have moved a column's whitespace
+token count), and the finetune half came out at ft6's 299,242 rows, 83.0%
+non-numeric, short-to-long numeric 2.44:1 — all three identical to the input,
+which is what ft7 could not do. Digit runs of 4-8 digits are 27.4% of it against
+ft6's 9.3% and ft7's 30.6%, so the digit dose is nine tenths of ft7's with the
+register mix held fixed. Append mode still reproduces ft7's corpus byte for
+byte from its own seed. Fresh 1:1 rehearsal at the ft6 boost, same valid set,
+598,350 rows; pack `pack.kaen.ft8`, table `sl9.kaen`. Not published.
+
+Against live (arm C + rebuild-3 table), int8 with own table, with ft7 alongside:
+
+    slice          live     ft7     ft8   ft8-live  ft8-ft7
+    flores        48.61   49.51   49.64     +1.02     +0.12
+    ted           54.23   55.48   55.35     +1.12     -0.13
+    crawl         38.69   39.70   39.46     +0.77     -0.24
+    subtitles     68.29   66.17   66.61     -1.68     +0.45
+    signs         69.91   66.64   67.01     -2.89     +0.37
+    ui            69.91   66.38   67.36     -2.56     +0.98
+    oneword_ho    51.67   48.35   48.28     -3.39     -0.07
+    numbers       74.10   73.40   71.60     -2.50     -1.80
+    numbers_ho    76.56   75.14   72.34     -4.23     -2.80
+    probes        61.83   68.38   66.06     +4.23     -2.32
+
+COMET22 on FLORES 82.86 (live 82.60, ft7 82.88). One-word band exact 43.3%
+against live's 44.2% and ft7's 44.3%.
+
+Digits held. `number_fidelity.py` against the Georgian source: numbers 3 bad
+(live 5, ft7 5), flores 3 (live 5, ft7 4), probes 0, numbers_ho 7 (live 3, ft7
+6); identical with shortlist=none, so it is the checkpoint. Seven of the eight
+ft6 failure lines are right — 2387, postal code 7002, ISO 10012:2003, 13
+საათზე, the 01012034567 id, 198 volts, and train 832's digits — and 1201000
+still comes back "120,1000". Two of the seven numbers_ho counts are measurement
+artefacts the live pack shares ("რეისი 8529 23:05" reads as one numeral to the
+measure; "420 ათასი დოლარი" written "$420,000" is correct English), so the real
+count is five against live's two.
+
+The dilution was real and it was not the whole cost. Every register ft7 diluted
+came back part of the way — ui +0.98 over ft7 and its blind A/B −16 → −7,
+subtitles +0.45 and −12 → −11, signs +0.37 with a blind A/B of +26 of 500,
+oneword +0.77 — while prose held. What moved the other way is the number-dense
+prose: numbers −1.80 against ft7, numbers_ho −2.80, and the numbers_ho blind
+A/B +4 → −26, decided on lexical and grammar rather than on figures. Reading
+the strata, ft8 is above ft7 on every clean stratum it shares (signs 67.12 vs
+66.70, subtitles 67.96 vs 66.27, ui source-only 63.99 vs 62.32) and below live
+on all of them.
+
+The gate refuses it on numbers_ho, 7 lines against live's 3, and the selection
+rule fails again on the ui and subtitles A/B and on the one-word band. Three
+runs now say the same thing: the perturbation fixes the digit copying at any
+dose that reaches the numeric rows, and every corpus-side way of delivering it
+costs the short-label registers something, because 33,541 rows of the finetune
+half are now figures nobody wrote. The corpus is the wrong place for this. The
+next lever is the streaming OpusTrainer Numbers modifier, which perturbs a
+probability of batches at read time and leaves both the corpus and its mix
+alone; ft7 and ft8 together are the shipped-adjacent result that argues for
+opening it upstream.

@@ -583,9 +583,14 @@ def main() -> None:
             w.write(line)
         for line in ft:
             w.write(line)
+    # split_digits: one piece per digit, so copying a figure is a fixed
+    # one-piece-per-digit operation instead of a segmentation the decoder has to
+    # guess ("2387" as ▁23+87 or ▁2+387). A joint vocab without it learned a
+    # short-digit-run prior from label-style finetune data and truncated longer
+    # figures (ka_findings.md §32-§33).
     spmlib.SentencePieceTrainer.train(
         input=str(corpus_txt), model_prefix=str(spm_prefix), vocab_size=args.vocab_size,
-        model_type="unigram", character_coverage=1.0, byte_fallback=True,
+        model_type="unigram", character_coverage=1.0, byte_fallback=True, split_digits=True,
         input_sentence_size=10_000_000, shuffle_input_sentence=True,
         num_threads=os.cpu_count() or 4, bos_id=-1, eos_id=0, unk_id=1, pad_id=-1,
     )

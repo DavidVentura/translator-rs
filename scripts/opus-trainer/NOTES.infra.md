@@ -84,3 +84,17 @@ Before committing to a full shard, confirm:
 
 Do not leave an unattended paid job without a process monitor, a completion
 marker, and a cleanup path.
+
+## Bucket sync compares checksums, not sizes (2026-09-02)
+
+`~/AndroidStudioProjects/bunny_sync.py` used to upload a file only when its size
+differed from the remote listing. A catalog whose only change is a version label
+(`lmt60_distill_20260901` → `…02`) keeps its byte count, so the ka-en publish on
+2026-09-02 uploaded the pack files but not `index_v6.json`, and the CDN kept
+serving the old catalog past the cache lifetime. Bunny's listing carries a
+`Checksum` (SHA256, upper-case hex) per object; the sync now hashes size-equal
+local files up to 1 MiB (`CHECKSUM_MAX_BYTES`) and uploads on a checksum
+mismatch. Larger files are trusted on size alone, since a model pack that
+changes at all changes size and hashing 14 GB of packs would dominate the run.
+986 files totalling 96 MB fall under the limit; a no-op sync takes ~5 s. When a publish reports "live index does not mention the label",
+check the remote checksum against the local file before blaming purge lag.

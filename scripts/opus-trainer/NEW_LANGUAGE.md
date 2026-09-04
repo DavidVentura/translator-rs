@@ -80,10 +80,19 @@ draw remains reproducible.
 Measure teacher output tokens per character for both directions. Use the result
 when estimating KD cost and decode time.
 
-Train a pair-specific joint SentencePiece vocabulary. Check piece count, unknown
-tokens, encode/decode round trips, and fertility for each side. A low unknown rate
-does not prove that the vocabulary represents the script efficiently because byte
-fallback can hide a missing script.
+Train a pair-specific joint SentencePiece vocabulary with `split_digits`, so
+every digit is its own piece. Without it a figure segments differently depending
+on its neighbours ("2387" as ▁23+87 or ▁2+387) and copying it becomes a guess
+the decoder makes from its training prior; a student finetuned on label-style
+data with many short figures then truncates longer ones ("2387" → "237",
+"7002" → "702") while every digit piece is available. `prep_data.py` sets the
+flag and `check_vocab.py` refuses a vocabulary whose figures segment into
+multi-digit pieces. Changing this on an existing pair means a new vocabulary and
+therefore a KD re-decode and student retrain; bundle it with the next re-decode
+rather than running one for it. Check piece count, unknown tokens, encode/decode
+round trips, and fertility for each side. A low unknown rate does not prove that
+the vocabulary represents the script efficiently because byte fallback can hide
+a missing script.
 
 ### Evaluation behavior
 
@@ -96,7 +105,12 @@ the language-coverage and calibration limitations understood. Treat metrics as
 system-ranking tools when human-judgment coverage is limited.
 
 Create production-input probes for signs, menus, warnings, dosages, entities,
-short inputs, and content words. Include adversarial cases for numbers,
+short inputs, and content words. Score numbers as a digit multiset against the
+SOURCE after stripping separators, treating currency spellings and decimal
+conventions as equivalent, and gate on that fidelity directly: chrF++ buries a
+dropped or altered digit under formatting differences the references charge
+for, and the target should mirror the source's own symbol and separator when
+the output is overlaid on a photographed price or label. Include adversarial cases for numbers,
 negations, copying, repetition, and length blowup. Review the translations by
 kind rather than reducing the probe set to one score.
 
@@ -309,12 +323,23 @@ Use these corpus roles:
   unavailable. Semantic misalignment directly teaches incorrect mappings.
 - **Validation data:** held-out two-column pairs in the direction being trained.
 - **Evaluation data:** held-out references and production-input probes that are
-  excluded from training by content hash. Apply the exclusion to every finetune
+  excluded from training by content hash, including from the KD draw: a slice
+  carved from the same OPUS pool the KD source was drawn from measures KD
+  reproduction, and a finetune that stops reproducing the teacher looks like a
+  regression there. Check every eval slice against the KD training corpus, not
+  only the finetune corpus, and report the clean stratum separately. Apply the exclusion to every finetune
   source, generated sets included, since a generated set is usually built from
-  the same prompts that produced the check set. Before scoring any finetuned
-  checkpoint, count exact overlaps between each eval slice and the actual
-  training TSV; a gain on an overlapping slice is memorisation until proven
-  otherwise.
+  the same prompts that produced the check set. `exclude_eval.py` does this for
+  any pair (raw-hash and normalised match on every text column against text,
+  TSV, jsonl and sha256 sources, with a JSON report) and `finetune_student.sh`
+  refuses a training TSV without its report. Include the early-stopping valid
+  set among the sources; a valid set that overlaps training selects a memorised
+  checkpoint. For an X→en holdout of short items, match on the source column or
+  the pair rather than either column, since a common English target ("Boil") is
+  legitimately the translation of many source words. Before scoring any
+  finetuned checkpoint, count exact overlaps between each eval slice and the
+  actual training TSV; a gain on an overlapping slice is memorisation until
+  proven otherwise, and a drop after cleaning is the memorisation leaving.
 
 Prepare the KD source and its original reference column together. Use
 `build_kd_source.sh` rather than independently sorting and sampling the two
@@ -526,7 +551,13 @@ slices, and probes.
 
 Package only after the artifact passes the release checks. Use a new package
 directory for each model update and verify hashes, sizes, vocabulary, shortlist,
-and index references before publishing.
+and index references before publishing. `gate_pack.sh` writes the `PACK_OK`
+marker only when the scored pack passes the selection rule, and
+`publish_pack.sh <infix> <pack_dir> <dated_label> --confirm` refuses a pack
+without it, refuses an existing label, re-measures size and hash after transfer,
+regenerates the catalog and index, syncs, fetches every live URL and re-hashes
+the download, logging each step to `data/DEPLOY_STATE.md`. Publish one direction
+at a time; a direction that fails the rule stays on its previous label.
 
 ## Completion checklist
 

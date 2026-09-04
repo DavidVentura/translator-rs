@@ -64,6 +64,23 @@ def side_report(sp: spm.SentencePieceProcessor, lines: list[str], label: str, ma
     return errs
 
 
+def digit_split_report(sp: spm.SentencePieceProcessor) -> list[str]:
+    # A figure must segment into one piece per digit (plus the word marker), or
+    # the decoder has to guess a segmentation when copying it and drops pieces on
+    # runs longer than the ones it saw most (ka_findings.md §32-§33).
+    probes = ["2387", "1201000", "Error 404", "12,50", "01012034567"]
+    bad = []
+    for text in probes:
+        pieces = sp.encode(text, out_type=str)
+        multi_digit = [pc for pc in pieces if sum(ch.isdigit() for ch in pc) > 1]
+        if multi_digit:
+            bad.append(f"{text!r} -> {pieces} (pieces with several digits: {multi_digit})")
+    if not bad:
+        return []
+    return ["vocab was trained without split_digits; figures do not segment one piece per digit:\n  "
+            + "\n  ".join(bad)]
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -90,6 +107,7 @@ def main() -> None:
                 break
     errs += side_report(sp, src, "src", max_fert)
     errs += side_report(sp, tgt, "tgt", max_fert)
+    errs += digit_split_report(sp)
 
     if errs:
         for e in errs:

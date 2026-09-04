@@ -1,0 +1,97 @@
+{
+  "currencies": {
+    "GEL": [
+      "₾",
+      "gel",
+      "lari",
+      "ლარი",
+      "ლარის",
+      "ლარით"
+    ],
+    "USD": [
+      "$",
+      "usd",
+      "dollar",
+      "dollars",
+      "დოლარი",
+      "დოლარის"
+    ],
+    "EUR": [
+      "€",
+      "eur",
+      "euro",
+      "euros",
+      "ევრო",
+      "ევროს"
+    ],
+    "GBP": [
+      "£",
+      "gbp",
+      "pound",
+      "pounds",
+      "sterling",
+      "ფუნტი"
+    ]
+  },
+  "number_words": {
+    "en": {
+      "zero": "0",
+      "one": "1",
+      "two": "2",
+      "three": "3",
+      "four": "4",
+      "five": "5",
+      "six": "6",
+      "seven": "7",
+      "eight": "8",
+      "nine": "9",
+      "ten": "10",
+      "eleven": "11",
+      "twelve": "12",
+      "once": "1",
+      "twice": "2",
+      "thrice": "3",
+      "single": "1",
+      "double": "2",
+      "triple": "3",
+      "quadruple": "4",
+      "dozen": "12",
+      "half": "0.5"
+    },
+    "ka": {
+      "ერთხელ": "1",
+      "ორჯერ": "2",
+      "სამჯერ": "3",
+      "ორჯერად": "2",
+      "ნახევარი": "0.5"
+    }
+  },
+  "currency_symbols": {
+    "GEL": "₾",
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£"
+  },
+  "currency_words": {
+    "en": {
+      "GEL": "lari",
+      "USD": "dollars",
+      "EUR": "euros",
+      "GBP": "pounds"
+    },
+    "ka": {
+      "GEL": "ლარი",
+      "USD": "დოლარი",
+      "EUR": "ევრო",
+      "GBP": "ფუნტი"
+    }
+  },
+  "numeral_word_suffixes": {
+    "en": [],
+    "ka": [
+      "ჯერ",
+      "ჯერად",
+      "ჯერზე"
+    ]
+  }
+}

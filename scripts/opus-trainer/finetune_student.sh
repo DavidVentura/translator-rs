@@ -28,6 +28,20 @@ set -euo pipefail
 
 TSV=$1; VOCAB=$2; PRE=$3; VALID=$4; OUT=$5; DEVICES=${6:-0}
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# 42 of the 175 `probes/check.en` lines trained the shipped en->ka finetune,
+# because the eval exclusion lived inside one generator's build step and a
+# corpus assembled any other way skipped it in silence. The report is required
+# here so that cannot happen again: the check runs on whatever TSV reaches the
+# GPU, whoever built it.
+if [ ! -s "$TSV.evalclean.json" ]; then
+  echo "finetune_student.sh: $TSV has no eval-leak report at $TSV.evalclean.json" >&2
+  echo "Run exclude_eval.py over the corpus first, e.g." >&2
+  echo "  exclude_eval.py --train $TSV --out ${TSV%.tsv}.clean.tsv --text-columns 2 \\" >&2
+  echo "    --eval probes/check.en probes/adversarial.en data/eval_exclude.sha256 ..." >&2
+  echo "and train on its output, which carries the report beside it." >&2
+  exit 1
+fi
 MARIAN=${MARIAN:-$(command -v marian || echo /root/marian-dev/build/marian)}
 mkdir -p "$(dirname "$OUT")"
 if [[ "$VOCAB" != *.spm ]]; then
