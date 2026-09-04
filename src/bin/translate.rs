@@ -18,7 +18,8 @@ struct Config {
 struct Hop {
     model: PathBuf,
     vocabulary: PathBuf,
-    shortlist: PathBuf,
+    #[serde(default)]
+    shortlist: Option<PathBuf>,
     #[serde(default)]
     target_vocabulary: Option<PathBuf>,
 }
@@ -128,7 +129,7 @@ fn resolve_paths(hop: &Hop, base: &Path) -> ModelPaths {
     ModelPaths {
         model: resolve_relative(&hop.model, base),
         vocabulary: resolve_relative(&hop.vocabulary, base),
-        shortlist: resolve_relative(&hop.shortlist, base),
+        shortlist: hop.shortlist.as_ref().map(|p| resolve_relative(p, base)),
         target_vocabulary: hop
             .target_vocabulary
             .as_ref()

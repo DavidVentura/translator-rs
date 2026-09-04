@@ -500,9 +500,26 @@ fn absolute_install_path(base_dir: &str, install_path: &str) -> PathBuf {
     Path::new(base_dir).join(install_path)
 }
 
+/// Target languages decoded over the full vocabulary instead of the lexical
+/// shortlist. The shortlist admits, per source word, the target pieces that
+/// word aligned to in running text, so a source word the target language
+/// renders as a suffix or a context word ("please" as the polite -ڭ ending)
+/// never has its standalone rendering admitted, and on short inputs the table
+/// starves the decoder of the only right pieces. Whether that costs more than
+/// it constrains is a per-pack trade: the en-es table stops a model that
+/// otherwise invents ("1987" → "Categoría: 1987"), and the ug-en table holds
+/// FLORES up by 0.8 chrF++, while the en-ug model gains on every short golden
+/// line without it and pays ~2× decode time.
+const FULL_VOCABULARY_TARGETS: &[&str] = &["ug"];
+
+fn uses_shortlist(to_code: &str) -> bool {
+    !FULL_VOCABULARY_TARGETS.contains(&to_code)
+}
+
 fn build_model_paths(
     base_dir: &str,
     step: &translator_core::language::LanguageDirection,
+    to_code: &str,
 ) -> ModelPaths {
     let src_vocab = absolute_install_path(base_dir, &step.src_vocab.path);
     let tgt_vocab = absolute_install_path(base_dir, &step.tgt_vocab.path);
@@ -515,7 +532,7 @@ fn build_model_paths(
     ModelPaths {
         model: absolute_install_path(base_dir, &step.model.path),
         vocabulary: src_vocab,
-        shortlist: absolute_install_path(base_dir, &step.lex.path),
+        shortlist: uses_shortlist(to_code).then(|| absolute_install_path(base_dir, &step.lex.path)),
         target_vocabulary,
     }
 }
@@ -544,7 +561,7 @@ pub fn resolve_translation_plan_in_snapshot(
             from_code: from.to_string(),
             to_code: to.to_string(),
             cache_key: cache_key(from, to),
-            paths: build_model_paths(&snapshot.base_dir, &direction),
+            paths: build_model_paths(&snapshot.base_dir, &direction, to),
         })
     };
 
@@ -675,6 +692,14 @@ fn ensure_plan_loaded(engine: &mut BergamotEngine, plan: &TranslationPlan) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_uyghur_target_decodes_without_shortlist() {
+        assert!(!super::uses_shortlist("ug"));
+        assert!(super::uses_shortlist("en"));
+        assert!(super::uses_shortlist("es"));
+        assert!(super::uses_shortlist("ka"));
+    }
+
     use super::*;
 
     fn line_with_leading_alternative(text: &str, len: u64) -> TranslationWithAlternatives {

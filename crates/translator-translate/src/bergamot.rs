@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use slimt_sys::{
@@ -53,7 +53,7 @@ const ALT_OPTS: AlternativesOptions = AlternativesOptions {
 pub struct ModelPaths {
     pub model: PathBuf,
     pub vocabulary: PathBuf,
-    pub shortlist: PathBuf,
+    pub shortlist: Option<PathBuf>,
     pub target_vocabulary: Option<PathBuf>,
 }
 
@@ -84,7 +84,7 @@ impl BergamotEngine {
             SlimtModel::with_arch_and_target_vocab(
                 &paths.model,
                 &paths.vocabulary,
-                &paths.shortlist,
+                paths.shortlist.as_deref().unwrap_or(Path::new("")),
                 None,
                 slimt_sys::ModelArch::default(),
                 paths.target_vocabulary.as_deref(),

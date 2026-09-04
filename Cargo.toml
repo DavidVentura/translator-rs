@@ -90,6 +90,7 @@ odt = ["translator-doc/odt"]
 dom-translate = ["translator-translate/dom-translate"]
 html = ["dom-translate", "translator-translate/html"]
 epub = ["translator-doc/epub"]
+http = ["dep:rouille", "dep:rand", "html", "image-render"]
 image-render = [
     "dep:translator-render",
     "translator-core/script-from-unicode",
@@ -148,6 +149,8 @@ log = "0.4"
 minifb = { version = "0.27", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 env_logger = { version = "0.11", optional = true }
+rouille = { version = "3.6", optional = true, default-features = false }
+rand = { version = "0.8", optional = true }
 
 
 [dev-dependencies]
@@ -168,6 +171,11 @@ mupdf = { git = "https://github.com/DavidVentura/mupdf-rs", optional = true, def
 name = "translate_smoke"
 path = "tests/translate_smoke.rs"
 required-features = ["html"]
+
+[[test]]
+name = "http_smoke"
+path = "tests/http_smoke.rs"
+required-features = ["http"]
 
 [[test]]
 name = "pdf_smoke"

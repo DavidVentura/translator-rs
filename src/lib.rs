@@ -89,6 +89,10 @@ pub use translator_translate::html_translate;
 pub use translator_translate::language_detect;
 pub use translator_translate::routing;
 pub use translator_translate::sentence_split;
+#[cfg(any(feature = "pdf", feature = "image-render"))]
+pub mod document;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod session;
 pub use translator_core::settings;
 pub use translator_core::tts;
