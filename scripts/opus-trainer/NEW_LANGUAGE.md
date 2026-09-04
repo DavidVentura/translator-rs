@@ -17,7 +17,7 @@ Complete the stages in order:
 4. Gate a teacher independently for each direction.
 5. Prepare cleaned data, held-out data, and the joint vocabulary.
 6. Decode the KD source and select or filter teacher outputs.
-7. Align the selected corpus and train the student.
+7. Align every training block and train the student with a curriculum.
 8. Evaluate the quantized artifact on every relevant slice.
 9. Package the model and complete the release checks.
 
@@ -78,7 +78,10 @@ draw remains reproducible.
 ### Vocabulary
 
 Measure teacher output tokens per character for both directions. Use the result
-when estimating KD cost and decode time.
+when estimating KD cost and decode time. For a causal-LM teacher it is also a
+coverage signal: a language that runs at about one token per character in the
+teacher's vocabulary was nearly absent from its pretraining, and lexical errors
+on that side should be expected before any decode runs.
 
 Train a pair-specific joint SentencePiece vocabulary with `split_digits`, so
 every digit is its own piece. Without it a figure segments differently depending
@@ -314,6 +317,43 @@ and length, and `--judge-sample` sends a fraction of the kept rows back to the
 model as a faithfulness judge. Run it in rounds; each round reads what earlier
 rounds wrote so duplicates fall rather than rise.
 
+When the generating model judges cleaner than the teacher on the short registers
+by a wide margin, use it as the teacher for those registers rather than only as
+a finetune set: decode the dialogue, UI and label sources of the KD draw with
+it and leave the bulk crawl prose to the cheaper teacher. Short lines carry few
+tokens, so the cost is small. Judge every generated row rather than a sample
+and drop the rows judged bad, because a block that is upweighted in training
+repeats each bad row many times more than a bad crawl row. Both sides of a
+generated pair are synthetic, so it is neither KD nor back-translation; it is
+the substitute for human bitext in registers where no native corpus exists in
+any language.
+
+### Back-translation
+
+KD fills the target column with teacher output, so everything the student
+knows about writing the target language comes from the teacher: its calques,
+its invented transliterations and its register. Back-translation is the only
+step that puts native target-language text into that column. Decode
+monolingual target-language text into English with the reverse-direction
+teacher and add the pairs as their own training block beside the KD block. KD
+pairs teach the student to understand the source; back-translated pairs teach
+it to write the target. The two failure domains are disjoint.
+
+The reverse decode only needs to be gist-faithful. Noise on the source side of
+a training pair costs little as long as the target is right, so use the
+reverse teacher and do not gate on its accuracy. Back-translation is gated by
+monolingual supply instead: it applies whenever more native text exists than
+bitext, which for any language with a Wikipedia and a web presence is by a wide
+margin. It targets non-words, calques and unnatural phrasing on the target
+side. It does not fix short-label sense errors, which come from understanding
+the source, and the back-translated source is the noisy side.
+
+Run the monolingual text through the same contamination and mojibake filters
+as the bitext before decoding; a web crawl carries the same sibling-language
+and legacy-encoding damage. Give the block a real share of training, on the
+order of the generated block or larger, and taper it in the final stage of the
+curriculum below.
+
 Use these corpus roles:
 
 - **KD source:** the source column used for teacher translation. The teacher
@@ -321,7 +361,13 @@ Use these corpus roles:
 - **Finetune data:** aligned source and target text. Use curated or high-confidence
   human bitext, or explicitly labeled SOTA-generated data when human data is
   unavailable. Semantic misalignment directly teaches incorrect mappings.
-- **Validation data:** held-out two-column pairs in the direction being trained.
+- **Validation data:** a frozen, in-distribution golden set in the direction
+  being trained, on the order of a few hundred lines, spanning every register
+  the model serves and hash-excluded from every training source. Early
+  stopping selects the checkpoint by this set, so a set drawn from one
+  register cannot see a regression in another: a finetune toward short text
+  validated on held-out TED prose gets worse by construction on that set and
+  stops at an arbitrary point.
 - **Evaluation data:** held-out references and production-input probes that are
   excluded from training by content hash, including from the KD draw: a slice
   carved from the same OPUS pool the KD source was drawn from measures KD
@@ -457,10 +503,26 @@ reference-based selection with a pair-quality score. Use rank one when the
 reference is below the selection gate. Keep the reference-selection threshold
 separate from the stricter threshold used to salvage human finetune data.
 
-Use the backward RNN to score teacher output against the original source when
-the pipeline includes the ce-filter. The backward model must be trained from
-independent human or high-confidence aligned bitext. Drop only the configured
-worst fraction, preserve the row order, and record the filter coverage.
+Score every teacher output with the backward model. The backward model is the
+shallow RNN from `backward.s2s.yml`, trained in the reverse direction on human
+or high-confidence aligned bitext only, so it is independent of the teacher
+(`train_backward.sh`, then `cefilter_score.sh` and `cefilter_cut.sh`). For each
+pair it reports the per-token cross-entropy of the original source given the
+teacher's target. A target that carries the meaning makes the source
+predictable and scores low; a dropped clause, a fabricated entity, a copied
+source or an inverted sense makes the source surprising and scores high. The
+reverse direction is the point: any forward score, the teacher's own
+confidence included, rewards fluent fabrication, and this is the class that
+orthographic filters cannot see. Rank within length buckets, since per-token
+cross-entropy favours short lines, drop only the configured worst fraction,
+preserve the row order, and record the filter coverage. It is a ranking, not a
+judge: it separates gross failures reliably and nuance poorly, and a model
+trained on thin bitext still separates the gross failures.
+
+The same model selects between teachers. Where the short registers are decoded
+by more than one teacher, keep the candidate with the lowest backward score
+per line. This lifts label quality above any single teacher without changing
+the teacher.
 
 Do not assume that a moved n-best hypothesis improved the translation. Compare
 the resulting student against the rank-one control using all evaluation slices
@@ -493,12 +555,35 @@ the augmented three-column corpus to Marian, and the model's alignment output is
 used for format and bold transfer. Verify that the training configuration,
 vocabulary, and alignment mode are the intended pair-specific versions.
 
-Treat finetuning as an explicit experiment. Use curated or high-confidence human
-bitext, or explicitly labeled SOTA-generated data when suitable human data is
-unavailable. Deduplicate generated inputs, record the model and prompt version,
-evaluate every slice, and retain the base checkpoint as the comparison.
-Finetuning can improve the intended production slice while reducing performance
-on other registers.
+Train once, with a curriculum, rather than a KD-only run followed by a
+finetune. OpusTrainer reads several named corpora and fills every batch from
+them in the proportions a stage gives; a stage ends after a stated number of
+passes over one named corpus and the next stage changes the mix. Marian sees
+one stream whose composition shifts. Give the KD block, the back-translated
+block, the human bitext and the generated block their own datasets, keep the
+curated blocks present from the first update, and raise their share in the
+last stage. The proportions are per batch, so a small corpus with a large
+share cycles more often; that is how the curated data is upweighted rather
+than diluted. A block that is only a few percent of the rows on disk can be a
+third of every end-stage batch.
+
+This replaces train-then-finetune because a finetune on a few hundred
+thousand rows after millions of KD rows moves the whole model toward those
+rows, regardless of their composition, and every subsequent addition to the
+finetune reshuffles a ratio nobody is steering. One pair went through five
+finetune iterations that way, each fixing its symptom and regressing a
+register the previous one had fixed, and a small set repeated for dozens of
+epochs memorised its rows before it generalised. In the curriculum there is
+nothing to overwrite later. This is the structure the browsermt pipeline
+uses; its first measurement in this pipeline is the next retrain of that
+pair, so compare against the train-then-finetune pack on the clean strata
+and record the result here.
+
+The stage that remains after training is a short quantization-aware
+continuation with `quantize-bits: 8` on the end-stage mix, which is what makes
+the int8 pack lossless. Any further finetune is an explicit experiment: record
+the model and prompt version of generated inputs, evaluate every slice, and
+retain the base checkpoint as the comparison.
 
 Run the multi-GPU efficiency check before committing to a multi-GPU training job.
 The measured throughput must be evaluated on a representative corpus and include
@@ -566,6 +651,8 @@ A language pair is ready for release when:
 - the language profile and pair-specific configuration are recorded
 - corpus roles, contamination checks, and held-out hashes are recorded
 - the KD corpus has an appropriate scale and a measured source/register mix
+- the back-translated, human and generated blocks are recorded with their
+  stage weights, and every teacher output passed the backward-model filter
 - short-input behavior has been evaluated for the teacher and student
 - the vocabulary passes script, round-trip, unknown-token, and fertility checks
 - each teacher passes the load, reference, production-input, and probe checks
