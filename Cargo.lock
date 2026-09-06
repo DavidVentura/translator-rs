@@ -687,7 +687,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#32d666592234149ce65d2ee9c9ea776fe05b42f2"
+source = "git+https://github.com/DavidVentura/piper-rs#764f7452a7e68d730c0aa32ce8b958dc639683e0"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -695,7 +695,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#32d666592234149ce65d2ee9c9ea776fe05b42f2"
+source = "git+https://github.com/DavidVentura/piper-rs#764f7452a7e68d730c0aa32ce8b958dc639683e0"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -864,6 +864,12 @@ checksum = "88a41f105fe1d5b6b34b2055e3dc59bb79b46b48b2040b9e6c7b4b5de097aa41"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "fst"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
 
 [[package]]
 name = "futures"
@@ -2245,9 +2251,10 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#32d666592234149ce65d2ee9c9ea776fe05b42f2"
+source = "git+https://github.com/DavidVentura/piper-rs#764f7452a7e68d730c0aa32ce8b958dc639683e0"
 dependencies = [
  "espeak-rs",
+ "fst",
  "log",
  "mnn-sys",
  "mucab",
