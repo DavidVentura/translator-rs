@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use piper_rs::{
-    Backend, CoquiVitsModel, CotoviaVitsModel, KokoroMnnModel, MmsModel, PiperModel,
-    SherpaVitsModel,
+    Backend, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroMnnModel, MmsModel,
+    PiperModel, SherpaVitsModel,
 };
 use serde::Deserialize;
 use translator::tts::{PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks};
@@ -428,6 +428,7 @@ fn synthesize_pack_sample(
         "mms" => synthesize_mms(pack_key, pack, catalog, bucket_dir, text)?,
         "coqui_vits" => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
         "cotovia_vits" => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
+        "glowtts_hifigan" => synthesize_glowtts_hifigan(pack_key, catalog, bucket_dir, text)?,
         "sherpa_vits" => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
         "kokoro_mnn" => synthesize_kokoro_mnn(pack_key, pack, catalog, bucket_dir, text)?,
         "kokoro" => {
@@ -552,6 +553,29 @@ fn synthesize_cotovia(
     model
         .synthesize(text, None, None)
         .map_err(|err| format!("Failed to synthesize Cotovia VITS voice `{pack_key}`: {err}"))
+}
+
+fn synthesize_glowtts_hifigan(
+    pack_key: &str,
+    catalog: &Catalog,
+    bucket_dir: &Path,
+    text: &str,
+) -> Result<(Vec<f32>, u32), String> {
+    let model_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
+        file.name.ends_with("glowtts.mnn")
+    })?;
+    let vocoder_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
+        file.name.ends_with("hifigan.mnn")
+    })?;
+    let lexicon_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
+        file.name.ends_with("lexicon.bin")
+    })?;
+    let mut model =
+        GlowTtsHifiganModel::new(&model_path, &vocoder_path, &lexicon_path, &Backend::Cpu)
+            .map_err(|err| format!("Failed to load GlowTTS + HiFiGAN model `{pack_key}`: {err}"))?;
+    model
+        .synthesize(text, None, None)
+        .map_err(|err| format!("Failed to synthesize GlowTTS + HiFiGAN voice `{pack_key}`: {err}"))
 }
 
 fn synthesize_mimic3(

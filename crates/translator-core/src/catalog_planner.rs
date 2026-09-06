@@ -815,10 +815,12 @@ pub fn resolve_tts_voice_files_for_pack(
 
     let model_asset = by_role(&FileRole::Model)?;
     let aux_asset = by_role(&tts.aux_role)?;
+    let vocoder_asset = by_role(&FileRole::new("vocoder"));
     Some(ResolvedTtsVoiceFiles {
         engine,
         model_install_path: model_asset.install_path.clone(),
         aux_install_path: aux_asset.install_path.clone(),
+        vocoder_install_path: vocoder_asset.map(|file| file.install_path.clone()),
         language_code: language_code.as_str().to_string(),
         speaker_id: tts.default_speaker_id,
     })

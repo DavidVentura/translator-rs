@@ -374,6 +374,8 @@ pub struct ResolvedTtsVoiceFiles {
     pub engine: String,
     pub model_install_path: String,
     pub aux_install_path: String,
+    /// Second network, for engines that split the acoustic model from the vocoder.
+    pub vocoder_install_path: Option<String>,
     pub language_code: String,
     pub speaker_id: Option<i32>,
 }

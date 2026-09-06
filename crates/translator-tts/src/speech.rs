@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use piper_rs::{
-    Backend, BoundaryAfter, CoquiVitsModel, CotoviaVitsModel, KokoroMnnModel, MmsModel,
-    PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
+    Backend, BoundaryAfter, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroMnnModel,
+    MmsModel, PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
 };
 use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
 use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
@@ -56,27 +56,40 @@ enum SpeechModel {
     CoquiVits(CoquiVitsModel),
     CotoviaVits(CotoviaVitsModel),
     SherpaVits(SherpaVitsModel),
+    GlowTtsHifigan(GlowTtsHifiganModel),
+}
+
+/// Every file a voice loads from, resolved out of the catalog. They travel as
+/// one value because each layer below needs the whole set, and which files a
+/// voice has depends on its engine.
+#[derive(Clone, PartialEq, Eq)]
+struct SpeechModelPaths {
+    engine: String,
+    model: String,
+    aux: String,
+    /// Second network, for engines that split the acoustic model from the vocoder.
+    vocoder: Option<String>,
+    language_code: String,
+    support_data_root: Option<String>,
+}
+
+impl SpeechModelPaths {
+    fn support_root(&self) -> &str {
+        self.support_data_root.as_deref().unwrap_or_default()
+    }
 }
 
 struct CachedSpeechModel {
-    engine: String,
-    model_path: String,
-    aux_path: String,
-    language_code: String,
-    support_data_root: String,
+    paths: SpeechModelPaths,
     voices: Vec<(String, i64)>,
     default_voice: Option<(String, i64)>,
     model: SpeechModel,
 }
 
 struct ResolvedSpeechAssets {
-    engine: String,
-    model_path: String,
-    aux_path: String,
-    language_code: String,
+    paths: SpeechModelPaths,
     script: Script,
     speaker_id: Option<i64>,
-    support_data_root: Option<String>,
 }
 
 fn log_timing(step: &str, started_at: Instant) {
@@ -164,6 +177,15 @@ fn available_voices(model: &SpeechModel) -> Vec<(String, i64)> {
             })
             .unwrap_or_default(),
         SpeechModel::CotoviaVits(model) => model
+            .voices()
+            .map(|voices| {
+                voices
+                    .iter()
+                    .map(|(name, id)| (name.clone(), *id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        SpeechModel::GlowTtsHifigan(model) => model
             .voices()
             .map(|voices| {
                 voices
@@ -289,7 +311,7 @@ fn resolve_requested_voice(
         }
         log_error(format!(
             "requested voice `{requested_voice_name}` was not found for engine={} language={}; falling back",
-            cached_model.engine, cached_model.language_code
+            cached_model.paths.engine, cached_model.paths.language_code
         ));
     }
 
@@ -350,14 +372,27 @@ fn resolve_speech_assets_for_pack(
     if !Path::new(&aux_path).exists() {
         return None;
     }
+    let vocoder = match &files.vocoder_install_path {
+        Some(relative) => {
+            let path = absolute_install_path(snapshot, relative);
+            if !Path::new(&path).exists() {
+                return None;
+            }
+            Some(path)
+        }
+        None => None,
+    };
     Some(ResolvedSpeechAssets {
-        engine: files.engine,
-        model_path,
-        aux_path,
-        language_code: files.language_code,
+        paths: SpeechModelPaths {
+            engine: files.engine,
+            model: model_path,
+            aux: aux_path,
+            vocoder,
+            language_code: files.language_code,
+            support_data_root,
+        },
         script: snapshot.catalog.script_for(language_code)?,
         speaker_id: files.speaker_id.map(i64::from),
-        support_data_root,
     })
 }
 
@@ -397,15 +432,7 @@ pub fn available_tts_voices_in_snapshot(
 ) -> Result<Vec<TtsVoiceOption>, TranslatorError> {
     let assets = resolve_speech_assets(snapshot, language_code)
         .ok_or_else(|| missing_tts_asset(language_code))?;
-    list_voices(
-        cache,
-        &assets.engine,
-        &assets.model_path,
-        &assets.aux_path,
-        assets.support_data_root.as_deref(),
-        &assets.language_code,
-    )
-    .map_err(TranslatorError::tts)
+    list_voices(cache, &assets.paths).map_err(TranslatorError::tts)
 }
 
 pub fn warm_tts_model_in_snapshot(
@@ -426,18 +453,8 @@ pub fn plan_speech_chunks_for_text_in_snapshot(
 ) -> Result<Vec<SpeechChunk>, TranslatorError> {
     let assets = resolve_speech_assets_for_pack(snapshot, language_code, pack_id)
         .ok_or_else(|| missing_tts_asset(language_code))?;
-    plan_speech_chunks_for_text(
-        cache,
-        &assets.engine,
-        &assets.model_path,
-        &assets.aux_path,
-        assets.support_data_root.as_deref(),
-        &assets.language_code,
-        assets.script,
-        text,
-        urls_and_hashtags,
-    )
-    .map_err(TranslatorError::tts)
+    plan_speech_chunks_for_text(cache, &assets.paths, assets.script, text, urls_and_hashtags)
+        .map_err(TranslatorError::tts)
 }
 
 pub fn synthesize_pcm_in_snapshot(
@@ -454,11 +471,7 @@ pub fn synthesize_pcm_in_snapshot(
         .ok_or_else(|| missing_tts_asset(language_code))?;
     synthesize_pcm(
         cache,
-        &assets.engine,
-        &assets.model_path,
-        &assets.aux_path,
-        assets.support_data_root.as_deref(),
-        &assets.language_code,
+        &assets.paths,
         assets.script,
         text,
         speech_speed,
@@ -487,24 +500,26 @@ fn japanese_dict_path(support_data_root: &str) -> Result<PathBuf, String> {
     Ok(candidate)
 }
 
-fn load_speech_model(
-    engine: &str,
-    model_path: &str,
-    aux_path: &str,
-    language_code: &str,
-    support_data_root: &str,
-) -> Result<SpeechModel, String> {
+fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
+    let SpeechModelPaths {
+        engine,
+        model: model_path,
+        aux: aux_path,
+        vocoder,
+        language_code,
+        ..
+    } = paths;
     if aux_path.is_empty() {
         return Err(format!("Missing auxiliary path for TTS engine `{engine}`"));
     }
 
-    match engine {
+    match engine.as_str() {
         "kokoro_mnn" => {
             let mut model =
                 KokoroMnnModel::new(Path::new(model_path), Path::new(aux_path), language_code)
                     .map_err(|err| format!("Failed to load Kokoro MNN voice: {err}"))?;
             if language_code == "ja" {
-                let dict_path = japanese_dict_path(support_data_root)?;
+                let dict_path = japanese_dict_path(paths.support_root())?;
                 model
                     .load_japanese_dict(dict_path.to_string_lossy().as_ref())
                     .map_err(|err| format!("Failed to load Japanese dictionary: {err}"))?;
@@ -532,6 +547,19 @@ fn load_speech_model(
                 .map(SpeechModel::CotoviaVits)
                 .map_err(|err| format!("Failed to load Cotovia VITS voice: {err}"))
         }
+        "glowtts_hifigan" => {
+            let vocoder = vocoder
+                .as_ref()
+                .ok_or_else(|| format!("Missing vocoder path for TTS engine `{engine}`"))?;
+            GlowTtsHifiganModel::new(
+                Path::new(model_path),
+                Path::new(vocoder),
+                Path::new(aux_path),
+                &Backend::Cpu,
+            )
+            .map(SpeechModel::GlowTtsHifigan)
+            .map_err(|err| format!("Failed to load GlowTTS + HiFiGAN voice: {err}"))
+        }
         "sherpa_vits" => {
             SherpaVitsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
                 .map(SpeechModel::SherpaVits)
@@ -551,44 +579,34 @@ fn load_speech_model(
 
 fn with_cached_model<T>(
     cache: &mut SpeechCache,
-    engine: &str,
-    model_path: &str,
-    aux_path: &str,
-    language_code: &str,
-    support_data_root: &str,
+    paths: &SpeechModelPaths,
     f: impl FnOnce(&mut CachedSpeechModel) -> Result<T, String>,
 ) -> Result<T, String> {
     let load_started_at = Instant::now();
+    let engine = paths.engine.as_str();
+    let language_code = paths.language_code.as_str();
 
     let cache_hit = cache
         .model
         .as_ref()
-        .map(|cached| {
-            cached.engine == engine
-                && cached.model_path == model_path
-                && cached.aux_path == aux_path
-                && cached.language_code == language_code
-                && cached.support_data_root == support_data_root
-        })
+        .map(|cached| &cached.paths == paths)
         .unwrap_or(false);
 
     if !cache_hit {
         eprintln!(
             "tts.model: cache_miss engine={} language={} model={} aux={} support_root={}",
-            engine, language_code, model_path, aux_path, support_data_root
+            engine,
+            language_code,
+            paths.model,
+            paths.aux,
+            paths.support_root()
         );
         let model_load_started_at = Instant::now();
         eprintln!(
             "tts.model: load.start engine={} language={}",
             engine, language_code
         );
-        let model = load_speech_model(
-            engine,
-            model_path,
-            aux_path,
-            language_code,
-            support_data_root,
-        )?;
+        let model = load_speech_model(paths)?;
         eprintln!(
             "tts.model: load.done engine={} language={} took_ms={}",
             engine,
@@ -620,11 +638,7 @@ fn with_cached_model<T>(
             );
         }
         cache.model = Some(CachedSpeechModel {
-            engine: engine.to_owned(),
-            model_path: model_path.to_owned(),
-            aux_path: aux_path.to_owned(),
-            language_code: language_code.to_owned(),
-            support_data_root: support_data_root.to_owned(),
+            paths: paths.clone(),
             voices,
             default_voice,
             model,
@@ -704,6 +718,9 @@ fn phonemize(model: &mut SpeechModel, text: &str) -> Result<String, String> {
         SpeechModel::SherpaVits(model) => model
             .phonemize(text)
             .map_err(|err| format!("Speech synthesis failed: {err}")),
+        SpeechModel::GlowTtsHifigan(model) => model
+            .phonemize(text)
+            .map_err(|err| format!("Speech synthesis failed: {err}")),
     }
 }
 
@@ -723,8 +740,8 @@ fn synthesize(
             if let Some((name, id)) = selected_voice.as_ref() {
                 log_debug(format!(
                     "using voice {name}={id} for engine={} language={} speech_speed={} length_scale={}",
-                    cached_model.engine,
-                    cached_model.language_code,
+                    cached_model.paths.engine,
+                    cached_model.paths.language_code,
                     clamped_speech_speed,
                     piper_length_scale_for_speed(clamped_speech_speed)
                 ));
@@ -751,8 +768,8 @@ fn synthesize(
             if let Some((name, id)) = selected_voice.as_ref() {
                 log_debug(format!(
                     "using voice {name}={id} for engine={} language={} speech_speed={} ({} available)",
-                    cached_model.engine,
-                    cached_model.language_code,
+                    cached_model.paths.engine,
+                    cached_model.paths.language_code,
                     clamped_speech_speed,
                     cached_model.voices.len()
                 ));
@@ -803,17 +820,24 @@ fn synthesize(
         SpeechModel::CotoviaVits(model) => model
             .synthesize(text, effective_speaker_id, Some(clamped_speech_speed))
             .map_err(|err| format!("Speech synthesis failed: {err}")),
+        SpeechModel::GlowTtsHifigan(model) => {
+            if is_phonemes {
+                model
+                    .synthesize_phonemes(text, effective_speaker_id, Some(clamped_speech_speed))
+                    .map_err(|err| format!("Speech synthesis failed: {err}"))
+            } else {
+                model
+                    .synthesize(text, effective_speaker_id, Some(clamped_speech_speed))
+                    .map_err(|err| format!("Speech synthesis failed: {err}"))
+            }
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn synthesize_pcm(
     cache: &mut SpeechCache,
-    engine: &str,
-    model_path: &str,
-    aux_path: &str,
-    support_data_root: Option<&str>,
-    language_code: &str,
+    paths: &SpeechModelPaths,
     script: Script,
     text: &str,
     speech_speed: f32,
@@ -826,51 +850,43 @@ fn synthesize_pcm(
     }
 
     let total_started_at = Instant::now();
-    configure_support_data_root(support_data_root);
-    let support_data_root = support_data_root.unwrap_or_default();
+    configure_support_data_root(paths.support_data_root.as_deref());
 
     let romanized = (!is_phonemes).then(|| romanize_foreign_runs_for_voice(text, script));
     let text = romanized.as_deref().unwrap_or(text);
 
     log_debug(format!(
-        "Synthesizing speech with engine={engine} model={model_path}"
+        "Synthesizing speech with engine={} model={}",
+        paths.engine, paths.model
     ));
-    let (samples, sample_rate) = with_cached_model(
-        cache,
-        engine,
-        model_path,
-        aux_path,
-        language_code,
-        support_data_root,
-        |cached_model| {
-            if is_phonemes {
-                log_debug(format!(
-                    "synthesizing direct phoneme chunk with {} phoneme char(s)",
-                    text.chars().count()
-                ));
-            } else {
-                let phonemize_started_at = Instant::now();
-                let phonemes = phonemize(&mut cached_model.model, text)?;
-                log_debug(format!(
-                    "phonemize produced 1 chunk, {} phoneme char(s)",
-                    phonemes.chars().count(),
-                ));
-                log_timing("phonemize", phonemize_started_at);
-            }
+    let (samples, sample_rate) = with_cached_model(cache, paths, |cached_model| {
+        if is_phonemes {
+            log_debug(format!(
+                "synthesizing direct phoneme chunk with {} phoneme char(s)",
+                text.chars().count()
+            ));
+        } else {
+            let phonemize_started_at = Instant::now();
+            let phonemes = phonemize(&mut cached_model.model, text)?;
+            log_debug(format!(
+                "phonemize produced 1 chunk, {} phoneme char(s)",
+                phonemes.chars().count(),
+            ));
+            log_timing("phonemize", phonemize_started_at);
+        }
 
-            let synth_started_at = Instant::now();
-            let result = synthesize(
-                cached_model,
-                text,
-                speech_speed,
-                voice_name,
-                speaker_id,
-                is_phonemes,
-            )?;
-            log_timing("infer", synth_started_at);
-            Ok(result)
-        },
-    )?;
+        let synth_started_at = Instant::now();
+        let result = synthesize(
+            cached_model,
+            text,
+            speech_speed,
+            voice_name,
+            speaker_id,
+            is_phonemes,
+        )?;
+        log_timing("infer", synth_started_at);
+        Ok(result)
+    })?;
 
     let convert_started_at = Instant::now();
     let pcm_samples: Vec<i16> = samples
@@ -895,76 +911,51 @@ fn synthesize_pcm(
 
 fn list_voices(
     cache: &mut SpeechCache,
-    engine: &str,
-    model_path: &str,
-    aux_path: &str,
-    support_data_root: Option<&str>,
-    language_code: &str,
+    paths: &SpeechModelPaths,
 ) -> Result<Vec<TtsVoiceOption>, String> {
-    configure_support_data_root(support_data_root);
-    let support_data_root = support_data_root.unwrap_or_default();
+    configure_support_data_root(paths.support_data_root.as_deref());
 
-    with_cached_model(
-        cache,
-        engine,
-        model_path,
-        aux_path,
-        language_code,
-        support_data_root,
-        |cached_model| {
-            Ok(visible_voices(
-                &cached_model.engine,
-                &cached_model.language_code,
-                &cached_model.voices,
-            ))
-        },
-    )
+    with_cached_model(cache, paths, |cached_model| {
+        Ok(visible_voices(
+            &cached_model.paths.engine,
+            &cached_model.paths.language_code,
+            &cached_model.voices,
+        ))
+    })
 }
 
-pub fn phonemize_chunks(
+fn phonemize_chunks(
     cache: &mut SpeechCache,
-    engine: &str,
-    model_path: &str,
-    aux_path: &str,
-    support_data_root: Option<&str>,
-    language_code: &str,
+    paths: &SpeechModelPaths,
     text: &str,
 ) -> Result<Vec<PiperPhonemeChunk>, String> {
     if text.trim().is_empty() {
         return Err("Text is empty".to_owned());
     }
 
-    configure_support_data_root(support_data_root);
-    let support_data_root = support_data_root.unwrap_or_default();
+    configure_support_data_root(paths.support_data_root.as_deref());
 
     log_debug(format!(
-        "Phonemizing text with engine={engine} model={model_path}"
+        "Phonemizing text with engine={} model={}",
+        paths.engine, paths.model
     ));
 
-    with_cached_model(
-        cache,
-        engine,
-        model_path,
-        aux_path,
-        language_code,
-        support_data_root,
-        |cached_model| {
-            let phonemize_started_at = Instant::now();
-            let phonemes = phonemize(&mut cached_model.model, text)?;
-            let phoneme_chunks = vec![PiperPhonemeChunk {
-                phonemes,
-                boundary_after: BoundaryAfter::Paragraph,
-            }];
-            log_debug(format!(
-                "phonemize produced {} chunk(s), {} phoneme char(s), chunk sizes [{}]",
-                phoneme_chunks.len(),
-                phoneme_chunks[0].phonemes.chars().count(),
-                summarize_phoneme_chunk_sizes(&phoneme_chunks),
-            ));
-            log_timing("phonemize", phonemize_started_at);
-            Ok(phoneme_chunks)
-        },
-    )
+    with_cached_model(cache, paths, |cached_model| {
+        let phonemize_started_at = Instant::now();
+        let phonemes = phonemize(&mut cached_model.model, text)?;
+        let phoneme_chunks = vec![PiperPhonemeChunk {
+            phonemes,
+            boundary_after: BoundaryAfter::Paragraph,
+        }];
+        log_debug(format!(
+            "phonemize produced {} chunk(s), {} phoneme char(s), chunk sizes [{}]",
+            phoneme_chunks.len(),
+            phoneme_chunks[0].phonemes.chars().count(),
+            summarize_phoneme_chunk_sizes(&phoneme_chunks),
+        ));
+        log_timing("phonemize", phonemize_started_at);
+        Ok(phoneme_chunks)
+    })
 }
 
 fn to_phoneme_chunk(chunk: PiperPhonemeChunk) -> PhonemeChunk {
@@ -992,11 +983,7 @@ fn strip_urls_and_hashtags(text: &str) -> String {
 
 fn plan_speech_chunks_for_text(
     cache: &mut SpeechCache,
-    engine: &str,
-    model_path: &str,
-    aux_path: &str,
-    support_data_root: Option<&str>,
-    language_code: &str,
+    paths: &SpeechModelPaths,
     script: Script,
     text: &str,
     urls_and_hashtags: UrlsAndHashtags,
@@ -1007,16 +994,8 @@ fn plan_speech_chunks_for_text(
     };
     let text = romanize_foreign_runs_for_voice(&filtered, script);
     plan_speech_chunks(&text, |chunk_text| {
-        phonemize_chunks(
-            cache,
-            engine,
-            model_path,
-            aux_path,
-            support_data_root,
-            language_code,
-            chunk_text,
-        )
-        .map(|chunks| chunks.into_iter().map(to_phoneme_chunk).collect::<Vec<_>>())
+        phonemize_chunks(cache, paths, chunk_text)
+            .map(|chunks| chunks.into_iter().map(to_phoneme_chunk).collect::<Vec<_>>())
     })
 }
 
