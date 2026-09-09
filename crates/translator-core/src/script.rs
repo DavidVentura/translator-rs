@@ -50,6 +50,26 @@ impl Script {
         matches!(self, Script::Arabic | Script::Hebrew)
     }
 
+    /// True when running text in this script separates words with spaces, so
+    /// whitespace tokens are words. Southeast Asian and CJK scripts run words
+    /// together (Tibetan uses the tsheg), so their token count says nothing.
+    pub fn uses_word_spacing(self) -> bool {
+        !matches!(
+            self,
+            Script::Thai
+                | Script::Lao
+                | Script::Tibetan
+                | Script::Myanmar
+                | Script::Khmer
+                | Script::Han
+                | Script::Hiragana
+                | Script::Katakana
+                | Script::Common
+                | Script::Inherited
+                | Script::Other
+        )
+    }
+
     /// ISO 15924 code (matches BCP-47 `Script` subtag), or `None` for the
     /// itemization categories that name no writing system: punctuation and
     /// digits, combining marks, and anything unenumerated.

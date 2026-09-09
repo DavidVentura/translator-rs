@@ -1,4 +1,4 @@
-use cld2::{Format, Hints, Reliable, detect_language_ext};
+use cld2::{Effort, Format, Hints, Reliable, detect_language_with_effort};
 use translator_core::api::{LanguageCode, ScriptedLanguage};
 use translator_core::script::Script;
 
@@ -15,7 +15,7 @@ pub fn detect_language(text: &str, hint: Option<&LanguageCode>) -> Option<Detect
         content_language: hint.map(LanguageCode::as_str),
         ..Default::default()
     };
-    let detected = detect_language_ext(text, Format::Text, &hints);
+    let detected = detect_language_with_effort(text, Format::Text, &hints, Effort::Standard);
     let language = detected.language?.0.to_string();
     let is_reliable = detected.reliability == Reliable;
     let confidence = detected
@@ -29,6 +29,26 @@ pub fn detect_language(text: &str, hint: Option<&LanguageCode>) -> Option<Detect
         is_reliable,
         confidence,
     })
+}
+
+/// Fewer whitespace-separated words than this and same-script languages are
+/// indistinguishable: a single word like `mango` or `teatro` exists verbatim in
+/// a dozen Latin-script languages.
+const MIN_WORDS: usize = 3;
+
+/// The words the detector may score. While the user is still typing, the last
+/// token is a fragment (`teatr`) that matches languages the finished word does
+/// not, so it is dropped unless whitespace or punctuation shows it is complete.
+fn complete_words(text: &str) -> Vec<&str> {
+    let mut words: Vec<&str> = text.split_whitespace().collect();
+    let ends_mid_word = text
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric());
+    if ends_mid_word {
+        words.pop();
+    }
+    words
 }
 
 pub fn detect_language_robust_code(
@@ -45,50 +65,51 @@ pub fn detect_language_robust_code(
     // whatever hint it is given, so it can't disambiguate. The text's own script
     // narrows the candidates to the supported languages that use it; when exactly
     // one does, that is the answer regardless of what cld2 thinks.
-    let candidates: Vec<&LanguageCode> = match Script::dominant(text) {
-        None => available_languages.iter().map(|lang| &lang.code).collect(),
-        Some(script) => {
-            let same_script: Vec<&LanguageCode> = available_languages
-                .iter()
-                .filter(|lang| lang.script == script)
-                .map(|lang| &lang.code)
-                .collect();
-            match same_script.len() {
-                0 => return None,
-                1 => return Some(same_script[0].clone()),
-                _ => same_script,
+    let script = Script::dominant(text)?;
+    let candidates: Vec<&LanguageCode> = available_languages
+        .iter()
+        .filter(|lang| lang.script == script)
+        .map(|lang| &lang.code)
+        .collect();
+    let scored_text: String = match candidates.as_slice() {
+        [] => return None,
+        [only] => return Some((*only).clone()),
+        _ if script.uses_word_spacing() => {
+            let words = complete_words(text);
+            if words.len() < MIN_WORDS {
+                return None;
             }
+            words.join(" ")
         }
+        _ => text.to_string(),
     };
 
-    if let Some(detected) = detect_language(text, hint) {
-        if detected.is_reliable
-            && candidates
+    let hints = Hints {
+        content_language: hint.map(LanguageCode::as_str),
+        ..Default::default()
+    };
+    let detected =
+        detect_language_with_effort(&scored_text, Format::Text, &hints, Effort::Standard);
+    if detected.reliability != Reliable {
+        return None;
+    }
+    detected
+        .scores
+        .iter()
+        .filter_map(|score| score.language)
+        .find_map(|lang| {
+            let code = catalog_code(lang.0);
+            candidates
                 .iter()
-                .any(|code| code.as_str() == detected.language)
-        {
-            return Some(LanguageCode::from(detected.language));
-        }
-    }
-
-    // cld2 gave nothing usable, so all that is left is asking which candidates it
-    // will rubber-stamp when forced. Short input in a language family gets several
-    // (`hej hur mar du` echoes both `da` and `sv`), and taking the first would make
-    // catalog order the tiebreaker. Only a lone echo is evidence of anything.
-    let echoed: Vec<&LanguageCode> = candidates
-        .into_iter()
-        .filter(|code| {
-            matches!(
-                detect_language(text, Some(*code)),
-                Some(detected) if detected.is_reliable && detected.language == code.as_str()
-            )
+                .find(|candidate| candidate.as_str() == code)
         })
-        .collect();
+        .map(|code| (*code).clone())
+}
 
-    match echoed.as_slice() {
-        [only] => Some((*only).clone()),
-        _ => None,
-    }
+/// cld2 spells script variants BCP-47 style (`zh-Hant`); the catalog keys
+/// them as `zh_hant`.
+fn catalog_code(cld2_code: &str) -> String {
+    cld2_code.to_ascii_lowercase().replace('-', "_")
 }
 
 #[cfg(test)]
@@ -111,7 +132,8 @@ mod tests {
                     "ko" => "Hang",
                     "ja" => "Jpan",
                     "zh" => "Hans",
-                    "ru" | "uk" => "Cyrl",
+                    "zh_hant" => "Hant",
+                    "ru" | "uk" | "bg" => "Cyrl",
                     _ => "Latn",
                 })
                 .expect("catalog script parses")
@@ -122,12 +144,6 @@ mod tests {
 
     fn detect(text: &str, available: &[&str]) -> Option<String> {
         detect_language_robust_code(text, None, &languages(available))
-            .map(|c| c.as_str().to_string())
-    }
-
-    fn detect_hinted(text: &str, hint: &str, available: &[&str]) -> Option<String> {
-        let hint = LanguageCode::from(hint);
-        detect_language_robust_code(text, Some(&hint), &languages(available))
             .map(|c| c.as_str().to_string())
     }
 
@@ -169,6 +185,47 @@ mod tests {
     }
 
     #[test]
+    fn typed_fragment_is_not_scored() {
+        // Typing "mango" passes through "mang", which cld2 would happily call
+        // Malay when forced; "teatr" and "páj" likewise land on Slovak and Czech.
+        let available = ["en", "es", "ms", "sk", "cs", "de"];
+        assert_eq!(detect("mang", &available), None);
+        assert_eq!(detect("teatr", &available), None);
+        assert_eq!(detect("páj", &available), None);
+        assert_eq!(detect("vamos al teatr", &available), None);
+        assert_eq!(detect("vamos al teatro", &available), None);
+        assert_eq!(
+            detect("vamos al teatro esta noch", &available).as_deref(),
+            Some("es")
+        );
+        assert_eq!(
+            detect("vamos al teatro esta noche.", &available).as_deref(),
+            Some("es")
+        );
+    }
+
+    #[test]
+    fn fewer_than_three_words_is_not_evidence() {
+        let available = ["en", "es", "fr", "de"];
+        assert_eq!(detect("hola como", &available), None);
+        assert_eq!(detect("hola, como está", &available), None);
+        assert_eq!(
+            detect("hola, como estás?", &available).as_deref(),
+            Some("es")
+        );
+    }
+
+    #[test]
+    fn unspaced_scripts_skip_the_word_gate() {
+        let available = ["en", "zh", "zh_hant"];
+        assert_eq!(detect("你好吗", &available).as_deref(), Some("zh"));
+        assert_eq!(
+            detect("火車站在哪裡", &available).as_deref(),
+            Some("zh_hant")
+        );
+    }
+
+    #[test]
     fn multi_language_script_defers_to_cld2() {
         // Latin and Cyrillic each cover several supported languages, so cld2's
         // ranking still decides within the script.
@@ -180,29 +237,6 @@ mod tests {
         assert_eq!(
             detect("Съешь же ещё этих мягких французских булочек", &available).as_deref(),
             Some("ru")
-        );
-    }
-
-    #[test]
-    fn partial_word_does_not_resolve_to_a_family_member() {
-        // Typing "hello how are you?" passes through "hello ho", which cld2 declines
-        // to classify unhinted but rubber-stamps as both `da` and `no` when forced.
-        let available = ["en", "da", "no", "sv", "de"];
-        assert_eq!(detect("hello ho", &available), None);
-        assert_eq!(detect_hinted("hello ho", "en", &available), None);
-        assert_eq!(
-            detect("hello how are you?", &available).as_deref(),
-            Some("en")
-        );
-    }
-
-    #[test]
-    fn hint_competes_instead_of_being_skipped() {
-        // A lone echo still wins, and the caller's own hint is allowed to be it.
-        let available = ["en", "da", "no", "sv", "de"];
-        assert_eq!(
-            detect_hinted("hei hvordan", "da", &available).as_deref(),
-            Some("da")
         );
     }
 }
