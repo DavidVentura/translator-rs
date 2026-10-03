@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::api::LanguageCode;
 use crate::language::Language;
 
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole,
-    InstalledTtsPack, LangAvailability, LanguageCatalog, MigrationAction, MigrationJob, OcrPack,
-    PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry, TtsVoicePackInfo,
-    TtsVoicePickerRegion,
+    InstalledTtsPack, LangAvailability, LanguageCatalog, LanguageFeature, MigrationAction,
+    MigrationJob, OcrPack, PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry,
+    TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,17 +630,38 @@ pub fn plan_translation_upgrades(
 /// catalog change that orphaned the on-disk variant), plus whatever their
 /// dependency chain is missing. Packs with no files at all are not included —
 /// those were never installed, and this app never downloads unrequested content.
+/// The exception is a language whose translation is installed: its core packs
+/// were requested along with it, so any that are absent (e.g. installs from
+/// before the language gained PP-OCR packs, issue #341) are restored too.
 pub fn plan_repair(snapshot: &CatalogSnapshot) -> DownloadPlan {
-    let mut broken_pack_ids = snapshot
+    let broken_pack_ids = snapshot
         .pack_statuses
         .values()
         .filter(|status| !status.installed && status.any_file_present)
-        .map(|status| status.pack_id.as_str())
-        .collect::<Vec<_>>();
-    broken_pack_ids.sort_unstable();
-    let tasks = status_files_in_snapshot(snapshot, broken_pack_ids, |status| {
-        status.missing_files.iter().collect()
-    })
+        .map(|status| status.pack_id.clone());
+    let incomplete_language_pack_ids = snapshot
+        .catalog
+        .languages
+        .keys()
+        .filter(|code| {
+            snapshot
+                .catalog
+                .root_pack_ids_for_feature(
+                    &LanguageCode::from(code.as_str()),
+                    LanguageFeature::Translation,
+                )
+                .iter()
+                .any(|pack_id| pack_installed_in_snapshot(snapshot, pack_id))
+        })
+        .flat_map(|code| snapshot.catalog.core_pack_ids_for_language(code));
+    let root_pack_ids = broken_pack_ids
+        .chain(incomplete_language_pack_ids)
+        .collect::<BTreeSet<_>>();
+    let tasks = status_files_in_snapshot(
+        snapshot,
+        root_pack_ids.iter().map(String::as_str),
+        |status| status.missing_files.iter().collect(),
+    )
     .into_iter()
     .filter_map(|item| {
         let pack = snapshot.catalog.pack(&item.pack_id)?;

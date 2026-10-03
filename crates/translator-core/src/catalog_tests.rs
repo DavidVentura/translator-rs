@@ -790,6 +790,35 @@ fn repair_plan_restores_partially_present_packs() {
 }
 
 #[test]
+fn repair_plan_restores_absent_core_packs_of_installed_language() {
+    // Translation installed by a version that predates the language's OCR pack:
+    // none of the OCR files were ever on disk, yet the language is in use.
+    let checker = FakeInstallChecker::with_files(&[
+        "bin/model.enes.bin",
+        "bin/lex.enen.bin",
+        "bin/vocab.aa.spm",
+        "bin/vocab.zz.spm",
+        "bin/model.esen.bin",
+        "bin/lex.esen.bin",
+        "bin/vocab.bb.spm",
+        "bin/vocab.yy.spm",
+        "bin/shared.bin",
+        "bin/mucab.bin",
+    ]);
+    let snapshot = build_catalog_snapshot(base_catalog(), "/base".to_string(), &checker);
+    assert!(!snapshot.pack_statuses["ocr-es"].any_file_present);
+
+    let plan = plan_repair(&snapshot);
+    let paths = plan
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["ppocr/rec_latin_es.mnn"]);
+    assert_eq!(plan.total_size, 11);
+}
+
+#[test]
 fn repair_plan_ignores_never_installed_packs() {
     let snapshot = build_catalog_snapshot(
         catalog_with_detector_alternatives(),
