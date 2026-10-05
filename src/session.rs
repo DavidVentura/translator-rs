@@ -138,6 +138,25 @@ impl TranslatorSession {
         self.set_snapshot(build_catalog_snapshot(catalog, base_dir, &checker));
     }
 
+    /// Swap in a newly fetched index or a moved install root while keeping the
+    /// warm engines, which key their caches on absolute model paths.
+    pub fn replace_catalog(
+        &self,
+        bundled_json: &str,
+        disk_json: Option<&str>,
+        base_dir: String,
+    ) -> Result<(), TranslatorError> {
+        let catalog = parse_selected_catalog(bundled_json, disk_json).ok_or_else(|| {
+            TranslatorError::new(
+                crate::api::TranslatorErrorKind::InvalidInput,
+                "failed to parse any catalog",
+            )
+        })?;
+        let checker = FsPackInstallChecker::new(&base_dir);
+        self.set_snapshot(build_catalog_snapshot(catalog, base_dir, &checker));
+        Ok(())
+    }
+
     pub fn apply_delete_plan(&self, plan: &DeletePlan) {
         use std::collections::HashSet;
         use std::path::Path;
