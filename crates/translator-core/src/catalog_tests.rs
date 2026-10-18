@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use crate::api::{DictionaryCode, LanguageCode};
 use crate::catalog::{
-    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, FileRequirement, FileRole,
-    LangAvailability, LanguageCatalog, LanguageFeature, LanguageTtsRegionV2, LanguageTtsV2,
-    PackInstallChecker, PackRecord, build_catalog_snapshot, plan_delete_superseded_files,
-    plan_language_download,
+    AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DownloadTask, FileRequirement, FileRole,
+    InstallMarker, LangAvailability, LanguageCatalog, LanguageFeature, LanguageTtsRegionV2,
+    LanguageTtsV2, PackInstallChecker, PackRecord, TaskInstall, build_catalog_snapshot,
+    download_task_installed, plan_delete_superseded_files, plan_language_download,
+    plan_language_install, plan_zip_extraction,
 };
 use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair};
 use crate::catalog::{plan_translation_upgrades, translation_upgrade_language_codes};
@@ -48,11 +49,8 @@ fn asset_file(name: &str, install_path: &str, size_bytes: u64) -> AssetFileV2 {
         install_path: install_path.to_string(),
         url: format!("https://example.invalid/{name}"),
         source_path: None,
-        archive_format: None,
-        extract_to: None,
-        delete_after_extract: false,
-        install_marker_path: None,
-        install_marker_version: None,
+        archive: None,
+        install_marker: None,
         // These fixtures exercise install/status/download planning, not runtime
         // role resolution, so each file just needs a distinct role to stay its
         // own singleton group (the filename guarantees that).
@@ -1253,5 +1251,348 @@ fn georgian_recognizer_resolves_for_ka() {
             assert!(!script.is_rtl(), "Georgian is left-to-right");
         }
         other => panic!("ka resolved to the wrong pack kind: {other:?}"),
+    }
+}
+
+#[test]
+fn translation_upgrade_deletes_the_alternatives_it_outranks() {
+    let checker = FakeInstallChecker::with_files(&[
+        "bin/model.entl.bin",
+        "bin/lex.entl.bin",
+        "bin/vocab.entl.spm",
+    ]);
+    let snapshot = build_catalog_snapshot(
+        catalog_with_translation_priority(),
+        "/base".to_string(),
+        &checker,
+    );
+
+    let plan = plan_translation_upgrades(&snapshot, &[LanguageCode::from("tl")]);
+
+    assert_eq!(
+        plan.delete_after.file_paths,
+        vec![
+            "bin/lex.entl.bin".to_string(),
+            "bin/model.entl.bin".to_string(),
+            "bin/vocab.entl.spm".to_string(),
+        ]
+    );
+    assert!(plan.delete_after.directory_paths.is_empty());
+}
+
+#[test]
+fn translation_upgrade_keeps_files_another_pack_still_resolves_to() {
+    let mut catalog = catalog_with_translation_priority();
+    catalog.packs.insert(
+        "translate-tl-en".to_string(),
+        translation_pack(
+            "translate-tl-en",
+            "tl",
+            "en",
+            vec![
+                role_file(
+                    "model.tlen.bin",
+                    "bin/model.tlen.bin",
+                    100,
+                    FileRole::Model,
+                    1,
+                ),
+                role_file(
+                    "vocab.entl.spm",
+                    "bin/vocab.entl.spm",
+                    5,
+                    FileRole::Vocab,
+                    1,
+                ),
+            ],
+            vec![],
+        ),
+    );
+    let checker = FakeInstallChecker::with_files(&[
+        "bin/model.entl.bin",
+        "bin/lex.entl.bin",
+        "bin/vocab.entl.spm",
+        "bin/model.tlen.bin",
+    ]);
+    let snapshot = build_catalog_snapshot(catalog, "/base".to_string(), &checker);
+
+    let plan = plan_translation_upgrades(&snapshot, &[LanguageCode::from("tl")]);
+
+    assert_eq!(
+        plan.delete_after.file_paths,
+        vec![
+            "bin/lex.entl.bin".to_string(),
+            "bin/model.entl.bin".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn ocr_upgrade_deletes_the_outranked_detector_only() {
+    let checker =
+        FakeInstallChecker::with_files(&["ppocr/det_old.mnn", "ppocr/pulc.mnn", "ppocr/latin.mnn"]);
+    let snapshot = build_catalog_snapshot(
+        catalog_with_detector_alternatives(),
+        "/base".to_string(),
+        &checker,
+    );
+
+    let plan = plan_ocr_engine_upgrades(&snapshot, &[LanguageCode::from("en")], "ppocr");
+
+    assert_eq!(
+        plan.delete_after.file_paths,
+        vec!["ppocr/det_old.mnn".to_string()]
+    );
+}
+
+#[test]
+fn install_plans_never_delete() {
+    let snapshot = build_catalog_snapshot(
+        catalog_with_detector_alternatives(),
+        "/base".to_string(),
+        &FakeInstallChecker::with_files(&["ppocr/det_old.mnn"]),
+    );
+
+    let plan = plan_language_install(&snapshot, &LanguageCode::from("en"));
+
+    assert!(!plan.tasks.is_empty());
+    assert_eq!(plan.delete_after, crate::catalog::DeletePlan::default());
+}
+
+fn catalog_with_doc_detect_support() -> LanguageCatalog {
+    let mut catalog = base_catalog();
+    catalog.packs.insert(
+        "support-doc-detect".to_string(),
+        pack_record(
+            "support-doc-detect",
+            PackKind::Support(SupportPack {
+                language: None,
+                languages: vec![],
+                aliases: vec![],
+                kind: Some("doc_detect".to_string()),
+                metadata: None,
+            }),
+            vec![asset_file("docaligner.mnn", "ocr/docrec/docaligner.mnn", 7)],
+            vec![],
+        ),
+    );
+    catalog
+}
+
+#[test]
+fn language_install_brings_missing_core_support() {
+    let snapshot = build_catalog_snapshot(
+        catalog_with_doc_detect_support(),
+        "/base".to_string(),
+        &FakeInstallChecker::with_files(&[]),
+    );
+    let es = LanguageCode::from("es");
+
+    let install = plan_language_install(&snapshot, &es);
+    let language_only = plan_language_download(&snapshot, &es);
+
+    let install_paths = install
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(install_paths.contains("ocr/docrec/docaligner.mnn"));
+    assert_eq!(install.tasks.len(), language_only.tasks.len() + 1);
+    assert_eq!(install.total_size, language_only.total_size + 7);
+}
+
+#[test]
+fn language_install_skips_core_support_already_on_disk() {
+    let snapshot = build_catalog_snapshot(
+        catalog_with_doc_detect_support(),
+        "/base".to_string(),
+        &FakeInstallChecker::with_files(&["ocr/docrec/docaligner.mnn"]),
+    );
+    let es = LanguageCode::from("es");
+    let paths = |plan: crate::catalog::DownloadPlan| {
+        plan.tasks
+            .into_iter()
+            .map(|task| task.install_path)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    assert_eq!(
+        paths(plan_language_install(&snapshot, &es)),
+        paths(plan_language_download(&snapshot, &es))
+    );
+}
+
+fn zip_task(marker: Option<InstallMarker>) -> DownloadTask {
+    DownloadTask {
+        pack_id: "support-adblock".to_string(),
+        install_path: "adblock/lists.zip".to_string(),
+        url: "https://example.invalid/lists.zip".to_string(),
+        size_bytes: 10,
+        install: TaskInstall::Zip {
+            extract_to: "adblock".to_string(),
+            delete_after_extract: true,
+            marker,
+        },
+    }
+}
+
+#[test]
+fn zip_task_counts_as_installed_by_its_marker_not_its_archive() {
+    let marker = InstallMarker {
+        path: "adblock/lists/.installed".to_string(),
+        version: 3,
+    };
+    let task = zip_task(Some(marker));
+    let archive_only = FakeInstallChecker::with_files(&["adblock/lists.zip"]);
+    let mut marker_present = FakeInstallChecker::with_files(&[]);
+    marker_present
+        .markers
+        .insert(("adblock/lists/.installed".to_string(), 3));
+    let mut stale_marker = FakeInstallChecker::with_files(&[]);
+    stale_marker
+        .markers
+        .insert(("adblock/lists/.installed".to_string(), 2));
+
+    assert!(!download_task_installed(&archive_only, &task));
+    assert!(download_task_installed(&marker_present, &task));
+    assert!(!download_task_installed(&stale_marker, &task));
+}
+
+#[test]
+fn raw_task_counts_as_installed_by_its_file() {
+    let task = DownloadTask {
+        install: TaskInstall::Raw,
+        install_path: "bin/model.bin".to_string(),
+        ..zip_task(None)
+    };
+
+    assert!(download_task_installed(
+        &FakeInstallChecker::with_files(&["bin/model.bin"]),
+        &task
+    ));
+    assert!(!download_task_installed(
+        &FakeInstallChecker::with_files(&[]),
+        &task
+    ));
+}
+
+#[test]
+fn zip_extraction_reroots_entries_under_the_marker_directory() {
+    let marker = InstallMarker {
+        path: "adblock/lists/.installed".to_string(),
+        version: 1,
+    };
+    let names = [
+        "easylist.txt",
+        "./nested/",
+        "nested/b.txt",
+        "lists/already.txt",
+    ]
+    .map(String::from)
+    .to_vec();
+
+    let plan = plan_zip_extraction("adblock", Some(&marker), &names).expect("valid archive");
+
+    let targets = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.install_path.as_str(), entry.is_directory))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec![
+            ("adblock/lists/easylist.txt", false),
+            ("adblock/lists/nested", true),
+            ("adblock/lists/nested/b.txt", false),
+            ("adblock/lists/already.txt", false),
+        ]
+    );
+    assert_eq!(
+        plan.replace_paths,
+        vec![
+            "adblock/lists/already.txt".to_string(),
+            "adblock/lists/easylist.txt".to_string(),
+            "adblock/lists/nested".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn zip_extraction_without_marker_keeps_entry_layout() {
+    let names = ["/top/a.txt", "top/sub/b.txt"].map(String::from).to_vec();
+
+    let plan = plan_zip_extraction("data", None, &names).expect("valid archive");
+
+    let paths = plan
+        .entries
+        .iter()
+        .map(|entry| entry.install_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["data/top/a.txt", "data/top/sub/b.txt"]);
+    assert_eq!(
+        plan.replace_paths,
+        vec!["data/top/a.txt".to_string(), "data/top/sub".to_string()]
+    );
+}
+
+#[test]
+fn zip_extraction_rejects_entries_escaping_the_root() {
+    let names = ["ok.txt", "../../etc/passwd"].map(String::from).to_vec();
+
+    assert!(plan_zip_extraction("adblock", None, &names).is_err());
+}
+
+fn catalog_json_with_file(file: &str) -> String {
+    format!(
+        r#"{{
+          "formatVersion":6,"generatedAt":1,"dictionaryVersion":1,
+          "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
+                      "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1}},
+          "languages":{{}},
+          "packs":{{"support-x":{{"feature":"support","kind":"adblock","files":[{file}]}}}}
+        }}"#
+    )
+}
+
+#[test]
+fn parses_zip_files_into_typed_archive_and_marker() {
+    let json = catalog_json_with_file(
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"adblock/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":"adblock","deleteAfterExtract":true,
+            "installMarkerPath":"adblock/l/.installed","installMarkerVersion":2,
+            "role":"lists","priority":0}"#,
+    );
+    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("catalog parses");
+
+    let file = &catalog.packs["support-x"].files[0];
+    assert_eq!(
+        file.archive,
+        Some(crate::catalog::ZipArchive {
+            extract_to: "adblock".to_string(),
+            delete_after_extract: true,
+        })
+    );
+    assert_eq!(
+        file.install_marker,
+        Some(InstallMarker {
+            path: "adblock/l/.installed".to_string(),
+            version: 2,
+        })
+    );
+}
+
+#[test]
+fn drops_packs_whose_files_this_build_cannot_install() {
+    for file in [
+        r#"{"name":"l.tar","sizeBytes":1,"installPath":"a/l.tar","url":"u",
+            "archiveFormat":"tar","extractTo":"a","role":"lists","priority":0}"#,
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "archiveFormat":"zip","role":"lists","priority":0}"#,
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "installMarkerPath":"a/.installed","role":"lists","priority":0}"#,
+    ] {
+        let catalog = crate::catalog::parse_and_validate_catalog(&catalog_json_with_file(file))
+            .expect("catalog parses");
+        assert!(!catalog.packs.contains_key("support-x"), "{file}");
     }
 }

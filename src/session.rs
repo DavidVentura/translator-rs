@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::{BergamotEngine, TranslateCtx};
 use crate::catalog::{
-    CatalogSnapshot, DeletePlan, DownloadPlan, FsPackInstallChecker, LanguageAvailabilityRow,
-    LanguageOverview, MigrationJob, PackInstallChecker, build_catalog_snapshot,
-    build_language_overview, language_rows_in_snapshot, parse_and_validate_catalog,
-    plan_delete_dictionary, plan_delete_language, plan_delete_superseded_tts,
-    plan_delete_support_by_kind, plan_delete_tts, plan_delete_tts_pack, plan_dictionary_download,
-    plan_language_download, plan_migrations, plan_support_download_by_kind, plan_tts_download,
-    select_best_catalog,
+    CatalogSnapshot, DeletePlan, DownloadPlan, DownloadTask, FsPackInstallChecker,
+    LanguageAvailabilityRow, LanguageOverview, MigrationJob, PackInstallChecker,
+    build_catalog_snapshot, build_language_overview, download_task_installed,
+    language_rows_in_snapshot, parse_and_validate_catalog, plan_delete_dictionary,
+    plan_delete_language, plan_delete_superseded_tts, plan_delete_support_by_kind, plan_delete_tts,
+    plan_delete_tts_pack, plan_dictionary_download, plan_language_install, plan_migrations,
+    plan_support_download_by_kind, plan_tts_download, select_best_catalog,
 };
 use crate::routing::MixedTextTranslationResult;
 #[cfg(feature = "ppocr")]
@@ -562,10 +562,15 @@ impl TranslatorSession {
         let snap = self.snapshot();
         let code = LanguageCode::from(language_code);
         match feature {
-            Feature::Core => Some(plan_language_download(&snap, &code)),
+            Feature::Core => Some(plan_language_install(&snap, &code)),
             Feature::Dictionary => plan_dictionary_download(&snap, &code),
             Feature::Tts => plan_tts_download(&snap, &code, selected_tts_pack_id),
         }
+    }
+
+    pub fn download_task_installed(&self, task: &DownloadTask) -> bool {
+        let snap = self.snapshot();
+        download_task_installed(&FsPackInstallChecker::new(&snap.base_dir), task)
     }
 
     pub fn plan_support_download_by_kind(&self, support_kind: &str) -> Option<DownloadPlan> {

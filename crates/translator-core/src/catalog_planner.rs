@@ -4,10 +4,10 @@ use crate::api::LanguageCode;
 use crate::language::Language;
 
 use super::model::{
-    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole,
+    AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole, InstallMarker,
     InstalledTtsPack, LangAvailability, LanguageCatalog, LanguageFeature, MigrationAction,
-    MigrationJob, OcrPack, PackKind, PackRecord, ResolvedTtsVoiceFiles, TtsSpeakerEntry,
-    TtsVoicePackInfo, TtsVoicePickerRegion,
+    MigrationJob, OcrPack, PackKind, PackRecord, ResolvedTtsVoiceFiles, TaskInstall,
+    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion, ZipEntryTarget, ZipExtractionPlan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,13 +187,9 @@ where
 
         let pack = self.catalog.pack(pack_id)?;
         let checker = self.install_checker;
-        let file_present =
-            |file: &AssetFileV2| match (&file.install_marker_path, file.install_marker_version) {
-                (Some(marker_path), Some(version)) => {
-                    checker.install_marker_exists(marker_path, version)
-                }
-                _ => checker.file_exists(&file.install_path),
-            };
+        let file_present = |file: &AssetFileV2| {
+            installed_at(checker, &file.install_path, file.install_marker.as_ref())
+        };
 
         let mut missing_files = Vec::new();
         let mut upgrade_files = Vec::new();
@@ -427,17 +423,10 @@ pub fn plan_ocr_engine_download(
     let pack_id = snapshot
         .catalog
         .ocr_pack_id_for_engine(language_code, engine)?;
-    let tasks = install_files_in_snapshot(snapshot, [pack_id.as_str()])
-        .into_iter()
-        .filter_map(|item| {
-            let pack = snapshot.catalog.pack(&item.pack_id)?;
-            Some(download_task_for(pack, &item.file))
-        })
-        .collect::<Vec<_>>();
-    Some(DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    })
+    Some(download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, [pack_id.as_str()]),
+    ))
 }
 
 pub fn plan_ocr_engine_downloads(
@@ -453,17 +442,10 @@ pub fn plan_ocr_engine_downloads(
                 .ocr_pack_id_for_engine(language_code, engine)
         })
         .collect::<Vec<_>>();
-    let tasks = install_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
-        .into_iter()
-        .filter_map(|item| {
-            let pack = snapshot.catalog.pack(&item.pack_id)?;
-            Some(download_task_for(pack, &item.file))
-        })
-        .collect::<Vec<_>>();
-    DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    }
+    download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str)),
+    )
 }
 
 // A fresh install fetches the best file of every role, optional ones included:
@@ -537,19 +519,7 @@ pub fn plan_ocr_engine_upgrades(
                 .ocr_pack_id_for_engine(language_code, engine)
         })
         .collect::<Vec<_>>();
-    let tasks = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
-        status.upgrade_files.iter().collect()
-    })
-    .into_iter()
-    .filter_map(|item| {
-        let pack = snapshot.catalog.pack(&item.pack_id)?;
-        Some(download_task_for(pack, &item.file))
-    })
-    .collect::<Vec<_>>();
-    DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    }
+    upgrade_plan(snapshot, &pack_ids)
 }
 
 fn translation_pack_ids_for_languages(
@@ -610,18 +580,55 @@ pub fn plan_translation_upgrades(
     language_codes: &[LanguageCode],
 ) -> DownloadPlan {
     let pack_ids = translation_pack_ids_for_languages(&snapshot.catalog, language_codes);
-    let tasks = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
+    upgrade_plan(snapshot, &pack_ids)
+}
+
+// Downloads every upgrade file of the packs' closure, then deletes what those
+// files outrank: the on-disk alternatives of each upgraded role plus anything
+// already superseded in those packs. A path another (non-upgraded) pack still
+// resolves to stays, since deleting it would break that pack.
+fn upgrade_plan(snapshot: &CatalogSnapshot, pack_ids: &[String]) -> DownloadPlan {
+    let closure = snapshot
+        .catalog
+        .dependency_closure(pack_ids.iter().map(String::as_str))
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let files = status_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str), |status| {
         status.upgrade_files.iter().collect()
-    })
-    .into_iter()
-    .filter_map(|item| {
-        let pack = snapshot.catalog.pack(&item.pack_id)?;
-        Some(download_task_for(pack, &item.file))
-    })
-    .collect::<Vec<_>>();
+    });
+    let in_use_elsewhere = snapshot
+        .pack_statuses
+        .iter()
+        .filter(|(pack_id, _)| !closure.contains(*pack_id))
+        .flat_map(|(_, status)| &status.active_files)
+        .map(|file| file.install_path.as_str())
+        .collect::<HashSet<_>>();
+    let mut file_paths = closure
+        .iter()
+        .filter_map(|pack_id| snapshot.pack_statuses.get(pack_id))
+        .flat_map(|status| {
+            let upgraded_roles = status
+                .upgrade_files
+                .iter()
+                .map(|file| &file.role)
+                .collect::<HashSet<_>>();
+            status
+                .active_files
+                .iter()
+                .filter(move |file| upgraded_roles.contains(&file.role))
+                .chain(&status.superseded_files)
+        })
+        .map(|file| file.install_path.clone())
+        .filter(|path| !in_use_elsewhere.contains(path.as_str()))
+        .collect::<Vec<_>>();
+    file_paths.sort();
+    file_paths.dedup();
     DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
+        delete_after: DeletePlan {
+            file_paths,
+            directory_paths: Vec::new(),
+        },
+        ..download_plan(snapshot, files)
     }
 }
 
@@ -657,21 +664,14 @@ pub fn plan_repair(snapshot: &CatalogSnapshot) -> DownloadPlan {
     let root_pack_ids = broken_pack_ids
         .chain(incomplete_language_pack_ids)
         .collect::<BTreeSet<_>>();
-    let tasks = status_files_in_snapshot(
+    download_plan(
         snapshot,
-        root_pack_ids.iter().map(String::as_str),
-        |status| status.missing_files.iter().collect(),
+        status_files_in_snapshot(
+            snapshot,
+            root_pack_ids.iter().map(String::as_str),
+            |status| status.missing_files.iter().collect(),
+        ),
     )
-    .into_iter()
-    .filter_map(|item| {
-        let pack = snapshot.catalog.pack(&item.pack_id)?;
-        Some(download_task_for(pack, &item.file))
-    })
-    .collect::<Vec<_>>();
-    DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    }
 }
 
 pub fn plan_delete_superseded_files(snapshot: &CatalogSnapshot) -> DeletePlan {
@@ -848,33 +848,31 @@ pub fn resolve_tts_voice_files_for_pack(
 }
 
 fn download_task_for(pack: &PackRecord, file: &AssetFileV2) -> DownloadTask {
+    let gzipped = file
+        .source_path
+        .as_deref()
+        .unwrap_or(file.url.as_str())
+        .ends_with(".gz");
+    let install = match &file.archive {
+        Some(archive) => TaskInstall::Zip {
+            extract_to: archive.extract_to.clone(),
+            delete_after_extract: archive.delete_after_extract,
+            marker: file.install_marker.clone(),
+        },
+        None if gzipped && matches!(&pack.kind, PackKind::Translation(_)) => TaskInstall::Gunzip,
+        None => TaskInstall::Raw,
+    };
     DownloadTask {
         pack_id: pack.id.clone(),
         install_path: file.install_path.clone(),
         url: file.url.clone(),
         size_bytes: file.size_bytes,
-        decompress: matches!(&pack.kind, PackKind::Translation(_))
-            && file
-                .source_path
-                .as_deref()
-                .unwrap_or(file.url.as_str())
-                .ends_with(".gz"),
-        archive_format: file.archive_format.clone(),
-        extract_to: file.extract_to.clone(),
-        delete_after_extract: file.delete_after_extract,
-        install_marker_path: file.install_marker_path.clone(),
-        install_marker_version: file.install_marker_version,
+        install,
     }
 }
 
-pub fn plan_language_download(
-    snapshot: &CatalogSnapshot,
-    language_code: &LanguageCode,
-) -> DownloadPlan {
-    let root_pack_ids = snapshot
-        .catalog
-        .core_pack_ids_for_language(language_code.as_str());
-    let tasks = install_files_in_snapshot(snapshot, root_pack_ids.iter().map(String::as_str))
+fn download_plan(snapshot: &CatalogSnapshot, files: Vec<MissingPackFile>) -> DownloadPlan {
+    let tasks = files
         .into_iter()
         .filter_map(|item| {
             let pack = snapshot.catalog.pack(&item.pack_id)?;
@@ -884,7 +882,121 @@ pub fn plan_language_download(
     DownloadPlan {
         total_size: tasks.iter().map(|task| task.size_bytes).sum(),
         tasks,
+        delete_after: DeletePlan::default(),
     }
+}
+
+fn installed_at(
+    checker: &impl PackInstallChecker,
+    install_path: &str,
+    marker: Option<&InstallMarker>,
+) -> bool {
+    match marker {
+        Some(marker) => checker.install_marker_exists(&marker.path, marker.version),
+        None => checker.file_exists(install_path),
+    }
+}
+
+// Plans are computed before any transfer starts, so a task can be satisfied by
+// the time it runs (another download shared the file); the downloader re-checks
+// right before fetching.
+pub fn download_task_installed(checker: &impl PackInstallChecker, task: &DownloadTask) -> bool {
+    let marker = match &task.install {
+        TaskInstall::Zip { marker, .. } => marker.as_ref(),
+        TaskInstall::Raw | TaskInstall::Gunzip => None,
+    };
+    installed_at(checker, &task.install_path, marker)
+}
+
+// Archives are built either with their install root as the top-level directory
+// or with its contents at the top level; entries are re-rooted under the
+// marker's directory so both layouts land in the same place.
+pub fn plan_zip_extraction(
+    extract_to: &str,
+    marker: Option<&InstallMarker>,
+    entry_names: &[String],
+) -> Result<ZipExtractionPlan, String> {
+    let install_root = marker
+        .and_then(|marker| std::path::Path::new(&marker.path).parent())
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().to_string());
+    let mut entries = Vec::new();
+    let mut replace_paths = BTreeSet::new();
+    for entry_name in entry_names {
+        let trimmed = entry_name.trim_start_matches('/');
+        let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
+        let parts = trimmed
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.iter().any(|part| *part == "..") {
+            return Err(format!(
+                "zip entry {entry_name} escapes the extraction root"
+            ));
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        let parts = match install_root.as_deref() {
+            Some(root) if parts[0] != root => std::iter::once(root).chain(parts).collect(),
+            _ => parts,
+        };
+        replace_paths.insert(join_install_path(extract_to, &parts[..parts.len().min(2)]));
+        entries.push(ZipEntryTarget {
+            entry_name: entry_name.clone(),
+            install_path: join_install_path(extract_to, &parts),
+            is_directory: entry_name.ends_with('/'),
+        });
+    }
+    Ok(ZipExtractionPlan {
+        entries,
+        replace_paths: replace_paths.into_iter().collect(),
+    })
+}
+
+fn join_install_path(base: &str, parts: &[&str]) -> String {
+    std::iter::once(base.trim_end_matches('/'))
+        .chain(parts.iter().copied())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub fn plan_language_download(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> DownloadPlan {
+    let root_pack_ids = snapshot
+        .catalog
+        .core_pack_ids_for_language(language_code.as_str());
+    download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, root_pack_ids.iter().map(String::as_str)),
+    )
+}
+
+// Support kinds the app needs as soon as any language is installed; installing
+// a language brings them along when they are missing.
+const CORE_SUPPORT_KINDS: [&str; 1] = ["doc_detect"];
+
+pub fn plan_language_install(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> DownloadPlan {
+    let core_pack_ids = snapshot
+        .catalog
+        .core_pack_ids_for_language(language_code.as_str());
+    let support_pack_ids = CORE_SUPPORT_KINDS
+        .iter()
+        .flat_map(|kind| snapshot.catalog.support_pack_ids_by_kind(kind));
+    let root_pack_ids = core_pack_ids
+        .into_iter()
+        .chain(support_pack_ids)
+        .collect::<BTreeSet<_>>();
+    download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, root_pack_ids.iter().map(String::as_str)),
+    )
 }
 
 pub fn plan_dictionary_download(
@@ -894,17 +1006,10 @@ pub fn plan_dictionary_download(
     let pack_id = snapshot
         .catalog
         .dictionary_pack_id_for_language(language_code.as_str())?;
-    let tasks = install_files_in_snapshot(snapshot, [pack_id.as_str()])
-        .into_iter()
-        .filter_map(|item| {
-            let pack = snapshot.catalog.pack(&item.pack_id)?;
-            Some(download_task_for(pack, &item.file))
-        })
-        .collect::<Vec<_>>();
-    Some(DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    })
+    Some(download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, [pack_id.as_str()]),
+    ))
 }
 
 pub fn installed_tts_voices_for_language(
@@ -992,17 +1097,10 @@ pub fn plan_tts_download(
             .catalog
             .default_tts_pack_id_for_language(language_code)?,
     };
-    let tasks = install_files_in_snapshot(snapshot, [selected_pack_id.as_str()])
-        .into_iter()
-        .filter_map(|item| {
-            let pack = snapshot.catalog.pack(&item.pack_id)?;
-            Some(download_task_for(pack, &item.file))
-        })
-        .collect::<Vec<_>>();
-    Some(DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    })
+    Some(download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, [selected_pack_id.as_str()]),
+    ))
 }
 
 pub fn plan_support_download_by_kind(
@@ -1013,17 +1111,10 @@ pub fn plan_support_download_by_kind(
     if pack_ids.is_empty() {
         return None;
     }
-    let tasks = install_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str))
-        .into_iter()
-        .filter_map(|item| {
-            let pack = snapshot.catalog.pack(&item.pack_id)?;
-            Some(download_task_for(pack, &item.file))
-        })
-        .collect::<Vec<_>>();
-    Some(DownloadPlan {
-        total_size: tasks.iter().map(|task| task.size_bytes).sum(),
-        tasks,
-    })
+    Some(download_plan(
+        snapshot,
+        install_files_in_snapshot(snapshot, pack_ids.iter().map(String::as_str)),
+    ))
 }
 
 fn delete_plan_for_pack_ids<'a, I>(catalog: &LanguageCatalog, pack_ids: I) -> DeletePlan
@@ -1043,9 +1134,9 @@ where
             if file_seen.insert(file.install_path.clone()) {
                 file_paths.push(file.install_path.clone());
             }
-            if file.archive_format.as_deref() == Some("zip")
-                && let Some(marker_path) = file.install_marker_path.as_deref()
-                && let Some(parent) = std::path::Path::new(marker_path).parent()
+            if file.archive.is_some()
+                && let Some(marker) = &file.install_marker
+                && let Some(parent) = std::path::Path::new(&marker.path).parent()
             {
                 let path = parent.to_string_lossy().to_string();
                 if !path.is_empty() && directory_seen.insert(path.clone()) {

@@ -118,13 +118,14 @@ pub use translator_tts::speech;
 pub use api::{DictionaryCode, LanguageCode, ScriptCode, TranslatorError, TranslatorErrorKind};
 pub use catalog::{
     CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FileRole,
-    FsPackInstallChecker, InstalledTtsPack, LanguageAvailabilityRow, LanguageCatalog,
-    LanguageOverview, OcrEngine, OcrPack, PpocrScript, TtsSpeakerEntry, TtsVoicePickerRegion,
+    FsPackInstallChecker, InstallMarker, InstalledTtsPack, LanguageAvailabilityRow,
+    LanguageCatalog, LanguageOverview, OcrEngine, OcrPack, PpocrScript, TaskInstall,
+    TtsSpeakerEntry, TtsVoicePickerRegion, ZipEntryTarget, ZipExtractionPlan,
     available_ocr_engines_for_language, installed_ocr_engines_for_language,
     installed_tts_voice_picker_regions, language_rows_in_snapshot, ocr_engine_ready,
     parse_and_validate_catalog, plan_delete_superseded_files, plan_ocr_engine_download,
     plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair, plan_translation_upgrades,
-    translation_upgrade_language_codes,
+    plan_zip_extraction, translation_upgrade_language_codes,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{

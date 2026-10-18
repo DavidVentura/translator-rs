@@ -6,9 +6,9 @@ use crate::language::Language;
 
 use super::model::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, FileRequirement, FileRole,
-    LanguageCatalog, LanguageFeature, LanguageInfo, LanguageResources, LanguageTtsRegionV2,
-    LanguageTtsV2, MigrationEntry, OcrPack, PackKind, PackRecord, PpocrScript, SupportPack,
-    TranslationPack, TtsPack, tts_pack_ids_from_config,
+    InstallMarker, LanguageCatalog, LanguageFeature, LanguageInfo, LanguageResources,
+    LanguageTtsRegionV2, LanguageTtsV2, MigrationEntry, OcrPack, PackKind, PackRecord, PpocrScript,
+    SupportPack, TranslationPack, TtsPack, ZipArchive, tts_pack_ids_from_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -229,19 +229,45 @@ impl From<CatalogSourcesWire> for CatalogSourcesV2 {
     }
 }
 
-impl From<AssetFileWire> for AssetFileV2 {
-    fn from(value: AssetFileWire) -> Self {
-        Self {
+impl TryFrom<AssetFileWire> for AssetFileV2 {
+    type Error = String;
+
+    fn try_from(value: AssetFileWire) -> Result<Self, Self::Error> {
+        let archive = match normalized(value.archive_format).as_deref() {
+            None => None,
+            Some("zip") => Some(ZipArchive {
+                extract_to: normalized(value.extract_to)
+                    .ok_or_else(|| format!("zip file {} has no extractTo", value.install_path))?,
+                delete_after_extract: value.delete_after_extract,
+            }),
+            Some(other) => {
+                return Err(format!(
+                    "unsupported archiveFormat {other} for {}",
+                    value.install_path
+                ));
+            }
+        };
+        let install_marker = match (
+            normalized(value.install_marker_path),
+            value.install_marker_version,
+        ) {
+            (None, None) => None,
+            (Some(path), Some(version)) => Some(InstallMarker { path, version }),
+            _ => {
+                return Err(format!(
+                    "install marker for {} needs both a path and a version",
+                    value.install_path
+                ));
+            }
+        };
+        Ok(Self {
             name: value.name,
             size_bytes: value.size_bytes,
             install_path: value.install_path,
             url: value.url,
-            source_path: value.source_path.filter(|value| !value.is_empty()),
-            archive_format: value.archive_format.filter(|value| !value.is_empty()),
-            extract_to: value.extract_to.filter(|value| !value.is_empty()),
-            delete_after_extract: value.delete_after_extract,
-            install_marker_path: value.install_marker_path.filter(|value| !value.is_empty()),
-            install_marker_version: value.install_marker_version,
+            source_path: normalized(value.source_path),
+            archive,
+            install_marker,
             role: FileRole::new(value.role),
             priority: value.priority,
             requirement: if value.optional {
@@ -249,8 +275,19 @@ impl From<AssetFileWire> for AssetFileV2 {
             } else {
                 FileRequirement::Required
             },
-        }
+        })
     }
+}
+
+// A file this build can't install (an archive format added by a newer catalog)
+// makes its whole pack uninstallable, so the pack is dropped like an unknown one.
+fn parse_files(files: Vec<AssetFileWire>) -> Option<Vec<AssetFileV2>> {
+    files
+        .into_iter()
+        .map(AssetFileV2::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .inspect_err(|error| log::warn!("dropping pack: {error}"))
+        .ok()
 }
 
 impl From<AssetPackMetadataWire> for AssetPackMetadataV2 {
@@ -291,7 +328,7 @@ impl AssetPackWire {
                 common,
             } => PackRecord {
                 id,
-                files: common.files.into_iter().map(Into::into).collect(),
+                files: parse_files(common.files)?,
                 depends_on: common.depends_on,
                 kind: PackKind::Translation(TranslationPack {
                     from,
@@ -309,7 +346,7 @@ impl AssetPackWire {
                 let ocr_pack = parse_ocr_pack(&engine, role.as_deref(), script.as_deref())?;
                 PackRecord {
                     id,
-                    files: common.files.into_iter().map(Into::into).collect(),
+                    files: parse_files(common.files)?,
                     depends_on: common.depends_on,
                     kind: PackKind::Ocr(ocr_pack),
                 }
@@ -328,7 +365,7 @@ impl AssetPackWire {
                 common,
             } => PackRecord {
                 id,
-                files: common.files.into_iter().map(Into::into).collect(),
+                files: parse_files(common.files)?,
                 depends_on: common.depends_on,
                 kind: PackKind::Tts(TtsPack {
                     language,
@@ -350,7 +387,7 @@ impl AssetPackWire {
                 common,
             } => PackRecord {
                 id,
-                files: common.files.into_iter().map(Into::into).collect(),
+                files: parse_files(common.files)?,
                 depends_on: common.depends_on,
                 kind: PackKind::Dictionary(DictionaryPack {
                     language: normalized(language),
@@ -367,7 +404,7 @@ impl AssetPackWire {
                 common,
             } => PackRecord {
                 id,
-                files: common.files.into_iter().map(Into::into).collect(),
+                files: parse_files(common.files)?,
                 depends_on: common.depends_on,
                 kind: PackKind::Support(SupportPack {
                     language: normalized(language),

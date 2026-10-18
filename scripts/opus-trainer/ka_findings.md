@@ -1765,3 +1765,157 @@ next lever is the streaming OpusTrainer Numbers modifier, which perturbs a
 probability of batches at read time and leaves both the corpus and its mix
 alone; ft7 and ft8 together are the shipped-adjacent result that argues for
 opening it upstream.
+
+## 35. Backward-scorer calibration: the shallow RNN cannot see what LMT gets wrong
+
+Run 2026-09-05 as the first measurement of the PIPELINE_PLAN.md boundary-2
+procedure: train ka→en backward scorers, score the 4M en→ka KD decode, judge a
+weighted sample, read the cutoff curve. Pipe run `kascorer`, flow
+`flows/backward_sweep.py`, one RTX 4090 for 84 min, $0.53. Scripts added:
+`scorer_build.py`, `backward_sweep.sh`, `scorer_sample.py`, `judge_pair.py`,
+`scorer_curve.py`. Labels and samples under `data/scorer/`.
+
+Scorer training set, `ka \t en`: the human, ui and dialogue pools (90,352 rows)
+plus every frontier set (458,020), deduplicated, valid rows and 476 judge-rejected
+tranche rows removed, eval-excluded, 548,372 total. Nested prefixes of one
+shuffle at 100k and 200k keep the same one-sixth human share, so the size sweep
+measures how much of THIS mix a scorer needs, not how much human bitext alone.
+
+| size | wall | stopped | best valid ce | AUC crawl | AUC all |
+|---|---|---|---|---|---|
+| 100k | 10.6 min | Up.5000 | 3.831 | 0.587 | 0.581 |
+| 200k | 17.3 min | Up.9000 | 3.169 | 0.611 | 0.608 |
+| 548k | 33.2 min | Up.18000 | 3.168 | 0.600 | 0.601 |
+
+Validation ce and ranking both plateau at 200k rows of this mix; 100k is
+measurably worse. Scoring 4M lines takes 5.8 min per model on the 4090 and about
+17 lines/s on 16 CPU threads.
+
+The KD draw IS register-labelled after all. `sample_mix.py` writes the draw in
+register blocks in PRECEDENCE order, verified line by line against the filtered
+pools: human 0–30,357, ui –51,406, dialogue –88,906, entity –187,287, crawl
+beyond. Corpus of origin inside crawl recovers by joining the English side to
+the OPUS zips after whitespace-collapse and NFC (98% matched).
+
+Judged rows: 1,000 uniform, 5,000 stratified by length bucket × full-scorer
+decile, 600 uniform within the four small registers. Weights are inverse
+inclusion probabilities, rescaled per stratum so pooled draws count the corpus
+once. Judge is `judge_pair.py` (luna, low effort), source and hypothesis only,
+full line. On 20 hand-verified controls it scored 16/20 at low and at medium
+effort; every miss is a context-free two-word label whose sense error it called
+style or fine. It is lenient on exactly the register the scorer is also blind to.
+
+What the judge found. 28.1% of the 4M is unusable, and 76% of that is a single
+word rendered in the wrong sense inside fluent Georgian: tap water → ground
+water, layers (hens) → geological layers, halfheartedly → partially, directed by
+→ produced by. Omission and truncation are 10%, additions 7%, garbled 3%,
+negation 2.4%, numbers 1.4%, copy-through 0.5%. The rate rises with length,
+14% at 1–3 words to 47% at 31+, as the chance of at least one wrong word does.
+Per register: crawl 28.7%, human 23.5%, dialogue 21.6%, ui 14.0%, entity 12.3%.
+Per crawl corpus: NLLB 28.1%, CCAligned 29.9%, HPLT+MultiHPLT 33.2%; the
+differences are inside the noise and NLLB is three quarters of crawl, so cutting
+by corpus buys nothing. The teacher-blind-spot section (§7) measured seven
+errors in thirty on signs by hand; this is the same error class at corpus scale.
+
+What the scorer sees. Weighted AUC 0.60 on crawl for every size: handed one bad
+crawl row and one good one, it picks the bad one 60 times in 100. By class,
+sense 0.59, omission 0.65, addition 0.65, garbled 0.64, negation 0.48, numbers
+0.59; only copy-through separates (0.90) and it is 0.5% of the bad. Synthetic
+controls on the uniform sample say the same from the other side: a wholly
+unrelated target lands below the bucket's worst-10% threshold four times in
+five, half a target missing one time in three, and English copied through on a
+1–3 word line never. Per-token normalisation averages one wrong token against
+everything that matched, and LMT's failure is one wrong token.
+
+The curve, full scorer, same drop % in every bucket:
+
+| drop % | bad removed % | good lost % |
+|---|---|---|
+| 5 | 7.8 | 4.0 |
+| 10 | 14.4 | 8.4 |
+| 20 | 25.2 | 18.1 |
+| 30 | 36.5 | 27.5 |
+
+Dropping 10% takes the corpus from 28.1% unusable to 26.7%; dropping 30% takes
+it to 25.5%. No cutoff is chosen, per the plan's rule. The ce-filter is not a
+usable instrument against this teacher in this direction, and the Uyghur verdict
+(§uig_round2_plan, "ranks register, not quality") now has a number behind it.
+
+The scorer does separate on the human, ui and dialogue blocks (AUC 0.72 / 0.87 /
+0.69), because its training set holds the human Georgian for those very English
+lines; that is reference-informed judging of 89k rows, not generalisation. Those
+89k rows should not be filtered at all: the draw discarded a human Georgian
+target and had the teacher regenerate it, and the regenerated version is wrong
+on 14–24% of them. Train on the reference column for those blocks.
+
+Bearing on the plan. The failure that decides quality here is lexical and
+per-line, it is 28% of the corpus, and no cheap ranker trained on 550k pairs can
+see it. Filtering is the wrong lever against it; the levers are the ones that
+change the labels: frontier decode of the registers that matter, native Georgian
+targets through back-translation, and the human targets where they already
+exist. A reference-free QE model as scorer is untested and would need the same
+judged sample to calibrate against; the sample is now built and can be reused
+for any scorer at the cost of one 4M scoring pass.
+
+## 36. Back-translation pilot: the teacher reads native Georgian at 18% wrong, the student at 36%
+
+Run 2026-09-05, about $1.50 of vast and ~3,700 judge calls. Purpose: put a number
+on the input-side noise a BT block for en→ka would carry, pick its decoder, and
+test whether re-sourcing the ka→en KD draw from HPLT v3 monolingual text buys
+cleaner teacher output than the mined crawl does. Files under `data/scorer/bt/`,
+labels under `data/scorer/labels/bt_*` and `kaen_kd`; flow `flows/lmt_pilot.py`
+(vLLM, LMT-60-8B greedy, ~50 lines/s on a 4090 after a 100 s load).
+
+Pilot: 1,000 native Georgian lines from the mono survey's judged samples,
+restricted to lines the survey's judge called clean and absent from the scorer's
+training data: news 300 (interpressnews, netgazeti, Leipzig newscrawl), legal 100
+(matsne), wiki 200, web 400 (HPLT v2/v3, CC-100, FineWeb-2, Leipzig web). Two
+decoders on the same lines, the shipped ka→en int8 student through slimt (15 s on
+the laptop) and the LMT-60-8B teacher. Judge `judge_pair.py --direction ka2en`.
+Control: 1,000 rows of the existing ka→en KD decode, 800 crawl + 50 per small
+register, judged the same way. HPLT v3 arm: all 663 remaining judged HPLT v3
+lines, clean and not, decoded by the teacher.
+
+| arm | n | unusable |
+|---|---|---|
+| student on native prose | 1,000 | 36.2% |
+| teacher on native prose | 1,000 | 18.3% |
+| teacher on mined crawl source (existing ka→en KD) | 800 | 21.1% |
+| teacher on HPLT v3 high-quality buckets, unfiltered | 400 | 16.0% |
+| teacher on HPLT v3 all buckets, unfiltered | 400 | 17.2% |
+| teacher on editorial news | 300 | 14.3% |
+
+Readings.
+
+The decoder decides the noise. The student is wrong on one native line in three,
+the teacher on one in five or six; they disagree on 297 of 1,000 lines and the
+student is the wrong one on 238 of those. BT is decoded with the teacher, which
+was always the plan since ka→en KD is the same decode; the pilot only prices it.
+The teacher's residual is the usual profile, 126 sense errors of 183, and 17
+number errors, which is higher than in any other arm and worth a probe.
+
+Source cleanliness moves the teacher a little, not a lot. HPLT v3 at 16-17%
+against mined crawl at 21%: about a fifth fewer unusable rows, in the direction
+the mono survey predicted (source 1.5% vs 8.5% unusable), but the teacher's own
+error rate is the floor and it sits around 14-18% on any clean prose. Within
+HPLT v3 the bucket and the survey's clean verdict barely matter (hiq clean 14.0%,
+not-clean 25.0%; all-buckets clean 17.4%, not-clean 14.9%, n 72-257). So
+re-sourcing the ka→en draw from HPLT v3 is worth doing for the Georgian side,
+which is the KD source and must be native, and it should not be expected to
+change the English side's error rate by more than a few points.
+
+Registers hold steady. News 14%, wiki 18%, web 21%, legal 21%; the crawl control
+was 21% and its dialogue block 36% (n=50). Ordinary written prose costs the
+teacher about the same everywhere; conversational text costs it more, and there
+is no native conversational Georgian to back-translate anyway.
+
+The scorer is unchanged. AUC 0.63 on student output, 0.60 on teacher output, 27
+unusable in the worst decile against a base of 18. Third setting, same verdict.
+
+Bearing on the plan. The BT block for en→ka carries roughly 18% input-side
+mismatch, almost all one wrong word, against the forward KD's 28% output-side
+mismatch. Input noise degrades the mapping; output noise is emitted at inference.
+That asymmetry is the case for the block, and its size is now known rather than
+assumed. Whether the mix of SOTA, KD and BT nets out cleaner than KD alone is a
+training question; judge the student's output on a fixed held-out thousand before
+and after, because chrF cannot see a wrong-sense word.

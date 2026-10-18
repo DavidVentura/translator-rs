@@ -119,11 +119,8 @@ pub struct AssetFileV2 {
     pub install_path: String,
     pub url: String,
     pub source_path: Option<String>,
-    pub archive_format: Option<String>,
-    pub extract_to: Option<String>,
-    pub delete_after_extract: bool,
-    pub install_marker_path: Option<String>,
-    pub install_marker_version: Option<i32>,
+    pub archive: Option<ZipArchive>,
+    pub install_marker: Option<InstallMarker>,
     pub role: FileRole,
     pub priority: i32,
     pub requirement: FileRequirement,
@@ -419,19 +416,39 @@ pub struct MigrationJob {
     pub action: MigrationAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipArchive {
+    pub extract_to: String,
+    pub delete_after_extract: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct InstallMarker {
+    pub path: String,
+    pub version: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum TaskInstall {
+    Raw,
+    Gunzip,
+    Zip {
+        extract_to: String,
+        delete_after_extract: bool,
+        marker: Option<InstallMarker>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DownloadTask {
     pub pack_id: String,
     pub install_path: String,
     pub url: String,
     pub size_bytes: u64,
-    pub decompress: bool,
-    pub archive_format: Option<String>,
-    pub extract_to: Option<String>,
-    pub delete_after_extract: bool,
-    pub install_marker_path: Option<String>,
-    pub install_marker_version: Option<i32>,
+    pub install: TaskInstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -439,6 +456,23 @@ pub struct DownloadTask {
 pub struct DownloadPlan {
     pub total_size: u64,
     pub tasks: Vec<DownloadTask>,
+    pub delete_after: DeletePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ZipExtractionPlan {
+    pub entries: Vec<ZipEntryTarget>,
+    // Cleared before unpacking so a re-extract never mixes an old tree with the new one.
+    pub replace_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ZipEntryTarget {
+    pub entry_name: String,
+    pub install_path: String,
+    pub is_directory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
