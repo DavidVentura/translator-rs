@@ -11,8 +11,29 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use translator::font_provider::NoFontProvider;
-use translator::http::{BindAddress, HttpServerConfig, OcrSettings, start};
+use translator::http::{
+    BindAddress, HttpServerConfig, OcrSettings, ServeSettings, ServerHost, start,
+};
 use translator::{BackgroundMode, FsPackInstallChecker, TranslatorSession};
+
+struct FixedHost(Arc<TranslatorSession>);
+
+impl ServerHost for FixedHost {
+    fn session(&self) -> Option<Arc<TranslatorSession>> {
+        Some(self.0.clone())
+    }
+
+    fn settings(&self) -> ServeSettings {
+        ServeSettings {
+            ocr: OcrSettings {
+                max_image_size: 1000,
+                min_confidence: 75,
+                background_mode: BackgroundMode::AutoDetect,
+            },
+            translate_pdf_images: false,
+        }
+    }
+}
 
 struct Reply {
     status: u16,
@@ -111,14 +132,8 @@ fn libretranslate_endpoints() {
             bind: BindAddress::Localhost,
             port: 0,
             output_dir: output_dir.to_string_lossy().into_owned(),
-            ocr: OcrSettings {
-                max_image_size: 1000,
-                min_confidence: 75,
-                background_mode: BackgroundMode::AutoDetect,
-            },
-            translate_pdf_images: false,
         },
-        Arc::new(move || Some(session.clone())),
+        Arc::new(FixedHost(session)),
         Arc::new(NoFontProvider),
     )
     .expect("start server");

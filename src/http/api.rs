@@ -8,7 +8,7 @@ use rouille::{Request, Response};
 use serde::{Deserialize, Serialize};
 
 use super::store::FileStore;
-use super::{HttpServerConfig, SessionSource};
+use super::{HttpServerConfig, ServerHost};
 use crate::api::ScriptedLanguage;
 use crate::catalog::language_rows_in_snapshot;
 use crate::document::{DocumentFormat, DocumentOptions, translate_document_bytes};
@@ -29,7 +29,7 @@ const AUTO_SOURCE: &str = "auto";
 
 pub struct Api {
     config: HttpServerConfig,
-    sessions: Arc<dyn SessionSource>,
+    host: Arc<dyn ServerHost>,
     fonts: Arc<dyn FontProvider + Send + Sync>,
     store: FileStore,
 }
@@ -295,13 +295,13 @@ struct FileForm {
 impl Api {
     pub fn new(
         config: HttpServerConfig,
-        sessions: Arc<dyn SessionSource>,
+        host: Arc<dyn ServerHost>,
         fonts: Arc<dyn FontProvider + Send + Sync>,
         store: FileStore,
     ) -> Self {
         Self {
             config,
-            sessions,
+            host,
             fonts,
             store,
         }
@@ -327,7 +327,7 @@ impl Api {
     }
 
     fn session(&self) -> Result<Arc<TranslatorSession>, ApiError> {
-        self.sessions
+        self.host
             .session()
             .ok_or_else(|| ApiError::internal("catalog unavailable"))
     }
@@ -481,7 +481,7 @@ impl Api {
         let image = decode_image(&form.upload.bytes)
             .map_err(|error| ApiError::bad_request(format!("could not decode image: {error}")))?;
         let (width, height) = image.dimensions();
-        let ocr = &self.config.ocr;
+        let ocr = self.host.settings().ocr;
         let prepared = session
             .translate_image_rgba(
                 image.as_raw(),
@@ -553,7 +553,7 @@ impl Api {
         let options = DocumentOptions {
             forced_source_code: from.as_ref().map(|language| language.code.as_str()),
             target_code: &to.code,
-            translate_pdf_images: self.config.translate_pdf_images,
+            translate_pdf_images: self.host.settings().translate_pdf_images,
             txt_layout: TxtLayout::Preserve,
             fonts: &*self.fonts,
         };

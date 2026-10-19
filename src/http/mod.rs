@@ -2,8 +2,8 @@
 //! engine: `POST /translate`, `POST /detect`, `GET /languages`,
 //! `POST /translate_file` + `GET /download/<id>`, and a bundled web page at
 //! `/`. Any client that already speaks LibreTranslate can point at it
-//! unchanged. Hosts own the lifecycle: they call [`start`] with a config
-//! snapshot and [`HttpServer::stop`] when the config changes or the app exits.
+//! unchanged. Hosts own the lifecycle: they call [`start`] with the listening
+//! config and [`HttpServer::stop`] when it changes or the app exits.
 
 mod api;
 mod store;
@@ -47,24 +47,22 @@ pub struct HttpServerConfig {
     pub port: u16,
     /// Where `/translate_file` outputs wait for their `/download/<id>` fetch.
     pub output_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ServeSettings {
     pub ocr: OcrSettings,
     pub translate_pdf_images: bool,
 }
 
-/// Resolves the session to serve a request with. Hosts that re-open their
-/// catalog (a new session per reload) hand out the current one per call, so
-/// the server never serves a stale availability snapshot.
-pub trait SessionSource: Send + Sync {
+/// Resolves what to serve a request with. Hosts that re-open their catalog (a
+/// new session per reload) hand out the current one per call, so the server
+/// never serves a stale availability snapshot, and users tune the OCR and
+/// document settings while the server runs without it having to restart.
+pub trait ServerHost: Send + Sync {
     fn session(&self) -> Option<Arc<TranslatorSession>>;
-}
-
-impl<F> SessionSource for F
-where
-    F: Fn() -> Option<Arc<TranslatorSession>> + Send + Sync,
-{
-    fn session(&self) -> Option<Arc<TranslatorSession>> {
-        self()
-    }
+    fn settings(&self) -> ServeSettings;
 }
 
 #[derive(Debug)]
@@ -105,13 +103,13 @@ const WORKER_THREADS: usize = 4;
 
 pub fn start(
     config: HttpServerConfig,
-    sessions: Arc<dyn SessionSource>,
+    host: Arc<dyn ServerHost>,
     fonts: Arc<dyn FontProvider + Send + Sync>,
 ) -> Result<HttpServer, StartError> {
     let addr = SocketAddr::new(config.bind.ip(), config.port);
     let store = store::FileStore::open(config.output_dir.as_ref())
         .map_err(|error| StartError(format!("cannot use output dir: {error}")))?;
-    let api = api::Api::new(config, sessions, fonts, store);
+    let api = api::Api::new(config, host, fonts, store);
     let server = rouille::Server::new(addr, move |request| api.handle(request))
         .map_err(|error| StartError(error.to_string()))?
         .pool_size(WORKER_THREADS);
