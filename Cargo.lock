@@ -2898,7 +2898,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slimt-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/slimt-sys#1cef6a655b713aef25695eba8451d10ac1c4f21a"
+source = "git+https://github.com/DavidVentura/slimt-sys#06e2c0006e71f66df99ba6409ad3f3e2bbcdcbfe"
 dependencies = [
  "cmake",
 ]
