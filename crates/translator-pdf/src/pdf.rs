@@ -4,7 +4,8 @@
 //! rendering used by the PDF smoke tests.
 
 use crate::styled::TranslatedStyledBlock;
-use mupdf::{Colorspace, Document, Error as MupdfError, Matrix};
+use mupdf::pdf::{PdfDocument, PdfWriteOptions};
+use mupdf::{Buffer, Colorspace, Document, Error as MupdfError, Matrix};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageDims {
@@ -70,6 +71,28 @@ impl std::fmt::Display for PdfError {
 }
 
 impl std::error::Error for PdfError {}
+
+/// The input PDF as re-serialized by MuPDF. MuPDF rebuilds a broken
+/// cross-reference table while lopdf rejects the whole file, so every pass
+/// reads this rewrite instead of the original bytes.
+pub struct NormalizedPdf {
+    buffer: Buffer,
+}
+
+impl NormalizedPdf {
+    pub fn new(pdf_bytes: Vec<u8>) -> Result<Self, PdfError> {
+        let document = PdfDocument::from_bytes(&pdf_bytes)?;
+        // MuPDF keeps its own copy of the input, so releasing ours before
+        // writing holds at most two copies of a large book in memory.
+        drop(pdf_bytes);
+        let buffer = document.write_with_options(PdfWriteOptions::default())?;
+        Ok(Self { buffer })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buffer.as_slice()
+    }
+}
 
 /// Renders every page of `pdf_bytes` into a square `bitmap_size × bitmap_size`
 /// RGBA letterboxed bitmap for diagnostics and smoke-test dumps.
@@ -184,5 +207,75 @@ mod tests {
         );
         assert!(t.pad_x.abs() < 0.5);
         assert!(t.pad_y > 0.0);
+    }
+
+    fn one_page_pdf(text: &str) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Object, Stream, dictionary};
+
+        let mut doc = lopdf::Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                Operation::new("Td", vec![72.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn break_startxref(pdf: &[u8]) -> Vec<u8> {
+        let at = pdf
+            .windows(b"startxref".len())
+            .rposition(|window| window == b"startxref")
+            .unwrap();
+        let mut broken = pdf[..at].to_vec();
+        broken.extend_from_slice(b"startxref\n17\n%%EOF\n");
+        broken
+    }
+
+    #[test]
+    fn normalized_pdf_repairs_a_cross_reference_table_lopdf_rejects() {
+        let broken = break_startxref(&one_page_pdf("Hello world"));
+        assert!(lopdf::Document::load_mem(&broken).is_err());
+
+        let normalized = NormalizedPdf::new(broken).unwrap();
+
+        let reloaded = lopdf::Document::load_mem(normalized.as_bytes()).unwrap();
+        assert_eq!(reloaded.get_pages().len(), 1);
+        crate::pdf_write::write_translated_pdf(
+            normalized.as_bytes(),
+            &[],
+            &translator_render::font_provider::NoFontProvider,
+        )
+        .unwrap();
     }
 }

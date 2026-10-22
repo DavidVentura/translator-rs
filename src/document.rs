@@ -129,7 +129,7 @@ fn installed_languages(session: &TranslatorSession) -> Vec<ScriptedLanguage> {
 pub fn translate_document_bytes(
     session: &TranslatorSession,
     format: DocumentFormat,
-    input_bytes: &[u8],
+    input_bytes: Vec<u8>,
     options: &DocumentOptions<'_>,
     on_progress: &(dyn Fn(DocumentProgress) + Sync),
     is_cancelled: &(dyn Fn() -> bool + Send + Sync),
@@ -171,7 +171,7 @@ pub fn translate_document_bytes(
             let source_code = options.forced_source_code.ok_or_else(|| {
                 DocumentError::Other("source language is required for text documents".to_string())
             })?;
-            let text = String::from_utf8(input_bytes.to_vec()).map_err(|error| {
+            let text = String::from_utf8(input_bytes).map_err(|error| {
                 DocumentError::Other(format!("text document is not UTF-8: {error}"))
             })?;
             crate::txt::translate_txt_with_progress(
@@ -193,7 +193,7 @@ pub fn translate_document_bytes(
         #[cfg(feature = "odt")]
         DocumentFormat::Odt => crate::odt::translate_odt_with_progress(
             session,
-            input_bytes,
+            &input_bytes,
             options.forced_source_code,
             target_code,
             &available,
@@ -206,7 +206,7 @@ pub fn translate_document_bytes(
         #[cfg(feature = "epub")]
         DocumentFormat::Epub => crate::epub::translate_epub_with_progress(
             session,
-            input_bytes,
+            &input_bytes,
             options.forced_source_code,
             target_code,
             &available,
@@ -252,7 +252,7 @@ pub fn translate_document_path(
     let output_bytes = translate_document_bytes(
         session,
         format,
-        &input_bytes,
+        input_bytes,
         options,
         on_progress,
         is_cancelled,
@@ -281,7 +281,7 @@ pub fn translate_document_path(
 #[allow(clippy::too_many_arguments)]
 fn translate_pdf(
     session: &TranslatorSession,
-    input_bytes: &[u8],
+    input_bytes: Vec<u8>,
     target: &ScriptedLanguage,
     available: &[ScriptedLanguage],
     options: &DocumentOptions<'_>,
@@ -289,6 +289,9 @@ fn translate_pdf(
     on_progress: &(dyn Fn(DocumentProgress) + Sync),
     report_text: &(dyn Fn(f32) + Sync),
 ) -> Result<Vec<u8>, DocumentError> {
+    let normalized = crate::pdf::NormalizedPdf::new(input_bytes)
+        .map_err(|error| DocumentError::Other(format!("failed to open PDF: {error}")))?;
+    let input_bytes = normalized.as_bytes();
     let source_code = options.forced_source_code;
     let fonts = options.fonts;
     // Image passes OCR the page, which needs a known source language; without

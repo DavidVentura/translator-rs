@@ -440,7 +440,7 @@ impl Api {
                 let format = DocumentFormat::from_extension(&extension).ok_or_else(|| {
                     ApiError::bad_request(format!("unsupported file type '.{extension}'"))
                 })?;
-                let bytes = self.translate_document(&session, &languages, &form, format, &to)?;
+                let bytes = self.translate_document(&session, &languages, form, format, &to)?;
                 let mime = document_mime(format);
                 self.store.put(
                     &bytes,
@@ -533,7 +533,7 @@ impl Api {
         &self,
         session: &TranslatorSession,
         languages: &Languages,
-        form: &FileForm,
+        form: FileForm,
         format: DocumentFormat,
         to: &Language,
     ) -> Result<Vec<u8>, ApiError> {
@@ -560,7 +560,7 @@ impl Api {
         translate_document_bytes(
             session,
             format,
-            &form.upload.bytes,
+            form.upload.bytes,
             &options,
             &|_| {},
             &|| false,
