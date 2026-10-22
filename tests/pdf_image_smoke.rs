@@ -73,6 +73,7 @@ fn translates_images_in_pdf() {
     let xobject_output = translate_pdf_images_in_place(
         &pdf_bytes,
         &session,
+        1500,
         &source_lang,
         &target_lang,
         &provider,
@@ -95,6 +96,7 @@ fn translates_images_in_pdf() {
     let after_pages = translate_pdf_pages_as_raster_in_place(
         &xobject_output.bytes,
         &session,
+        1500,
         &source_lang,
         &target_lang,
         &provider,

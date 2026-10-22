@@ -11,7 +11,7 @@ use super::store::FileStore;
 use super::{HttpServerConfig, ServerHost};
 use crate::api::ScriptedLanguage;
 use crate::catalog::language_rows_in_snapshot;
-use crate::document::{DocumentFormat, DocumentOptions, translate_document_bytes};
+use crate::document::{DocumentFormat, DocumentOptions, PdfImages, translate_document_bytes};
 use crate::font_provider::FontProvider;
 use crate::language::Language;
 use crate::language_detect::detect_language_robust_code;
@@ -550,10 +550,18 @@ impl Api {
         if let Some(from) = &from {
             languages.require_pair(from, to)?;
         }
+        let settings = self.host.settings();
+        let pdf_images = if settings.translate_pdf_images {
+            PdfImages::Translate {
+                max_image_size: settings.ocr.max_image_size,
+            }
+        } else {
+            PdfImages::Skip
+        };
         let options = DocumentOptions {
             forced_source_code: from.as_ref().map(|language| language.code.as_str()),
             target_code: &to.code,
-            translate_pdf_images: self.host.settings().translate_pdf_images,
+            pdf_images,
             txt_layout: TxtLayout::Preserve,
             fonts: &*self.fonts,
         };

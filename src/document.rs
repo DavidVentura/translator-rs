@@ -107,12 +107,23 @@ impl fmt::Display for DocumentError {
 
 impl std::error::Error for DocumentError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfImages {
+    Skip,
+    /// `max_image_size` bounds the OCR detector input to `max_image_size²`
+    /// pixels, the same budget still images get; large figures otherwise run
+    /// detection at full resolution and exhaust memory.
+    Translate {
+        max_image_size: u32,
+    },
+}
+
 pub struct DocumentOptions<'a> {
     /// `None` lets odt/epub/pdf detect the source per fragment; txt has no
     /// structure to detect over and requires it.
     pub forced_source_code: Option<&'a str>,
     pub target_code: &'a str,
-    pub translate_pdf_images: bool,
+    pub pdf_images: PdfImages,
     pub txt_layout: TxtLayout,
     pub fonts: &'a (dyn FontProvider + Send + Sync),
 }
@@ -296,10 +307,15 @@ fn translate_pdf(
     let fonts = options.fonts;
     // Image passes OCR the page, which needs a known source language; without
     // one only the text pass runs.
-    let image_source = source_code.filter(|_| options.translate_pdf_images);
+    let image_pass = match options.pdf_images {
+        PdfImages::Skip => None,
+        PdfImages::Translate { max_image_size } => {
+            source_code.map(|source_code| (source_code, max_image_size))
+        }
+    };
 
     #[cfg(feature = "pdf-image-translate")]
-    let overlay_pages: HashSet<usize> = if image_source.is_some() {
+    let overlay_pages: HashSet<usize> = if image_pass.is_some() {
         crate::pdf_image_translate::log_page_inventory(input_bytes);
         let pages = crate::pdf_image_translate::pages_without_extractable_text(input_bytes);
         if let Some(inv) = crate::pdf_image_translate::pdf_translation_inventory(input_bytes) {
@@ -340,12 +356,12 @@ fn translate_pdf(
 
     #[cfg(not(feature = "pdf-image-translate"))]
     {
-        let _ = (image_source, is_cancelled);
+        let _ = (image_pass, is_cancelled);
         Ok(after_text)
     }
     #[cfg(feature = "pdf-image-translate")]
     {
-        let Some(source_code) = image_source else {
+        let Some((source_code, max_image_size)) = image_pass else {
             return Ok(after_text);
         };
         let xobject_progress = |current: usize, total: usize| {
@@ -357,6 +373,7 @@ fn translate_pdf(
         let xobject_output = crate::pdf_image_translate::translate_pdf_images_in_place(
             &after_text,
             session,
+            max_image_size,
             source_code,
             target.as_str(),
             fonts,
@@ -386,6 +403,7 @@ fn translate_pdf(
         let final_bytes = crate::pdf_image_translate::translate_pdf_pages_as_raster_in_place(
             &xobject_output.bytes,
             session,
+            max_image_size,
             source_code,
             target,
             fonts,
