@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use piper_rs::{
-    Backend, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroMnnModel, MmsModel,
-    PiperModel, SherpaVitsModel,
+    Backend, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroLanguage, KokoroMnnModel,
+    MmsModel, PiperModel, SherpaVitsModel,
 };
 use serde::Deserialize;
-use translator::tts::{PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks};
+use translator::tts::{
+    BoundaryPauses, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks,
+};
 
 const DEFAULT_INDEX_PATH: &str = "~/AndroidStudioProjects/bucket/index_v7.json";
 const DEFAULT_OUTPUT_DIR: &str = "samples";
@@ -44,6 +46,8 @@ struct Pack {
     engine: Option<String>,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    locale: Option<String>,
     #[serde(default)]
     voice: Option<String>,
     #[serde(default)]
@@ -457,13 +461,14 @@ fn synthesize_pack_sample(
 fn plan_for_text<P>(
     engine: &str,
     pack_key: &str,
+    pauses: BoundaryPauses,
     text: &str,
     mut phonemize_fn: P,
 ) -> Result<Vec<SpeechChunk>, String>
 where
     P: FnMut(&str) -> Result<String, String>,
 {
-    plan_speech_chunks(text, |chunk_text| {
+    plan_speech_chunks(text, pauses, |chunk_text| {
         let phonemes = phonemize_fn(chunk_text)?;
         Ok(vec![PhonemeChunk {
             content: phonemes,
@@ -518,7 +523,7 @@ fn synthesize_piper(
         .transpose()?
         .flatten();
 
-    let plan = plan_for_text("Piper", pack_key, text, |t| {
+    let plan = plan_for_text("Piper", pack_key, BoundaryPauses::NONE, text, |t| {
         model
             .phonemize(t)
             .map_err(|err| format!("Failed to phonemize Piper voice `{pack_key}`: {err}"))
@@ -600,7 +605,7 @@ fn synthesize_mimic3(
         .transpose()?
         .flatten();
 
-    let plan = plan_for_text("Mimic3", pack_key, text, |t| {
+    let plan = plan_for_text("Mimic3", pack_key, BoundaryPauses::NONE, text, |t| {
         model
             .phonemize(t)
             .map_err(|err| format!("Failed to phonemize Mimic3 voice `{pack_key}`: {err}"))
@@ -637,7 +642,7 @@ fn synthesize_mms(
     let mut model = MmsModel::new(&model_path, &tokens_path, language, &Backend::Cpu)
         .map_err(|err| format!("Failed to load MMS model `{pack_key}`: {err}"))?;
 
-    let plan = plan_for_text("MMS", pack_key, text, |t| {
+    let plan = plan_for_text("MMS", pack_key, BoundaryPauses::NONE, text, |t| {
         model
             .phonemize(t)
             .map_err(|err| format!("Failed to phonemize MMS voice `{pack_key}`: {err}"))
@@ -679,7 +684,7 @@ fn synthesize_coqui(
         .transpose()?
         .flatten();
 
-    let plan = plan_for_text("Coqui VITS", pack_key, text, |t| {
+    let plan = plan_for_text("Coqui VITS", pack_key, BoundaryPauses::NONE, text, |t| {
         model
             .phonemize(t)
             .map_err(|err| format!("Failed to phonemize Coqui VITS voice `{pack_key}`: {err}"))
@@ -711,7 +716,7 @@ fn synthesize_sherpa(
     let mut model = SherpaVitsModel::new(&model_path, &config_path, &Backend::Cpu)
         .map_err(|err| format!("Failed to load Sherpa VITS model `{pack_key}`: {err}"))?;
 
-    let plan = plan_for_text("Sherpa VITS", pack_key, text, |t| {
+    let plan = plan_for_text("Sherpa VITS", pack_key, BoundaryPauses::NONE, text, |t| {
         model
             .phonemize(t)
             .map_err(|err| format!("Failed to phonemize Sherpa VITS voice `{pack_key}`: {err}"))
@@ -740,10 +745,12 @@ fn synthesize_kokoro_mnn(
     let voices_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
         file.name == "voices-v1.0.bin"
     })?;
-    let language = pack
-        .language
+    let locale = pack
+        .locale
         .as_deref()
-        .ok_or_else(|| format!("Pack `{pack_key}` is missing `language`"))?;
+        .ok_or_else(|| format!("Pack `{pack_key}` is missing `locale`"))?;
+    let language =
+        KokoroLanguage::from_locale(locale).map_err(|err| format!("Pack `{pack_key}`: {err}"))?;
 
     let mut model = KokoroMnnModel::new(&model_path, &voices_path, language)
         .map_err(|err| format!("Failed to load Kokoro model `{pack_key}`: {err}"))?;
@@ -756,7 +763,7 @@ fn synthesize_kokoro_mnn(
         .transpose()?
         .flatten();
 
-    let plan = plan_for_text("Kokoro", pack_key, text, |t| {
+    let plan = plan_for_text("Kokoro", pack_key, BoundaryPauses::KOKORO, text, |t| {
         model
             .phonemize(t)
             .map_err(|err| format!("Failed to phonemize Kokoro voice `{pack_key}`: {err}"))
@@ -775,11 +782,11 @@ fn synthesize_kokoro_mnn(
 fn load_kokoro_language_support(
     model: &mut KokoroMnnModel,
     pack_key: &str,
-    language: &str,
+    language: KokoroLanguage,
     catalog: &Catalog,
     bucket_dir: &Path,
 ) -> Result<(), String> {
-    if language == "ja" {
+    if language == KokoroLanguage::Japanese {
         let mucab_path = find_language_support_file(catalog, bucket_dir, "ja", "mucab", "mucab.bin")
             .ok_or_else(|| format!("Japanese Kokoro voice `{pack_key}` requires `mucab.bin`, but no `support`/`mucab` pack was found in the index"))?;
         let mucab_str = mucab_path.to_str().ok_or_else(|| {

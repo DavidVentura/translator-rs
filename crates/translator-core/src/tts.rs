@@ -56,19 +56,52 @@ pub enum UrlsAndHashtags {
     Skip,
 }
 
-const CLAUSE_PAUSE_MS: i32 = 0;
-const SENTENCE_PAUSE_MS: i32 = 0;
-const PARAGRAPH_PAUSE_MS: i32 = 0;
+/// Silence inserted after each kind of break between synthesized chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryPauses {
+    pub clause_ms: i32,
+    pub sentence_ms: i32,
+    pub paragraph_ms: i32,
+}
+
+impl BoundaryPauses {
+    /// For engines whose audio already ends in a natural pause.
+    pub const NONE: Self = Self {
+        clause_ms: 0,
+        sentence_ms: 0,
+        paragraph_ms: 0,
+    };
+
+    /// Kokoro's output is trimmed of silence, so the pauses kokoro-onnx puts
+    /// back after clauses and sentences have to come from the planner.
+    pub const KOKORO: Self = Self {
+        clause_ms: 100,
+        sentence_ms: 250,
+        paragraph_ms: 250,
+    };
+
+    pub fn for_engine(engine: &str) -> Self {
+        match engine {
+            "kokoro_mnn" => Self::KOKORO,
+            _ => Self::NONE,
+        }
+    }
+}
+
 const MIN_PAUSE_SPLIT_CHARS: usize = 12;
 const MAX_DIRECT_PHONEME_CHARS: usize = 100;
 const SENTENCE_BOUNDARY_CHARS: [char; 6] = ['.', '?', '!', '。', '？', '！'];
 const CLAUSE_PAUSE_CHARS: [char; 8] = [',', ';', ':', '、', '，', '；', '：', '،'];
 
-pub fn plan_speech_chunks<F>(text: &str, mut phonemize_text: F) -> Result<Vec<SpeechChunk>, String>
+pub fn plan_speech_chunks<F>(
+    text: &str,
+    pauses: BoundaryPauses,
+    mut phonemize_text: F,
+) -> Result<Vec<SpeechChunk>, String>
 where
     F: FnMut(&str) -> Result<Vec<PhonemeChunk>, String>,
 {
-    let mut chunks = plan_speech_chunks_internal(text, &mut phonemize_text)?;
+    let mut chunks = plan_speech_chunks_internal(text, pauses, &mut phonemize_text)?;
     if let Some(last_chunk) = chunks.last_mut() {
         last_chunk.pause_after_ms = None;
     }
@@ -77,6 +110,7 @@ where
 
 fn plan_speech_chunks_internal<F>(
     text: &str,
+    pauses: BoundaryPauses,
     phonemize_text: &mut F,
 ) -> Result<Vec<SpeechChunk>, String>
 where
@@ -86,9 +120,9 @@ where
     if source_chunks.len() > 1 {
         let mut requests = Vec::new();
         for (source_chunk, boundary) in source_chunks {
-            let mut recursive = plan_speech_chunks_internal(&source_chunk, phonemize_text)?;
+            let mut recursive = plan_speech_chunks_internal(&source_chunk, pauses, phonemize_text)?;
             if let Some(last) = recursive.last_mut() {
-                last.pause_after_ms = boundary_pause_ms(boundary);
+                last.pause_after_ms = boundary_pause_ms(boundary, pauses);
             }
             requests.extend(recursive);
         }
@@ -109,13 +143,13 @@ where
             .map(|chunk| SpeechChunk {
                 content: chunk.content,
                 is_phonemes: true,
-                pause_after_ms: boundary_pause_ms(chunk.boundary_after),
+                pause_after_ms: boundary_pause_ms(chunk.boundary_after, pauses),
             })
             .collect());
     }
 
     if let Some(split_requests) =
-        build_split_chunk_requests(text, &phoneme_chunks[0], phonemize_text)?
+        build_split_chunk_requests(text, &phoneme_chunks[0], pauses, phonemize_text)?
     {
         return Ok(split_requests);
     }
@@ -130,6 +164,7 @@ where
 fn build_split_chunk_requests<F>(
     source_chunk: &str,
     phoneme_chunk: &PhonemeChunk,
+    pauses: BoundaryPauses,
     phonemize_text: &mut F,
 ) -> Result<Option<Vec<SpeechChunk>>, String>
 where
@@ -142,7 +177,7 @@ where
     let Some((first, second)) = split_at_best_pause(source_chunk) else {
         return Ok(None);
     };
-    let remaining_requests = plan_speech_chunks_internal(&second, phonemize_text)?;
+    let remaining_requests = plan_speech_chunks_internal(&second, pauses, phonemize_text)?;
     if remaining_requests.is_empty() {
         return Ok(None);
     }
@@ -151,7 +186,7 @@ where
     requests.push(SpeechChunk {
         content: first,
         is_phonemes: false,
-        pause_after_ms: Some(CLAUSE_PAUSE_MS),
+        pause_after_ms: Some(pauses.clause_ms),
     });
     requests.extend(remaining_requests);
     Ok(Some(requests))
@@ -294,11 +329,11 @@ fn is_sentence_boundary_char(ch: char) -> bool {
     SENTENCE_BOUNDARY_CHARS.contains(&ch)
 }
 
-fn boundary_pause_ms(boundary: SpeechChunkBoundary) -> Option<i32> {
+fn boundary_pause_ms(boundary: SpeechChunkBoundary, pauses: BoundaryPauses) -> Option<i32> {
     match boundary {
         SpeechChunkBoundary::None => None,
-        SpeechChunkBoundary::Sentence => Some(SENTENCE_PAUSE_MS),
-        SpeechChunkBoundary::Paragraph => Some(PARAGRAPH_PAUSE_MS),
+        SpeechChunkBoundary::Sentence => Some(pauses.sentence_ms),
+        SpeechChunkBoundary::Paragraph => Some(pauses.paragraph_ms),
     }
 }
 
@@ -306,9 +341,15 @@ fn boundary_pause_ms(boundary: SpeechChunkBoundary) -> Option<i32> {
 mod tests {
     use super::*;
 
+    const PAUSES: BoundaryPauses = BoundaryPauses {
+        clause_ms: 1,
+        sentence_ms: 2,
+        paragraph_ms: 3,
+    };
+
     #[test]
     fn splits_sentences_and_clears_final_pause() {
-        let chunks = plan_speech_chunks("Hello. World!", |_| {
+        let chunks = plan_speech_chunks("Hello. World!", PAUSES, |_| {
             Ok(vec![PhonemeChunk {
                 content: "abc".to_owned(),
                 boundary_after: SpeechChunkBoundary::Paragraph,
@@ -318,14 +359,14 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].content, "Hello.");
-        assert_eq!(chunks[0].pause_after_ms, Some(SENTENCE_PAUSE_MS));
+        assert_eq!(chunks[0].pause_after_ms, Some(PAUSES.sentence_ms));
         assert_eq!(chunks[1].content, "World!");
         assert_eq!(chunks[1].pause_after_ms, None);
     }
 
     #[test]
     fn paragraphs_use_paragraph_pause() {
-        let chunks = plan_speech_chunks("Hello.\n\nWorld!", |_| {
+        let chunks = plan_speech_chunks("Hello.\n\nWorld!", PAUSES, |_| {
             Ok(vec![PhonemeChunk {
                 content: "abc".to_owned(),
                 boundary_after: SpeechChunkBoundary::Paragraph,
@@ -334,13 +375,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].pause_after_ms, Some(PARAGRAPH_PAUSE_MS));
+        assert_eq!(chunks[0].pause_after_ms, Some(PAUSES.paragraph_ms));
         assert_eq!(chunks[1].pause_after_ms, None);
     }
 
     #[test]
     fn forwards_multi_chunk_phonemizer_boundaries() {
-        let chunks = plan_speech_chunks("Hello world", |_| {
+        let chunks = plan_speech_chunks("Hello world", PAUSES, |_| {
             Ok(vec![
                 PhonemeChunk {
                     content: "a".to_owned(),
@@ -356,14 +397,14 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert!(chunks.iter().all(|chunk| chunk.is_phonemes));
-        assert_eq!(chunks[0].pause_after_ms, Some(SENTENCE_PAUSE_MS));
+        assert_eq!(chunks[0].pause_after_ms, Some(PAUSES.sentence_ms));
         assert_eq!(chunks[1].pause_after_ms, None);
     }
 
     #[test]
     fn long_phoneme_chunk_splits_at_clause_pause() {
         let text = "This is a long clause, and this is the rest of the sentence for splitting";
-        let chunks = plan_speech_chunks(text, |_| {
+        let chunks = plan_speech_chunks(text, PAUSES, |_| {
             Ok(vec![PhonemeChunk {
                 content: "x".repeat(MAX_DIRECT_PHONEME_CHARS + 1),
                 boundary_after: SpeechChunkBoundary::Paragraph,
@@ -373,7 +414,7 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert!(!chunks[0].is_phonemes);
-        assert_eq!(chunks[0].pause_after_ms, Some(CLAUSE_PAUSE_MS));
+        assert_eq!(chunks[0].pause_after_ms, Some(PAUSES.clause_ms));
         assert_eq!(chunks[1].pause_after_ms, None);
     }
 }

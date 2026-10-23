@@ -517,6 +517,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,7 +577,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -681,13 +687,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#764f7452a7e68d730c0aa32ce8b958dc639683e0"
+source = "git+https://github.com/DavidVentura/piper-rs#4141cf0f5ee7ea30f7bd22bc4f52b6087494a7d1"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -695,7 +701,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#764f7452a7e68d730c0aa32ce8b958dc639683e0"
+source = "git+https://github.com/DavidVentura/piper-rs#4141cf0f5ee7ea30f7bd22bc4f52b6087494a7d1"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -1034,6 +1040,17 @@ dependencies = [
  "slotmap",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1796,7 +1813,7 @@ dependencies = [
 [[package]]
 name = "mnn-sys"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/mnn-sys#e2ad1f3b62c042ee8c53f6faa331b2ac3f1cef12"
+source = "git+https://github.com/DavidVentura/mnn-sys#9c0d4527d5755de37affc5dd1517cf10073844ad"
 dependencies = [
  "bindgen 0.69.5",
  "cc",
@@ -1817,7 +1834,7 @@ dependencies = [
 [[package]]
 name = "mucab"
 version = "0.1.0"
-source = "git+https://github.com/DavidVentura/mucab#d65aafbb0c0b83c7aa58eb4e1e3c9f54c05bd48f"
+source = "git+https://github.com/DavidVentura/mucab#fa6e863562bb8b7cf77d5a4156d42e86bd728f62"
 dependencies = [
  "encoding_rs",
  "glob",
@@ -2251,15 +2268,17 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#764f7452a7e68d730c0aa32ce8b958dc639683e0"
+source = "git+https://github.com/DavidVentura/piper-rs#4141cf0f5ee7ea30f7bd22bc4f52b6087494a7d1"
 dependencies = [
  "espeak-rs",
  "fst",
+ "half",
  "log",
  "mnn-sys",
  "mucab",
  "ndarray",
  "ndarray-npy",
+ "py_literal",
  "rustfst",
  "serde",
  "serde_json",
@@ -2697,7 +2716,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3034,7 +3053,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3943,7 +3962,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -897,6 +897,8 @@ pub fn resolve_tts_voice_files_for_pack(
         aux_install_path: aux_asset.install_path.clone(),
         vocoder_install_path: vocoder_asset.map(|file| file.install_path.clone()),
         language_code: language_code.as_str().to_string(),
+        locale: tts.locale.clone(),
+        voice: tts.voice.clone(),
         speaker_id: tts.default_speaker_id,
     })
 }

@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use piper_rs::{
-    Backend, BoundaryAfter, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroMnnModel,
-    MmsModel, PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
+    Backend, BoundaryAfter, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroLanguage,
+    KokoroMnnModel, MmsModel, PhonemeChunk as PiperPhonemeChunk, PiperModel, SherpaVitsModel,
 };
 use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
 use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
 use translator_core::script::Script;
 use translator_core::tts::{
-    PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption, UrlsAndHashtags,
-    plan_speech_chunks,
+    BoundaryPauses, PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption,
+    UrlsAndHashtags, plan_speech_chunks,
 };
 
 fn log_debug(message: impl AsRef<str>) {
@@ -70,6 +70,8 @@ struct SpeechModelPaths {
     /// Second network, for engines that split the acoustic model from the vocoder.
     vocoder: Option<String>,
     language_code: String,
+    locale: Option<String>,
+    voice: Option<String>,
     support_data_root: Option<String>,
 }
 
@@ -116,28 +118,6 @@ fn summarize_phoneme_chunk_sizes(chunks: &[PiperPhonemeChunk]) -> String {
     }
 }
 
-fn normalized_language_family(language_code: &str) -> &str {
-    language_code
-        .split(['-', '_'])
-        .next()
-        .unwrap_or(language_code)
-}
-
-fn kokoro_voice_prefixes(language_code: &str) -> &'static [&'static str] {
-    match normalized_language_family(language_code) {
-        "en" => &["a", "b"],
-        "es" => &["e"],
-        "fr" => &["f"],
-        "hi" => &["h"],
-        "it" => &["i"],
-        "ja" => &["j"],
-        "ko" => &["j"],
-        "pt" => &["p"],
-        "zh" => &["z"],
-        _ => &[],
-    }
-}
-
 fn available_voices(model: &SpeechModel) -> Vec<(String, i64)> {
     let mut voices = match model {
         SpeechModel::Piper(model) => model
@@ -149,15 +129,21 @@ fn available_voices(model: &SpeechModel) -> Vec<(String, i64)> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
-        SpeechModel::KokoroMnn(model) => model
-            .voices()
-            .map(|voices| {
-                voices
-                    .iter()
-                    .map(|(name, id)| (name.clone(), *id))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
+        // One voices file holds every Kokoro language; a pack only offers the
+        // voices trained on its own.
+        SpeechModel::KokoroMnn(model) => {
+            let prefix = model.language().voice_prefix();
+            model
+                .voices()
+                .map(|voices| {
+                    voices
+                        .iter()
+                        .filter(|(name, _)| name.starts_with(prefix))
+                        .map(|(name, id)| (name.clone(), *id))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
         SpeechModel::Mms(model) => model
             .voices()
             .map(|voices| {
@@ -243,57 +229,39 @@ fn format_voice_display_name(name: &str) -> String {
         .join(" ")
 }
 
-fn visible_voices(
-    engine: &str,
-    language_code: &str,
-    voices: &[(String, i64)],
-) -> Vec<TtsVoiceOption> {
-    let filtered = if engine == "kokoro" || engine == "kokoro_mnn" {
-        let prefixes = kokoro_voice_prefixes(language_code);
-        let matching = voices
-            .iter()
-            .filter(|(name, _)| prefixes.iter().any(|prefix| name.starts_with(prefix)))
-            .cloned()
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            voices.to_vec()
-        } else {
-            matching
-        }
-    } else {
-        voices.to_vec()
-    };
-
-    filtered
-        .into_iter()
+fn visible_voices(voices: &[(String, i64)]) -> Vec<TtsVoiceOption> {
+    voices
+        .iter()
         .map(|(name, speaker_id)| TtsVoiceOption {
-            display_name: format_voice_display_name(&name),
-            name,
-            speaker_id,
+            display_name: format_voice_display_name(name),
+            name: name.clone(),
+            speaker_id: *speaker_id,
         })
         .collect()
 }
 
+/// Kokoro packs name their default voice; every other engine's default comes
+/// from the pack's speaker id.
 fn select_default_voice(
-    engine: &str,
-    language_code: &str,
+    model: &SpeechModel,
+    paths: &SpeechModelPaths,
     voices: &[(String, i64)],
-) -> Option<(String, i64)> {
-    if voices.is_empty() {
-        return None;
-    }
-
-    if engine != "kokoro" && engine != "kokoro_mnn" {
-        return None;
-    }
-
-    for prefix in kokoro_voice_prefixes(language_code) {
-        if let Some((name, id)) = voices.iter().find(|(name, _)| name.starts_with(prefix)) {
-            return Some((name.clone(), *id));
-        }
-    }
-
-    Some(voices[0].clone())
+) -> Result<Option<(String, i64)>, String> {
+    let SpeechModel::KokoroMnn(_) = model else {
+        return Ok(None);
+    };
+    let voice = paths
+        .voice
+        .as_deref()
+        .ok_or_else(|| "Kokoro voice pack does not name its voice".to_string())?;
+    voices
+        .iter()
+        .find(|(name, _)| name == voice)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| {
+            format!("Kokoro voice `{voice}` is not in the voices file for this language")
+        })
 }
 
 fn resolve_requested_voice(
@@ -389,6 +357,8 @@ fn resolve_speech_assets_for_pack(
             aux: aux_path,
             vocoder,
             language_code: files.language_code,
+            locale: files.locale,
+            voice: files.voice,
             support_data_root,
         },
         script: snapshot.catalog.script_for(language_code)?,
@@ -515,10 +485,15 @@ fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
 
     match engine.as_str() {
         "kokoro_mnn" => {
+            let locale = paths
+                .locale
+                .as_deref()
+                .ok_or_else(|| "Kokoro voice pack has no locale".to_string())?;
+            let language = KokoroLanguage::from_locale(locale).map_err(|err| format!("{err}"))?;
             let mut model =
-                KokoroMnnModel::new(Path::new(model_path), Path::new(aux_path), language_code)
+                KokoroMnnModel::new(Path::new(model_path), Path::new(aux_path), language)
                     .map_err(|err| format!("Failed to load Kokoro MNN voice: {err}"))?;
-            if language_code == "ja" {
+            if language == KokoroLanguage::Japanese {
                 let dict_path = japanese_dict_path(paths.support_root())?;
                 model
                     .load_japanese_dict(dict_path.to_string_lossy().as_ref())
@@ -614,7 +589,7 @@ fn with_cached_model<T>(
             model_load_started_at.elapsed().as_millis()
         );
         let voices = available_voices(&model);
-        let default_voice = select_default_voice(engine, language_code, &voices);
+        let default_voice = select_default_voice(&model, paths, &voices)?;
         if voices.is_empty() {
             eprintln!(
                 "tts.model: voices.loaded engine={} language={} count=0",
@@ -916,11 +891,7 @@ fn list_voices(
     configure_support_data_root(paths.support_data_root.as_deref());
 
     with_cached_model(cache, paths, |cached_model| {
-        Ok(visible_voices(
-            &cached_model.paths.engine,
-            &cached_model.paths.language_code,
-            &cached_model.voices,
-        ))
+        Ok(visible_voices(&cached_model.voices))
     })
 }
 
@@ -993,10 +964,14 @@ fn plan_speech_chunks_for_text(
         UrlsAndHashtags::Skip => Cow::Owned(strip_urls_and_hashtags(text)),
     };
     let text = romanize_foreign_runs_for_voice(&filtered, script);
-    plan_speech_chunks(&text, |chunk_text| {
-        phonemize_chunks(cache, paths, chunk_text)
-            .map(|chunks| chunks.into_iter().map(to_phoneme_chunk).collect::<Vec<_>>())
-    })
+    plan_speech_chunks(
+        &text,
+        BoundaryPauses::for_engine(&paths.engine),
+        |chunk_text| {
+            phonemize_chunks(cache, paths, chunk_text)
+                .map(|chunks| chunks.into_iter().map(to_phoneme_chunk).collect::<Vec<_>>())
+        },
+    )
 }
 
 #[cfg(test)]
