@@ -152,9 +152,9 @@ python3 generate_index.py > "$STAGE/index_internal.log" 2>&1 \
   || fail "generate_index.py (internal) failed, see $STAGE/index_internal.log"
 python3 generate_index.py --mode public --base-url "$BASEURL" > "$STAGE/index_public.log" 2>&1 \
   || fail "generate_index.py (public) failed, see $STAGE/index_public.log"
-cp app/src/main/assets/index_v6.json "$BUCKET/index_v6.json"
-state "index_v6.json regenerated ($(stat -c %s "$BUCKET/index_v6.json") bytes)"
-grep -q "$PAIR/$DATED" "$BUCKET/index_v6.json" || fail "$PAIR/$DATED never reached index_v6.json"
+cp app/src/main/assets/index_v7.json "$BUCKET/index_v7.json"
+state "index_v7.json regenerated ($(stat -c %s "$BUCKET/index_v7.json") bytes)"
+grep -q "$PAIR/$DATED" "$BUCKET/index_v7.json" || fail "$PAIR/$DATED never reached index_v7.json"
 
 # ---------- stage 6: sync and purge ----------
 cd /home/david/AndroidStudioProjects || fail "no bucket parent"
@@ -164,7 +164,7 @@ state "bucket synced; sync log tail: $(tail -3 "$STAGE/sync.log" | tr '\n' ' ')"
 # ---------- stage 7: prove it is live ----------
 ok=1
 URLBASE=$BASEURL/translation/1/models/$PAIR/$DATED/exported
-for u in "$BASEURL/index_v6.json" "$URLBASE/$MODEL.gz" "$URLBASE/$LEX.gz" "$URLBASE/$VOCAB.gz"; do
+for u in "$BASEURL/index_v7.json" "$URLBASE/$MODEL.gz" "$URLBASE/$LEX.gz" "$URLBASE/$VOCAB.gz"; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -r 0-1023 "$u")
   state "GET $u -> $code"
   case "$code" in 20*) ;; *) ok=0 ;; esac
@@ -172,10 +172,10 @@ done
 remote_hash=$(curl -s "$URLBASE/$MODEL.gz" | gunzip -c | sha256sum | cut -d' ' -f1)
 state "published model re-downloaded, uncompressed sha256 $remote_hash"
 [ "$remote_hash" = "$local_hash" ] || { state "**WARNING** published digest differs from the local pack"; ok=0; }
-if curl -s "$BASEURL/index_v6.json" | grep -q "$PAIR/$DATED"; then
-  state "live index_v6.json points $PAIR at $DATED"
+if curl -s "$BASEURL/index_v7.json" | grep -q "$PAIR/$DATED"; then
+  state "live index_v7.json points $PAIR at $DATED"
 else
-  state "**WARNING** live index_v6.json does not mention $PAIR/$DATED yet (CDN purge may lag)"
+  state "**WARNING** live index_v7.json does not mention $PAIR/$DATED yet (CDN purge may lag)"
   ok=0
 fi
 

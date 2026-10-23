@@ -1110,7 +1110,7 @@ fn parses_v6_migrations_from_asset() {
         .parent()
         .and_then(|parent| parent.parent())
         .map(|parent| {
-            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v6.json")
+            parent.join("AndroidStudioProjects/Translator/app/src/main/assets/index_v7.json")
         })
         .expect("repo layout should have a parent");
     let Ok(json) = std::fs::read_to_string(asset_path) else {
@@ -1234,7 +1234,7 @@ fn plan_migrations_classifies_by_disk_state() {
 /// "no ppocr pack for language ka" at runtime.
 #[test]
 fn georgian_recognizer_resolves_for_ka() {
-    let index = std::path::Path::new("/home/david/AndroidStudioProjects/bucket/index_v6.json");
+    let index = std::path::Path::new("/home/david/AndroidStudioProjects/bucket/index_v7.json");
     if !index.exists() {
         return; // the bucket checkout is not present in every environment
     }
