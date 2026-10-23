@@ -124,6 +124,7 @@ pub struct AssetFileV2 {
     pub role: FileRole,
     pub priority: i32,
     pub requirement: FileRequirement,
+    pub replaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

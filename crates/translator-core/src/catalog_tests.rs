@@ -57,6 +57,7 @@ fn asset_file(name: &str, install_path: &str, size_bytes: u64) -> AssetFileV2 {
         role: FileRole::new(name),
         priority: 0,
         requirement: FileRequirement::Required,
+        replaces: Vec::new(),
     }
 }
 
@@ -1595,4 +1596,222 @@ fn drops_packs_whose_files_this_build_cannot_install() {
             .expect("catalog parses");
         assert!(!catalog.packs.contains_key("support-x"), "{file}");
     }
+}
+
+// ja and ko existed in the previous catalog and read every voice from one shared
+// voices file; es is new. Each now ships its own voice file, and the Kokoro core
+// carries a newer model next to the previous one.
+const LEGACY_VOICES: &str = "bin/kokoro/voices-v1.0.bin";
+const OLD_MODEL: &str = "bin/kokoro_mnn/kokoro.mnn";
+const OLD_WEIGHT: &str = "bin/kokoro_mnn/kokoro.mnn.weight";
+const NEW_MODEL: &str = "bin/kokoro_mnn/v2/kokoro.mnn";
+const NEW_WEIGHT: &str = "bin/kokoro_mnn/v2/kokoro.mnn.weight";
+const JA_VOICE: &str = "bin/kokoro_mnn/ja/ja_JP/jf_alpha/high/jf_alpha.bin";
+const KO_VOICE: &str = "bin/kokoro_mnn/ko/ko_KR/jf_alpha/high/jf_alpha.bin";
+const ES_VOICE: &str = "bin/kokoro_mnn/es/es_ES/ef_dora/high/ef_dora.bin";
+const ESPEAK: &str = "bin/espeak-ng-data/phondata";
+
+fn kokoro_language(code: &str, region: &str) -> String {
+    format!(
+        r#""{code}":{{"meta":{{"code":"{code}","name":"{code}","shortName":"{code}","script":"Latn"}},
+          "assets":{{"translate":[],"ocr":{{}}}},
+          "tts":{{"defaultRegion":"{region}","regions":{{"{region}":{{"displayName":"{region}",
+            "voices":["tts-kokoro-{code}"]}}}}}}}}"#
+    )
+}
+
+fn kokoro_voice_pack(code: &str, path: &str, replaces: &str) -> String {
+    format!(
+        r#""tts-kokoro-{code}":{{"feature":"tts","engine":"kokoro_mnn","auxRole":"voices","language":"{code}",
+          "files":[{{"name":"v.bin","sizeBytes":261390,"installPath":"{path}","url":"u","role":"voices",
+                     "priority":0,"replaces":[{replaces}]}}],
+          "dependsOn":["dict-{code}","kokoro-core"]}},
+        "dict-{code}":{{"feature":"support","kind":"tts-espeak-dict","files":[{{"name":"{code}_dict",
+          "sizeBytes":50000,"installPath":"bin/espeak-ng-data/{code}_dict","url":"u","role":"dict","priority":0}}],
+          "dependsOn":["espeak"]}}"#
+    )
+}
+
+fn kokoro_catalog() -> LanguageCatalog {
+    let legacy = format!("\"{LEGACY_VOICES}\"");
+    let json = format!(
+        r#"{{"formatVersion":6,"generatedAt":1,"dictionaryVersion":1,
+          "sources":{{"languageIndexVersion":1,"languageIndexUpdatedAt":1,
+                      "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":1}},
+          "languages":{{{},{},{}}},
+          "packs":{{{},{},{},
+            "kokoro-core":{{"feature":"support","kind":"tts-kokoro-mnn-core","files":[
+              {{"name":"kokoro.mnn","sizeBytes":967400,"installPath":"{NEW_MODEL}","url":"u","role":"model","priority":1}},
+              {{"name":"kokoro.mnn.weight","sizeBytes":70179368,"installPath":"{NEW_WEIGHT}","url":"u","role":"modelWeight","priority":1}},
+              {{"name":"kokoro.mnn","sizeBytes":1028464,"installPath":"{OLD_MODEL}","url":"u","role":"model","priority":0}},
+              {{"name":"kokoro.mnn.weight","sizeBytes":86949555,"installPath":"{OLD_WEIGHT}","url":"u","role":"modelWeight","priority":0}}],
+              "dependsOn":[]}},
+            "espeak":{{"feature":"support","kind":"tts-espeak-core","files":[{{"name":"phondata","sizeBytes":1,
+              "installPath":"{ESPEAK}","url":"u","role":"espeakCore","priority":0}}],"dependsOn":[]}}
+          }}}}"#,
+        kokoro_language("ja", "JP"),
+        kokoro_language("ko", "KR"),
+        kokoro_language("es", "ES"),
+        kokoro_voice_pack("ja", JA_VOICE, &legacy),
+        kokoro_voice_pack("ko", KO_VOICE, &legacy),
+        kokoro_voice_pack("es", ES_VOICE, ""),
+    );
+    crate::catalog::parse_and_validate_catalog(&json).expect("kokoro catalog parses")
+}
+
+fn kokoro_snapshot(files: &[&str]) -> crate::catalog::CatalogSnapshot {
+    build_catalog_snapshot(
+        kokoro_catalog(),
+        "/base".to_string(),
+        &FakeInstallChecker::with_files(files),
+    )
+}
+
+// A device that installed Japanese Kokoro from the previous catalog.
+const JA_INSTALL: &[&str] = &[
+    ESPEAK,
+    "bin/espeak-ng-data/ja_dict",
+    OLD_MODEL,
+    OLD_WEIGHT,
+    LEGACY_VOICES,
+];
+
+fn task_paths(plan: &crate::catalog::DownloadPlan) -> Vec<&str> {
+    let mut paths = plan
+        .tasks
+        .iter()
+        .map(|task| task.install_path.as_str())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn sorted(paths: &[String]) -> Vec<&str> {
+    let mut paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn previous_kokoro_install_keeps_loading_its_replaced_files() {
+    let snapshot = kokoro_snapshot(JA_INSTALL);
+
+    let resolved = crate::catalog::resolve_tts_voice_files_for_pack(
+        &snapshot,
+        &LanguageCode::from("ja"),
+        Some("tts-kokoro-ja"),
+    )
+    .expect("ja still resolves");
+    assert_eq!(resolved.model_install_path, OLD_MODEL);
+    assert_eq!(resolved.aux_install_path, LEGACY_VOICES);
+    assert!(plan_repair(&snapshot).tasks.is_empty());
+}
+
+#[test]
+fn replaced_file_does_not_install_a_sibling_whose_dependencies_are_missing() {
+    let snapshot = kokoro_snapshot(JA_INSTALL);
+
+    let ko = &snapshot.pack_statuses["tts-kokoro-ko"];
+    assert!(!ko.installed);
+    assert!(!ko.any_file_present);
+    assert!(plan_repair(&snapshot).tasks.is_empty());
+}
+
+#[test]
+fn previous_kokoro_install_is_offered_its_voice_file_and_the_new_model() {
+    let snapshot = kokoro_snapshot(JA_INSTALL);
+
+    assert_eq!(
+        crate::catalog::tts_upgrade_language_codes(&snapshot),
+        vec![LanguageCode::from("ja")]
+    );
+    let plan = crate::catalog::plan_tts_upgrades(&snapshot, &[LanguageCode::from("ja")]);
+    assert_eq!(task_paths(&plan), vec![JA_VOICE, NEW_MODEL, NEW_WEIGHT]);
+    assert_eq!(
+        sorted(&plan.delete_after.file_paths),
+        vec![LEGACY_VOICES, OLD_MODEL, OLD_WEIGHT]
+    );
+}
+
+#[test]
+fn upgrading_one_voice_keeps_the_replaced_file_a_sibling_still_loads() {
+    let mut files = JA_INSTALL.to_vec();
+    files.push("bin/espeak-ng-data/ko_dict");
+    let snapshot = kokoro_snapshot(&files);
+
+    let plan = crate::catalog::plan_tts_upgrades(&snapshot, &[LanguageCode::from("ja")]);
+    assert_eq!(task_paths(&plan), vec![JA_VOICE, NEW_MODEL, NEW_WEIGHT]);
+    assert_eq!(
+        sorted(&plan.delete_after.file_paths),
+        vec![OLD_MODEL, OLD_WEIGHT]
+    );
+
+    let both = crate::catalog::plan_tts_upgrades(
+        &snapshot,
+        &[LanguageCode::from("ja"), LanguageCode::from("ko")],
+    );
+    assert_eq!(
+        sorted(&both.delete_after.file_paths),
+        vec![LEGACY_VOICES, OLD_MODEL, OLD_WEIGHT]
+    );
+}
+
+#[test]
+fn adding_a_kokoro_language_reuses_the_installed_model() {
+    let snapshot = kokoro_snapshot(JA_INSTALL);
+
+    let plan = crate::catalog::plan_tts_download(&snapshot, &LanguageCode::from("es"), None)
+        .expect("es has a voice");
+    assert_eq!(
+        task_paths(&plan),
+        vec!["bin/espeak-ng-data/es_dict", ES_VOICE]
+    );
+
+    let mut files = JA_INSTALL.to_vec();
+    files.extend(["bin/espeak-ng-data/es_dict", ES_VOICE]);
+    let snapshot = kokoro_snapshot(&files);
+    let resolved = crate::catalog::resolve_tts_voice_files_for_pack(
+        &snapshot,
+        &LanguageCode::from("es"),
+        Some("tts-kokoro-es"),
+    )
+    .expect("es resolves");
+    assert_eq!(resolved.model_install_path, OLD_MODEL);
+    assert_eq!(resolved.aux_install_path, ES_VOICE);
+}
+
+#[test]
+fn fresh_kokoro_install_downloads_only_the_current_files() {
+    let snapshot = kokoro_snapshot(&[]);
+
+    let plan = crate::catalog::plan_tts_download(&snapshot, &LanguageCode::from("ja"), None)
+        .expect("ja has a voice");
+    assert_eq!(
+        task_paths(&plan),
+        vec![
+            "bin/espeak-ng-data/ja_dict",
+            ESPEAK,
+            JA_VOICE,
+            NEW_MODEL,
+            NEW_WEIGHT
+        ]
+    );
+}
+
+#[test]
+fn deleting_a_voice_keeps_the_replaced_file_a_sibling_still_loads() {
+    let mut files = JA_INSTALL.to_vec();
+    files.push("bin/espeak-ng-data/ko_dict");
+    let snapshot = kokoro_snapshot(&files);
+
+    let plan = crate::catalog::plan_delete_tts_pack(&snapshot, "tts-kokoro-ja");
+    assert_eq!(
+        sorted(&plan.file_paths),
+        vec!["bin/espeak-ng-data/ja_dict", JA_VOICE]
+    );
+
+    let snapshot = kokoro_snapshot(JA_INSTALL);
+    let plan = crate::catalog::plan_delete_tts_pack(&snapshot, "tts-kokoro-ja");
+    assert!(plan.file_paths.iter().any(|path| path == LEGACY_VOICES));
+    assert!(plan.file_paths.iter().any(|path| path == OLD_MODEL));
 }

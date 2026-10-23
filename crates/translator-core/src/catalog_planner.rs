@@ -6,7 +6,7 @@ use crate::language::Language;
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole, InstallMarker,
     InstalledTtsPack, LangAvailability, LanguageCatalog, LanguageFeature, MigrationAction,
-    MigrationJob, OcrPack, PackKind, PackRecord, ResolvedTtsVoiceFiles, TaskInstall,
+    MigrationJob, OcrPack, PackKind, PackRecord, ResolvedTtsVoiceFiles, TaskInstall, TtsPack,
     TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion, ZipEntryTarget, ZipExtractionPlan,
 };
 
@@ -191,6 +191,13 @@ where
             installed_at(checker, &file.install_path, file.install_marker.as_ref())
         };
 
+        let missing_dependency_ids = pack
+            .depends_on
+            .iter()
+            .filter(|dep_id| self.status(dep_id).is_none_or(|status| !status.installed))
+            .cloned()
+            .collect::<Vec<_>>();
+
         let mut missing_files = Vec::new();
         let mut upgrade_files = Vec::new();
         let mut superseded_files = Vec::new();
@@ -212,6 +219,17 @@ where
                 .copied()
                 .collect::<Vec<_>>();
             any_file_present |= !present.is_empty();
+            if present.is_empty()
+                && let Some(stand_in) = replaced_stand_in(checker, &group, &missing_dependency_ids)
+            {
+                // An install from an older catalog keeps loading the file this
+                // one replaces, so it doesn't break and needs no download; the
+                // replacement is offered as an upgrade.
+                any_file_present = true;
+                upgrade_files.push(group[0].clone());
+                active_files.push(stand_in);
+                continue;
+            }
             let Some(best_present) = present.first() else {
                 // No file of this role on disk. A required role gates the pack;
                 // an optional one is offered as an improvement upgrade instead so
@@ -231,13 +249,6 @@ where
             }
             superseded_files.extend(present[1..].iter().map(|file| (*file).clone()));
         }
-
-        let missing_dependency_ids = pack
-            .depends_on
-            .iter()
-            .filter(|dep_id| self.status(dep_id).is_none_or(|status| !status.installed))
-            .cloned()
-            .collect::<Vec<_>>();
 
         let status = PackInstallStatus {
             pack_id: pack_id.to_string(),
@@ -583,6 +594,49 @@ pub fn plan_translation_upgrades(
     upgrade_plan(snapshot, &pack_ids)
 }
 
+fn installed_tts_packs(snapshot: &CatalogSnapshot) -> impl Iterator<Item = (&String, &TtsPack)> {
+    snapshot
+        .pack_statuses
+        .iter()
+        .filter(|(_, status)| status.installed)
+        .filter_map(|(pack_id, _)| match &snapshot.catalog.pack(pack_id)?.kind {
+            PackKind::Tts(tts) => Some((pack_id, tts)),
+            _ => None,
+        })
+}
+
+pub fn tts_upgrade_language_codes(snapshot: &CatalogSnapshot) -> Vec<LanguageCode> {
+    let mut codes = installed_tts_packs(snapshot)
+        .filter(|(pack_id, _)| {
+            snapshot
+                .catalog
+                .dependency_closure([pack_id.as_str()])
+                .iter()
+                .filter_map(|id| snapshot.pack_statuses.get(id))
+                .any(|status| !status.upgrade_files.is_empty())
+        })
+        .map(|(_, tts)| LanguageCode::new(tts.language.clone()))
+        .collect::<Vec<_>>();
+    codes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    codes.dedup();
+    codes
+}
+
+pub fn plan_tts_upgrades(
+    snapshot: &CatalogSnapshot,
+    language_codes: &[LanguageCode],
+) -> DownloadPlan {
+    let pack_ids = installed_tts_packs(snapshot)
+        .filter(|(_, tts)| {
+            language_codes
+                .iter()
+                .any(|code| code.as_str() == tts.language)
+        })
+        .map(|(pack_id, _)| pack_id.clone())
+        .collect::<Vec<_>>();
+    upgrade_plan(snapshot, &pack_ids)
+}
+
 // Downloads every upgrade file of the packs' closure, then deletes what those
 // files outrank: the on-disk alternatives of each upgraded role plus anything
 // already superseded in those packs. A path another (non-upgraded) pack still
@@ -886,6 +940,36 @@ fn download_plan(snapshot: &CatalogSnapshot, files: Vec<MissingPackFile>) -> Dow
     }
 }
 
+// A replaced file can be shared by sibling packs (one voices file for several
+// voices), so its presence alone does not say which of them were installed.
+// The catalog it came from counted such a pack installed once its dependencies
+// were, so only then does the replaced file stand in for this pack.
+fn replaced_stand_in(
+    checker: &impl PackInstallChecker,
+    group: &[&AssetFileV2],
+    missing_dependency_ids: &[String],
+) -> Option<AssetFileV2> {
+    if !missing_dependency_ids.is_empty() {
+        return None;
+    }
+    group.iter().find_map(|file| {
+        let path = file
+            .replaces
+            .iter()
+            .find(|path| checker.file_exists(path))?;
+        let name = path
+            .rsplit('/')
+            .next()
+            .expect("rsplit yields at least one piece");
+        Some(AssetFileV2 {
+            name: name.to_string(),
+            install_path: path.clone(),
+            replaces: Vec::new(),
+            ..(*file).clone()
+        })
+    })
+}
+
 fn installed_at(
     checker: &impl PackInstallChecker,
     install_path: &str,
@@ -1117,22 +1201,34 @@ pub fn plan_support_download_by_kind(
     ))
 }
 
-fn delete_plan_for_pack_ids<'a, I>(catalog: &LanguageCatalog, pack_ids: I) -> DeletePlan
+fn delete_plan_for_pack_ids<'a, I>(snapshot: &CatalogSnapshot, pack_ids: I) -> DeletePlan
 where
     I: IntoIterator<Item = &'a str>,
 {
+    let pack_ids = pack_ids.into_iter().collect::<HashSet<_>>();
+    // A path can be loaded by a pack that stays (a replaced file shared by sibling
+    // packs), and deleting it would break that pack.
+    let in_use_elsewhere = snapshot
+        .pack_statuses
+        .iter()
+        .filter(|(pack_id, _)| !pack_ids.contains(pack_id.as_str()))
+        .flat_map(|(_, status)| &status.active_files)
+        .map(|file| file.install_path.as_str())
+        .collect::<HashSet<_>>();
     let mut file_paths = Vec::new();
     let mut file_seen = HashSet::new();
     let mut directory_paths = Vec::new();
     let mut directory_seen = HashSet::new();
 
-    for pack_id in pack_ids {
-        let Some(pack) = catalog.pack(pack_id) else {
+    for pack_id in &pack_ids {
+        let Some(pack) = snapshot.catalog.pack(pack_id) else {
             continue;
         };
         for file in &pack.files {
-            if file_seen.insert(file.install_path.clone()) {
-                file_paths.push(file.install_path.clone());
+            for path in std::iter::once(&file.install_path).chain(&file.replaces) {
+                if !in_use_elsewhere.contains(path.as_str()) && file_seen.insert(path.clone()) {
+                    file_paths.push(path.clone());
+                }
             }
             if file.archive.is_some()
                 && let Some(marker) = &file.install_marker
@@ -1191,10 +1287,7 @@ pub fn plan_delete_dictionary(
         .collect::<HashSet<_>>();
     let delete_pack_ids =
         delete_pack_ids(&snapshot.catalog, [target_pack.as_str()], keep_root_packs);
-    delete_plan_for_pack_ids(
-        &snapshot.catalog,
-        delete_pack_ids.iter().map(String::as_str),
-    )
+    delete_plan_for_pack_ids(snapshot, delete_pack_ids.iter().map(String::as_str))
 }
 
 pub fn plan_delete_language(
@@ -1217,10 +1310,7 @@ pub fn plan_delete_language(
         target_root_packs.iter().map(String::as_str),
         keep_root_packs,
     );
-    delete_plan_for_pack_ids(
-        &snapshot.catalog,
-        delete_pack_ids.iter().map(String::as_str),
-    )
+    delete_plan_for_pack_ids(snapshot, delete_pack_ids.iter().map(String::as_str))
 }
 
 pub fn plan_delete_tts(snapshot: &CatalogSnapshot, language_code: &LanguageCode) -> DeletePlan {
@@ -1250,10 +1340,7 @@ pub fn plan_delete_tts(snapshot: &CatalogSnapshot, language_code: &LanguageCode)
         target_root_packs.iter().map(String::as_str),
         keep_root_packs,
     );
-    delete_plan_for_pack_ids(
-        &snapshot.catalog,
-        delete_pack_ids.iter().map(String::as_str),
-    )
+    delete_plan_for_pack_ids(snapshot, delete_pack_ids.iter().map(String::as_str))
 }
 
 pub fn plan_delete_support_by_kind(snapshot: &CatalogSnapshot, support_kind: &str) -> DeletePlan {
@@ -1262,7 +1349,7 @@ pub fn plan_delete_support_by_kind(snapshot: &CatalogSnapshot, support_kind: &st
         .support_pack_ids_by_kind(support_kind)
         .into_iter()
         .collect::<HashSet<_>>();
-    delete_plan_for_pack_ids(&snapshot.catalog, pack_ids.iter().map(String::as_str))
+    delete_plan_for_pack_ids(snapshot, pack_ids.iter().map(String::as_str))
 }
 
 pub fn plan_delete_tts_pack(snapshot: &CatalogSnapshot, pack_id: &str) -> DeletePlan {
@@ -1281,10 +1368,7 @@ pub fn plan_delete_tts_pack(snapshot: &CatalogSnapshot, pack_id: &str) -> Delete
         .filter(|other| other != pack_id && pack_installed_in_snapshot(snapshot, other))
         .collect::<HashSet<_>>();
     let delete_pack_ids = delete_pack_ids(&snapshot.catalog, [pack_id], keep_root_packs);
-    delete_plan_for_pack_ids(
-        &snapshot.catalog,
-        delete_pack_ids.iter().map(String::as_str),
-    )
+    delete_plan_for_pack_ids(snapshot, delete_pack_ids.iter().map(String::as_str))
 }
 
 pub fn plan_delete_superseded_tts(
@@ -1329,8 +1413,5 @@ pub fn plan_delete_superseded_tts(
         superseded_root_packs.iter().map(String::as_str),
         keep_root_packs,
     );
-    delete_plan_for_pack_ids(
-        &snapshot.catalog,
-        delete_pack_ids.iter().map(String::as_str),
-    )
+    delete_plan_for_pack_ids(snapshot, delete_pack_ids.iter().map(String::as_str))
 }

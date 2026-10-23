@@ -87,6 +87,8 @@ struct AssetFileWire {
     priority: i32,
     #[serde(default)]
     optional: bool,
+    #[serde(default)]
+    replaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -275,6 +277,7 @@ impl TryFrom<AssetFileWire> for AssetFileV2 {
             } else {
                 FileRequirement::Required
             },
+            replaces: value.replaces,
         })
     }
 }
