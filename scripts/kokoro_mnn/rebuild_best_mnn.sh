@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-SOURCE_ONNX="${SOURCE_ONNX:-kokoro-v1.0.patched.i32.onnx}"
+SOURCE_ONNX="${SOURCE_ONNX:-kokoro-v1.0.patched.i32.dft.onnx}"
 SOURCE_FP32_ONNX="${SOURCE_FP32_ONNX:-kokoro-v1.0.onnx}"
 PATCH_ONNX="${PATCH_ONNX:-1}"
 WORK_DIR="${WORK_DIR:-compression_params}"
@@ -14,16 +14,18 @@ OPTFAST_DEDUP_MNN="${OPTFAST_DEDUP_MNN:-kokoro.mnn}"
 OPTFAST_JSON="${OPTFAST_JSON:-kokoro-optfast-external.json}"
 
 CLEAN_BASE_COMPRESS="$WORK_DIR/block128.base.json"
-CLEAN_FINAL_COMPRESS="$WORK_DIR/block128.skip-istft-convpost-duration-bert.json"
+CLEAN_FP32_COMPRESS="$WORK_DIR/block128.skip-istft-convpost-duration-bert.json"
+CLEAN_FINAL_COMPRESS="$WORK_DIR/block128.skip-istft-convpost-duration-bert.int4-decode.json"
 CLEAN_BASE_MNN="$WORK_DIR/block128.base.mnn"
 
 OPTFAST_BASE_COMPRESS="$WORK_DIR/block128.optfast.base.json"
-OPTFAST_FINAL_COMPRESS="$WORK_DIR/block128.optfast.skip-istft-convpost-duration-bert.json"
+OPTFAST_FP32_COMPRESS="$WORK_DIR/block128.optfast.skip-istft-convpost-duration-bert.json"
+OPTFAST_FINAL_COMPRESS="$WORK_DIR/block128.optfast.skip-istft-convpost-duration-bert.int4-decode.json"
 OPTFAST_BASE_MNN="$WORK_DIR/block128.optfast.base.mnn"
 
 mkdir -p "$WORK_DIR"
-rm -f "$CLEAN_BASE_COMPRESS" "$CLEAN_FINAL_COMPRESS" \
-  "$OPTFAST_BASE_COMPRESS" "$OPTFAST_FINAL_COMPRESS"
+rm -f "$CLEAN_BASE_COMPRESS" "$CLEAN_FP32_COMPRESS" "$CLEAN_FINAL_COMPRESS" \
+  "$OPTFAST_BASE_COMPRESS" "$OPTFAST_FP32_COMPRESS" "$OPTFAST_FINAL_COMPRESS"
 
 if [[ ! -f "$SOURCE_ONNX" && "$PATCH_ONNX" == "1" ]]; then
   uv run python patch_resize.py --input "$SOURCE_FP32_ONNX" --output "$SOURCE_ONNX"
@@ -46,26 +48,38 @@ uv run mnnconvert -f ONNX \
   --compressionParamsFile "$CLEAN_BASE_COMPRESS"
 
 # Final pass config:
+# - harmonic-source DFT conv fp32: its DC/Nyquist bias steers the phase branch;
 # - final iSTFT ConvTranspose fp32: removes the 4.8/9.6 kHz whistle;
 # - generator conv_post fp32: fixes Android low-memory static/roughness;
 # - predictor + BERT-side projections fp32: fixes Android low-memory rounded
 #   duration drift on the long sentence.
 uv run python edit_compression_params.py \
   --infile "$CLEAN_BASE_COMPRESS" \
-  --outfile "$CLEAN_FINAL_COMPRESS" \
+  --outfile "$CLEAN_FP32_COMPRESS" \
   --bits 0 \
+  --op /decoder/decoder/generator/STFT/conv \
   --op /decoder/decoder/generator/istft/stft/ConvTranspose_output_0 \
   --op-prefix /decoder/decoder/generator/conv_post/ \
   --op-prefix /encoder/predictor/ \
   --op /encoder/bert/encoder/embedding_hidden_mapping_in/Add_output_0__matmul_converted \
   --op /encoder/bert_encoder/Add_output_0__matmul_converted
 
+# The decoder's encode/decode blocks hold 34M of the 81M weights but run at the
+# mel frame rate, so int4 there costs little quality for ~17 MB.
+uv run python edit_compression_params.py \
+  --infile "$CLEAN_FP32_COMPRESS" \
+  --outfile "$CLEAN_FINAL_COMPRESS" \
+  --bits 4 \
+  --op-prefix /decoder/decoder/decode \
+  --op-prefix /decoder/decoder/encode
+
 uv run mnnconvert -f ONNX \
   --modelFile "$SOURCE_ONNX" \
   --MNNModel "$CLEAN_MNN" \
   --weightQuantBits 8 \
   --weightQuantBlock 128 \
-  --compressionParamsFile "$CLEAN_FINAL_COMPRESS"
+  --compressionParamsFile "$CLEAN_FINAL_COMPRESS" \
+  --hqq
 
 # The shipping candidate uses --optimizePrefer 2 for the BERT/ALBERT speedup.
 # Generate compression params under that optimized graph, then keep the same
@@ -80,13 +94,23 @@ uv run mnnconvert -f ONNX \
 
 uv run python edit_compression_params.py \
   --infile "$OPTFAST_BASE_COMPRESS" \
-  --outfile "$OPTFAST_FINAL_COMPRESS" \
+  --outfile "$OPTFAST_FP32_COMPRESS" \
   --bits 0 \
+  --op /decoder/decoder/generator/STFT/conv \
   --op /decoder/decoder/generator/istft/stft/ConvTranspose_output_0 \
   --op-prefix /decoder/decoder/generator/conv_post/ \
   --op-prefix /encoder/predictor/ \
   --op /encoder/bert/encoder/embedding_hidden_mapping_in/Add_output_0__matmul_converted \
   --op /encoder/bert_encoder/Add_output_0__matmul_converted
+
+# The decoder's encode/decode blocks hold 34M of the 81M weights but run at the
+# mel frame rate, so int4 there costs little quality for ~17 MB.
+uv run python edit_compression_params.py \
+  --infile "$OPTFAST_FP32_COMPRESS" \
+  --outfile "$OPTFAST_FINAL_COMPRESS" \
+  --bits 4 \
+  --op-prefix /decoder/decoder/decode \
+  --op-prefix /decoder/decoder/encode
 
 uv run mnnconvert -f ONNX \
   --modelFile "$SOURCE_ONNX" \
@@ -95,7 +119,8 @@ uv run mnnconvert -f ONNX \
   --weightQuantBlock 128 \
   --compressionParamsFile "$OPTFAST_FINAL_COMPRESS" \
   --optimizePrefer 2 \
-  --saveExternalData
+  --saveExternalData \
+  --hqq
 
 # Dump JSON as metadata only. Do not JSON->MNN roundtrip: that perturbs Kokoro
 # output. The deduper patches offsets directly in the original flatbuffer.

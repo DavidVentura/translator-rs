@@ -1,6 +1,6 @@
 """Patch Kokoro fp32 ONNX into the stable MNN conversion source.
 
-The output is `kokoro-v1.0.patched.i32.onnx` by default. It applies the
+The output is `kokoro-v1.0.patched.i32.dft.onnx` by default. It applies the
 Resize/Round cleanup and normalizes the token-id graph input to
 `input_ids: INT32` so MNN's Gather path matches ORT. Kokoro ONNX exports have
 used both `tokens` and `input_ids`; this script accepts either source name.
@@ -11,6 +11,11 @@ For each Resize node listed in TARGETS we:
     Shape, multiplied/divided by the integer factor.
 
 This removes any rounding-mode dependence between ONNX runtimes.
+
+It also rewrites three generator pieces that are slow in MNN or overflow in
+fp16: the harmonic-source STFT becomes a fixed DFT convolution, the decomposed
+instance norms become InstanceNormalization, and the phase atan2 no longer
+divides by an exact zero.
 """
 
 import argparse
@@ -19,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+import onnxruntime as ort
 
 
 # (node name, integer factor; positive=upsample by N, negative=downsample by |N|)
@@ -69,6 +75,168 @@ def normalize_token_input_to_int32(graph: gs.Graph) -> None:
             return
     names = ", ".join(inp.name for inp in graph.inputs)
     raise SystemExit(f"token input not found; expected input_ids or tokens, got: {names}")
+
+
+# Large enough to stay a normal number in fp16, small enough to be far below
+# any bin that carries signal.
+PHASE_EPS = 1e-4
+
+
+def constant_value(tensor: gs.Tensor) -> np.ndarray:
+    if isinstance(tensor, gs.Constant):
+        return np.asarray(tensor.values)
+    producer = tensor.inputs[0]
+    if producer.op != "Constant":
+        raise SystemExit(f"{tensor.name} is not a constant (produced by {producer.op})")
+    return np.asarray(producer.attrs["value"].values)
+
+
+def consumers(tensor: gs.Tensor, op: str) -> list[gs.Node]:
+    # A node that reads a tensor twice (x * x) is listed twice in tensor.outputs.
+    unique = {id(n): n for n in tensor.outputs}
+    return [n for n in unique.values() if n.op == op]
+
+
+def replace_stft_with_dft_conv(graph: gs.Graph) -> None:
+    """MNN's Stft kernel is single-threaded and slow for this n_fft=20 STFT, and
+    its fp16 path returns exact zeros that the exported atan2 turns into NaN. A
+    Conv1d over the windowed DFT basis computes the same frames.
+
+    torch.stft gives the DC and Nyquist bins an exact +0 imaginary part, so
+    torch.angle is +pi when their real part is negative. The exported atan2
+    only takes the +pi branch for a strictly positive imaginary part, so those
+    two channels get a PHASE_EPS bias to land on the branch Kokoro was trained on.
+    """
+    stfts = [n for n in graph.nodes if n.op == "STFT"]
+    if len(stfts) != 1:
+        raise SystemExit(f"expected one STFT node, found {len(stfts)}")
+    stft = stfts[0]
+    signal, frame_step, window, frame_length = stft.inputs
+    hop = int(constant_value(frame_step))
+    n_fft = int(constant_value(frame_length))
+    win = constant_value(window).astype(np.float64)
+    if stft.attrs.get("onesided", 1) != 1 or len(win) != n_fft:
+        raise SystemExit(f"unexpected STFT configuration on {stft.name}")
+
+    bins = n_fft // 2 + 1
+    n = np.arange(n_fft)
+    basis = np.zeros((2 * bins, 1, n_fft))
+    for k in range(bins):
+        basis[2 * k, 0] = win * np.cos(2 * np.pi * k * n / n_fft)
+        basis[2 * k + 1, 0] = -win * np.sin(2 * np.pi * k * n / n_fft)
+    nyquist_imag = 2 * (bins - 1) + 1
+    basis[1, 0] = 0
+    basis[nyquist_imag, 0] = 0
+    bias = np.zeros(2 * bins, np.float32)
+    bias[1] = bias[nyquist_imag] = PHASE_EPS
+
+    name = stft.name
+    signal_3d = gs.Variable(f"{name}/signal_3d", dtype=np.float32)
+    conv_out = gs.Variable(f"{name}/conv", dtype=np.float32)
+    bins_split = gs.Variable(f"{name}/bins_split", dtype=np.float32)
+    out = stft.outputs[0]
+    stft.outputs = []
+    graph.nodes.extend([
+        gs.Node(op="Unsqueeze", inputs=[signal, gs.Constant(f"{name}/axis1", np.array([1], np.int64))], outputs=[signal_3d]),
+        gs.Node(
+            op="Conv",
+            name=f"{name}/dft",
+            attrs={"strides": [hop], "kernel_shape": [n_fft]},
+            inputs=[signal_3d, gs.Constant(f"{name}/basis", basis.astype(np.float32)), gs.Constant(f"{name}/bias", bias)],
+            outputs=[conv_out],
+        ),
+        gs.Node(op="Reshape", inputs=[conv_out, gs.Constant(f"{name}/split_shape", np.array([0, bins, 2, -1], np.int64))], outputs=[bins_split]),
+        gs.Node(op="Transpose", attrs={"perm": [0, 3, 1, 2]}, inputs=[bins_split], outputs=[out]),
+    ])
+    print(f"replaced {name} (STFT n_fft={n_fft} hop={hop}) with a DFT Conv")
+
+
+def guard_phase_division(graph: gs.Graph) -> None:
+    """The phase is exported as atan(imag / real); in silent frames fp16 gives
+    real == imag == 0 and the 0/0 NaN spreads through every instance norm into
+    the whole utterance."""
+    atans = [n for n in graph.nodes if n.op == "Atan"]
+    if len(atans) != 1:
+        raise SystemExit(f"expected one Atan node, found {len(atans)}")
+    div = atans[0].inputs[0].inputs[0]
+    if div.op != "Div":
+        raise SystemExit(f"Atan input comes from {div.op}, expected Div")
+    real = div.inputs[1]
+    unique = div.name.replace("/", "_").lstrip("_")
+    is_zero = gs.Variable(f"{unique}/real_is_zero", dtype=np.bool_)
+    guarded = gs.Variable(f"{unique}/real_guarded", dtype=np.float32)
+    graph.nodes.extend([
+        gs.Node(op="Equal", inputs=[real, gs.Constant(f"{unique}/zero", np.array(0, np.float32))], outputs=[is_zero]),
+        gs.Node(op="Where", inputs=[is_zero, gs.Constant(f"{unique}/eps", np.array(PHASE_EPS, np.float32)), real], outputs=[guarded]),
+    ])
+    div.inputs[1] = guarded
+    print(f"guarded {div.name} against a zero real part")
+
+
+def find_instance_norms(graph: gs.Graph) -> list[tuple[gs.Tensor, gs.Node, float]]:
+    """AdaIN exports InstanceNorm1d as (x - mean) / sqrt(mean((x - mean)^2) + eps)
+    over the time axis: seven elementwise/reduction passes per norm."""
+    found = []
+    for mean in [n for n in graph.nodes if n.op == "ReduceMean"]:
+        x = mean.inputs[0]
+        subs = [s for s in consumers(mean.outputs[0], "Sub") if s.inputs[0] is x]
+        if len(subs) != 1:
+            continue
+        centered = subs[0].outputs[0]
+        squares = [m for m in consumers(centered, "Mul") if m.inputs[0] is m.inputs[1]]
+        if len(squares) != 1:
+            continue
+        variances = consumers(squares[0].outputs[0], "ReduceMean")
+        if len(variances) != 1:
+            continue
+        eps_adds = consumers(variances[0].outputs[0], "Add")
+        if len(eps_adds) != 1:
+            continue
+        sqrts = consumers(eps_adds[0].outputs[0], "Sqrt")
+        if len(sqrts) != 1:
+            continue
+        divs = [d for d in consumers(centered, "Div") if d.inputs[1] is sqrts[0].outputs[0]]
+        if len(divs) != 1:
+            continue
+        axes = constant_value(mean.inputs[1]).reshape(-1).tolist() if len(mean.inputs) > 1 else mean.attrs["axes"]
+        if axes not in ([2], [-1]):
+            raise SystemExit(f"{mean.name} normalizes over axes {axes}, expected the time axis")
+        eps = float(constant_value(eps_adds[0].inputs[1]).reshape(-1)[0])
+        found.append((x, divs[0], eps))
+    return found
+
+
+def channel_counts(graph: gs.Graph, tensors: list[gs.Tensor]) -> list[int]:
+    """Most normalized tensors have data-dependent shapes that ONNX shape
+    inference cannot resolve, so read the channel axis from one real run."""
+    probe = graph.copy()
+    by_name = probe.tensors()
+    probe.outputs = [by_name[t.name] for t in tensors]
+    for out in probe.outputs:
+        out.dtype = np.float32
+    session = ort.InferenceSession(gs.export_onnx(probe).SerializeToString(), providers=["CPUExecutionProvider"])
+    ids = np.full((1, 20), 50, np.int32)
+    ids[0, 0] = ids[0, -1] = 0
+    outs = session.run(None, {"input_ids": ids, "style": np.zeros((1, 256), np.float32), "speed": np.ones(1, np.float32)})
+    return [o.shape[1] for o in outs]
+
+
+def fuse_instance_norms(graph: gs.Graph) -> None:
+    norms = find_instance_norms(graph)
+    if not norms:
+        raise SystemExit("no decomposed instance norm found")
+    channels = channel_counts(graph, [x for x, _, _ in norms])
+    for (x, div, eps), c in zip(norms, channels):
+        out = div.outputs[0]
+        div.outputs = []
+        graph.nodes.append(gs.Node(
+            op="InstanceNormalization",
+            name=f"{div.name}_instance_norm",
+            attrs={"epsilon": eps},
+            inputs=[x, gs.Constant(f"{div.name}/in_scale", np.ones(c, np.float32)), gs.Constant(f"{div.name}/in_bias", np.zeros(c, np.float32))],
+            outputs=[out],
+        ))
+    print(f"fused {len(norms)} decomposed instance norms into InstanceNormalization")
 
 
 def patch(input_path: Path, output_path: Path) -> None:
@@ -133,6 +301,10 @@ def patch(input_path: Path, output_path: Path) -> None:
 
         print(f"patched {name}: factor={factor}")
 
+    replace_stft_with_dft_conv(graph)
+    guard_phase_division(graph)
+    graph.cleanup().toposort()
+    fuse_instance_norms(graph)
     graph.cleanup().toposort()
     onnx.save(gs.export_onnx(graph), str(output_path))
     print(f"wrote {output_path}")
@@ -141,7 +313,7 @@ def patch(input_path: Path, output_path: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default="kokoro-v1.0.onnx")
-    ap.add_argument("--output", default="kokoro-v1.0.patched.i32.onnx")
+    ap.add_argument("--output", default="kokoro-v1.0.patched.i32.dft.onnx")
     args = ap.parse_args()
     patch(Path(args.input), Path(args.output))
 
