@@ -693,7 +693,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#4141cf0f5ee7ea30f7bd22bc4f52b6087494a7d1"
+source = "git+https://github.com/DavidVentura/piper-rs#60b8daea72e8bd606086035d68a7ad7edd4a9fca"
 dependencies = [
  "espeak-rs-sys",
 ]
@@ -701,7 +701,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#4141cf0f5ee7ea30f7bd22bc4f52b6087494a7d1"
+source = "git+https://github.com/DavidVentura/piper-rs#60b8daea72e8bd606086035d68a7ad7edd4a9fca"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
@@ -2268,7 +2268,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
-source = "git+https://github.com/DavidVentura/piper-rs#4141cf0f5ee7ea30f7bd22bc4f52b6087494a7d1"
+source = "git+https://github.com/DavidVentura/piper-rs#60b8daea72e8bd606086035d68a7ad7edd4a9fca"
 dependencies = [
  "espeak-rs",
  "fst",
