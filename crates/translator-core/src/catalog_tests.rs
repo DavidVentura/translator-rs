@@ -1815,3 +1815,32 @@ fn deleting_a_voice_keeps_the_replaced_file_a_sibling_still_loads() {
     assert!(plan.file_paths.iter().any(|path| path == LEGACY_VOICES));
     assert!(plan.file_paths.iter().any(|path| path == OLD_MODEL));
 }
+
+#[test]
+fn voice_size_counts_only_the_preferred_kokoro_model() {
+    let snapshot = kokoro_snapshot(&[]);
+
+    assert_eq!(
+        snapshot.catalog.pack_size_bytes("tts-kokoro-es"),
+        261390 + 50000 + 1 + 967400 + 70179368
+    );
+}
+
+#[test]
+fn voice_download_size_leaves_out_files_another_kokoro_voice_brought() {
+    let snapshot = kokoro_snapshot(&[
+        ESPEAK,
+        "bin/espeak-ng-data/ja_dict",
+        NEW_MODEL,
+        NEW_WEIGHT,
+        JA_VOICE,
+    ]);
+
+    let regions = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("es"));
+    let voice = &regions[0].voices[0];
+    assert_eq!(voice.download_size_bytes, 261390 + 50000);
+    assert_eq!(voice.size_bytes, 261390 + 50000 + 1 + 967400 + 70179368);
+
+    let regions = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("ja"));
+    assert_eq!(regions[0].voices[0].download_size_bytes, 0);
+}

@@ -26,7 +26,7 @@ pub use planner::{
     plan_ocr_engine_upgrades, plan_repair, plan_support_download_by_kind,
     plan_translation_upgrades, plan_tts_download, plan_tts_upgrades, plan_zip_extraction,
     resolve_tts_voice_files, resolve_tts_voice_files_for_pack, translation_upgrade_language_codes,
-    tts_upgrade_language_codes,
+    tts_upgrade_language_codes, tts_voice_picker_regions,
 };
 pub use wire::{parse_and_validate_catalog, parse_language_catalog, select_best_catalog};
 

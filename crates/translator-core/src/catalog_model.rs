@@ -341,6 +341,9 @@ pub struct TtsVoicePackInfo {
     pub display_name: String,
     pub quality: Option<String>,
     pub size_bytes: u64,
+    /// What installing the voice would fetch now, leaving out the shared files
+    /// another installed pack already brought.
+    pub download_size_bytes: u64,
     pub sample_url: Option<String>,
 }
 
@@ -695,41 +698,8 @@ impl LanguageCatalog {
             .sum()
     }
 
-    pub fn tts_voice_pack_info(&self, pack_id: &str) -> Option<TtsVoicePackInfo> {
-        let pack = self.pack(pack_id)?;
-        let PackKind::Tts(tts) = &pack.kind else {
-            return None;
-        };
-        Some(TtsVoicePackInfo {
-            pack_id: pack.id.clone(),
-            display_name: tts.voice.clone().unwrap_or_else(|| pack.id.clone()),
-            quality: tts.quality.clone(),
-            size_bytes: self.pack_size_bytes(pack_id),
-            sample_url: tts.sample_url.clone(),
-        })
-    }
-
-    pub fn tts_voice_picker_regions(
-        &self,
-        language_code: &LanguageCode,
-    ) -> Vec<TtsVoicePickerRegion> {
-        self.ordered_tts_regions_for_language(language_code)
-            .into_iter()
-            .map(|(code, region)| TtsVoicePickerRegion {
-                code,
-                display_name: region.display_name,
-                voices: region
-                    .voices
-                    .into_iter()
-                    .filter_map(|pack_id| self.tts_voice_pack_info(&pack_id))
-                    .collect(),
-            })
-            .filter(|region| !region.voices.is_empty())
-            .collect()
-    }
-
     pub fn pack_size_bytes(&self, pack_id: &str) -> u64 {
-        self.unique_files_in_dependency_closure([pack_id])
+        self.preferred_files_in_dependency_closure([pack_id])
             .into_iter()
             .map(|file| file.size_bytes)
             .sum()
@@ -869,7 +839,7 @@ impl LanguageCatalog {
 
     pub fn support_size_bytes_by_kind(&self, support_kind: &str) -> u64 {
         let pack_ids = self.support_pack_ids_by_kind(support_kind);
-        self.unique_files_in_dependency_closure(pack_ids.iter().map(String::as_str))
+        self.preferred_files_in_dependency_closure(pack_ids.iter().map(String::as_str))
             .into_iter()
             .map(|file| file.size_bytes)
             .sum()
@@ -896,7 +866,10 @@ impl LanguageCatalog {
             .map(|(_, pack_id)| pack_id.clone())
     }
 
-    pub(crate) fn unique_files_in_dependency_closure<'a, I>(
+    // A role can list an older alternative next to the file that replaced it so
+    // installs that predate the replacement keep loading; a fresh install
+    // fetches only the highest-priority file of each role.
+    pub(crate) fn preferred_files_in_dependency_closure<'a, I>(
         &'a self,
         root_pack_ids: I,
     ) -> Vec<&'a AssetFileV2>
@@ -909,7 +882,13 @@ impl LanguageCatalog {
             let Some(pack) = self.packs.get(&pack_id) else {
                 continue;
             };
-            for file in &pack.files {
+            let preferred = pack.files.iter().filter(|file| {
+                !pack
+                    .files
+                    .iter()
+                    .any(|other| other.role == file.role && other.priority > file.priority)
+            });
+            for file in preferred {
                 if seen_install_paths.insert(file.install_path.clone()) {
                     files.push(file);
                 }

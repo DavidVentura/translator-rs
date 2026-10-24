@@ -126,7 +126,7 @@ pub use catalog::{
     parse_and_validate_catalog, plan_delete_superseded_files, plan_ocr_engine_download,
     plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair, plan_translation_upgrades,
     plan_tts_upgrades, plan_zip_extraction, translation_upgrade_language_codes,
-    tts_upgrade_language_codes,
+    tts_upgrade_language_codes, tts_voice_picker_regions,
 };
 pub use language_detect::DetectionResult;
 pub use ocr::{

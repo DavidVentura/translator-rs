@@ -344,8 +344,7 @@ pub fn build_language_overview(snapshot: &CatalogSnapshot) -> Vec<LanguageOvervi
                 && plan_dictionary_download(snapshot, &language_code)
                     .is_some_and(|plan| plan.tasks.is_empty());
 
-            let tts_voice_regions = catalog
-                .tts_voice_picker_regions(&language_code)
+            let tts_voice_regions = tts_voice_picker_regions(snapshot, &language_code)
                 .into_iter()
                 .map(|region| TtsVoiceRegionOverview {
                     code: region.code,
@@ -1136,13 +1135,51 @@ pub fn installed_tts_voices_for_language(
         .collect()
 }
 
-pub fn installed_tts_voice_picker_regions(
+pub fn tts_voice_picker_regions(
     snapshot: &CatalogSnapshot,
     language_code: &LanguageCode,
 ) -> Vec<TtsVoicePickerRegion> {
     snapshot
         .catalog
-        .tts_voice_picker_regions(language_code)
+        .ordered_tts_regions_for_language(language_code)
+        .into_iter()
+        .map(|(code, region)| TtsVoicePickerRegion {
+            code,
+            display_name: region.display_name,
+            voices: region
+                .voices
+                .into_iter()
+                .filter_map(|pack_id| tts_voice_pack_info(snapshot, &pack_id))
+                .collect(),
+        })
+        .filter(|region| !region.voices.is_empty())
+        .collect()
+}
+
+fn tts_voice_pack_info(snapshot: &CatalogSnapshot, pack_id: &str) -> Option<TtsVoicePackInfo> {
+    let pack = snapshot.catalog.pack(pack_id)?;
+    let PackKind::Tts(tts) = &pack.kind else {
+        return None;
+    };
+    Some(TtsVoicePackInfo {
+        pack_id: pack.id.clone(),
+        display_name: tts.voice.clone().unwrap_or_else(|| pack.id.clone()),
+        quality: tts.quality.clone(),
+        size_bytes: snapshot.catalog.pack_size_bytes(pack_id),
+        download_size_bytes: download_plan(
+            snapshot,
+            install_files_in_snapshot(snapshot, [pack_id]),
+        )
+        .total_size,
+        sample_url: tts.sample_url.clone(),
+    })
+}
+
+pub fn installed_tts_voice_picker_regions(
+    snapshot: &CatalogSnapshot,
+    language_code: &LanguageCode,
+) -> Vec<TtsVoicePickerRegion> {
+    tts_voice_picker_regions(snapshot, language_code)
         .into_iter()
         .filter_map(|region| {
             let installed_voices: Vec<_> = region
