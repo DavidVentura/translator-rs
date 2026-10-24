@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::language::Language;
+use crate::tts::TtsEngine;
 
 use super::model::{
     AssetFileV2, AssetPackMetadataV2, CatalogSourcesV2, DictionaryPack, FileRequirement, FileRole,
@@ -372,7 +373,7 @@ impl AssetPackWire {
                 depends_on: common.depends_on,
                 kind: PackKind::Tts(TtsPack {
                     language,
-                    engine: normalized(engine),
+                    engine: TtsEngine::from_wire(engine.as_deref()?)?,
                     aux_role: FileRole::new(aux_role),
                     locale: normalized(locale),
                     region: normalized(region),
@@ -718,5 +719,18 @@ mod tests {
             panic!("expected a tts pack");
         };
         assert_eq!(tts.aux_role, FileRole::new("sidecar"));
+    }
+
+    #[test]
+    fn tts_pack_of_unknown_engine_is_dropped() {
+        let json = r#"{"formatVersion":6,"generatedAt":0,"dictionaryVersion":1,
+            "sources":{"languageIndexVersion":1,"languageIndexUpdatedAt":0,
+                       "dictionaryIndexVersion":1,"dictionaryIndexUpdatedAt":0},
+            "languages":{},
+            "packs":{"tts-x":{"feature":"tts","language":"en","engine":"future_vits","auxRole":"sidecar",
+              "files":[{"name":"v.mnn","sizeBytes":1,"installPath":"p","url":"u","role":"model","priority":0}],
+              "dependsOn":[]}}}"#;
+        let catalog = parse_language_catalog(json).expect("catalog parses");
+        assert!(catalog.pack("tts-x").is_none());
     }
 }

@@ -868,8 +868,6 @@ pub fn resolve_tts_voice_files_for_pack(
     let PackKind::Tts(tts) = &voice_pack.kind else {
         return None;
     };
-    let engine = tts.engine.clone().unwrap_or_else(|| "piper".to_string());
-
     // The model and its aux file may live in the voice pack or in a shared
     // dependency (kokoro core/voices, cotovia lexicon), so resolve across the
     // closure's on-disk files.
@@ -892,7 +890,7 @@ pub fn resolve_tts_voice_files_for_pack(
     let aux_asset = by_role(&tts.aux_role)?;
     let vocoder_asset = by_role(&FileRole::new("vocoder"));
     Some(ResolvedTtsVoiceFiles {
-        engine,
+        engine: tts.engine,
         model_install_path: model_asset.install_path.clone(),
         aux_install_path: aux_asset.install_path.clone(),
         vocoder_install_path: vocoder_asset.map(|file| file.install_path.clone()),
@@ -1113,7 +1111,7 @@ pub fn installed_tts_voices_for_language(
                 return None;
             };
             let voice = tts.voice.clone().unwrap_or_else(|| pack.id.clone());
-            let display_name = voice_display_name(&voice);
+            let display_name = tts.engine.pack_display_name(&voice);
             let voices = if tts.speakers.is_empty() {
                 vec![TtsSpeakerEntry {
                     name: voice,
@@ -1166,9 +1164,11 @@ fn tts_voice_pack_info(snapshot: &CatalogSnapshot, pack_id: &str) -> Option<TtsV
     let PackKind::Tts(tts) = &pack.kind else {
         return None;
     };
+    let voice_name = tts.voice.clone().unwrap_or_else(|| pack.id.clone());
     Some(TtsVoicePackInfo {
         pack_id: pack.id.clone(),
-        display_name: tts.voice.clone().unwrap_or_else(|| pack.id.clone()),
+        display_name: tts.engine.pack_display_name(&voice_name),
+        voice_name,
         quality: tts.quality.clone(),
         size_bytes: snapshot.catalog.pack_size_bytes(pack_id),
         download_size_bytes: download_plan(

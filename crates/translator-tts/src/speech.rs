@@ -10,8 +10,8 @@ use translator_core::api::{LanguageCode, TranslatorError, VoiceName};
 use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
 use translator_core::script::Script;
 use translator_core::tts::{
-    BoundaryPauses, PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption,
-    UrlsAndHashtags, plan_speech_chunks, voice_display_name,
+    BoundaryPauses, PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsEngine,
+    TtsVoiceOption, UrlsAndHashtags, plan_speech_chunks, voice_display_name,
 };
 
 fn log_debug(message: impl AsRef<str>) {
@@ -64,7 +64,7 @@ enum SpeechModel {
 /// voice has depends on its engine.
 #[derive(Clone, PartialEq, Eq)]
 struct SpeechModelPaths {
-    engine: String,
+    engine: TtsEngine,
     model: String,
     aux: String,
     /// Second network, for engines that split the acoustic model from the vocoder.
@@ -448,8 +448,8 @@ fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
         return Err(format!("Missing auxiliary path for TTS engine `{engine}`"));
     }
 
-    match engine.as_str() {
-        "kokoro_mnn" => {
+    match engine {
+        TtsEngine::KokoroMnn => {
             let locale = paths
                 .locale
                 .as_deref()
@@ -466,7 +466,7 @@ fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
             }
             Ok(SpeechModel::KokoroMnn(model))
         }
-        "mms" => MmsModel::new(
+        TtsEngine::Mms => MmsModel::new(
             Path::new(model_path),
             Path::new(aux_path),
             language_code,
@@ -474,7 +474,7 @@ fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
         )
         .map(SpeechModel::Mms)
         .map_err(|err| format!("Failed to load MMS voice: {err}")),
-        "coqui_vits" => CoquiVitsModel::new(
+        TtsEngine::CoquiVits => CoquiVitsModel::new(
             Path::new(model_path),
             Path::new(aux_path),
             language_code,
@@ -482,12 +482,12 @@ fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
         )
         .map(SpeechModel::CoquiVits)
         .map_err(|err| format!("Failed to load Coqui VITS voice: {err}")),
-        "cotovia_vits" => {
+        TtsEngine::CotoviaVits => {
             CotoviaVitsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
                 .map(SpeechModel::CotoviaVits)
                 .map_err(|err| format!("Failed to load Cotovia VITS voice: {err}"))
         }
-        "glowtts_hifigan" => {
+        TtsEngine::GlowTtsHifigan => {
             let vocoder = vocoder
                 .as_ref()
                 .ok_or_else(|| format!("Missing vocoder path for TTS engine `{engine}`"))?;
@@ -500,20 +500,21 @@ fn load_speech_model(paths: &SpeechModelPaths) -> Result<SpeechModel, String> {
             .map(SpeechModel::GlowTtsHifigan)
             .map_err(|err| format!("Failed to load GlowTTS + HiFiGAN voice: {err}"))
         }
-        "sherpa_vits" => {
+        TtsEngine::SherpaVits => {
             SherpaVitsModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
                 .map(SpeechModel::SherpaVits)
                 .map_err(|err| format!("Failed to load Sherpa VITS voice: {err}"))
         }
-        "mimic3" => {
+        TtsEngine::Mimic3 => {
             PiperModel::from_mimic3(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
                 .map(SpeechModel::Piper)
                 .map_err(|err| format!("Failed to load Mimic3 voice: {err}"))
         }
-        "piper" => PiperModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
-            .map(SpeechModel::Piper)
-            .map_err(|err| format!("Failed to load Piper voice: {err}")),
-        other => Err(format!("Unsupported TTS engine `{other}`")),
+        TtsEngine::Piper => {
+            PiperModel::new(Path::new(model_path), Path::new(aux_path), &Backend::Cpu)
+                .map(SpeechModel::Piper)
+                .map_err(|err| format!("Failed to load Piper voice: {err}"))
+        }
     }
 }
 
@@ -523,7 +524,7 @@ fn with_cached_model<T>(
     f: impl FnOnce(&mut CachedSpeechModel) -> Result<T, String>,
 ) -> Result<T, String> {
     let load_started_at = Instant::now();
-    let engine = paths.engine.as_str();
+    let engine = paths.engine;
     let language_code = paths.language_code.as_str();
 
     let cache_hit = cache
@@ -931,7 +932,7 @@ fn plan_speech_chunks_for_text(
     let text = romanize_foreign_runs_for_voice(&filtered, script);
     plan_speech_chunks(
         &text,
-        BoundaryPauses::for_engine(&paths.engine),
+        BoundaryPauses::for_engine(paths.engine),
         |chunk_text| {
             phonemize_chunks(cache, paths, chunk_text)
                 .map(|chunks| chunks.into_iter().map(to_phoneme_chunk).collect::<Vec<_>>())

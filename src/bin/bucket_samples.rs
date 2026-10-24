@@ -11,7 +11,7 @@ use piper_rs::{
 };
 use serde::Deserialize;
 use translator::tts::{
-    BoundaryPauses, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, plan_speech_chunks,
+    BoundaryPauses, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsEngine, plan_speech_chunks,
 };
 
 const DEFAULT_INDEX_PATH: &str = "~/AndroidStudioProjects/bucket/index_v7.json";
@@ -397,10 +397,12 @@ fn synthesize_pack_sample(
     bucket_dir: &Path,
     output_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let engine = pack
+    let engine_name = pack
         .engine
         .as_deref()
         .ok_or_else(|| format!("Pack `{pack_key}` is missing `engine`"))?;
+    let engine = TtsEngine::from_wire(engine_name)
+        .ok_or_else(|| format!("Unsupported engine `{engine_name}` for `{pack_key}`"))?;
     let language = pack
         .language
         .as_deref()
@@ -431,20 +433,16 @@ fn synthesize_pack_sample(
     }
 
     let (samples, sample_rate) = match engine {
-        "piper" => synthesize_piper(pack_key, pack, catalog, bucket_dir, text)?,
-        "mimic3" => synthesize_mimic3(pack_key, pack, catalog, bucket_dir, text)?,
-        "mms" => synthesize_mms(pack_key, pack, catalog, bucket_dir, text)?,
-        "coqui_vits" => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
-        "cotovia_vits" => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
-        "glowtts_hifigan" => synthesize_glowtts_hifigan(pack_key, catalog, bucket_dir, text)?,
-        "sherpa_vits" => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
-        "kokoro_mnn" => synthesize_kokoro_mnn(pack_key, pack, catalog, bucket_dir, text)?,
-        "kokoro" => {
-            return Err(format!(
-                "`{pack_key}` uses the legacy ort kokoro engine (superseded by kokoro_mnn); skipped"
-            ));
+        TtsEngine::Piper => synthesize_piper(pack_key, pack, catalog, bucket_dir, text)?,
+        TtsEngine::Mimic3 => synthesize_mimic3(pack_key, pack, catalog, bucket_dir, text)?,
+        TtsEngine::Mms => synthesize_mms(pack_key, pack, catalog, bucket_dir, text)?,
+        TtsEngine::CoquiVits => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
+        TtsEngine::CotoviaVits => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
+        TtsEngine::GlowTtsHifigan => {
+            synthesize_glowtts_hifigan(pack_key, catalog, bucket_dir, text)?
         }
-        other => return Err(format!("Unsupported engine `{other}` for `{pack_key}`")),
+        TtsEngine::SherpaVits => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
+        TtsEngine::KokoroMnn => synthesize_kokoro_mnn(pack_key, pack, catalog, bucket_dir, text)?,
     };
 
     let samples_i16: Vec<i16> = samples

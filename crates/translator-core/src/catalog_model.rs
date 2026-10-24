@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::api::{DictionaryCode, LanguageCode};
 use crate::language::{Language, LanguageDirection, ModelFile};
+use crate::tts::TtsEngine;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogSourcesV2 {
@@ -288,7 +289,7 @@ impl PpocrScript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TtsPack {
     pub language: String,
-    pub engine: Option<String>,
+    pub engine: TtsEngine,
     pub aux_role: FileRole,
     pub locale: Option<String>,
     pub region: Option<String>,
@@ -338,6 +339,7 @@ pub enum LanguageFeature {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TtsVoicePackInfo {
     pub pack_id: String,
+    pub voice_name: String,
     pub display_name: String,
     pub quality: Option<String>,
     pub size_bytes: u64,
@@ -374,7 +376,7 @@ pub struct TtsVoicePickerRegion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTtsVoiceFiles {
-    pub engine: String,
+    pub engine: TtsEngine,
     pub model_install_path: String,
     pub aux_install_path: String,
     /// Second network, for engines that split the acoustic model from the vocoder.

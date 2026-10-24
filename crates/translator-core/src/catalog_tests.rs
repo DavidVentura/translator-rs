@@ -11,6 +11,7 @@ use crate::catalog::{
 use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair};
 use crate::catalog::{plan_translation_upgrades, translation_upgrade_language_codes};
 use crate::language::Language;
+use crate::tts::TtsEngine;
 
 use super::model::{
     DictionaryPack, LanguageInfo, LanguageResources, OcrPack, PackKind, PpocrScript, SupportPack,
@@ -191,7 +192,7 @@ fn tts_pack(
         id,
         PackKind::Tts(TtsPack {
             language: language.to_string(),
-            engine: Some("piper".to_string()),
+            engine: TtsEngine::Piper,
             aux_role: FileRole::new("sidecar"),
             locale: None,
             region: Some(region.to_string()),
@@ -1870,7 +1871,7 @@ fn installed_multi_speaker_voice_offers_its_speakers_by_name() {
 
     let packs =
         crate::catalog::installed_tts_voices_for_language(&snapshot, &LanguageCode::from("es"));
-    assert_eq!(packs[0].display_name, "Dora");
+    assert_eq!(packs[0].display_name, "Kokoro");
     let speakers = packs[0]
         .voices
         .iter()
@@ -1898,6 +1899,8 @@ fn voice_picker_counts_each_pack_speakers() {
 
     let es = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("es"));
     assert_eq!(es[0].voices[0].speaker_count, 3);
+    assert_eq!(es[0].voices[0].voice_name, "ef_dora");
+    assert_eq!(es[0].voices[0].display_name, "Kokoro");
     let ja = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("ja"));
     assert_eq!(ja[0].voices[0].speaker_count, 1);
 }

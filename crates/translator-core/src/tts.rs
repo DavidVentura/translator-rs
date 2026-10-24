@@ -22,6 +22,62 @@ pub struct TtsVoiceOption {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TtsEngine {
+    Piper,
+    Mimic3,
+    Mms,
+    CoquiVits,
+    CotoviaVits,
+    GlowTtsHifigan,
+    SherpaVits,
+    KokoroMnn,
+}
+
+impl TtsEngine {
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Some(match name {
+            "piper" => Self::Piper,
+            "mimic3" => Self::Mimic3,
+            "mms" => Self::Mms,
+            "coqui_vits" => Self::CoquiVits,
+            "cotovia_vits" => Self::CotoviaVits,
+            "glowtts_hifigan" => Self::GlowTtsHifigan,
+            "sherpa_vits" => Self::SherpaVits,
+            "kokoro_mnn" => Self::KokoroMnn,
+            _ => return None,
+        })
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Piper => "piper",
+            Self::Mimic3 => "mimic3",
+            Self::Mms => "mms",
+            Self::CoquiVits => "coqui_vits",
+            Self::CotoviaVits => "cotovia_vits",
+            Self::GlowTtsHifigan => "glowtts_hifigan",
+            Self::SherpaVits => "sherpa_vits",
+            Self::KokoroMnn => "kokoro_mnn",
+        }
+    }
+
+    pub fn pack_display_name(self, voice: &str) -> String {
+        match self {
+            // A Kokoro pack holds every voice of its language; the one it names
+            // is only the default speaker.
+            Self::KokoroMnn => "Kokoro".to_string(),
+            _ => voice_display_name(voice),
+        }
+    }
+}
+
+impl std::fmt::Display for TtsEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
 fn is_kokoro_voice_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(
@@ -115,9 +171,9 @@ impl BoundaryPauses {
         paragraph_ms: 250,
     };
 
-    pub fn for_engine(engine: &str) -> Self {
+    pub fn for_engine(engine: TtsEngine) -> Self {
         match engine {
-            "kokoro_mnn" => Self::KOKORO,
+            TtsEngine::KokoroMnn => Self::KOKORO,
             _ => Self::NONE,
         }
     }
