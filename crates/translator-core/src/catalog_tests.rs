@@ -197,7 +197,7 @@ fn tts_pack(
             region: Some(region.to_string()),
             voice: None,
             quality: None,
-            num_speakers: None,
+            speakers: Vec::new(),
             default_speaker_id: Some(default_speaker_id),
             sample_url: None,
         }),
@@ -1620,9 +1620,16 @@ fn kokoro_language(code: &str, region: &str) -> String {
     )
 }
 
-fn kokoro_voice_pack(code: &str, path: &str, replaces: &str) -> String {
+fn kokoro_voice_pack(
+    code: &str,
+    path: &str,
+    replaces: &str,
+    voice: &str,
+    speakers: &str,
+) -> String {
     format!(
         r#""tts-kokoro-{code}":{{"feature":"tts","engine":"kokoro_mnn","auxRole":"voices","language":"{code}",
+          "voice":"{voice}","speakers":[{speakers}],
           "files":[{{"name":"v.bin","sizeBytes":261390,"installPath":"{path}","url":"u","role":"voices",
                      "priority":0,"replaces":[{replaces}]}}],
           "dependsOn":["dict-{code}","kokoro-core"]}},
@@ -1652,9 +1659,15 @@ fn kokoro_catalog() -> LanguageCatalog {
         kokoro_language("ja", "JP"),
         kokoro_language("ko", "KR"),
         kokoro_language("es", "ES"),
-        kokoro_voice_pack("ja", JA_VOICE, &legacy),
-        kokoro_voice_pack("ko", KO_VOICE, &legacy),
-        kokoro_voice_pack("es", ES_VOICE, ""),
+        kokoro_voice_pack("ja", JA_VOICE, &legacy, "jf_alpha", ""),
+        kokoro_voice_pack("ko", KO_VOICE, &legacy, "jf_alpha", ""),
+        kokoro_voice_pack(
+            "es",
+            ES_VOICE,
+            "",
+            "ef_dora",
+            r#""ef_dora","em_alex","em_santa""#
+        ),
     );
     crate::catalog::parse_and_validate_catalog(&json).expect("kokoro catalog parses")
 }
@@ -1843,4 +1856,48 @@ fn voice_download_size_leaves_out_files_another_kokoro_voice_brought() {
 
     let regions = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("ja"));
     assert_eq!(regions[0].voices[0].download_size_bytes, 0);
+}
+
+#[test]
+fn installed_multi_speaker_voice_offers_its_speakers_by_name() {
+    let snapshot = kokoro_snapshot(&[
+        ESPEAK,
+        "bin/espeak-ng-data/es_dict",
+        NEW_MODEL,
+        NEW_WEIGHT,
+        ES_VOICE,
+    ]);
+
+    let packs =
+        crate::catalog::installed_tts_voices_for_language(&snapshot, &LanguageCode::from("es"));
+    assert_eq!(packs[0].display_name, "Dora");
+    let speakers = packs[0]
+        .voices
+        .iter()
+        .map(|voice| {
+            (
+                voice.name.as_str(),
+                voice.display_name.as_str(),
+                voice.speaker_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        speakers,
+        [
+            ("ef_dora", "Dora", 0),
+            ("em_alex", "Alex", 1),
+            ("em_santa", "Santa", 2)
+        ]
+    );
+}
+
+#[test]
+fn voice_picker_counts_each_pack_speakers() {
+    let snapshot = kokoro_snapshot(&[]);
+
+    let es = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("es"));
+    assert_eq!(es[0].voices[0].speaker_count, 3);
+    let ja = crate::catalog::tts_voice_picker_regions(&snapshot, &LanguageCode::from("ja"));
+    assert_eq!(ja[0].voices[0].speaker_count, 1);
 }

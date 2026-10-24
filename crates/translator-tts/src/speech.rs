@@ -11,7 +11,7 @@ use translator_core::catalog::{CatalogSnapshot, ResolvedTtsVoiceFiles};
 use translator_core::script::Script;
 use translator_core::tts::{
     BoundaryPauses, PcmAudio, PhonemeChunk, SpeechChunk, SpeechChunkBoundary, TtsVoiceOption,
-    UrlsAndHashtags, plan_speech_chunks,
+    UrlsAndHashtags, plan_speech_chunks, voice_display_name,
 };
 
 fn log_debug(message: impl AsRef<str>) {
@@ -194,46 +194,11 @@ fn available_voices(model: &SpeechModel) -> Vec<(String, i64)> {
     voices
 }
 
-fn is_kokoro_voice_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(
-        (chars.next(), chars.next(), chars.next()),
-        (Some(first), Some(second), Some('_'))
-            if first.is_ascii_lowercase() && second.is_ascii_lowercase()
-    )
-}
-
-fn format_voice_display_name(name: &str) -> String {
-    let trimmed = if is_kokoro_voice_name(name) {
-        &name[3..]
-    } else {
-        name
-    };
-
-    trimmed
-        .split(['_', '-'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => {
-                    let mut formatted = String::new();
-                    formatted.extend(first.to_uppercase());
-                    formatted.push_str(chars.as_str());
-                    formatted
-                }
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn visible_voices(voices: &[(String, i64)]) -> Vec<TtsVoiceOption> {
     voices
         .iter()
         .map(|(name, speaker_id)| TtsVoiceOption {
-            display_name: format_voice_display_name(name),
+            display_name: voice_display_name(name),
             name: name.clone(),
             speaker_id: *speaker_id,
         })

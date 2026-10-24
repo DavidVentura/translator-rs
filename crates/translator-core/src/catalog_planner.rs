@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::api::LanguageCode;
 use crate::language::Language;
+use crate::tts::voice_display_name;
 
 use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole, InstallMarker,
@@ -1111,18 +1112,22 @@ pub fn installed_tts_voices_for_language(
             let PackKind::Tts(tts) = &pack.kind else {
                 return None;
             };
-            let display_name = tts.voice.clone().unwrap_or_else(|| pack.id.clone());
-            let num_speakers = tts.num_speakers.unwrap_or(1).max(1);
-            let voices = if num_speakers <= 1 {
+            let voice = tts.voice.clone().unwrap_or_else(|| pack.id.clone());
+            let display_name = voice_display_name(&voice);
+            let voices = if tts.speakers.is_empty() {
                 vec![TtsSpeakerEntry {
-                    name: display_name.clone(),
+                    name: voice,
+                    display_name: display_name.clone(),
                     speaker_id: tts.default_speaker_id.unwrap_or(0),
                 }]
             } else {
-                (0..num_speakers)
-                    .map(|index| TtsSpeakerEntry {
-                        name: format!("speaker_{index}"),
-                        speaker_id: index,
+                // The engine resolves a requested voice by the model's own speaker names.
+                (0..)
+                    .zip(&tts.speakers)
+                    .map(|(speaker_id, name)| TtsSpeakerEntry {
+                        name: name.clone(),
+                        display_name: voice_display_name(name),
+                        speaker_id,
                     })
                     .collect()
             };
@@ -1171,6 +1176,8 @@ fn tts_voice_pack_info(snapshot: &CatalogSnapshot, pack_id: &str) -> Option<TtsV
             install_files_in_snapshot(snapshot, [pack_id]),
         )
         .total_size,
+        speaker_count: u32::try_from(tts.speakers.len().max(1))
+            .expect("a voice pack lists fewer than 2^32 speakers"),
         sample_url: tts.sample_url.clone(),
     })
 }

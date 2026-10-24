@@ -54,6 +54,8 @@ struct Pack {
     quality: Option<String>,
     #[serde(default, rename = "defaultSpeakerId")]
     default_speaker_id: Option<i64>,
+    #[serde(default, rename = "auxRole")]
+    aux_role: Option<String>,
     #[serde(default)]
     files: Vec<PackFile>,
     #[serde(default, rename = "dependsOn")]
@@ -63,6 +65,8 @@ struct Pack {
 #[derive(Debug, Deserialize)]
 struct PackFile {
     name: String,
+    role: String,
+    priority: u32,
     #[serde(default, rename = "installPath")]
     install_path: Option<String>,
     #[serde(default)]
@@ -739,12 +743,12 @@ fn synthesize_kokoro_mnn(
     bucket_dir: &Path,
     text: &str,
 ) -> Result<(Vec<f32>, u32), String> {
-    let model_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
-        file.name == "kokoro.mnn"
-    })?;
-    let voices_path = find_file_path(pack_key, catalog, bucket_dir, |file| {
-        file.name == "voices-v1.0.bin"
-    })?;
+    let aux_role = pack
+        .aux_role
+        .as_deref()
+        .ok_or_else(|| format!("Pack `{pack_key}` is missing `auxRole`"))?;
+    let model_path = find_preferred_role_path(pack_key, catalog, bucket_dir, "model")?;
+    let voices_path = find_preferred_role_path(pack_key, catalog, bucket_dir, aux_role)?;
     let locale = pack
         .locale
         .as_deref()
@@ -948,6 +952,41 @@ where
     }
 
     Err(format!("No matching file found for `{pack_key}`"))
+}
+
+// The app loads the highest-priority file of a role, so samples must too: a
+// pack can list a previous model next to the current one.
+fn find_preferred_role_path(
+    pack_key: &str,
+    catalog: &Catalog,
+    bucket_dir: &Path,
+    role: &str,
+) -> Result<PathBuf, String> {
+    let mut stack = vec![pack_key.to_string()];
+    let mut visited = HashSet::new();
+    let mut best: Option<&PackFile> = None;
+    while let Some(current_key) = stack.pop() {
+        if !visited.insert(current_key.clone()) {
+            continue;
+        }
+        let pack = catalog
+            .packs
+            .get(&current_key)
+            .ok_or_else(|| format!("Pack `{current_key}` not found in catalog"))?;
+        for file in pack.files.iter().filter(|file| file.role == role) {
+            if best.is_none_or(|best| file.priority > best.priority) {
+                best = Some(file);
+            }
+        }
+        stack.extend(pack.depends_on.iter().cloned());
+    }
+    let file = best.ok_or_else(|| format!("No `{role}` file found for `{pack_key}`"))?;
+    resolve_local_file_path(bucket_dir, file).ok_or_else(|| {
+        format!(
+            "Matched `{role}` file `{}` for `{pack_key}`, but could not resolve a local path",
+            file.name
+        )
+    })
 }
 
 fn resolve_local_file_path(bucket_dir: &Path, file: &PackFile) -> Option<PathBuf> {

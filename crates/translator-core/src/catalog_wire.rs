@@ -142,8 +142,8 @@ enum AssetPackWire {
         region: Option<String>,
         voice: Option<String>,
         quality: Option<String>,
-        #[serde(rename = "numSpeakers")]
-        num_speakers: Option<i32>,
+        #[serde(default)]
+        speakers: Vec<String>,
         #[serde(rename = "defaultSpeakerId")]
         default_speaker_id: Option<i32>,
         #[serde(rename = "sampleUrl", default)]
@@ -362,7 +362,7 @@ impl AssetPackWire {
                 region,
                 voice,
                 quality,
-                num_speakers,
+                speakers,
                 default_speaker_id,
                 sample_url,
                 common,
@@ -378,7 +378,7 @@ impl AssetPackWire {
                     region: normalized(region),
                     voice: normalized(voice),
                     quality: normalized(quality),
-                    num_speakers,
+                    speakers,
                     default_speaker_id,
                     sample_url: normalized(sample_url),
                 }),

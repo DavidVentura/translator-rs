@@ -294,7 +294,7 @@ pub struct TtsPack {
     pub region: Option<String>,
     pub voice: Option<String>,
     pub quality: Option<String>,
-    pub num_speakers: Option<i32>,
+    pub speakers: Vec<String>,
     pub default_speaker_id: Option<i32>,
     pub sample_url: Option<String>,
 }
@@ -344,6 +344,7 @@ pub struct TtsVoicePackInfo {
     /// What installing the voice would fetch now, leaving out the shared files
     /// another installed pack already brought.
     pub download_size_bytes: u64,
+    pub speaker_count: u32,
     pub sample_url: Option<String>,
 }
 
@@ -351,6 +352,7 @@ pub struct TtsVoicePackInfo {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TtsSpeakerEntry {
     pub name: String,
+    pub display_name: String,
     pub speaker_id: i32,
 }
 

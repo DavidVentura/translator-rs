@@ -22,6 +22,41 @@ pub struct TtsVoiceOption {
     pub display_name: String,
 }
 
+fn is_kokoro_voice_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(first), Some(second), Some('_'))
+            if first.is_ascii_lowercase() && second.is_ascii_lowercase()
+    )
+}
+
+pub fn voice_display_name(name: &str) -> String {
+    let trimmed = if is_kokoro_voice_name(name) {
+        &name[3..]
+    } else {
+        name
+    };
+
+    trimmed
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut formatted = String::new();
+                    formatted.extend(first.to_uppercase());
+                    formatted.push_str(chars.as_str());
+                    formatted
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PcmAudio {
