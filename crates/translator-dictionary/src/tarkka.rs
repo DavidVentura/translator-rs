@@ -65,8 +65,8 @@ pub fn lookup_dictionary_for_code(
     dictionary_code: &DictionaryCode,
     word: &str,
 ) -> Result<Option<WordWithTaggedEntries>, TranslatorError> {
-    let normalized = word.trim();
-    if normalized.is_empty() {
+    let keys = lookup_keys(word);
+    if keys.is_empty() {
         return Ok(None);
     }
 
@@ -77,15 +77,31 @@ pub fn lookup_dictionary_for_code(
         ))
     })?;
 
-    let lowered = normalized.to_lowercase();
-    match cache.lookup(&path, normalized) {
-        Ok(Some(word_data)) => Ok(Some(word_data)),
-        Ok(None) if lowered != normalized => cache
-            .lookup(&path, &lowered)
-            .map_err(TranslatorError::dictionary),
-        Ok(None) => Ok(None),
-        Err(err) => Err(TranslatorError::dictionary(err)),
+    for key in &keys {
+        if let Some(found) = cache
+            .lookup(&path, key)
+            .map_err(TranslatorError::dictionary)?
+        {
+            return Ok(Some(found));
+        }
     }
+    Ok(None)
+}
+
+// Words picked off an image keep the punctuation OCR read around them (`"Stel`, `in."`), but
+// entries like `etc.` keep theirs too, so the form as given is tried before the stripped one.
+fn lookup_keys(word: &str) -> Vec<String> {
+    let trimmed = word.trim();
+    let stripped = trimmed.trim_matches(|c: char| !c.is_alphanumeric());
+    let mut keys: Vec<String> = Vec::new();
+    for form in [trimmed, stripped] {
+        for key in [form.to_string(), form.to_lowercase()] {
+            if !key.is_empty() && !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
 }
 
 fn dictionary_path_for_language(
@@ -126,5 +142,37 @@ pub fn close_dictionary_in_snapshot(
 ) {
     if let Some(path) = dictionary_path_for_language(snapshot, language_code) {
         cache.close(&path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lookup_keys;
+
+    #[test]
+    fn plain_word_is_looked_up_as_given_then_lowercased() {
+        assert_eq!(lookup_keys(" Huis "), vec!["Huis", "huis"]);
+        assert_eq!(lookup_keys("huis"), vec!["huis"]);
+    }
+
+    #[test]
+    fn surrounding_punctuation_is_stripped_after_the_exact_form() {
+        assert_eq!(lookup_keys("in.\""), vec!["in.\"", "in"]);
+        assert_eq!(
+            lookup_keys("\"Stel"),
+            vec!["\"Stel", "\"stel", "Stel", "stel"]
+        );
+        assert_eq!(lookup_keys("etc."), vec!["etc.", "etc"]);
+    }
+
+    #[test]
+    fn inner_punctuation_is_kept() {
+        assert_eq!(lookup_keys("l'eau,"), vec!["l'eau,", "l'eau"]);
+    }
+
+    #[test]
+    fn punctuation_only_or_blank_has_nothing_to_look_up() {
+        assert_eq!(lookup_keys("  "), Vec::<String>::new());
+        assert_eq!(lookup_keys("—"), vec!["—"]);
     }
 }

@@ -423,7 +423,7 @@ impl TranslatorSession {
         background_mode: BackgroundMode,
         // Optional boxes from a prior `detect_image_boxes` call; when `Some`, detection is skipped.
         detection: Option<Vec<crate::ocr::DetectedTextBox>>,
-    ) -> Result<PreparedImageOverlay, TranslatorError> {
+    ) -> Result<crate::ocr::RecognizedImageOverlay, TranslatorError> {
         let still =
             crate::ocr_runtime::build_still_image(rgba_bytes, width, height, max_image_size)?;
         self.translate_from_still(
@@ -479,7 +479,7 @@ impl TranslatorSession {
         reading_order: Option<ReadingOrder>,
         background_mode: BackgroundMode,
         detection: Option<Vec<crate::ocr::DetectedTextBox>>,
-    ) -> Result<PreparedImageOverlay, TranslatorError> {
+    ) -> Result<crate::ocr::RecognizedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
         let tgt = LanguageCode::from(target_code);
         let ppocr = self.ppocr(&snap)?;
@@ -933,6 +933,7 @@ impl translator_pdf::pdf_image_translate::ImageTranslator for TranslatorSession 
             background_mode,
             detection,
         )
+        .map(|recognized| recognized.overlay)
     }
 }
 

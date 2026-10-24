@@ -11,7 +11,9 @@ use translator_core::catalog::{OcrPack, PackKind, PpocrScript};
 use translator_core::ocr::{
     DetectedTextBox, OcrSourceSelection, OrientedRect, RecognizedTextLine, TextLine,
 };
-use translator_core::ocr::{PreparedImageOverlay, ReadingOrder, Rect, TextBlock};
+use translator_core::ocr::{
+    PreparedImageOverlay, ReadingOrder, RecognizedImageOverlay, Rect, TextBlock,
+};
 use translator_core::settings::BackgroundMode;
 use translator_raster::live_frame::StillImage;
 use translator_raster::overlay::prepare_overlay_image;
@@ -64,7 +66,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
     // Detected boxes from a prior `detect_boxes_from_still` pass; when `Some`, detection is
     // skipped so the staged detect→translate path runs the detector only once.
     detection: Option<Vec<DetectedTextBox>>,
-) -> Result<PreparedImageOverlay, TranslatorError> {
+) -> Result<RecognizedImageOverlay, TranslatorError> {
     let rgb = &still.rgb;
     let det_boxes: Vec<DetectedTextBox> = match detection {
         Some(boxes) => boxes,
@@ -341,7 +343,10 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         .map(|(i, _)| i as u32)
         .collect();
     overlay.source_words = translator_core::ocr::order_words_visually(source_words, &rtl_lines);
-    Ok(overlay)
+    Ok(RecognizedImageOverlay {
+        overlay,
+        source_code,
+    })
 }
 
 /// Flatten the recognized lines into per-word source boxes in image space, in recognition

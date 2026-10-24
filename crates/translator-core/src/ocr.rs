@@ -655,6 +655,14 @@ pub struct PreparedImageOverlay {
     pub translated_words: Vec<PositionedWord>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RecognizedImageOverlay {
+    pub overlay: PreparedImageOverlay,
+    // Under auto-detect only the OCR pass knows which language the text was read as.
+    pub source_code: crate::api::LanguageCode,
+}
+
 /// Lightweight detection result — what the PaddlePaddle detector produces before
 /// the recognizer is run. Exposes only the box geometry so callers can cheaply
 /// track box motion across frames (live mode) and selectively run recognition.

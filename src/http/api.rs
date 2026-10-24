@@ -504,7 +504,8 @@ impl Api {
                 } else {
                     ApiError::bad_request(error.message)
                 }
-            })?;
+            })?
+            .overlay;
         let rendered = render_overlay(
             &prepared,
             &*self.fonts,
