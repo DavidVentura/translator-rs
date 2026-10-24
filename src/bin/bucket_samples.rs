@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use piper_rs::{
-    Backend, CoquiVitsModel, CotoviaVitsModel, GlowTtsHifiganModel, KokoroLanguage, KokoroMnnModel,
-    MmsModel, PiperModel, SherpaVitsModel,
+    Backend, CoquiVitsModel, CotoviaVitsModel, Espeak, GlowTtsHifiganModel, KokoroLanguage,
+    KokoroMnnModel, MmsModel, PiperModel, SherpaVitsModel,
 };
 use serde::Deserialize;
 use translator::tts::{
@@ -110,7 +110,7 @@ fn run(args: Args) -> Result<(), String> {
     })?;
     let catalog = Arc::new(catalog);
 
-    configure_espeak_data(&args.bucket_dir)?;
+    let espeak = Arc::new(Mutex::new(open_espeak(&args.bucket_dir)?));
     fs::create_dir_all(&args.output_dir).map_err(|err| {
         format!(
             "Failed to create output directory `{}`: {err}",
@@ -151,6 +151,7 @@ fn run(args: Args) -> Result<(), String> {
 
     let totals = process_packs(
         Arc::clone(&catalog),
+        espeak,
         args.bucket_dir.clone(),
         args.output_dir.clone(),
         pack_keys,
@@ -263,6 +264,7 @@ fn usage() -> &'static str {
 
 fn process_packs(
     catalog: Arc<Catalog>,
+    espeak: Arc<Mutex<Espeak>>,
     bucket_dir: PathBuf,
     output_dir: PathBuf,
     pack_keys: Vec<String>,
@@ -280,6 +282,7 @@ fn process_packs(
         let totals = Arc::clone(&totals);
         let errors = Arc::clone(&errors);
         let catalog = Arc::clone(&catalog);
+        let espeak = Arc::clone(&espeak);
         let bucket_dir = bucket_dir.clone();
         let output_dir = output_dir.clone();
 
@@ -304,7 +307,14 @@ fn process_packs(
                 let quality = pack.quality.as_deref().unwrap_or("unknown");
                 println!("[worker {worker_id}] {language} | {engine} | {voice} | {quality}");
 
-                match synthesize_pack_sample(&pack_key, pack, &catalog, &bucket_dir, &output_dir) {
+                match synthesize_pack_sample(
+                    &pack_key,
+                    pack,
+                    &catalog,
+                    &espeak,
+                    &bucket_dir,
+                    &output_dir,
+                ) {
                     Ok(path) => {
                         println!("[worker {worker_id}]   saved {}", path.display());
                         let mut totals = totals
@@ -361,7 +371,7 @@ fn process_packs(
     Ok(totals)
 }
 
-fn configure_espeak_data(bucket_dir: &Path) -> Result<(), String> {
+fn open_espeak(bucket_dir: &Path) -> Result<Espeak, String> {
     for candidate in [
         bucket_dir.join("tts/1"),
         bucket_dir.join("bin"),
@@ -370,10 +380,10 @@ fn configure_espeak_data(bucket_dir: &Path) -> Result<(), String> {
     ] {
         let espeak_dir = candidate.join("espeak-ng-data");
         if has_complete_espeak_data(&espeak_dir) {
-            piper_rs::init_espeak(&candidate)
+            let espeak = Espeak::open(&candidate)
                 .map_err(|err| format!("Failed to initialize eSpeak: {err}"))?;
             println!("Using eSpeak data from {}", espeak_dir.display());
-            return Ok(());
+            return Ok(espeak);
         }
     }
 
@@ -382,6 +392,12 @@ fn configure_espeak_data(bucket_dir: &Path) -> Result<(), String> {
         If you only have `espeak-ng-data.zip`, unzip it next to itself first.",
         bucket_dir.display()
     ))
+}
+
+fn lock_espeak(espeak: &Mutex<Espeak>) -> Result<MutexGuard<'_, Espeak>, String> {
+    espeak
+        .lock()
+        .map_err(|_| "eSpeak lock poisoned".to_string())
 }
 
 fn has_complete_espeak_data(espeak_dir: &Path) -> bool {
@@ -394,6 +410,7 @@ fn synthesize_pack_sample(
     pack_key: &str,
     pack: &Pack,
     catalog: &Catalog,
+    espeak: &Mutex<Espeak>,
     bucket_dir: &Path,
     output_dir: &Path,
 ) -> Result<PathBuf, String> {
@@ -433,8 +450,8 @@ fn synthesize_pack_sample(
     }
 
     let (samples, sample_rate) = match engine {
-        TtsEngine::Piper => synthesize_piper(pack_key, pack, catalog, bucket_dir, text)?,
-        TtsEngine::Mimic3 => synthesize_mimic3(pack_key, pack, catalog, bucket_dir, text)?,
+        TtsEngine::Piper => synthesize_piper(pack_key, pack, catalog, espeak, bucket_dir, text)?,
+        TtsEngine::Mimic3 => synthesize_mimic3(pack_key, pack, catalog, espeak, bucket_dir, text)?,
         TtsEngine::Mms => synthesize_mms(pack_key, pack, catalog, bucket_dir, text)?,
         TtsEngine::CoquiVits => synthesize_coqui(pack_key, pack, catalog, bucket_dir, text)?,
         TtsEngine::CotoviaVits => synthesize_cotovia(pack_key, catalog, bucket_dir, text)?,
@@ -442,7 +459,9 @@ fn synthesize_pack_sample(
             synthesize_glowtts_hifigan(pack_key, catalog, bucket_dir, text)?
         }
         TtsEngine::SherpaVits => synthesize_sherpa(pack_key, catalog, bucket_dir, text)?,
-        TtsEngine::KokoroMnn => synthesize_kokoro_mnn(pack_key, pack, catalog, bucket_dir, text)?,
+        TtsEngine::KokoroMnn => {
+            synthesize_kokoro_mnn(pack_key, pack, catalog, espeak, bucket_dir, text)?
+        }
     };
 
     let samples_i16: Vec<i16> = samples
@@ -507,6 +526,7 @@ fn synthesize_piper(
     pack_key: &str,
     pack: &Pack,
     catalog: &Catalog,
+    espeak: &Mutex<Espeak>,
     bucket_dir: &Path,
     text: &str,
 ) -> Result<(Vec<f32>, u32), String> {
@@ -527,17 +547,23 @@ fn synthesize_piper(
 
     let plan = plan_for_text("Piper", pack_key, BoundaryPauses::NONE, text, |t| {
         model
-            .phonemize(t)
+            .phonemize(&mut *lock_espeak(espeak)?, t)
             .map_err(|err| format!("Failed to phonemize Piper voice `{pack_key}`: {err}"))
     })?;
 
     synthesize_plan(plan, |content, is_phonemes| {
-        if is_phonemes {
-            model.synthesize_phonemes(content, speaker_id)
+        // Phonemize under the shared eSpeak lock and synthesize outside it, so
+        // workers only wait on each other for eSpeak.
+        let phonemes = if is_phonemes {
+            content.to_owned()
         } else {
-            model.synthesize(content, speaker_id)
-        }
-        .map_err(|err| format!("Failed to synthesize Piper voice `{pack_key}`: {err}"))
+            model
+                .phonemize(&mut *lock_espeak(espeak)?, content)
+                .map_err(|err| format!("Failed to phonemize `{pack_key}`: {err}"))?
+        };
+        model
+            .synthesize_phonemes(&phonemes, speaker_id)
+            .map_err(|err| format!("Failed to synthesize Piper voice `{pack_key}`: {err}"))
     })
 }
 
@@ -589,6 +615,7 @@ fn synthesize_mimic3(
     pack_key: &str,
     pack: &Pack,
     catalog: &Catalog,
+    espeak: &Mutex<Espeak>,
     bucket_dir: &Path,
     text: &str,
 ) -> Result<(Vec<f32>, u32), String> {
@@ -609,17 +636,21 @@ fn synthesize_mimic3(
 
     let plan = plan_for_text("Mimic3", pack_key, BoundaryPauses::NONE, text, |t| {
         model
-            .phonemize(t)
+            .phonemize(&mut *lock_espeak(espeak)?, t)
             .map_err(|err| format!("Failed to phonemize Mimic3 voice `{pack_key}`: {err}"))
     })?;
 
     synthesize_plan(plan, |content, is_phonemes| {
-        if is_phonemes {
-            model.synthesize_phonemes(content, speaker_id)
+        let phonemes = if is_phonemes {
+            content.to_owned()
         } else {
-            model.synthesize(content, speaker_id)
-        }
-        .map_err(|err| format!("Failed to synthesize Mimic3 voice `{pack_key}`: {err}"))
+            model
+                .phonemize(&mut *lock_espeak(espeak)?, content)
+                .map_err(|err| format!("Failed to phonemize `{pack_key}`: {err}"))?
+        };
+        model
+            .synthesize_phonemes(&phonemes, speaker_id)
+            .map_err(|err| format!("Failed to synthesize Mimic3 voice `{pack_key}`: {err}"))
     })
 }
 
@@ -738,6 +769,7 @@ fn synthesize_kokoro_mnn(
     pack_key: &str,
     pack: &Pack,
     catalog: &Catalog,
+    espeak: &Mutex<Espeak>,
     bucket_dir: &Path,
     text: &str,
 ) -> Result<(Vec<f32>, u32), String> {
@@ -767,17 +799,21 @@ fn synthesize_kokoro_mnn(
 
     let plan = plan_for_text("Kokoro", pack_key, BoundaryPauses::KOKORO, text, |t| {
         model
-            .phonemize(t)
+            .phonemize(&mut *lock_espeak(espeak)?, t)
             .map_err(|err| format!("Failed to phonemize Kokoro voice `{pack_key}`: {err}"))
     })?;
 
     synthesize_plan(plan, |content, is_phonemes| {
-        if is_phonemes {
-            model.synthesize_phonemes(content, speaker_id, None)
+        let phonemes = if is_phonemes {
+            content.to_owned()
         } else {
-            model.synthesize(content, speaker_id, None)
-        }
-        .map_err(|err| format!("Failed to synthesize Kokoro voice `{pack_key}`: {err}"))
+            model
+                .phonemize(&mut *lock_espeak(espeak)?, content)
+                .map_err(|err| format!("Failed to phonemize `{pack_key}`: {err}"))?
+        };
+        model
+            .synthesize_phonemes(&phonemes, speaker_id, None)
+            .map_err(|err| format!("Failed to synthesize Kokoro voice `{pack_key}`: {err}"))
     })
 }
 

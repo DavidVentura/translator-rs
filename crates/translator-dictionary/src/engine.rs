@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 use translator_core::api::{LanguageCode, TranslatorError};
 use translator_core::catalog::CatalogSnapshot;
 
@@ -9,7 +7,7 @@ use crate::tarkka::{
 };
 
 pub struct DictionaryEngine {
-    cache: Mutex<DictionaryCache>,
+    cache: DictionaryCache,
 }
 
 impl Default for DictionaryEngine {
@@ -21,22 +19,20 @@ impl Default for DictionaryEngine {
 impl DictionaryEngine {
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(DictionaryCache::new()),
+            cache: DictionaryCache::new(),
         }
     }
 
     pub fn lookup(
-        &self,
+        &mut self,
         snap: &CatalogSnapshot,
         language: &LanguageCode,
         word: &str,
     ) -> Result<Option<WordWithTaggedEntries>, TranslatorError> {
-        let mut cache = self.cache.lock().expect("dictionary cache poisoned");
-        lookup_dictionary_in_snapshot(snap, &mut cache, language, word)
+        lookup_dictionary_in_snapshot(snap, &mut self.cache, language, word)
     }
 
-    pub fn close(&self, snap: &CatalogSnapshot, language: &LanguageCode) {
-        let mut cache = self.cache.lock().expect("dictionary cache poisoned");
-        close_dictionary_in_snapshot(snap, &mut cache, language);
+    pub fn close(&mut self, snap: &CatalogSnapshot, language: &LanguageCode) {
+        close_dictionary_in_snapshot(snap, &mut self.cache, language);
     }
 }

@@ -62,6 +62,10 @@ impl TtsEngine {
         }
     }
 
+    pub fn phonemizes_with_espeak(self) -> bool {
+        matches!(self, Self::Piper | Self::Mimic3 | Self::KokoroMnn)
+    }
+
     pub fn pack_display_name(self, voice: &str) -> String {
         match self {
             // A Kokoro pack holds every voice of its language; the one it names

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use translator_core::api::{TranslatorError, TranslatorErrorKind};
 use translator_core::catalog::{
@@ -21,7 +21,7 @@ struct PpocrEngineKey {
 }
 
 pub struct OcrEngine {
-    warm: Mutex<Option<(PpocrEngineKey, Arc<PpocrEngine>)>>,
+    warm: Option<(PpocrEngineKey, Arc<PpocrEngine>)>,
 }
 
 impl Default for OcrEngine {
@@ -32,12 +32,10 @@ impl Default for OcrEngine {
 
 impl OcrEngine {
     pub fn new() -> Self {
-        Self {
-            warm: Mutex::new(None),
-        }
+        Self { warm: None }
     }
 
-    pub fn engine(&self, snap: &CatalogSnapshot) -> Result<Arc<PpocrEngine>, TranslatorError> {
+    pub fn engine(&mut self, snap: &CatalogSnapshot) -> Result<Arc<PpocrEngine>, TranslatorError> {
         let catalog = &snap.catalog;
         let pack_installed = |pack_id: &str| {
             snap.pack_statuses
@@ -140,8 +138,7 @@ impl OcrEngine {
                 .collect(),
         };
 
-        let mut cache = self.warm.lock().expect("ppocr cache poisoned");
-        if let Some((cached_key, engine)) = cache.as_ref() {
+        if let Some((cached_key, engine)) = self.warm.as_ref() {
             if cached_key == &key {
                 return Ok(Arc::clone(engine));
             }
@@ -155,7 +152,7 @@ impl OcrEngine {
             ink_path.as_deref(),
         )?;
         let engine = Arc::new(engine);
-        *cache = Some((key, Arc::clone(&engine)));
+        self.warm = Some((key, Arc::clone(&engine)));
         Ok(engine)
     }
 }

@@ -173,6 +173,11 @@ path = "tests/translate_smoke.rs"
 required-features = ["html"]
 
 [[test]]
+name = "session_smoke"
+path = "tests/session_smoke.rs"
+required-features = ["tts"]
+
+[[test]]
 name = "http_smoke"
 path = "tests/http_smoke.rs"
 required-features = ["http"]

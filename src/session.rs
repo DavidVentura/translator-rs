@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::api::{LanguageCode, TranslatorError};
 use crate::bergamot::{BergamotEngine, TranslateCtx};
@@ -53,24 +53,23 @@ pub enum Feature {
     Tts,
 }
 
-static BERGAMOT_ENGINE: OnceLock<Mutex<BergamotEngine>> = OnceLock::new();
-
 pub struct TranslatorSession {
     snapshot: RwLock<Arc<CatalogSnapshot>>,
     /// Set true by `cancel_ongoing_work()` (from any thread) to abort the
     /// in-flight document translation. slimt worker threads poll it and stop
     /// within ~one batch. Document translations reset it to false at entry.
-    /// Translations are serialized through the global engine mutex, so a
+    /// Translations are serialized through the session's engine mutex, so a
     /// single per-session flag unambiguously targets the active document.
     document_cancel: AtomicBool,
+    bergamot: Mutex<BergamotEngine>,
     #[cfg(feature = "tts")]
-    tts: TtsEngine,
+    tts: Mutex<TtsEngine>,
     #[cfg(feature = "dictionary")]
-    dictionary: DictionaryEngine,
+    dictionary: Mutex<DictionaryEngine>,
     #[cfg(feature = "doc-align")]
-    doc_align: DocAlignEngine,
+    doc_align: Mutex<DocAlignEngine>,
     #[cfg(feature = "ppocr")]
-    ocr: OcrEngine,
+    ocr: Mutex<OcrEngine>,
 }
 
 impl TranslatorSession {
@@ -78,14 +77,15 @@ impl TranslatorSession {
         Self {
             snapshot: RwLock::new(Arc::new(snapshot)),
             document_cancel: AtomicBool::new(false),
+            bergamot: Mutex::new(BergamotEngine::new()),
             #[cfg(feature = "tts")]
-            tts: TtsEngine::new(),
+            tts: Mutex::new(TtsEngine::new()),
             #[cfg(feature = "dictionary")]
-            dictionary: DictionaryEngine::new(),
+            dictionary: Mutex::new(DictionaryEngine::new()),
             #[cfg(feature = "doc-align")]
-            doc_align: DocAlignEngine::new(),
+            doc_align: Mutex::new(DocAlignEngine::new()),
             #[cfg(feature = "ppocr")]
-            ocr: OcrEngine::new(),
+            ocr: Mutex::new(OcrEngine::new()),
         }
     }
 
@@ -95,8 +95,19 @@ impl TranslatorSession {
         Self::from_snapshot(snapshot)
     }
 
-    fn engine(&self) -> &'static Mutex<BergamotEngine> {
-        BERGAMOT_ENGINE.get_or_init(|| Mutex::new(BergamotEngine::new()))
+    fn engine(&self) -> &Mutex<BergamotEngine> {
+        &self.bergamot
+    }
+
+    #[cfg(feature = "ppocr")]
+    fn ppocr(
+        &self,
+        snap: &CatalogSnapshot,
+    ) -> Result<Arc<crate::ppocr::PpocrEngine>, TranslatorError> {
+        self.ocr
+            .lock()
+            .expect("ocr engine lock poisoned")
+            .engine(snap)
     }
 
     pub fn open<C>(
@@ -450,7 +461,7 @@ impl TranslatorSession {
         height: u32,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
         let snap = self.snapshot();
-        let ppocr = self.ocr.engine(&snap)?;
+        let ppocr = self.ppocr(&snap)?;
         crate::ocr_runtime::detect_boxes_from_still(&ppocr, still, width, height)
     }
 
@@ -471,7 +482,7 @@ impl TranslatorSession {
     ) -> Result<PreparedImageOverlay, TranslatorError> {
         let snap = self.snapshot();
         let tgt = LanguageCode::from(target_code);
-        let ppocr = self.ocr.engine(&snap)?;
+        let ppocr = self.ppocr(&snap)?;
         log::info!("ocr engine: ppocr ({:?})", source_selection);
         translate_image_rgba_ppocr_in_snapshot(
             self.engine(),
@@ -509,7 +520,7 @@ impl TranslatorSession {
         max_image_size: u32,
     ) -> Result<Vec<crate::ocr::DetectedTextBox>, TranslatorError> {
         let snap = self.snapshot();
-        let ppocr = self.ocr.engine(&snap)?;
+        let ppocr = self.ppocr(&snap)?;
         crate::ocr_runtime::detect_image_boxes_ppocr(
             &ppocr,
             rgba_bytes,
@@ -517,11 +528,6 @@ impl TranslatorSession {
             height,
             max_image_size,
         )
-    }
-
-    #[cfg(feature = "planar-tracker")]
-    pub(crate) fn ocr(&self) -> &OcrEngine {
-        &self.ocr
     }
 
     pub fn retranslate_prepared_overlay(
@@ -583,12 +589,10 @@ impl TranslatorSession {
         let code = LanguageCode::from(language_code);
         match feature {
             Feature::Core => {
-                if let Some(engine) = BERGAMOT_ENGINE.get() {
-                    engine
-                        .lock()
-                        .expect("engine lock poisoned")
-                        .evict_involving(language_code);
-                }
+                self.engine()
+                    .lock()
+                    .expect("engine lock poisoned")
+                    .evict_involving(language_code);
                 #[cfg(feature = "dictionary")]
                 self.close_dictionary(&snap, &code);
                 #[cfg(feature = "tts")]
@@ -615,7 +619,10 @@ impl TranslatorSession {
 
     #[cfg(feature = "dictionary")]
     fn close_dictionary(&self, snapshot: &CatalogSnapshot, language_code: &LanguageCode) {
-        self.dictionary.close(snapshot, language_code);
+        self.dictionary
+            .lock()
+            .expect("dictionary engine lock poisoned")
+            .close(snapshot, language_code);
     }
 
     pub fn prepare_delete_superseded_tts(
@@ -639,7 +646,7 @@ impl TranslatorSession {
 
     #[cfg(feature = "tts")]
     fn clear_speech_cache(&self) {
-        self.tts.clear();
+        self.tts.lock().expect("tts engine lock poisoned").clear();
     }
 
     pub fn size_bytes(&self, language_code: &str, feature: Feature) -> u64 {
@@ -675,6 +682,8 @@ impl TranslatorSession {
         word: &str,
     ) -> Result<Option<WordWithTaggedEntries>, TranslatorError> {
         self.dictionary
+            .lock()
+            .expect("dictionary engine lock poisoned")
             .lookup(&self.snapshot(), &LanguageCode::from(language_code), word)
     }
 
@@ -684,6 +693,8 @@ impl TranslatorSession {
         language_code: &str,
     ) -> Result<Vec<TtsVoiceOption>, TranslatorError> {
         self.tts
+            .lock()
+            .expect("tts engine lock poisoned")
             .available_voices(&self.snapshot(), &LanguageCode::from(language_code))
     }
 
@@ -696,6 +707,8 @@ impl TranslatorSession {
     #[cfg(feature = "tts")]
     pub fn warm_tts_model(&self, language_code: &str) -> Result<(), TranslatorError> {
         self.tts
+            .lock()
+            .expect("tts engine lock poisoned")
             .warm_model(&self.snapshot(), &LanguageCode::from(language_code))
     }
 
@@ -707,13 +720,16 @@ impl TranslatorSession {
         pack_id: Option<&str>,
         urls_and_hashtags: UrlsAndHashtags,
     ) -> Result<Vec<SpeechChunk>, TranslatorError> {
-        self.tts.plan_speech_chunks(
-            &self.snapshot(),
-            &LanguageCode::from(language_code),
-            text,
-            pack_id,
-            urls_and_hashtags,
-        )
+        self.tts
+            .lock()
+            .expect("tts engine lock poisoned")
+            .plan_speech_chunks(
+                &self.snapshot(),
+                &LanguageCode::from(language_code),
+                text,
+                pack_id,
+                urls_and_hashtags,
+            )
     }
 
     #[cfg(feature = "tts")]
@@ -726,15 +742,18 @@ impl TranslatorSession {
         is_phonemes: bool,
         pack_id: Option<&str>,
     ) -> Result<PcmAudio, TranslatorError> {
-        self.tts.synthesize_pcm(
-            &self.snapshot(),
-            &LanguageCode::from(language_code),
-            text,
-            speech_speed,
-            voice_name.map(VoiceName::from).as_ref(),
-            is_phonemes,
-            pack_id,
-        )
+        self.tts
+            .lock()
+            .expect("tts engine lock poisoned")
+            .synthesize_pcm(
+                &self.snapshot(),
+                &LanguageCode::from(language_code),
+                text,
+                speech_speed,
+                voice_name.map(VoiceName::from).as_ref(),
+                is_phonemes,
+                pack_id,
+            )
     }
 
     pub fn transliterate(&self, text: &str, language_code: &str) -> Option<String> {
@@ -775,6 +794,8 @@ impl TranslatorSession {
         height: u32,
     ) -> Result<Option<DocumentDetection>, TranslatorError> {
         self.doc_align
+            .lock()
+            .expect("doc-align engine lock poisoned")
             .detect_document_quad(&self.snapshot(), rgba, width, height)
     }
 
@@ -811,7 +832,7 @@ impl translator_live::live_session::LiveRecognizer for TranslatorSession {
         canonical_quadrant: Option<crate::coords::Quadrant>,
     ) -> Result<Vec<crate::ocr::RecognizedTextLine>, String> {
         let snap = self.snapshot();
-        let ppocr = self.ocr().engine(&snap).map_err(|e| format!("{e:?}"))?;
+        let ppocr = self.ppocr(&snap).map_err(|e| format!("{e:?}"))?;
         let script = match source_selection {
             OcrSourceSelection::Auto => None,
             OcrSourceSelection::Specific { language_code } => Some(
@@ -863,9 +884,7 @@ impl translator_live::live_session::LiveTranslator for TranslatorSession {
 #[cfg(feature = "planar-tracker")]
 impl translator_live::live_session::LiveOcrHost for TranslatorSession {
     fn ppocr_engine(&self) -> Result<Arc<crate::ppocr::PpocrEngine>, String> {
-        self.ocr()
-            .engine(&self.snapshot())
-            .map_err(|e| format!("{e:?}"))
+        self.ppocr(&self.snapshot()).map_err(|e| format!("{e:?}"))
     }
 
     fn orient_script(&self, from_lang: &str, is_auto_source: bool) -> Option<crate::PpocrScript> {
