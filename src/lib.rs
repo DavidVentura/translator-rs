@@ -93,6 +93,7 @@ pub use translator_translate::sentence_split;
 pub mod document;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod install;
 pub mod session;
 pub use translator_core::settings;
 pub use translator_core::tts;
@@ -120,14 +121,14 @@ pub use catalog::{
     CatalogSnapshot, DeletePlan, DictionaryInfo, DownloadPlan, DownloadTask, FileRole,
     FsPackInstallChecker, InstallMarker, InstalledTtsPack, LanguageAvailabilityRow,
     LanguageCatalog, LanguageOverview, OcrEngine, OcrPack, PpocrScript, TaskInstall,
-    TtsSpeakerEntry, TtsVoicePickerRegion, ZipEntryTarget, ZipExtractionPlan,
-    available_ocr_engines_for_language, installed_ocr_engines_for_language,
-    installed_tts_voice_picker_regions, language_rows_in_snapshot, ocr_engine_ready,
-    parse_and_validate_catalog, plan_delete_superseded_files, plan_ocr_engine_download,
-    plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair, plan_translation_upgrades,
-    plan_tts_upgrades, plan_zip_extraction, translation_upgrade_language_codes,
-    tts_upgrade_language_codes, tts_voice_picker_regions,
+    TtsSpeakerEntry, TtsVoicePickerRegion, ZipArchive, available_ocr_engines_for_language,
+    installed_ocr_engines_for_language, installed_tts_voice_picker_regions,
+    language_rows_in_snapshot, ocr_engine_ready, parse_and_validate_catalog,
+    plan_delete_superseded_files, plan_ocr_engine_download, plan_ocr_engine_downloads,
+    plan_ocr_engine_upgrades, plan_repair, plan_translation_upgrades, plan_tts_upgrades,
+    translation_upgrade_language_codes, tts_upgrade_language_codes, tts_voice_picker_regions,
 };
+pub use install::{DownloadEncoding, InstallError, Installation, StageTarget};
 pub use language_detect::DetectionResult;
 pub use ocr::{
     DetectedTextBox, OcrSourceSelection, OrientedRect, OverlayColors, PreparedImageOverlay,

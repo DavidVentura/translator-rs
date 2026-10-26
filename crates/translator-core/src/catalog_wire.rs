@@ -236,21 +236,7 @@ impl TryFrom<AssetFileWire> for AssetFileV2 {
     type Error = String;
 
     fn try_from(value: AssetFileWire) -> Result<Self, Self::Error> {
-        let archive = match normalized(value.archive_format).as_deref() {
-            None => None,
-            Some("zip") => Some(ZipArchive {
-                extract_to: normalized(value.extract_to)
-                    .ok_or_else(|| format!("zip file {} has no extractTo", value.install_path))?,
-                delete_after_extract: value.delete_after_extract,
-            }),
-            Some(other) => {
-                return Err(format!(
-                    "unsupported archiveFormat {other} for {}",
-                    value.install_path
-                ));
-            }
-        };
-        let install_marker = match (
+        let marker = match (
             normalized(value.install_marker_path),
             value.install_marker_version,
         ) {
@@ -263,6 +249,40 @@ impl TryFrom<AssetFileWire> for AssetFileV2 {
                 ));
             }
         };
+        // The marker is the only thing that says an extracted archive is installed (the archive
+        // itself is usually deleted), and a marker means nothing without one.
+        let archive = match (normalized(value.archive_format).as_deref(), marker) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{} has an install marker but is not an archive",
+                    value.install_path
+                ));
+            }
+            (Some("zip"), Some(marker)) => {
+                let extract_to = normalized(value.extract_to)
+                    .ok_or_else(|| format!("zip file {} has no extractTo", value.install_path))?;
+                let (extract_to, root_dir) = archive_layout(&extract_to, &marker.path)?;
+                Some(ZipArchive {
+                    extract_to,
+                    root_dir,
+                    delete_after_extract: value.delete_after_extract,
+                    marker,
+                })
+            }
+            (Some("zip"), None) => {
+                return Err(format!(
+                    "zip file {} has no install marker",
+                    value.install_path
+                ));
+            }
+            (Some(other), _) => {
+                return Err(format!(
+                    "unsupported archiveFormat {other} for {}",
+                    value.install_path
+                ));
+            }
+        };
         Ok(Self {
             name: value.name,
             size_bytes: value.size_bytes,
@@ -270,7 +290,6 @@ impl TryFrom<AssetFileWire> for AssetFileV2 {
             url: value.url,
             source_path: normalized(value.source_path),
             archive,
-            install_marker,
             role: FileRole::new(value.role),
             priority: value.priority,
             requirement: if value.optional {
@@ -281,6 +300,38 @@ impl TryFrom<AssetFileWire> for AssetFileV2 {
             replaces: value.replaces,
         })
     }
+}
+
+// Splits a marker path into the archive's extraction directory and its single
+// top-level directory, which must sit directly under that extraction directory.
+fn archive_layout(extract_to: &str, marker_path: &str) -> Result<(String, String), String> {
+    let extract_parts = relative_parts(extract_to)?;
+    let marker_parts = relative_parts(marker_path)?;
+    match marker_parts
+        .split_last()
+        .and_then(|(_, dir)| dir.split_last())
+    {
+        Some((root_dir, parent)) if parent == extract_parts.as_slice() => {
+            Ok((extract_parts.join("/"), root_dir.to_string()))
+        }
+        _ => Err(format!(
+            "install marker {marker_path} must sit in a directory directly under {extract_to}"
+        )),
+    }
+}
+
+fn relative_parts(path: &str) -> Result<Vec<&str>, String> {
+    std::path::Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::CurDir => None,
+            std::path::Component::Normal(part) => Some(
+                part.to_str()
+                    .ok_or_else(|| format!("{path} is not valid UTF-8")),
+            ),
+            _ => Some(Err(format!("{path} must stay inside the install root"))),
+        })
+        .collect()
 }
 
 // A file this build can't install (an archive format added by a newer catalog)

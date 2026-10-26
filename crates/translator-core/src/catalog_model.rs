@@ -121,7 +121,6 @@ pub struct AssetFileV2 {
     pub url: String,
     pub source_path: Option<String>,
     pub archive: Option<ZipArchive>,
-    pub install_marker: Option<InstallMarker>,
     pub role: FileRole,
     pub priority: i32,
     pub requirement: FileRequirement,
@@ -426,10 +425,27 @@ pub struct MigrationJob {
     pub action: MigrationAction,
 }
 
+/// An archive holds exactly one top-level directory, `root_dir`, which lands
+/// directly under `extract_to` and holds the marker; the catalog parser
+/// rejects any other shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ZipArchive {
+    /// Relative to the install root, with `""` for the root itself.
     pub extract_to: String,
+    pub root_dir: String,
     pub delete_after_extract: bool,
+    pub marker: InstallMarker,
+}
+
+impl ZipArchive {
+    pub fn install_dir(&self) -> String {
+        if self.extract_to.is_empty() {
+            self.root_dir.clone()
+        } else {
+            format!("{}/{}", self.extract_to, self.root_dir)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,11 +460,7 @@ pub struct InstallMarker {
 pub enum TaskInstall {
     Raw,
     Gunzip,
-    Zip {
-        extract_to: String,
-        delete_after_extract: bool,
-        marker: Option<InstallMarker>,
-    },
+    Zip { archive: ZipArchive },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,22 +479,6 @@ pub struct DownloadPlan {
     pub total_size: u64,
     pub tasks: Vec<DownloadTask>,
     pub delete_after: DeletePlan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct ZipExtractionPlan {
-    pub entries: Vec<ZipEntryTarget>,
-    // Cleared before unpacking so a re-extract never mixes an old tree with the new one.
-    pub replace_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct ZipEntryTarget {
-    pub entry_name: String,
-    pub install_path: String,
-    pub is_directory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

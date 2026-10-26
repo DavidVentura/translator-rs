@@ -6,7 +6,7 @@ use crate::catalog::{
     InstallMarker, LangAvailability, LanguageCatalog, LanguageFeature, LanguageTtsRegionV2,
     LanguageTtsV2, PackInstallChecker, PackRecord, TaskInstall, build_catalog_snapshot,
     download_task_installed, plan_delete_superseded_files, plan_language_download,
-    plan_language_install, plan_zip_extraction,
+    plan_language_install,
 };
 use crate::catalog::{plan_ocr_engine_downloads, plan_ocr_engine_upgrades, plan_repair};
 use crate::catalog::{plan_translation_upgrades, translation_upgrade_language_codes};
@@ -51,7 +51,6 @@ fn asset_file(name: &str, install_path: &str, size_bytes: u64) -> AssetFileV2 {
         url: format!("https://example.invalid/{name}"),
         source_path: None,
         archive: None,
-        install_marker: None,
         // These fixtures exercise install/status/download planning, not runtime
         // role resolution, so each file just needs a distinct role to stay its
         // own singleton group (the filename guarantees that).
@@ -1424,16 +1423,19 @@ fn language_install_skips_core_support_already_on_disk() {
     );
 }
 
-fn zip_task(marker: Option<InstallMarker>) -> DownloadTask {
+fn zip_task(marker: InstallMarker) -> DownloadTask {
     DownloadTask {
         pack_id: "support-adblock".to_string(),
         install_path: "adblock/lists.zip".to_string(),
         url: "https://example.invalid/lists.zip".to_string(),
         size_bytes: 10,
         install: TaskInstall::Zip {
-            extract_to: "adblock".to_string(),
-            delete_after_extract: true,
-            marker,
+            archive: crate::catalog::ZipArchive {
+                extract_to: "adblock".to_string(),
+                root_dir: "lists".to_string(),
+                delete_after_extract: true,
+                marker,
+            },
         },
     }
 }
@@ -1444,7 +1446,7 @@ fn zip_task_counts_as_installed_by_its_marker_not_its_archive() {
         path: "adblock/lists/.installed".to_string(),
         version: 3,
     };
-    let task = zip_task(Some(marker));
+    let task = zip_task(marker);
     let archive_only = FakeInstallChecker::with_files(&["adblock/lists.zip"]);
     let mut marker_present = FakeInstallChecker::with_files(&[]);
     marker_present
@@ -1465,7 +1467,10 @@ fn raw_task_counts_as_installed_by_its_file() {
     let task = DownloadTask {
         install: TaskInstall::Raw,
         install_path: "bin/model.bin".to_string(),
-        ..zip_task(None)
+        ..zip_task(InstallMarker {
+            path: "adblock/lists/.installed".to_string(),
+            version: 1,
+        })
     };
 
     assert!(download_task_installed(
@@ -1476,72 +1481,6 @@ fn raw_task_counts_as_installed_by_its_file() {
         &FakeInstallChecker::with_files(&[]),
         &task
     ));
-}
-
-#[test]
-fn zip_extraction_reroots_entries_under_the_marker_directory() {
-    let marker = InstallMarker {
-        path: "adblock/lists/.installed".to_string(),
-        version: 1,
-    };
-    let names = [
-        "easylist.txt",
-        "./nested/",
-        "nested/b.txt",
-        "lists/already.txt",
-    ]
-    .map(String::from)
-    .to_vec();
-
-    let plan = plan_zip_extraction("adblock", Some(&marker), &names).expect("valid archive");
-
-    let targets = plan
-        .entries
-        .iter()
-        .map(|entry| (entry.install_path.as_str(), entry.is_directory))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        targets,
-        vec![
-            ("adblock/lists/easylist.txt", false),
-            ("adblock/lists/nested", true),
-            ("adblock/lists/nested/b.txt", false),
-            ("adblock/lists/already.txt", false),
-        ]
-    );
-    assert_eq!(
-        plan.replace_paths,
-        vec![
-            "adblock/lists/already.txt".to_string(),
-            "adblock/lists/easylist.txt".to_string(),
-            "adblock/lists/nested".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn zip_extraction_without_marker_keeps_entry_layout() {
-    let names = ["/top/a.txt", "top/sub/b.txt"].map(String::from).to_vec();
-
-    let plan = plan_zip_extraction("data", None, &names).expect("valid archive");
-
-    let paths = plan
-        .entries
-        .iter()
-        .map(|entry| entry.install_path.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(paths, vec!["data/top/a.txt", "data/top/sub/b.txt"]);
-    assert_eq!(
-        plan.replace_paths,
-        vec!["data/top/a.txt".to_string(), "data/top/sub".to_string()]
-    );
-}
-
-#[test]
-fn zip_extraction_rejects_entries_escaping_the_root() {
-    let names = ["ok.txt", "../../etc/passwd"].map(String::from).to_vec();
-
-    assert!(plan_zip_extraction("adblock", None, &names).is_err());
 }
 
 fn catalog_json_with_file(file: &str) -> String {
@@ -1571,16 +1510,66 @@ fn parses_zip_files_into_typed_archive_and_marker() {
         file.archive,
         Some(crate::catalog::ZipArchive {
             extract_to: "adblock".to_string(),
+            root_dir: "l".to_string(),
             delete_after_extract: true,
+            marker: InstallMarker {
+                path: "adblock/l/.installed".to_string(),
+                version: 2,
+            },
         })
     );
-    assert_eq!(
-        file.install_marker,
-        Some(InstallMarker {
-            path: "adblock/l/.installed".to_string(),
-            version: 2,
-        })
+}
+
+#[test]
+fn zip_extracting_into_the_install_root_keeps_its_root_dir() {
+    let json = catalog_json_with_file(
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"adblock/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":".","deleteAfterExtract":true,
+            "installMarkerPath":"adblock/.install-info.json","installMarkerVersion":1,
+            "role":"lists","priority":0}"#,
     );
+    let catalog = crate::catalog::parse_and_validate_catalog(&json).expect("catalog parses");
+
+    let archive = catalog.packs["support-x"].files[0]
+        .archive
+        .clone()
+        .expect("zip file");
+    assert_eq!(archive.extract_to, "");
+    assert_eq!(archive.root_dir, "adblock");
+    assert_eq!(archive.install_dir(), "adblock");
+}
+
+#[test]
+fn drops_packs_whose_archive_and_marker_disagree() {
+    for file in [
+        // A zip without a marker could never read as installed once its archive is deleted.
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":"a","role":"lists","priority":0}"#,
+        r#"{"name":"l.txt","sizeBytes":1,"installPath":"a/l.txt","url":"u",
+            "installMarkerPath":"a/l/.installed","installMarkerVersion":1,
+            "role":"lists","priority":0}"#,
+        // The marker has to sit in the archive's root directory, one level under extractTo.
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":"a",
+            "installMarkerPath":"a/.installed","installMarkerVersion":1,
+            "role":"lists","priority":0}"#,
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":"a",
+            "installMarkerPath":"a/l/nested/.installed","installMarkerVersion":1,
+            "role":"lists","priority":0}"#,
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":"a",
+            "installMarkerPath":"b/l/.installed","installMarkerVersion":1,
+            "role":"lists","priority":0}"#,
+        r#"{"name":"l.zip","sizeBytes":1,"installPath":"a/l.zip","url":"u",
+            "archiveFormat":"zip","extractTo":"../a",
+            "installMarkerPath":"../a/l/.installed","installMarkerVersion":1,
+            "role":"lists","priority":0}"#,
+    ] {
+        let catalog = crate::catalog::parse_and_validate_catalog(&catalog_json_with_file(file))
+            .expect("catalog parses");
+        assert!(!catalog.packs.contains_key("support-x"), "{file}");
+    }
 }
 
 #[test]

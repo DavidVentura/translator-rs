@@ -8,7 +8,7 @@ use super::model::{
     AssetFileV2, DeletePlan, DownloadPlan, DownloadTask, FileRequirement, FileRole, InstallMarker,
     InstalledTtsPack, LangAvailability, LanguageCatalog, LanguageFeature, MigrationAction,
     MigrationJob, OcrPack, PackKind, PackRecord, ResolvedTtsVoiceFiles, TaskInstall, TtsPack,
-    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion, ZipEntryTarget, ZipExtractionPlan,
+    TtsSpeakerEntry, TtsVoicePackInfo, TtsVoicePickerRegion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,14 +78,31 @@ impl PackInstallChecker for FsPackInstallChecker {
         let Ok(contents) = std::fs::read_to_string(marker_file) else {
             return false;
         };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        let Ok(marker) = serde_json::from_str::<InstallMarkerFile>(&contents) else {
             return false;
         };
-        json.get("version")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok())
-            == Some(expected_version)
+        marker.version == expected_version
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InstallMarkerFile {
+    version: i32,
+}
+
+pub fn write_install_marker(
+    base_dir: &std::path::Path,
+    marker: &InstallMarker,
+) -> std::io::Result<()> {
+    let marker_file = base_dir.join(&marker.path);
+    if let Some(parent) = marker_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(&InstallMarkerFile {
+        version: marker.version,
+    })
+    .expect("a marker always serializes");
+    std::fs::write(marker_file, json + "\n")
 }
 
 /// Select the on-device ONNX→MNN conversions for the current install: only
@@ -189,7 +206,11 @@ where
         let pack = self.catalog.pack(pack_id)?;
         let checker = self.install_checker;
         let file_present = |file: &AssetFileV2| {
-            installed_at(checker, &file.install_path, file.install_marker.as_ref())
+            installed_at(
+                checker,
+                &file.install_path,
+                file.archive.as_ref().map(|archive| &archive.marker),
+            )
         };
 
         let missing_dependency_ids = pack
@@ -909,9 +930,7 @@ fn download_task_for(pack: &PackRecord, file: &AssetFileV2) -> DownloadTask {
         .ends_with(".gz");
     let install = match &file.archive {
         Some(archive) => TaskInstall::Zip {
-            extract_to: archive.extract_to.clone(),
-            delete_after_extract: archive.delete_after_extract,
-            marker: file.install_marker.clone(),
+            archive: archive.clone(),
         },
         None if gzipped && matches!(&pack.kind, PackKind::Translation(_)) => TaskInstall::Gunzip,
         None => TaskInstall::Raw,
@@ -986,64 +1005,10 @@ fn installed_at(
 // right before fetching.
 pub fn download_task_installed(checker: &impl PackInstallChecker, task: &DownloadTask) -> bool {
     let marker = match &task.install {
-        TaskInstall::Zip { marker, .. } => marker.as_ref(),
+        TaskInstall::Zip { archive } => Some(&archive.marker),
         TaskInstall::Raw | TaskInstall::Gunzip => None,
     };
     installed_at(checker, &task.install_path, marker)
-}
-
-// Archives are built either with their install root as the top-level directory
-// or with its contents at the top level; entries are re-rooted under the
-// marker's directory so both layouts land in the same place.
-pub fn plan_zip_extraction(
-    extract_to: &str,
-    marker: Option<&InstallMarker>,
-    entry_names: &[String],
-) -> Result<ZipExtractionPlan, String> {
-    let install_root = marker
-        .and_then(|marker| std::path::Path::new(&marker.path).parent())
-        .and_then(|parent| parent.file_name())
-        .map(|name| name.to_string_lossy().to_string());
-    let mut entries = Vec::new();
-    let mut replace_paths = BTreeSet::new();
-    for entry_name in entry_names {
-        let trimmed = entry_name.trim_start_matches('/');
-        let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
-        let parts = trimmed
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        if parts.iter().any(|part| *part == "..") {
-            return Err(format!(
-                "zip entry {entry_name} escapes the extraction root"
-            ));
-        }
-        if parts.is_empty() {
-            continue;
-        }
-        let parts = match install_root.as_deref() {
-            Some(root) if parts[0] != root => std::iter::once(root).chain(parts).collect(),
-            _ => parts,
-        };
-        replace_paths.insert(join_install_path(extract_to, &parts[..parts.len().min(2)]));
-        entries.push(ZipEntryTarget {
-            entry_name: entry_name.clone(),
-            install_path: join_install_path(extract_to, &parts),
-            is_directory: entry_name.ends_with('/'),
-        });
-    }
-    Ok(ZipExtractionPlan {
-        entries,
-        replace_paths: replace_paths.into_iter().collect(),
-    })
-}
-
-fn join_install_path(base: &str, parts: &[&str]) -> String {
-    std::iter::once(base.trim_end_matches('/'))
-        .chain(parts.iter().copied())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 pub fn plan_language_download(
@@ -1276,12 +1241,9 @@ where
                     file_paths.push(path.clone());
                 }
             }
-            if file.archive.is_some()
-                && let Some(marker) = &file.install_marker
-                && let Some(parent) = std::path::Path::new(&marker.path).parent()
-            {
-                let path = parent.to_string_lossy().to_string();
-                if !path.is_empty() && directory_seen.insert(path.clone()) {
+            if let Some(archive) = &file.archive {
+                let path = archive.install_dir();
+                if directory_seen.insert(path.clone()) {
                     directory_paths.push(path);
                 }
             }

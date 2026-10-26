@@ -67,7 +67,8 @@ fn link(source: &Path, target: &Path) {
 /// pre-extracted from the bucket, and gzipped translation models from the
 /// desktop install.
 fn install_file(sources: &Sources, base: &Path, file: &AssetFileV2) {
-    if let Some(marker) = &file.install_marker {
+    if let Some(archive) = &file.archive {
+        let marker = &archive.marker;
         let extracted = bucket_path(&sources.bucket, &file.url).with_extension("");
         let marker_path = base.join(&marker.path);
         let target_dir = marker_path
@@ -77,8 +78,7 @@ fn install_file(sources: &Sources, base: &Path, file: &AssetFileV2) {
             let entry = entry.expect("archive entry");
             link(&entry.path(), &target_dir.join(entry.file_name()));
         }
-        fs::write(&marker_path, format!("{{\"version\":{}}}", marker.version))
-            .expect("write install marker");
+        translator::catalog::write_install_marker(base, marker).expect("write install marker");
         return;
     }
     let from_bucket = bucket_path(&sources.bucket, &file.url);
@@ -105,7 +105,7 @@ fn install(sources: &Sources, catalog: &LanguageCatalog, base: &Path) {
             .unwrap_or_else(|| panic!("catalog has no pack `{pack_id}`"));
         // Markers first, so a file landing inside an extracted archive finds its directory.
         let mut files = pack.files.iter().collect::<Vec<_>>();
-        files.sort_by_key(|file| file.install_marker.is_none());
+        files.sort_by_key(|file| file.archive.is_none());
         for file in files {
             install_file(sources, base, file);
         }

@@ -12,6 +12,7 @@ use crate::catalog::{
     plan_delete_tts_pack, plan_dictionary_download, plan_language_install, plan_migrations,
     plan_support_download_by_kind, plan_tts_download, select_best_catalog,
 };
+use crate::install::{InstallError, Installation};
 use crate::routing::MixedTextTranslationResult;
 #[cfg(feature = "ppocr")]
 use crate::settings::BackgroundMode;
@@ -577,6 +578,27 @@ impl TranslatorSession {
     pub fn download_task_installed(&self, task: &DownloadTask) -> bool {
         let snap = self.snapshot();
         download_task_installed(&FsPackInstallChecker::new(&snap.base_dir), task)
+    }
+
+    pub fn begin_install(&self, plan: DownloadPlan) -> Result<Installation, InstallError> {
+        Installation::begin(std::path::Path::new(&self.snapshot().base_dir), plan)
+    }
+
+    pub fn commit_install(&self, installation: &Installation) -> Result<(), InstallError> {
+        let current = std::path::PathBuf::from(&self.snapshot().base_dir);
+        if installation.install_root() != current {
+            return Err(InstallError::InstallRootChanged {
+                staged_for: installation.install_root().display().to_string(),
+                current: current.display().to_string(),
+            });
+        }
+        installation.move_into_place()?;
+        self.apply_delete_plan(installation.delete_after());
+        Ok(())
+    }
+
+    pub fn discard_abandoned_installs(&self) -> Result<(), InstallError> {
+        crate::install::discard_abandoned(std::path::Path::new(&self.snapshot().base_dir))
     }
 
     pub fn plan_support_download_by_kind(&self, support_kind: &str) -> Option<DownloadPlan> {
