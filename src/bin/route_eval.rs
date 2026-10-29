@@ -12,6 +12,9 @@
 //! The PULC classifier's unclassified-line count is reported too: those lines are routed by
 //! guesswork, so it is the number a better classifier input should drive down.
 //!
+//! The classifier is scored on its own as well: of the lines it did classify, how many it put in
+//! the script family the line needs (`pulc_right`) and how many elsewhere (`pulc_wrong`).
+//!
 //! A degraded line also reports its character error rate against the Latin recognizer's reading,
 //! so "read by the wrong recognizer" and "read wrong" can be told apart. `ROUTE_EVAL_VERBOSE=1`
 //! prints every line, not just the misrouted ones.
@@ -31,7 +34,7 @@ use translator::live_session::LiveOcrHost;
 use translator::ocr_runtime::{
     build_still_image, detect_boxes_from_still, route_ppocr_predictions,
 };
-use translator::ppocr::PpocrProfile;
+use translator::ppocr::{PpocrProfile, PpocrScriptClass};
 use translator::script::Script;
 
 const MAX_IMAGE_SIZE: u32 = 1400;
@@ -76,6 +79,21 @@ fn reads(recognizer: PpocrScript, script: Script) -> bool {
     }
 }
 
+/// Whether a PULC class names the recognizer family a line needs.
+fn class_matches(class: PpocrScriptClass, label: PpocrScript) -> bool {
+    match class {
+        PpocrScriptClass::Latin => label == PpocrScript::Latin,
+        PpocrScriptClass::Cyrillic => same_family(label, PpocrScript::Eslav),
+        PpocrScriptClass::Arabic => label == PpocrScript::Arabic,
+        PpocrScriptClass::Devanagari => label == PpocrScript::Devanagari,
+        PpocrScriptClass::Chinese | PpocrScriptClass::Japanese => label == PpocrScript::Cj,
+        PpocrScriptClass::Korean => label == PpocrScript::Korean,
+        PpocrScriptClass::Tamil => label == PpocrScript::Ta,
+        PpocrScriptClass::Telugu => label == PpocrScript::Te,
+        PpocrScriptClass::Kannada => label == PpocrScript::Indic,
+    }
+}
+
 fn same_family(a: PpocrScript, b: PpocrScript) -> bool {
     let cyrillic = |s| matches!(s, PpocrScript::Cyrillic | PpocrScript::Eslav);
     a == b || (cyrillic(a) && cyrillic(b))
@@ -91,6 +109,8 @@ struct Tally {
     degraded_chars: usize,
     /// Lines PULC gave no confident class, which routing then has to guess.
     unclassified: usize,
+    pulc_right: usize,
+    pulc_wrong: usize,
 }
 
 impl Tally {
@@ -101,6 +121,8 @@ impl Tally {
         self.degraded_edits += other.degraded_edits;
         self.degraded_chars += other.degraded_chars;
         self.unclassified += other.unclassified;
+        self.pulc_right += other.pulc_right;
+        self.pulc_wrong += other.pulc_wrong;
     }
 
     fn degraded_cer(&self) -> f32 {
@@ -246,6 +268,12 @@ fn main() {
                     .as_ref()
                     .map(|p| p.class.name())
                     .unwrap_or("-");
+                match &predictions[i] {
+                    Some(p) if class_matches(p.class, label) => tally.pulc_right += 1,
+                    Some(_) => tally.pulc_wrong += 1,
+                    None => {}
+                }
+                let aspect = boxes[i].rect.width() as f32 / boxes[i].rect.height().max(1) as f32;
                 let text = readings
                     .iter()
                     .find(|(s, _)| *s == label)
@@ -255,7 +283,7 @@ fn main() {
                     tally.correct += 1;
                     if verbose {
                         failures.push(format!(
-                            "  ok        pulc={class:9} routed={:8} {:?}",
+                            "  ok        pulc={class:9}aspect={aspect:4.1} routed={:8} {:?}",
                             route.as_slug(),
                             routed_texts[i]
                         ));
@@ -267,24 +295,26 @@ fn main() {
                     tally.degraded_edits += edits;
                     tally.degraded_chars += reference.chars().count();
                     failures.push(format!(
-                        "  degraded  pulc={class:9} routed={:8} edits={edits:2} {:?} (latin: {reference:?})",
+                        "  degraded  pulc={class:9}aspect={aspect:4.1} routed={:8} edits={edits:2} {:?} (latin: {reference:?})",
                         route.as_slug(),
                         routed_texts[i]
                     ));
                 } else {
                     tally.destroyed += 1;
                     failures.push(format!(
-                        "  DESTROYED pulc={class:9} routed={:8} needs={:8} {text:?}",
+                        "  DESTROYED pulc={class:9}aspect={aspect:4.1} routed={:8} needs={:8} {text:?}",
                         route.as_slug(),
                         label.as_slug()
                     ));
                 }
             }
             println!(
-                "{:28} lines={:3} unclassified={:3} correct={:3} degraded={:3} (cer {:.3}) destroyed={:3}",
+                "{:28} lines={:3} unclassified={:3} pulc_right={:3} pulc_wrong={:3} correct={:3} degraded={:3} (cer {:.3}) destroyed={:3}",
                 image_path.file_name().unwrap().to_string_lossy(),
                 routed.len(),
                 tally.unclassified,
+                tally.pulc_right,
+                tally.pulc_wrong,
                 tally.correct,
                 tally.degraded,
                 tally.degraded_cer(),
@@ -297,8 +327,10 @@ fn main() {
         }
     }
     println!(
-        "TOTAL unclassified={} correct={} degraded={} (cer {:.3}) destroyed={}",
+        "TOTAL unclassified={} pulc_right={} pulc_wrong={} correct={} degraded={} (cer {:.3}) destroyed={}",
         total.unclassified,
+        total.pulc_right,
+        total.pulc_wrong,
         total.correct,
         total.degraded,
         total.degraded_cer(),
