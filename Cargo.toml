@@ -66,6 +66,11 @@ name = "golden_eval"
 path = "src/bin/golden_eval.rs"
 required-features = ["ppocr"]
 
+[[bin]]
+name = "route_eval"
+path = "src/bin/route_eval.rs"
+required-features = ["planar-tracker"]
+
 [features]
 default = []
 translate-cli = ["dep:toml"]
