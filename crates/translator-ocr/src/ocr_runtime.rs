@@ -293,33 +293,69 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
          source_words={words_ms:.1}ms blocks+grouping={:.1}ms",
         t_blocks.elapsed().as_secs_f32() * 1000.0,
     );
-    let (source_code, blocks, block_sources) = match source_selection {
+    let (source_code, blocks, block_pieces) = match source_selection {
         OcrSourceSelection::Specific { language_code } => {
-            let block_sources = vec![language_code.clone(); blocks.len()];
-            (language_code.clone(), blocks, block_sources)
+            if blocks
+                .iter()
+                .all(|b| b.translation_text().trim().is_empty())
+            {
+                return Err(TranslatorError::ocr("No text found in image"));
+            }
+            let block_pieces = blocks
+                .iter()
+                .map(|b| {
+                    vec![BlockPiece {
+                        range: 0..b.translation_text().len(),
+                        translation: PieceTranslation::From(language_code.clone()),
+                    }]
+                })
+                .collect();
+            (language_code.clone(), blocks, block_pieces)
         }
         OcrSourceSelection::Auto => {
             let block_texts: Vec<String> = blocks.iter().map(TextBlock::translation_text).collect();
-            let routes = plan_block_sources(
-                &block_texts,
+            let block_ranges: Vec<Vec<std::ops::Range<usize>>> =
+                block_texts.iter().map(|t| split_script_pieces(t)).collect();
+            let piece_texts: Vec<String> = block_texts
+                .iter()
+                .zip(&block_ranges)
+                .flat_map(|(text, ranges)| ranges.iter().map(|r| text[r.clone()].to_string()))
+                .collect();
+            let routes = plan_piece_sources(
+                &piece_texts,
                 &available_scripted_languages(snapshot),
                 target_code,
                 |code| snapshot.can_translate(code, target_code),
             );
-            log::info!("ppocr auto block sources: {routes:?}");
-            let source_code = image_source_code(&block_texts, &routes, target_code)?;
-            // Only blocks with a translation are drawn; the rest keep their original pixels.
-            let (blocks, block_sources): (Vec<TextBlock>, Vec<LanguageCode>) = blocks
+            log::info!("ppocr auto piece sources: {routes:?}");
+            let source_code = image_source_code(&piece_texts, &routes, target_code)?;
+            let mut routes = routes.into_iter();
+            // Only blocks with a translated piece are drawn; the rest keep their original pixels.
+            let (blocks, block_pieces): (Vec<TextBlock>, Vec<Vec<BlockPiece>>) = blocks
                 .into_iter()
-                .zip(routes)
-                .filter_map(|(block, route)| match route {
-                    BlockSource::Translate(code) => Some((block, code)),
-                    BlockSource::Target
-                    | BlockSource::NotInstalled(_)
-                    | BlockSource::Undetected => None,
+                .zip(block_ranges)
+                .map(|(block, ranges)| {
+                    let pieces: Vec<BlockPiece> = ranges
+                        .into_iter()
+                        .map(|range| BlockPiece {
+                            range,
+                            translation: match routes.next().expect("one route per piece") {
+                                PieceSource::Translate(code) => PieceTranslation::From(code),
+                                PieceSource::Target
+                                | PieceSource::NotInstalled(_)
+                                | PieceSource::Undetected => PieceTranslation::Keep,
+                            },
+                        })
+                        .collect();
+                    (block, pieces)
+                })
+                .filter(|(_, pieces)| {
+                    pieces
+                        .iter()
+                        .any(|p| matches!(p.translation, PieceTranslation::From(_)))
                 })
                 .unzip();
-            (source_code, blocks, block_sources)
+            (source_code, blocks, block_pieces)
         }
     };
 
@@ -342,7 +378,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         rgba_bytes,
         width,
         height,
-        &block_sources,
+        &block_pieces,
         target_code,
         blocks,
         background_mode,
@@ -781,9 +817,83 @@ fn available_scripted_languages(snapshot: &CatalogSnapshot) -> Vec<ScriptedLangu
         .collect()
 }
 
-/// What still-image auto-detect decided for one OCR block.
+/// A run of a block's text in one writing script, and whether it gets translated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BlockSource {
+struct BlockPiece {
+    /// Byte range into the block's `translation_text`.
+    range: std::ops::Range<usize>,
+    translation: PieceTranslation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PieceTranslation {
+    From(LanguageCode),
+    Keep,
+}
+
+/// Byte ranges covering `text` exactly, one per run of a single writing script. Mixed-language
+/// text is written with its languages in separate clauses ("Они сказали тебе … закрылся. (They
+/// told you …)", "Я иду в парк – Je marche au parc"), so the cuts are at clause punctuation and only
+/// where the script changes; another script inside a clause ("купи iPhone сегодня", an email) stays
+/// part of it. Line breaks aren't cuts: a block's lines are layout, and a clause often spans them.
+fn split_script_pieces(text: &str) -> Vec<std::ops::Range<usize>> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let spaced = |ch: Option<char>| ch.is_none_or(char::is_whitespace);
+    let mut cuts = vec![0, text.len()];
+    for (k, &(i, c)) in chars.iter().enumerate() {
+        let prev = k.checked_sub(1).map(|p| chars[p].1);
+        let next = chars.get(k + 1).map(|&(_, n)| n);
+        let end = i + c.len_utf8();
+        match c {
+            '(' | '[' | '«' | '“' => cuts.push(i),
+            ')' | ']' | '»' | '”' => cuts.push(end),
+            '.' | ';' | ':' | '!' | '?' if spaced(next) => cuts.push(end),
+            '–' | '—' => cuts.extend([i, end]),
+            '-' if spaced(prev) && spaced(next) => cuts.extend([i, end]),
+            _ => {}
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut pieces: Vec<(std::ops::Range<usize>, Option<Script>)> = Vec::new();
+    for clause in cuts.windows(2).map(|w| w[0]..w[1]) {
+        let script = clause_script(&text[clause.clone()]);
+        match pieces.last_mut() {
+            Some((last, last_script))
+                if script.is_none() || last_script.is_none() || *last_script == script =>
+            {
+                last.end = clause.end;
+                *last_script = last_script.or(script);
+            }
+            _ => pieces.push((clause, script)),
+        }
+    }
+    pieces.into_iter().map(|(range, _)| range).collect()
+}
+
+/// The script most of a clause's words are written in. Counted per word, not per letter, so one
+/// long token in another script (an email, a URL, a product name) doesn't outvote the words
+/// around it.
+fn clause_script(clause: &str) -> Option<Script> {
+    let mut votes: Vec<(Script, usize)> = Vec::new();
+    for script in clause.split_whitespace().filter_map(Script::dominant) {
+        match votes.iter_mut().find(|(s, _)| *s == script) {
+            Some((_, count)) => *count += 1,
+            None => votes.push((script, 1)),
+        }
+    }
+    let best = votes.iter().map(|(_, count)| *count).max()?;
+    let mut leaders = votes.iter().filter(|(_, count)| *count == best);
+    let (script, _) = leaders.next()?;
+    if leaders.next().is_some() {
+        return Script::dominant(clause);
+    }
+    Some(*script)
+}
+
+/// What still-image auto-detect decided for one piece of a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PieceSource {
     Translate(LanguageCode),
     Target,
     /// Detected, but no installed models translate it to the target.
@@ -791,24 +901,24 @@ enum BlockSource {
     Undetected,
 }
 
-/// Detect each block of a still image on its own. A page can mix languages (Russian sentences
+/// Detect each piece of a still image on its own. A page can mix languages (Russian sentences
 /// glossed in English, a French and a Russian column), and a single image-wide verdict there is
-/// either unreliable or names one language for all of them. A block too short to detect alone
+/// either unreliable or names one language for all of them. A piece too short to detect alone
 /// takes the language detected over all of the image's text in its script, so a one-word label on
 /// a single-language sign still translates.
-fn plan_block_sources(
+fn plan_piece_sources(
     block_texts: &[String],
     available: &[ScriptedLanguage],
     target: &LanguageCode,
     can_translate: impl Fn(&LanguageCode) -> bool,
-) -> Vec<BlockSource> {
+) -> Vec<PieceSource> {
     let mut script_context: std::collections::HashMap<Script, Option<LanguageCode>> =
         std::collections::HashMap::new();
     block_texts
         .iter()
         .map(|text| {
             let Some(script) = Script::dominant(text) else {
-                return BlockSource::Undetected;
+                return PieceSource::Undetected;
             };
             let detected = detect_language_robust_code(text, None, available).or_else(|| {
                 script_context
@@ -825,10 +935,10 @@ fn plan_block_sources(
                     .clone()
             });
             match detected {
-                None => BlockSource::Undetected,
-                Some(code) if &code == target => BlockSource::Target,
-                Some(code) if can_translate(&code) => BlockSource::Translate(code),
-                Some(code) => BlockSource::NotInstalled(code),
+                None => PieceSource::Undetected,
+                Some(code) if &code == target => PieceSource::Target,
+                Some(code) if can_translate(&code) => PieceSource::Translate(code),
+                Some(code) => PieceSource::NotInstalled(code),
             }
         })
         .collect()
@@ -840,10 +950,10 @@ fn plan_block_sources(
 /// download it.
 fn image_source_code(
     block_texts: &[String],
-    routes: &[BlockSource],
+    routes: &[PieceSource],
     target: &LanguageCode,
 ) -> Result<LanguageCode, TranslatorError> {
-    let most_text = |pick: fn(&BlockSource) -> Option<&LanguageCode>| {
+    let most_text = |pick: fn(&PieceSource) -> Option<&LanguageCode>| {
         let mut chars_by_code: Vec<(&LanguageCode, usize)> = Vec::new();
         for (text, route) in block_texts.iter().zip(routes) {
             let Some(code) = pick(route) else {
@@ -861,13 +971,13 @@ fn image_source_code(
             .map(|(code, _)| code.clone())
     };
     if let Some(code) = most_text(|r| match r {
-        BlockSource::Translate(code) => Some(code),
+        PieceSource::Translate(code) => Some(code),
         _ => None,
     }) {
         return Ok(code);
     }
     if let Some(code) = most_text(|r| match r {
-        BlockSource::NotInstalled(code) => Some(code),
+        PieceSource::NotInstalled(code) => Some(code),
         _ => None,
     }) {
         return Err(TranslatorError::missing_asset(format!(
@@ -876,7 +986,7 @@ fn image_source_code(
             target.as_str()
         )));
     }
-    if routes.contains(&BlockSource::Target) {
+    if routes.contains(&PieceSource::Target) {
         return Ok(target.clone());
     }
     Err(TranslatorError::ocr(
@@ -904,7 +1014,7 @@ fn finalize_image_overlay(
     rgba_bytes: &[u8],
     width: u32,
     height: u32,
-    block_sources: &[LanguageCode],
+    block_pieces: &[Vec<BlockPiece>],
     target_code: &LanguageCode,
     blocks: Vec<TextBlock>,
     background_mode: BackgroundMode,
@@ -917,9 +1027,9 @@ fn finalize_image_overlay(
         translate_block_texts(
             &mut engine_guard,
             snapshot,
-            block_sources,
             target_code,
             &blocks,
+            block_pieces,
         )?
     };
     let translate_ms = t_translate.elapsed().as_secs_f32() * 1000.0;
@@ -1028,41 +1138,111 @@ fn remap_block_styles(
     out
 }
 
-/// Translate each block from its own source language, one model batch per language.
+/// Style ranges overlapping `range`, clipped to it and rebased to its start.
+fn styles_within(
+    styles: &[translator_core::ocr::StyleRange],
+    range: &std::ops::Range<usize>,
+) -> BlockStyles {
+    let (start, end) = (range.start as u32, range.end as u32);
+    styles
+        .iter()
+        .filter(|r| r.start < end && r.end > start)
+        .map(|r| translator_core::ocr::StyleRange {
+            start: r.start.max(start) - start,
+            end: r.end.min(end) - start,
+            kind: r.kind,
+        })
+        .collect()
+}
+
+fn styles_shifted(styles: BlockStyles, offset: usize) -> BlockStyles {
+    styles
+        .into_iter()
+        .map(|r| translator_core::ocr::StyleRange {
+            start: r.start + offset as u32,
+            end: r.end + offset as u32,
+            kind: r.kind,
+        })
+        .collect()
+}
+
+/// Translate each block piece by piece, one model batch per source language, and stitch every
+/// block back together with its kept pieces verbatim.
 fn translate_block_texts(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
-    block_sources: &[LanguageCode],
     target_code: &LanguageCode,
     blocks: &[TextBlock],
+    block_pieces: &[Vec<BlockPiece>],
 ) -> Result<(Vec<String>, Vec<BlockStyles>), TranslatorError> {
-    assert_eq!(
-        block_sources.len(),
-        blocks.len(),
-        "one source language per block"
-    );
+    assert_eq!(block_pieces.len(), blocks.len(), "one piece list per block");
     let sources: Vec<(String, BlockStyles)> = blocks
         .iter()
         .map(TextBlock::translation_text_with_styles)
         .collect();
-    let mut groups: Vec<(&LanguageCode, Vec<usize>)> = Vec::new();
-    for (index, code) in block_sources.iter().enumerate() {
-        match groups.iter_mut().find(|(c, _)| *c == code) {
-            Some((_, indices)) => indices.push(index),
-            None => groups.push((code, vec![index])),
+
+    // The translated core of a piece excludes its surrounding whitespace, which stays in place.
+    let core_of = |text: &str, range: &std::ops::Range<usize>| {
+        let piece = &text[range.clone()];
+        let start = range.start + (piece.len() - piece.trim_start().len());
+        start..start + piece.trim().len()
+    };
+    let mut groups: Vec<(&LanguageCode, Vec<(usize, usize)>)> = Vec::new();
+    for (bi, pieces) in block_pieces.iter().enumerate() {
+        for (pi, piece) in pieces.iter().enumerate() {
+            let PieceTranslation::From(code) = &piece.translation else {
+                continue;
+            };
+            match groups.iter_mut().find(|(c, _)| *c == code) {
+                Some((_, members)) => members.push((bi, pi)),
+                None => groups.push((code, vec![(bi, pi)])),
+            }
         }
     }
-    let mut translated_blocks = vec![String::new(); blocks.len()];
-    let mut target_styles: Vec<BlockStyles> = vec![Vec::new(); blocks.len()];
-    for (code, indices) in groups {
-        let group_sources: Vec<(String, BlockStyles)> =
-            indices.iter().map(|&i| sources[i].clone()).collect();
+    let mut translated: std::collections::HashMap<(usize, usize), (String, BlockStyles)> =
+        std::collections::HashMap::new();
+    for (code, members) in groups {
+        let group_sources: Vec<(String, BlockStyles)> = members
+            .iter()
+            .map(|&(bi, pi)| {
+                let (text, styles) = &sources[bi];
+                let core = core_of(text, &block_pieces[bi][pi].range);
+                (text[core.clone()].to_string(), styles_within(styles, &core))
+            })
+            .collect();
         let (texts, styles) =
             translate_from_sources(engine, snapshot, code, target_code, &group_sources)?;
-        for ((index, text), style) in indices.into_iter().zip(texts).zip(styles) {
-            translated_blocks[index] = text;
-            target_styles[index] = style;
+        for ((member, text), style) in members.into_iter().zip(texts).zip(styles) {
+            translated.insert(member, (text, style));
         }
+    }
+
+    let mut translated_blocks = Vec::with_capacity(blocks.len());
+    let mut target_styles = Vec::with_capacity(blocks.len());
+    for (bi, pieces) in block_pieces.iter().enumerate() {
+        let (text, styles) = &sources[bi];
+        let mut out = String::new();
+        let mut out_styles = BlockStyles::new();
+        for (pi, piece) in pieces.iter().enumerate() {
+            match translated.remove(&(bi, pi)) {
+                Some((piece_text, piece_styles)) => {
+                    let core = core_of(text, &piece.range);
+                    out.push_str(&text[piece.range.start..core.start]);
+                    out_styles.extend(styles_shifted(piece_styles, out.len()));
+                    out.push_str(&piece_text);
+                    out.push_str(&text[core.end..piece.range.end]);
+                }
+                None => {
+                    out_styles.extend(styles_shifted(
+                        styles_within(styles, &piece.range),
+                        out.len(),
+                    ));
+                    out.push_str(&text[piece.range.clone()]);
+                }
+            }
+        }
+        translated_blocks.push(out);
+        target_styles.push(out_styles);
     }
     Ok((translated_blocks, target_styles))
 }
@@ -1217,13 +1397,13 @@ mod tests {
             "Actuellement, je travaille sur un projet qui se déroule en fait à Paris.",
             "They told you the results of the exam after the bank closed.",
         ]);
-        let routes = plan_block_sources(&blocks, &available, &en(), |_| true);
+        let routes = plan_piece_sources(&blocks, &available, &en(), |_| true);
         assert_eq!(
             routes,
             vec![
-                BlockSource::Translate(LanguageCode::from("ru")),
-                BlockSource::Translate(LanguageCode::from("fr")),
-                BlockSource::Target,
+                PieceSource::Translate(LanguageCode::from("ru")),
+                PieceSource::Translate(LanguageCode::from("fr")),
+                PieceSource::Target,
             ]
         );
     }
@@ -1239,8 +1419,8 @@ mod tests {
             "Sortie",
             "La sortie de secours se trouve au bout du couloir, à côté de l'ascenseur.",
         ]);
-        let routes = plan_block_sources(&blocks, &available, &en(), |_| true);
-        let fr = BlockSource::Translate(LanguageCode::from("fr"));
+        let routes = plan_piece_sources(&blocks, &available, &en(), |_| true);
+        let fr = PieceSource::Translate(LanguageCode::from("fr"));
         assert_eq!(routes, vec![fr.clone(), fr]);
     }
 
@@ -1248,10 +1428,10 @@ mod tests {
     fn untranslatable_language_is_reported_missing_when_nothing_else_translates() {
         let available = languages(&[("de", Script::Latin), ("en", Script::Latin)]);
         let blocks = texts(&["Der Notausgang befindet sich am Ende des Flurs neben dem Aufzug."]);
-        let routes = plan_block_sources(&blocks, &available, &en(), |_| false);
+        let routes = plan_piece_sources(&blocks, &available, &en(), |_| false);
         assert_eq!(
             routes,
-            vec![BlockSource::NotInstalled(LanguageCode::from("de"))]
+            vec![PieceSource::NotInstalled(LanguageCode::from("de"))]
         );
         let err = image_source_code(&blocks, &routes, &en()).unwrap_err();
         assert!(err.is_missing_asset());
@@ -1266,9 +1446,9 @@ mod tests {
             "hello there",
         ]);
         let routes = vec![
-            BlockSource::Translate(LanguageCode::from("ru")),
-            BlockSource::Translate(LanguageCode::from("fr")),
-            BlockSource::Target,
+            PieceSource::Translate(LanguageCode::from("ru")),
+            PieceSource::Translate(LanguageCode::from("fr")),
+            PieceSource::Target,
         ];
         assert_eq!(
             image_source_code(&blocks, &routes, &en()).unwrap(),
@@ -1279,7 +1459,7 @@ mod tests {
     #[test]
     fn image_already_in_target_reads_as_target() {
         let blocks = texts(&["hello there", "1234"]);
-        let routes = vec![BlockSource::Target, BlockSource::Undetected];
+        let routes = vec![PieceSource::Target, PieceSource::Undetected];
         assert_eq!(image_source_code(&blocks, &routes, &en()).unwrap(), en());
     }
 
@@ -1287,13 +1467,57 @@ mod tests {
     fn image_with_no_detectable_text_is_an_error() {
         let blocks = texts(&["1234", "--"]);
         let routes =
-            plan_block_sources(&blocks, &languages(&[("en", Script::Latin)]), &en(), |_| {
+            plan_piece_sources(&blocks, &languages(&[("en", Script::Latin)]), &en(), |_| {
                 true
             });
         assert_eq!(
             routes,
-            vec![BlockSource::Undetected, BlockSource::Undetected]
+            vec![PieceSource::Undetected, PieceSource::Undetected]
         );
         assert!(image_source_code(&blocks, &routes, &en()).is_err());
+    }
+
+    fn pieces(text: &str) -> Vec<&str> {
+        split_script_pieces(text)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect()
+    }
+
+    #[test]
+    fn splits_a_russian_sentence_from_its_english_gloss() {
+        assert_eq!(
+            pieces(
+                "Past Tense & Cases: Они сказали тебе результаты, как банк закрылся. (They told you the results.)"
+            ),
+            vec![
+                "Past Tense & Cases:",
+                " Они сказали тебе результаты, как банк закрылся. ",
+                "(They told you the results.)",
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_at_a_spaced_dash_and_keeps_same_script_clauses_together() {
+        assert_eq!(
+            pieces("Я иду в парк (Ya idu v park) – Je marche au parc"),
+            vec!["Я иду в парк ", "(Ya idu v park) – Je marche au parc"]
+        );
+    }
+
+    #[test]
+    fn another_script_inside_a_clause_stays_part_of_it() {
+        assert_eq!(pieces("купи iPhone сегодня"), vec!["купи iPhone сегодня"]);
+        assert_eq!(
+            pieces("пишите на info@example.com: ответим"),
+            vec!["пишите на info@example.com: ответим"]
+        );
+    }
+
+    #[test]
+    fn pieces_cover_the_text_exactly() {
+        let text = "«Привет», said he. — Да! (yes) 3.5 kg";
+        assert_eq!(pieces(text).concat(), text);
     }
 }
