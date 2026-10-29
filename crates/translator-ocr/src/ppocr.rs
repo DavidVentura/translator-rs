@@ -1428,8 +1428,10 @@ fn log_text_preview(text: &str) -> String {
 
 fn normalize_rec_text_for_script(script: PpocrScript, text: String) -> String {
     match script {
+        // Every recognizer reads Latin alongside its own script, but only the Cyrillic ones can
+        // emit a Latin/Cyrillic twin in the wrong script.
         PpocrScript::Cyrillic | PpocrScript::Eslav => {
-            translator_core::script_normalize::repair_cyrillic_word_mixing(&text)
+            translator_core::script_normalize::repair_latin_cyrillic_confusables(&text)
         }
         _ => text,
     }

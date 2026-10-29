@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use crate::ppocr::{
     InkChannelOrder, PpocrEngine, PpocrProfile, PpocrScriptClass, PpocrScriptPrediction,
 };
-use translator_core::api::{LanguageCode, TranslatorError};
+use translator_core::api::{LanguageCode, ScriptedLanguage, TranslatorError};
 use translator_core::catalog::CatalogSnapshot;
 use translator_core::catalog::{OcrPack, PackKind, PpocrScript};
 use translator_core::ocr::{
@@ -14,6 +14,7 @@ use translator_core::ocr::{
 use translator_core::ocr::{
     PreparedImageOverlay, ReadingOrder, RecognizedImageOverlay, Rect, TextBlock,
 };
+use translator_core::script::Script;
 use translator_core::settings::BackgroundMode;
 use translator_raster::live_frame::StillImage;
 use translator_raster::overlay::prepare_overlay_image;
@@ -292,21 +293,33 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
          source_words={words_ms:.1}ms blocks+grouping={:.1}ms",
         t_blocks.elapsed().as_secs_f32() * 1000.0,
     );
-    let source_code = match source_selection {
-        OcrSourceSelection::Specific { language_code } => language_code.clone(),
+    let (source_code, blocks, block_sources) = match source_selection {
+        OcrSourceSelection::Specific { language_code } => {
+            let block_sources = vec![language_code.clone(); blocks.len()];
+            (language_code.clone(), blocks, block_sources)
+        }
         OcrSourceSelection::Auto => {
-            let blocks_text = blocks
-                .iter()
-                .map(TextBlock::translation_text)
-                .collect::<Vec<_>>()
-                .join("\n");
-            let Some(detected) = ocr_source_from_text(snapshot, &blocks_text, Some(target_code))
-            else {
-                return Err(TranslatorError::ocr(
-                    "could not detect image source language",
-                ));
-            };
-            detected
+            let block_texts: Vec<String> = blocks.iter().map(TextBlock::translation_text).collect();
+            let routes = plan_block_sources(
+                &block_texts,
+                &available_scripted_languages(snapshot),
+                target_code,
+                |code| snapshot.can_translate(code, target_code),
+            );
+            log::info!("ppocr auto block sources: {routes:?}");
+            let source_code = image_source_code(&block_texts, &routes, target_code)?;
+            // Only blocks with a translation are drawn; the rest keep their original pixels.
+            let (blocks, block_sources): (Vec<TextBlock>, Vec<LanguageCode>) = blocks
+                .into_iter()
+                .zip(routes)
+                .filter_map(|(block, route)| match route {
+                    BlockSource::Translate(code) => Some((block, code)),
+                    BlockSource::Target
+                    | BlockSource::NotInstalled(_)
+                    | BlockSource::Undetected => None,
+                })
+                .unzip();
+            (source_code, blocks, block_sources)
         }
     };
 
@@ -329,7 +342,7 @@ pub fn translate_image_rgba_ppocr_in_snapshot(
         rgba_bytes,
         width,
         height,
-        &source_code,
+        &block_sources,
         target_code,
         blocks,
         background_mode,
@@ -744,7 +757,20 @@ fn ocr_source_from_text(
     text: &str,
     target_code: Option<&LanguageCode>,
 ) -> Option<LanguageCode> {
-    let available = snapshot
+    let detected =
+        detect_language_robust_code(text, None, &available_scripted_languages(snapshot))?;
+    if let Some(target) = target_code {
+        if !snapshot.can_translate(&detected, target) {
+            return None;
+        }
+    }
+    Some(detected)
+}
+
+/// Every catalog language, installed or not, so detection can name a language the user
+/// still has to download.
+fn available_scripted_languages(snapshot: &CatalogSnapshot) -> Vec<ScriptedLanguage> {
+    snapshot
         .availability_by_code
         .keys()
         .filter_map(|code| {
@@ -752,14 +778,110 @@ fn ocr_source_from_text(
                 .catalog
                 .scripted_language(&LanguageCode::from(code.as_str()))
         })
-        .collect::<Vec<_>>();
-    let detected = detect_language_robust_code(text, None, &available)?;
-    if let Some(target) = target_code {
-        if !snapshot.can_translate(&detected, target) {
-            return None;
+        .collect()
+}
+
+/// What still-image auto-detect decided for one OCR block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockSource {
+    Translate(LanguageCode),
+    Target,
+    /// Detected, but no installed models translate it to the target.
+    NotInstalled(LanguageCode),
+    Undetected,
+}
+
+/// Detect each block of a still image on its own. A page can mix languages (Russian sentences
+/// glossed in English, a French and a Russian column), and a single image-wide verdict there is
+/// either unreliable or names one language for all of them. A block too short to detect alone
+/// takes the language detected over all of the image's text in its script, so a one-word label on
+/// a single-language sign still translates.
+fn plan_block_sources(
+    block_texts: &[String],
+    available: &[ScriptedLanguage],
+    target: &LanguageCode,
+    can_translate: impl Fn(&LanguageCode) -> bool,
+) -> Vec<BlockSource> {
+    let mut script_context: std::collections::HashMap<Script, Option<LanguageCode>> =
+        std::collections::HashMap::new();
+    block_texts
+        .iter()
+        .map(|text| {
+            let Some(script) = Script::dominant(text) else {
+                return BlockSource::Undetected;
+            };
+            let detected = detect_language_robust_code(text, None, available).or_else(|| {
+                script_context
+                    .entry(script)
+                    .or_insert_with(|| {
+                        let same_script = block_texts
+                            .iter()
+                            .filter(|t| Script::dominant(t) == Some(script))
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        detect_language_robust_code(&same_script, None, available)
+                    })
+                    .clone()
+            });
+            match detected {
+                None => BlockSource::Undetected,
+                Some(code) if &code == target => BlockSource::Target,
+                Some(code) if can_translate(&code) => BlockSource::Translate(code),
+                Some(code) => BlockSource::NotInstalled(code),
+            }
+        })
+        .collect()
+}
+
+/// The language a still image is reported as read in: the translated language covering the most
+/// text. An image with nothing to translate is an error unless all of its detected text already
+/// is the target, and a detected language without models is reported as missing so the user can
+/// download it.
+fn image_source_code(
+    block_texts: &[String],
+    routes: &[BlockSource],
+    target: &LanguageCode,
+) -> Result<LanguageCode, TranslatorError> {
+    let most_text = |pick: fn(&BlockSource) -> Option<&LanguageCode>| {
+        let mut chars_by_code: Vec<(&LanguageCode, usize)> = Vec::new();
+        for (text, route) in block_texts.iter().zip(routes) {
+            let Some(code) = pick(route) else {
+                continue;
+            };
+            let chars = text.chars().count();
+            match chars_by_code.iter_mut().find(|(c, _)| *c == code) {
+                Some((_, total)) => *total += chars,
+                None => chars_by_code.push((code, chars)),
+            }
         }
+        chars_by_code
+            .into_iter()
+            .max_by_key(|(_, chars)| *chars)
+            .map(|(code, _)| code.clone())
+    };
+    if let Some(code) = most_text(|r| match r {
+        BlockSource::Translate(code) => Some(code),
+        _ => None,
+    }) {
+        return Ok(code);
     }
-    Some(detected)
+    if let Some(code) = most_text(|r| match r {
+        BlockSource::NotInstalled(code) => Some(code),
+        _ => None,
+    }) {
+        return Err(TranslatorError::missing_asset(format!(
+            "no installed translation for {}->{}",
+            code.as_str(),
+            target.as_str()
+        )));
+    }
+    if routes.contains(&BlockSource::Target) {
+        return Ok(target.clone());
+    }
+    Err(TranslatorError::ocr(
+        "could not detect image source language",
+    ))
 }
 
 pub fn ocr_source_for_lines(
@@ -782,7 +904,7 @@ fn finalize_image_overlay(
     rgba_bytes: &[u8],
     width: u32,
     height: u32,
-    source_code: &LanguageCode,
+    block_sources: &[LanguageCode],
     target_code: &LanguageCode,
     blocks: Vec<TextBlock>,
     background_mode: BackgroundMode,
@@ -795,7 +917,7 @@ fn finalize_image_overlay(
         translate_block_texts(
             &mut engine_guard,
             snapshot,
-            source_code,
+            block_sources,
             target_code,
             &blocks,
         )?
@@ -906,18 +1028,43 @@ fn remap_block_styles(
     out
 }
 
+/// Translate each block from its own source language, one model batch per language.
 fn translate_block_texts(
     engine: &mut BergamotEngine,
     snapshot: &CatalogSnapshot,
-    source_code: &LanguageCode,
+    block_sources: &[LanguageCode],
     target_code: &LanguageCode,
     blocks: &[TextBlock],
 ) -> Result<(Vec<String>, Vec<BlockStyles>), TranslatorError> {
+    assert_eq!(
+        block_sources.len(),
+        blocks.len(),
+        "one source language per block"
+    );
     let sources: Vec<(String, BlockStyles)> = blocks
         .iter()
         .map(TextBlock::translation_text_with_styles)
         .collect();
-    translate_from_sources(engine, snapshot, source_code, target_code, &sources)
+    let mut groups: Vec<(&LanguageCode, Vec<usize>)> = Vec::new();
+    for (index, code) in block_sources.iter().enumerate() {
+        match groups.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, indices)) => indices.push(index),
+            None => groups.push((code, vec![index])),
+        }
+    }
+    let mut translated_blocks = vec![String::new(); blocks.len()];
+    let mut target_styles: Vec<BlockStyles> = vec![Vec::new(); blocks.len()];
+    for (code, indices) in groups {
+        let group_sources: Vec<(String, BlockStyles)> =
+            indices.iter().map(|&i| sources[i].clone()).collect();
+        let (texts, styles) =
+            translate_from_sources(engine, snapshot, code, target_code, &group_sources)?;
+        for ((index, text), style) in indices.into_iter().zip(texts).zip(styles) {
+            translated_blocks[index] = text;
+            target_styles[index] = style;
+        }
+    }
+    Ok((translated_blocks, target_styles))
 }
 
 /// Translate each block's source text and remap its source-space style ranges onto the result.
@@ -1035,4 +1182,118 @@ pub fn retranslate_overlay(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn languages(list: &[(&str, Script)]) -> Vec<ScriptedLanguage> {
+        list.iter()
+            .map(|(code, script)| ScriptedLanguage {
+                code: LanguageCode::from(*code),
+                script: *script,
+            })
+            .collect()
+    }
+
+    fn texts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn en() -> LanguageCode {
+        LanguageCode::from("en")
+    }
+
+    #[test]
+    fn mixed_language_page_routes_each_block_to_its_own_language() {
+        let available = languages(&[
+            ("ru", Script::Cyrillic),
+            ("fr", Script::Latin),
+            ("en", Script::Latin),
+        ]);
+        let blocks = texts(&[
+            "Они сказали тебе результаты экзамена после того, как банк закрылся.",
+            "Actuellement, je travaille sur un projet qui se déroule en fait à Paris.",
+            "They told you the results of the exam after the bank closed.",
+        ]);
+        let routes = plan_block_sources(&blocks, &available, &en(), |_| true);
+        assert_eq!(
+            routes,
+            vec![
+                BlockSource::Translate(LanguageCode::from("ru")),
+                BlockSource::Translate(LanguageCode::from("fr")),
+                BlockSource::Target,
+            ]
+        );
+    }
+
+    #[test]
+    fn short_block_takes_the_language_of_its_scripts_text() {
+        let available = languages(&[
+            ("fr", Script::Latin),
+            ("es", Script::Latin),
+            ("en", Script::Latin),
+        ]);
+        let blocks = texts(&[
+            "Sortie",
+            "La sortie de secours se trouve au bout du couloir, à côté de l'ascenseur.",
+        ]);
+        let routes = plan_block_sources(&blocks, &available, &en(), |_| true);
+        let fr = BlockSource::Translate(LanguageCode::from("fr"));
+        assert_eq!(routes, vec![fr.clone(), fr]);
+    }
+
+    #[test]
+    fn untranslatable_language_is_reported_missing_when_nothing_else_translates() {
+        let available = languages(&[("de", Script::Latin), ("en", Script::Latin)]);
+        let blocks = texts(&["Der Notausgang befindet sich am Ende des Flurs neben dem Aufzug."]);
+        let routes = plan_block_sources(&blocks, &available, &en(), |_| false);
+        assert_eq!(
+            routes,
+            vec![BlockSource::NotInstalled(LanguageCode::from("de"))]
+        );
+        let err = image_source_code(&blocks, &routes, &en()).unwrap_err();
+        assert!(err.is_missing_asset());
+        assert!(err.message.contains("de->en"), "{}", err.message);
+    }
+
+    #[test]
+    fn image_source_is_the_translated_language_with_most_text() {
+        let blocks = texts(&[
+            "короткий",
+            "a much longer french block of text",
+            "hello there",
+        ]);
+        let routes = vec![
+            BlockSource::Translate(LanguageCode::from("ru")),
+            BlockSource::Translate(LanguageCode::from("fr")),
+            BlockSource::Target,
+        ];
+        assert_eq!(
+            image_source_code(&blocks, &routes, &en()).unwrap(),
+            LanguageCode::from("fr")
+        );
+    }
+
+    #[test]
+    fn image_already_in_target_reads_as_target() {
+        let blocks = texts(&["hello there", "1234"]);
+        let routes = vec![BlockSource::Target, BlockSource::Undetected];
+        assert_eq!(image_source_code(&blocks, &routes, &en()).unwrap(), en());
+    }
+
+    #[test]
+    fn image_with_no_detectable_text_is_an_error() {
+        let blocks = texts(&["1234", "--"]);
+        let routes =
+            plan_block_sources(&blocks, &languages(&[("en", Script::Latin)]), &en(), |_| {
+                true
+            });
+        assert_eq!(
+            routes,
+            vec![BlockSource::Undetected, BlockSource::Undetected]
+        );
+        assert!(image_source_code(&blocks, &routes, &en()).is_err());
+    }
 }
