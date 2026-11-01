@@ -1003,7 +1003,7 @@ fn decode_image_to_rgba(
         return Ok((
             img.width(),
             img.height(),
-            img.to_rgba8().into_raw(),
+            rgba_to_bgra(img.to_rgba8().into_raw()),
             SourceKind::Other,
         ));
     }
@@ -1034,7 +1034,7 @@ fn decode_image_to_rgba(
         return Ok((
             img.width(),
             img.height(),
-            img.to_rgba8().into_raw(),
+           rgba_to_bgra(img.to_rgba8().into_raw()),
             SourceKind::Other,
         ));
     }
@@ -1256,6 +1256,12 @@ fn parse_indexed_colorspace(items: &[Object], doc: &Document) -> ColorSpaceKind 
         ));
     }
     ColorSpaceKind::Indexed { base_kind, lookup }
+}
+fn rgba_to_bgra(mut rgba: Vec<u8>) -> Vec<u8> {
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    rgba
 }
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
