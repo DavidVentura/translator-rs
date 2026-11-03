@@ -41,7 +41,7 @@ fn boundary_regex() -> &'static Regex {
         // Group 1 ends after the closing delimiters (they stay with the current
         // sentence); group 2 is the opening-delimiter run and group 3 the first
         // real character — the next sentence begins at group 2's start.
-        Regex::new(r#"([.!?।॥։۔؟።፧]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*)(\S)"#)
+        Regex::new(r#"([.!?।॥։۔؟።፧។៕]+["'”’)\]»]*)\s+(["'“‘(\[¿¡«]*)(\S)"#)
             .expect("valid sentence-boundary regex")
     })
 }
@@ -439,6 +439,19 @@ mod tests {
     fn non_latin_terminators_split() {
         assert_eq!(split_sentences("दरवाज़ा बंद है। कृपया आएं।").len(), 2);
         assert_eq!(split_sentences("أين هو؟ إنه هنا.").len(), 2);
+    }
+
+    #[test]
+    fn khmer_khan_and_bariyoosan_split() {
+        // Khmer ends a sentence with the khan ។ (U+17D4) and a passage with the
+        // bariyoosan ៕ (U+17D5). Its spaces separate phrases, so a space alone
+        // must not split. Mirrors CANDIDATE in scripts/opus-trainer/split_sentences.py.
+        assert_eq!(
+            split_sentences("ហាងបិទថ្ងៃអាទិត្យ។ សូមអភ័យទោស។"),
+            vec!["ហាងបិទថ្ងៃអាទិត្យ។", "សូមអភ័យទោស។"]
+        );
+        assert_eq!(split_sentences("ចប់ហើយ៕ សូមអរគុណ។").len(), 2);
+        assert_eq!(split_sentences("សូមដោះស្បែកជើង មុនពេលចូលវិហារ។").len(), 1);
     }
 
     #[test]
