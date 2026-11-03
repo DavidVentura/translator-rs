@@ -519,12 +519,22 @@ def _words_for(value: int) -> set[str]:
     return out
 
 
+KHMER_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+
+
+def ascii_digits(s: str) -> str:
+    """Khmer digits ០-៩ as ASCII. `\\d` already matches them, so without this a
+    sign printed with Khmer digits and an English side with ASCII ones compared as
+    different figures. Khmer only, so the Georgian gates behave exactly as before."""
+    return s.translate(KHMER_DIGITS)
+
+
 def _digits_of(tok: str) -> str:
-    return "".join(DIGITS.findall(tok))
+    return ascii_digits("".join(DIGITS.findall(tok)))
 
 
 def _parts(tok: str) -> list[str]:
-    return [p for p in re.split(r"[.,  ]", tok) if p]
+    return [ascii_digits(p) for p in re.split(r"[.,  ]", tok) if p]
 
 
 def _matches(tok: str, other_digits: set[str], other_parts: set[str],

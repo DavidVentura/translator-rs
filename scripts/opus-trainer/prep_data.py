@@ -169,6 +169,8 @@ def fix_wiki(s: str) -> str:
 
 
 def alpha_ratio_ok(s: str, word_ratio: float, alpha_ratio: float) -> bool:
+    if is_unspaced(s):
+        return _alpha_ratio_unspaced(s, word_ratio, alpha_ratio)
     toks = s.split()
     if not toks:
         return False
@@ -180,12 +182,106 @@ def alpha_ratio_ok(s: str, word_ratio: float, alpha_ratio: float) -> bool:
     return letters / nonspace >= alpha_ratio
 
 
+def _alpha_ratio_unspaced(s: str, word_ratio: float, alpha_ratio: float) -> bool:
+    """alpha_ratio_ok for Khmer-type lines. Only these lines take this path, so
+    every pair already shipped is filtered exactly as before.
+
+    - Marks (category M) count as letters: in abugidas the vowel signs and
+      stacked subscripts are Mn/Mc, so counting only L dropped 42% of Tatoeba
+      en-km as "not text".
+    - Khmer typography sets punctuation off with spaces (« ... » ។), so
+      punctuation-only tokens are left out of the word ratio.
+    - Format characters (Cf, e.g. zero-width spaces) are left out of the
+      character ratio.
+    """
+    toks = [t for t in s.split() if not all(unicodedata.category(c)[0] == "P" for c in t)]
+    if not toks:
+        return False
+    is_letter = lambda c: unicodedata.category(c)[0] in "LM"
+    lettered = sum(1 for t in toks if any(is_letter(c) for c in t))
+    if lettered / len(toks) < word_ratio:
+        return False
+    nonspace = sum(1 for c in s if not c.isspace() and unicodedata.category(c) != "Cf")
+    letters = sum(1 for c in s if is_letter(c))
+    return nonspace > 0 and letters / nonspace >= alpha_ratio
+
+
+# Khmer is written without spaces between words: its spaces separate phrases,
+# so `split()` undercounts words several-fold (median
+# 4.5 English tokens per Khmer token on TED2020/tico-19) and the token-ratio
+# filter dropped 68% of those human-translated corpora. For such a line the word
+# count is estimated from characters instead. CHARS_PER_WORD is measured for
+# Khmer as non-space characters per English word on human bitext: median 6.0 over
+# 4,358 TED2020 + tico-19 + Tatoeba pairs (5.3 TED, 6.3 tico, 4.1 for Tatoeba's
+# short sentences). Khmer blocks only: Thai, Lao and Burmese share the problem
+# but CHARS_PER_WORD has not been measured for them, so add their ranges together
+# with their own measurement.
+UNSPACED = ((0x1780, 0x17FF), (0x19E0, 0x19FF))
+CHARS_PER_WORD = 6.0
+
+
+def is_unspaced(s: str) -> bool:
+    letters = [c for c in s if c.isalpha()]
+    hits = sum(1 for c in letters if any(lo <= ord(c) <= hi for lo, hi in UNSPACED))
+    return bool(letters) and hits / len(letters) > 0.5
+
+
+def word_count(s: str) -> int:
+    if is_unspaced(s):
+        return max(1, round(sum(1 for c in s if not c.isspace()) / CHARS_PER_WORD))
+    return len(s.split())
+
+
+# Khmer digits ០-៩ as ASCII, or ២០ against 20 is a "mismatch": that alone dropped
+# 18% of wikimedia en-km. Khmer only, so no shipped pair's filtering changes; add
+# another script's digits here when its pair needs it.
+KHMER_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+
+
+def _ascii_digits(s: str) -> str:
+    return s.translate(KHMER_DIGITS)
+
+
 def _nums(s: str) -> set[str]:
+    s = _ascii_digits(s)
     return {(m["sign"] or "") + re.sub(r"[^\d]+", "*", m["value"]) for m in NUM_EXPR.finditer(s)}
 
 
+# NUM_EXPR's \b needs a word boundary on both sides of a number, and Python counts
+# a Khmer letter as a word character. Khmer is written without spaces, so a figure
+# sits directly against the letters around it ("86នាទី", "ទី20", "ទី២"), \b finds
+# no boundary, and the Khmer side yields no number at all: 1,296 of the 1,878 pairs
+# of the professionally translated ALT corpus that failed this check were that
+# case, plus 212 where the English "20th" is the side with no match. Only
+# digit-adjacency matters here, so this pattern lets letters touch a number; it
+# still refuses a number glued to a Latin letter or inside a longer figure, as \b
+# did ("A5", "5,000" stays one figure). Used only when a pair contains Khmer, so no
+# other language's filtering changes.
+NUM_EXPR_UNSPACED = re.compile(r"""
+    (?:
+        (?P<sign>(?:(?<=\s)|^)[-+])
+        |(?<![A-Za-z\d_.,:])
+    )
+    (?:0*)
+    (?P<value>\d+(?:[.,:]\d+)*)
+    (?!\d)
+""", re.X)
+
+
+def _has_unspaced_script(s: str) -> bool:
+    return any(lo <= ord(c) <= hi for c in s for lo, hi in UNSPACED)
+
+
+def _nums_unspaced(s: str) -> set[str]:
+    s = _ascii_digits(s)
+    return {(m["sign"] or "") + re.sub(r"[^\d]+", "*", m["value"]) for m in NUM_EXPR_UNSPACED.finditer(s)}
+
+
 def num_mismatch_ok(s: str, t: str, ratio: float) -> bool:
-    a, b = _nums(s), _nums(t)
+    if _has_unspaced_script(s) or _has_unspaced_script(t):
+        a, b = _nums_unspaced(s), _nums_unspaced(t)
+    else:
+        a, b = _nums(s), _nums(t)
     if not a and not b:
         return True
     return (len(a & b) + 1) / (len(a ^ b) + 1) >= ratio
@@ -196,7 +292,10 @@ def url_mismatch_ok(s: str, t: str) -> bool:
 
 
 def max_word_ok(s: str, t: str, limit: int) -> bool:
-    return not any(len(tok) > limit for field in (s, t) for tok in field.split(" "))
+    # A space-separated "word" on a Khmer line is a phrase and can legitimately
+    # run past `limit` characters; word_count() and max_chars already bound it.
+    return not any(len(tok) > limit for field in (s, t) if not is_unspaced(field)
+                   for tok in field.split(" "))
 
 
 # A DECODE-HANG GUARD, not a quality rule, and the threshold is set accordingly.
@@ -259,6 +358,15 @@ def clean_pair(s_raw: str, t_raw: str, args) -> tuple[str, str] | None:
     to drop it. Pure and picklable-input, so it runs in worker processes."""
     s = deescape(s_raw.replace("\t", " "))
     t = deescape(t_raw.replace("\t", " "))
+    # Zero-width spaces are invisible word-break hints (common in Khmer web and
+    # UI text). SentencePiece's NMT_NFKC deletes them at encode time anyway, so a
+    # line that keeps them fails check_vocab's roundtrip (600 of 604 failures on
+    # en-km); drop them so the stored text is what the model sees. Only on
+    # unspaced-script lines, so other pairs' text is untouched.
+    if is_unspaced(s):
+        s = s.replace("\u200b", "")
+    if is_unspaced(t):
+        t = t.replace("\u200b", "")
     if WIKI_CODE.search(s) or WIKI_CODE.search(t):
         return None
     s = strip_artifacts(fix_wiki(s))
@@ -273,12 +381,12 @@ def clean_pair(s_raw: str, t_raw: str, args) -> tuple[str, str] | None:
         return None
     if not max_word_ok(s, t, args.max_word_len):
         return None
-    sw, tw = s.split(), t.split()
-    if not (args.min_tokens <= len(sw) <= args.max_tokens):
+    sw, tw = word_count(s), word_count(t)
+    if not (args.min_tokens <= sw <= args.max_tokens):
         return None
-    if not (args.min_tokens <= len(tw) <= args.max_tokens):
+    if not (args.min_tokens <= tw <= args.max_tokens):
         return None
-    if max(len(sw), len(tw)) / min(len(sw), len(tw)) > args.ratio:
+    if max(sw, tw) / min(sw, tw) > args.ratio:
         return None
     if max(len(s), len(t)) > args.max_chars:
         return None
@@ -330,6 +438,10 @@ def _clean_batch(task: tuple[str, list]) -> tuple[str, int, list[str]]:
             # coverage; pass short pairs through on the non-LID filters alone.
             short = (
                 args.lid_bypass_tokens > 0
+                # Deliberately split(), not word_count(): an unspaced Khmer UI
+                # string is one whitespace token, so it keeps the bypass. Counting
+                # it in estimated words sent short Khmer lines to LID, which is
+                # unreliable on them, and translatewiki en-km fell from 71% to 66%.
                 and len(s.split()) <= args.lid_bypass_tokens
                 and len(t.split()) <= args.lid_bypass_tokens
             )

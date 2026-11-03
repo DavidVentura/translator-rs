@@ -64,6 +64,7 @@ CONFIG_DEFAULT = pathlib.Path(__file__).with_name("configs") / "number_words.jso
 # separator, so "14:05" is two numerals; that is what makes the doubled-time
 # corruption above visible as an added figure rather than one opaque token.
 THIN_SPACES = "   "
+KHMER_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
 NUMERAL = re.compile(rf"\d+(?:[.,'{THIN_SPACES} ]\d+)*")
 SEPARATOR = re.compile(rf"[.,'{THIN_SPACES} ]")
 WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -160,6 +161,9 @@ def canonical_numeral(token: str) -> str:
     that writes 2,500 for two and a half agrees with itself even where the
     reading is wrong.
     """
+    # Khmer digits compare as ASCII, so ១២៥០០ on a Khmer sign and 12500 in the
+    # English are the same figure. Khmer only, so existing pairs score as before.
+    token = token.translate(KHMER_DIGITS)
     groups = SEPARATOR.split(token)
     separators = SEPARATOR.findall(token)
     integer, fraction = groups[0], ""
